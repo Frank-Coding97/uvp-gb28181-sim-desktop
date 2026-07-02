@@ -1,6 +1,8 @@
 # crate: sip-core
 
-**状态:草案(M0 骨架)** · worktree `feat/protocol` · 与 GB28181 无关的通用 SIP 协议栈。
+**状态:开发中(M1)** · worktree `feat/protocol` · 与 GB28181 无关的通用 SIP 协议栈。
+
+> 进度:`message`(消息解析/序列化)✅ 已实现 · `auth`/`transport`/`transaction` 🚧 开发中。
 
 ## 职责
 
