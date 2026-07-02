@@ -10,10 +10,10 @@
 
 | 功能 | 需求 | 里程碑 | 状态 |
 |---|---|---|---|
-| REGISTER / Digest MD5 / 注销 | FR-1 | M1 | ⬜ |
-| 心跳保活 + 超时重注册(指数退避) | FR-2 | M1 | ⬜ |
-| SIP over UDP / TCP | FR-4 | M1 | ⬜ |
-| OPTIONS 探活响应 | FR-3 | M1 | ⬜ |
+| REGISTER / Digest MD5 / 注销 | FR-1 | M1 | 🚧 已实现待联调 |
+| 心跳保活 + 超时重注册(指数退避) | FR-2 | M1 | 🚧 已实现待联调 |
+| SIP over UDP / TCP | FR-4 | M1 | 🚧 UDP 已实现,TCP M2 |
+| OPTIONS 探活响应 | FR-3 | M1 | 🚧 已实现待联调 |
 
 ## 设备查询(平台 → 设备)
 

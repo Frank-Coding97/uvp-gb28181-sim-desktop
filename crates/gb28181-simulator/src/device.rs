@@ -154,6 +154,100 @@ impl DeviceSimulator {
         let resp = sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default()).await?;
         Ok(resp.status)
     }
+
+    /// 处理一条入站请求:对 OPTIONS(及 M1 阶段的简单 MESSAGE)回 200 OK。
+    /// 返回是否已应答(true=已回,false=暂不处理)。
+    pub async fn answer_inbound(
+        &self,
+        transport: &Arc<UdpTransport>,
+        incoming: &sip_core::Incoming,
+    ) -> Result<bool> {
+        if let sip_core::SipMessage::Request(req) = &incoming.message {
+            match req.method {
+                sip_core::Method::Options | sip_core::Method::Message => {
+                    let resp = sip_core::SipMessage::Response(builder::response_ok(req));
+                    transport.send_to(&resp, incoming.from).await?;
+                    Ok(true)
+                }
+                // 其它请求(INVITE 等)M2 处理。
+                _ => Ok(false),
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// 运行设备:注册 → 启动入站应答(OPTIONS)→ 周期心跳,直到 `shutdown` 完成。
+    ///
+    /// 心跳连续失败 `max_hb_fail` 次判定掉线,触发重注册(指数退避 backoff→2×,上限 backoff_max)。
+    /// 这是设备"保持在线"的主循环(docs/10-functional/device-simulation.md §3.2/§3.3)。
+    pub async fn run(
+        self: Arc<Self>,
+        transport: Arc<UdpTransport>,
+        local_host: String,
+        local_port: u16,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) {
+        use std::time::Duration;
+        tokio::pin!(shutdown);
+
+        // 入站请求应答任务(OPTIONS)。
+        let mut inbound = transport.register_inbound(self.config.device_id.as_str().to_string());
+        let inbound_sim = self.clone();
+        let inbound_tp = transport.clone();
+        let inbound_task = tokio::spawn(async move {
+            while let Some(inc) = inbound.recv().await {
+                if let Err(e) = inbound_sim.answer_inbound(&inbound_tp, &inc).await {
+                    tracing::warn!(error=%e, "入站请求应答失败");
+                }
+            }
+        });
+
+        // 初次注册(失败则退避重试)。
+        let backoff_base = Duration::from_secs(1);
+        let backoff_max = Duration::from_secs(30);
+        let mut backoff = backoff_base;
+        while (self.register(&transport, &local_host, local_port).await).is_err() {
+            tokio::select! {
+                _ = &mut shutdown => { inbound_task.abort(); return; }
+                _ = tokio::time::sleep(backoff) => {
+                    backoff = (backoff * 2).min(backoff_max);
+                }
+            }
+        }
+        tracing::info!(device=%self.config.device_id, "注册成功");
+
+        // 心跳主循环。
+        let interval = Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
+        let max_hb_fail = 3u32;
+        let mut hb_fail = 0u32;
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                _ = tokio::time::sleep(interval) => {
+                    match self.send_keepalive(&transport, &local_host, local_port).await {
+                        Ok(200) => hb_fail = 0,
+                        _ => {
+                            hb_fail += 1;
+                            if hb_fail >= max_hb_fail {
+                                tracing::warn!(device=%self.config.device_id, "心跳连续失败,重注册");
+                                hb_fail = 0;
+                                let mut b = backoff_base;
+                                while self.register(&transport, &local_host, local_port).await.is_err() {
+                                    tokio::select! {
+                                        _ = &mut shutdown => { inbound_task.abort(); return; }
+                                        _ = tokio::time::sleep(b) => { b = (b * 2).min(backoff_max); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        inbound_task.abort();
+        transport.unregister_inbound(self.config.device_id.as_str());
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +305,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, DeviceState::Registered);
+    }
+
+    #[tokio::test]
+    async fn options_回_200() {
+        use sip_core::{Method, Request};
+
+        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", platform_addr.port()));
+
+        // 平台构造发往设备 AOR 的 OPTIONS,并注册接收响应的队列。
+        let mut h = Headers::new();
+        h.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKopt");
+        h.set("From", "<sip:34020000002000000001@3402>;tag=p1");
+        h.set("To", "<sip:34020000001320000001@3402>");
+        h.set("Call-ID", "opt-call-1");
+        h.set("CSeq", "1 OPTIONS");
+        let options = Request {
+            method: Method::Options,
+            uri: format!("sip:{}@127.0.0.1", sim.config().device_id),
+            headers: h,
+            body: Vec::new(),
+        };
+        let mut presp = platform_tp.register("opt-call-1");
+
+        // 设备侧应答一条入站请求。
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(options),
+            from: platform_addr,
+        };
+        let answered = sim.answer_inbound(&device_tp, &incoming).await.unwrap();
+        assert!(answered);
+
+        // 平台应收到 200 OK(Call-ID 回显)。
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), presp.recv())
+            .await
+            .expect("超时")
+            .expect("关闭");
+        match got.message {
+            SipMessage::Response(r) => {
+                assert_eq!(r.status, 200);
+                assert_eq!(r.headers.call_id(), Some("opt-call-1"));
+            }
+            _ => panic!("应为响应"),
+        }
     }
 }

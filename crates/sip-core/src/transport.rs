@@ -33,8 +33,10 @@ pub struct Incoming {
 /// 3. 发送用 [`UdpTransport::send_to`];接收循环把消息按 Call-ID 投递到对应队列。
 pub struct UdpTransport {
     socket: Arc<UdpSocket>,
-    /// Call-ID → 该设备的消息投递发送端。
+    /// Call-ID → 发起事务的设备的响应投递端。
     routes: Arc<DashMap<String, mpsc::UnboundedSender<Incoming>>>,
+    /// 设备 AOR(device_id)→ 该设备的入站请求投递端。
+    aor_routes: Arc<DashMap<String, mpsc::UnboundedSender<Incoming>>>,
 }
 
 impl UdpTransport {
@@ -46,6 +48,7 @@ impl UdpTransport {
         let transport = Arc::new(UdpTransport {
             socket: Arc::new(socket),
             routes: Arc::new(DashMap::new()),
+            aor_routes: Arc::new(DashMap::new()),
         });
         transport.clone().spawn_recv_loop();
         Ok(transport)
@@ -56,16 +59,28 @@ impl UdpTransport {
         self.socket.local_addr().map_err(Error::Io)
     }
 
-    /// 为某 Call-ID 注册接收队列,返回接收端。同一 Call-ID 重复注册会覆盖旧队列。
+    /// 为某 Call-ID 注册响应接收队列(客户端事务用)。同一 Call-ID 重复注册覆盖。
     pub fn register(&self, call_id: impl Into<String>) -> mpsc::UnboundedReceiver<Incoming> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.routes.insert(call_id.into(), tx);
         rx
     }
 
-    /// 注销某 Call-ID 的路由(设备下线时调)。
+    /// 为某设备 AOR(device_id)注册入站请求队列(接收平台主动发来的 OPTIONS/查询)。
+    pub fn register_inbound(&self, aor: impl Into<String>) -> mpsc::UnboundedReceiver<Incoming> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.aor_routes.insert(aor.into(), tx);
+        rx
+    }
+
+    /// 注销某 Call-ID 的响应路由(事务结束时可调)。
     pub fn unregister(&self, call_id: &str) {
         self.routes.remove(call_id);
+    }
+
+    /// 注销某设备 AOR 的入站路由(设备下线时调)。
+    pub fn unregister_inbound(&self, aor: &str) {
+        self.aor_routes.remove(aor);
     }
 
     /// 发送一条 SIP 消息到目标地址。
@@ -75,7 +90,7 @@ impl UdpTransport {
         Ok(())
     }
 
-    /// 启动后台接收循环:收包 → 解析 → 按 Call-ID 投递。
+    /// 启动后台接收循环:收包 → 解析 → 分发。
     fn spawn_recv_loop(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -96,23 +111,39 @@ impl UdpTransport {
         });
     }
 
-    /// 按消息的 Call-ID 投递到对应设备队列;无路由则丢弃并告警。
+    /// 分发:响应按 Call-ID 路由到事务队列;若 Call-ID 无匹配且是请求,
+    /// 则按 Request-URI 的 AOR(user 部分)路由到设备入站队列。
     fn dispatch(&self, incoming: Incoming) {
+        // 先按 Call-ID 尝试(响应、以及在对话内的请求)。
         let call_id = match &incoming.message {
             SipMessage::Request(r) => r.headers.call_id(),
             SipMessage::Response(r) => r.headers.call_id(),
         };
-        match call_id {
-            Some(id) => {
-                if let Some(tx) = self.routes.get(id) {
-                    let _ = tx.send(incoming);
-                } else {
-                    tracing::debug!(call_id=%id, "无匹配 Call-ID 路由,丢弃");
-                }
+        if let Some(id) = call_id {
+            if let Some(tx) = self.routes.get(id) {
+                let _ = tx.send(incoming);
+                return;
             }
-            None => tracing::warn!("消息缺少 Call-ID,无法路由"),
         }
+        // 未匹配 Call-ID:入站请求按 AOR 路由。
+        if let SipMessage::Request(req) = &incoming.message {
+            if let Some(aor) = uri_user(&req.uri) {
+                if let Some(tx) = self.aor_routes.get(aor) {
+                    let _ = tx.send(incoming);
+                    return;
+                }
+                tracing::debug!(aor=%aor, "无匹配 AOR 入站路由,丢弃请求");
+                return;
+            }
+        }
+        tracing::debug!("消息无匹配路由,丢弃");
     }
+}
+
+/// 从 SIP URI(如 `sip:34020000001320000001@host:5060`)提取 user 部分(AOR)。
+fn uri_user(uri: &str) -> Option<&str> {
+    let after_scheme = uri.strip_prefix("sip:").unwrap_or(uri);
+    after_scheme.split('@').next().filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -151,5 +182,45 @@ mod tests {
             SipMessage::Response(r) => assert_eq!(r.status, 200),
             _ => panic!("应为响应"),
         }
+    }
+
+    #[tokio::test]
+    async fn 入站请求按_aor_路由() {
+        use crate::message::{Method, Request};
+
+        let device = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_addr = device.local_addr().unwrap();
+
+        // 设备按自身 AOR(device_id)注册入站队列。
+        let mut inbound = device.register_inbound("34020000001320000001");
+
+        // 平台发来 OPTIONS(新 Call-ID,Request-URI 指向该设备 AOR)。
+        let mut headers = Headers::new();
+        headers.set("Call-ID", "fresh-call-from-platform");
+        headers.set("CSeq", "1 OPTIONS");
+        let req = SipMessage::Request(Request {
+            method: Method::Options,
+            uri: "sip:34020000001320000001@127.0.0.1:5060".into(),
+            headers,
+            body: Vec::new(),
+        });
+        platform.send_to(&req, device_addr).await.unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
+            .await
+            .expect("超时未收到")
+            .expect("队列关闭");
+        match got.message {
+            SipMessage::Request(r) => assert_eq!(r.method, Method::Options),
+            _ => panic!("应为请求"),
+        }
+    }
+
+    #[test]
+    fn uri_user_提取() {
+        assert_eq!(uri_user("sip:34020000001320000001@h:5060"), Some("34020000001320000001"));
+        assert_eq!(uri_user("34020000001320000001@h"), Some("34020000001320000001"));
+        assert_eq!(uri_user("sip:@h"), None);
     }
 }

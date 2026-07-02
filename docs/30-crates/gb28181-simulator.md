@@ -2,7 +2,7 @@
 
 **状态:开发中(M1)** · worktree `feat/protocol` · 单设备完整状态机 = 组合 sip-core + gb28181-protocol + media-rtp。
 
-> 进度:`builder`(REGISTER/MESSAGE 构造)✅ · `register()` 注册闭环(REGISTER→401→Digest→200)✅ 单测 · `send_keepalive()` 心跳 ✅ · run 循环 / OPTIONS 应答 / 目录点播 🚧。已单测,待对真实 WVP 联调(roadmap M1 验收)。
+> 进度:`builder`(REGISTER/MESSAGE/200 OK 构造)✅ · `register()` 注册闭环(REGISTER→401→Digest→200)✅ · `send_keepalive()` 心跳 ✅ · `answer_inbound()` OPTIONS/MESSAGE 回 200 ✅ · `run()` 主循环(注册+入站应答+周期心跳+掉线重注册指数退避)✅ · 目录/点播 🚧 M2。已单测,待对真实 WVP 联调(roadmap M1 验收)。
 
 ## 职责
 

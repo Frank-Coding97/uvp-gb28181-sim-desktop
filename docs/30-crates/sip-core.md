@@ -26,9 +26,12 @@ pub mod auth;         // Digest MD5
 - 客户端/服务端事务状态机;UDP 超时重传(T1 起,指数退避到 T2);事务与响应按 branch/CSeq 匹配。
 
 ### transport
-- `trait SipTransport { async fn send(...); fn recv_stream(...) }`。
-- **压测关键**:共享 socket + Call-ID/事务路由分发,避免每设备一 socket(见 `10-functional/stress-testing.md#42`)。
-- TCP 走 RFC 4571 解帧。
+- `UdpTransport`:共享 socket,后台接收循环解析后分发。
+- **响应**按 `Call-ID` 路由到发起事务的设备队列(`register(call_id)`)。
+- **入站请求**(平台主动发来的 OPTIONS / MESSAGE 查询)按目标设备 AOR 路由:取 Request-URI 的
+  user 部分(即 device_id),投递到该设备的入站队列(`register_inbound(device_id)`)。
+- **压测关键**:所有虚拟设备复用少量 socket,避免每设备一 socket 耗尽端口(见 `10-functional/stress-testing.md#42`)。
+- TCP(RFC 4571)在 M2 补充。
 
 ### auth
 - 解析 401/407 挑战,计算 `response = MD5(HA1:nonce:HA2)`,构造 `Authorization`。GB28181 用 MD5。

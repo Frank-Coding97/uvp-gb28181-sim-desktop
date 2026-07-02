@@ -127,6 +127,38 @@ pub fn message_xml(
     }
 }
 
+/// 为入站请求构造 200 OK 响应。按 SIP 规则回显 Via/From/To/Call-ID/CSeq
+/// (若 To 无 tag 则补一个),用于应答平台的 OPTIONS / 简单 MESSAGE。
+pub fn response_ok(request: &sip_core::Request) -> sip_core::Response {
+    let mut headers = Headers::new();
+    for via in request.headers.get_all("Via") {
+        headers.append("Via", via.to_string());
+    }
+    if let Some(from) = request.headers.get("From") {
+        headers.append("From", from.to_string());
+    }
+    if let Some(to) = request.headers.get("To") {
+        // To 无 tag 则补一个(UAS 生成)。
+        if to.contains("tag=") {
+            headers.append("To", to.to_string());
+        } else {
+            headers.append("To", format!("{to};tag={}", rand_token("")));
+        }
+    }
+    if let Some(cid) = request.headers.call_id() {
+        headers.append("Call-ID", cid.to_string());
+    }
+    if let Some(cseq) = request.headers.cseq() {
+        headers.append("CSeq", cseq.to_string());
+    }
+    sip_core::Response {
+        status: 200,
+        reason: "OK".into(),
+        headers,
+        body: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
