@@ -1,6 +1,8 @@
 # crate: gb28181-simulator
 
-**状态:草案(M0 骨架)** · worktree `feat/protocol` · 单设备完整状态机 = 组合 sip-core + gb28181-protocol + media-rtp。
+**状态:开发中(M1)** · worktree `feat/protocol` · 单设备完整状态机 = 组合 sip-core + gb28181-protocol + media-rtp。
+
+> 进度:`builder`(REGISTER/MESSAGE 构造)✅ · `register()` 注册闭环(REGISTER→401→Digest→200)✅ 单测 · `send_keepalive()` 心跳 ✅ · run 循环 / OPTIONS 应答 / 目录点播 🚧。已单测,待对真实 WVP 联调(roadmap M1 验收)。
 
 ## 职责
 

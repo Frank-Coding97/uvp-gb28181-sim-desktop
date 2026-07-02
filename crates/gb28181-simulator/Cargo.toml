@@ -12,3 +12,7 @@ gb28181-protocol = { path = "../gb28181-protocol" }
 media-rtp = { path = "../media-rtp" }
 tokio.workspace = true
 tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

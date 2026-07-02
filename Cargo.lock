@@ -929,6 +929,7 @@ dependencies = [
  "common",
  "gb28181-protocol",
  "media-rtp",
+ "rand",
  "sip-core",
  "tokio",
  "tracing",
