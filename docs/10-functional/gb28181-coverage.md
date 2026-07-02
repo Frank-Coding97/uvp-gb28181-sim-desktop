@@ -10,24 +10,31 @@
 
 | 功能 | 需求 | 里程碑 | 状态 |
 |---|---|---|---|
-| REGISTER / Digest MD5 / 注销 | FR-1 | M1 | 🚧 已实现待联调 |
-| 心跳保活 + 超时重注册(指数退避) | FR-2 | M1 | 🚧 已实现待联调 |
-| SIP over UDP / TCP | FR-4 | M1 | 🚧 UDP 已实现,TCP M2 |
-| OPTIONS 探活响应 | FR-3 | M1 | 🚧 已实现待联调 |
+| REGISTER / Digest MD5 / 注销 | FR-1 | M1 | ✅ 已实现待 WVP 验收 |
+| 心跳保活 + 超时重注册(指数退避) | FR-2 | M1 | ✅ 已实现待 WVP 验收 |
+| SIP over UDP / TCP | FR-4 | M1 | 🚧 UDP ✅,TCP M3+ |
+| OPTIONS 探活响应 | FR-3 | M1 | ✅ 已实现待 WVP 验收 |
 
 ## 设备查询(平台 → 设备)
 
 | 功能 | 需求 | 里程碑 | 状态 |
 |---|---|---|---|
-| 目录查询(Catalog,GB-2022 全字段) | FR-5 | M2 | ⬜ |
-| 设备信息(DeviceInfo) | FR-6 | M2 | ⬜ |
-| 设备状态(DeviceStatus) | FR-6 | M2 | ⬜ |
+| 目录查询(Catalog,GB-2022 全字段) | FR-5 | M2 | ✅ 已实现 |
+| 设备信息(DeviceInfo) | FR-6 | M2 | ✅ 已实现 |
+| 设备状态(DeviceStatus) | FR-6 | M2 | ✅ 已实现 |
 | 录像列表(RecordInfo) | FR-10 | M3+ | ⬜ |
-| GB-2016 / GB-2022 版本切换 | FR-11 | M2 | ⬜ |
+| GB-2016 / GB-2022 版本切换 | FR-11 | M2 | 🚧 仅 GB-2022 |
 
 ## 实时音视频
 
 | 功能 | 需求 | 里程碑 | 状态 |
+|---|---|---|---|
+| INVITE / ACK / BYE 会话 | FR-7 | M2 | ✅ 已实现 |
+| SDP 协商(PS/90000,y=ssrc) | FR-7 | M2 | ✅ 已实现 |
+| RTP over UDP 推流 | FR-8 | M2 | ✅ 已实现 |
+| PS 封装 H.264(含 SPS/PPS/IDR) | FR-8 | M2 | ✅ 已实现 |
+| H.264 文件循环推流 | FR-8 | M2 | ✅ 已实现 |
+
 |---|---|---|---|
 | INVITE 点播 / ACK / BYE 停流 | FR-7 | M2 | ⬜ |
 | H.264 / H.265 + PS 封装 | FR-8 | M2 | ⬜ |

@@ -1,6 +1,8 @@
 # crate: media-rtp
 
-**状态:草案(M0 骨架)** · worktree `feat/media` · RTP/PS 封装与推流引擎。
+**状态:M2 完成** · RTP/PS 封装与推流引擎。
+
+> 进度:M2(rtp 包头+切片+统计、PS 封装 H.264、FileSource Annex B 切帧循环、push_stream 驱动)✅ · 单测 10 个全绿。M3 补充 NoneSource/LightSource(A/B 档)与 TCP 推流。
 
 ## 职责
 
