@@ -105,4 +105,4 @@ apps/desktop/src-tauri ← stress-engine（或通过子进程 HTTP 调用）
 - RTP 推流按 `active_ratio` 只让部分设备真推流，码率/帧率受控。
 - 指标用原子计数 + 无锁聚合（`dashmap`/`metrics`），热路径不加锁。
 
-详见 [压测设计](gb28181.md#压测设计)。
+详见 [压测设计](../10-functional/stress-testing.md)。

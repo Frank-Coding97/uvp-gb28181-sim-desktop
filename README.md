@@ -73,9 +73,13 @@ npm run tauri build
 
 ## 文档
 
-- [架构总览](docs/architecture.md)
-- [GB28181 使用说明](docs/gb28181.md)
-- [开发路线图与并发分工](docs/roadmap.md)
+完整文档见 [`docs/`](docs/)(文档中心 + 文档先行约定)。常用入口:
+
+- [产品愿景](docs/00-product/vision.md) · [需求清单 FR/NFR](docs/00-product/requirements.md)
+- [功能规格:设备模拟](docs/10-functional/device-simulation.md) · [压力测试](docs/10-functional/stress-testing.md)
+- [架构总览](docs/20-architecture/overview.md) · [UI↔引擎 API 契约](docs/20-architecture/api-contract.md) · [数据模型](docs/20-architecture/data-model.md)
+- [各 crate 规格](docs/30-crates/) · [协议规格](docs/40-protocol/)
+- [路线图与并发分工](docs/90-process/roadmap.md) · [编码规范](docs/90-process/coding-standards.md) · [测试策略](docs/90-process/testing-strategy.md)
 
 ---
 
