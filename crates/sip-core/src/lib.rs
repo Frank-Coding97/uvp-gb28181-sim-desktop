@@ -5,12 +5,14 @@
 
 pub mod auth;
 pub mod message;
+pub mod sdp;
 pub mod transaction;
 pub mod transport;
 
 // 常用类型再导出,方便上层 `use sip_core::{...}`。
 pub use auth::{authorization, Challenge};
 pub use message::{Headers, Method, Request, Response, SipMessage};
+pub use sdp::SessionDescription;
 pub use transaction::{client_transact, Timing};
 pub use transport::{Incoming, UdpTransport};
 
