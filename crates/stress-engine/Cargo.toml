@@ -1,0 +1,21 @@
+[package]
+name = "stress-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "stress_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stress-engine"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+scenario = { path = "../scenario" }
+gb28181-simulator = { path = "../gb28181-simulator" }
+tokio.workspace = true
+tracing.workspace = true

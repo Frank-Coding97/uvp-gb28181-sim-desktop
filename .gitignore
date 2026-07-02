@@ -1,0 +1,30 @@
+# ---- 构建产物 ----
+/target
+**/target
+# Cargo.lock 提交入库:本 workspace 最终产出桌面应用,锁定依赖保证可复现构建。
+
+# ---- Node / 前端 ----
+node_modules/
+apps/desktop/dist/
+apps/desktop/.vite/
+*.local
+
+# ---- Tauri ----
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# ---- 运行时数据 ----
+*.sqlite
+*.sqlite-*
+*.db
+/data
+/logs
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ---- 保留 AI 记忆目录不入库 ----
+.claude/

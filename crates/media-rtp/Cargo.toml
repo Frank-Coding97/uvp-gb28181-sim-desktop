@@ -1,0 +1,13 @@
+[package]
+name = "media-rtp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+rand.workspace = true

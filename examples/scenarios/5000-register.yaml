@@ -1,0 +1,26 @@
+# 5000 台设备并发注册压测示例
+# 用法(M3 后):stress-engine --scenario examples/scenarios/5000-register.yaml
+scenario:
+  name: "5000-device-register-test"
+  platform:
+    host: "192.168.1.100"          # 上级平台(如 WVP-Pro)SIP 地址
+    port: 5060
+    domain: "34020000002000000001" # 平台 ID
+  devices:
+    count: 5000
+    id_prefix: "34020000001320000" # 后 7 位按 start_index 递增补齐到 20 位
+    start_index: 1
+    password: "12345678"
+  register:
+    enabled: true
+    rate_per_second: 100           # 每秒拉起 100 台,爬坡避免注册风暴
+  heartbeat:
+    enabled: true
+    interval_seconds: 60
+  media:
+    enabled: true
+    mode: "real"                   # none | light | real
+    active_ratio: 0.1              # 仅 10% 设备真推流
+    bitrate_kbps: 512
+    file: "./assets/media/test.h264"
+  duration_seconds: 1800
