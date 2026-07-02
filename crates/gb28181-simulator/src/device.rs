@@ -37,6 +37,10 @@ pub struct DeviceConfig {
     pub channels: Vec<ChannelConfig>,
     /// 设备信息(DeviceInfo 查询应答用)。
     pub device_info: DeviceInfo,
+    /// 视频源文件路径(H.264 Annex B);None 表示不推流(A 档)。
+    pub video_source: Option<String>,
+    /// 推流帧率(fps)。
+    pub video_fps: u32,
 }
 
 /// 通道配置(对应目录查询中的一个 Item)。
@@ -74,11 +78,21 @@ pub enum DeviceState {
     Failed,
 }
 
-/// 设备仿真运行时状态机。持有配置 + 会话标识 + CSeq 计数。
+/// 设备仿真运行时状态机。持有配置 + 会话标识 + CSeq 计数 + 会话状态(推流任务)。
 pub struct DeviceSimulator {
     config: DeviceConfig,
     ids: DialogIds,
     cseq: AtomicU32,
+    /// 当前活跃的推流会话(INVITE → 推流中,BYE → 停止)。
+    session: tokio::sync::Mutex<Option<PushSession>>,
+}
+
+/// 活跃的推流会话(推流任务句柄 + 停止信号)。
+struct PushSession {
+    /// push_stream 任务。
+    _task: tokio::task::JoinHandle<()>,
+    /// 停止信号发送端(drop 或 send 均可触发停流)。
+    stop_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 impl DeviceSimulator {
@@ -88,6 +102,7 @@ impl DeviceSimulator {
             config,
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
+            session: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -213,7 +228,18 @@ impl DeviceSimulator {
                     transport.send_to(&resp, incoming.from).await?;
                     Ok(true)
                 }
-                // INVITE 等待 M2 集成处理。
+                sip_core::Method::Invite => {
+                    // 解析 SDP,启动推流,回 200 OK。
+                    self.handle_invite(transport, req, incoming.from).await
+                }
+                sip_core::Method::Bye => {
+                    // 停止推流,回 200 OK。
+                    self.handle_bye(transport, req, incoming.from).await
+                }
+                sip_core::Method::Ack => {
+                    // ACK 无需响应,但标志会话已确认。
+                    Ok(true)
+                }
                 _ => Ok(false),
             }
         } else {
@@ -271,6 +297,78 @@ impl DeviceSimulator {
             }
             _ => Err(Error::Gb28181(format!("未实现的查询类型: {}", query.cmd_type))),
         }
+    }
+
+    /// 处理 INVITE:解析平台 SDP,启动推流,回 200 OK(带本端 SDP)。
+    async fn handle_invite(
+        &self,
+        transport: &Arc<UdpTransport>,
+        req: &sip_core::Request,
+        from: SocketAddr,
+    ) -> Result<bool> {
+        use std::net::IpAddr;
+
+        // 解析平台 SDP(提取 RTP 目标地址与端口)。
+        let body_str = std::str::from_utf8(&req.body)
+            .map_err(|_| Error::Sip("INVITE body 非 UTF-8".into()))?;
+        let platform_sdp = sip_core::SessionDescription::parse(body_str)?;
+        let rtp_host: IpAddr = platform_sdp.connection.addr.parse()
+            .map_err(|_| Error::Sip("SDP c= 地址非法".into()))?;
+        let rtp_port = platform_sdp.media.port;
+        let rtp_dst = SocketAddr::new(rtp_host, rtp_port);
+
+        // 生成本端 SSRC(简化:用设备 ID hash)。
+        let ssrc = self.config.device_id.as_str().bytes().fold(0u32, |a, b| a.wrapping_add(b as u32));
+
+        // 启动推流任务(若配置了视频源)。
+        let mut sess_guard = self.session.lock().await;
+        if sess_guard.is_some() {
+            return Err(Error::Gb28181("已有活跃会话".into()));
+        }
+
+        if let Some(ref path) = self.config.video_source {
+            let source = media_rtp::FileSource::from_path(path)
+                .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))?;
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let fps = self.config.video_fps;
+            let task = tokio::spawn(async move {
+                let _ = media_rtp::push_stream(Box::new(source), rtp_dst, ssrc, fps, async {
+                    let _ = stop_rx.await;
+                }).await;
+            });
+            *sess_guard = Some(PushSession { _task: task, stop_tx });
+        }
+        drop(sess_guard);
+
+        // 构造 200 OK(带本端 SDP)。
+        let local_ip = transport.local_addr()?.ip();
+        let local_sdp = sip_core::SessionDescription::new_device_response(local_ip, 0, ssrc);
+        let sdp_body = local_sdp.to_string();
+
+        let mut resp = builder::response_ok(req);
+        resp.headers.set("Content-Type", "application/sdp");
+        resp.body = sdp_body.as_bytes().to_vec();
+        let msg = sip_core::SipMessage::Response(resp);
+        transport.send_to(&msg, from).await?;
+        Ok(true)
+    }
+
+    /// 处理 BYE:停止推流,回 200 OK。
+    async fn handle_bye(
+        &self,
+        transport: &Arc<UdpTransport>,
+        req: &sip_core::Request,
+        from: SocketAddr,
+    ) -> Result<bool> {
+        let mut sess_guard = self.session.lock().await;
+        if let Some(session) = sess_guard.take() {
+            let _ = session.stop_tx.send(()); // 触发停流
+        }
+        drop(sess_guard);
+
+        let resp = sip_core::SipMessage::Response(builder::response_ok(req));
+        transport.send_to(&resp, from).await?;
+        Ok(true)
     }
 
     /// 运行设备:注册 → 启动入站应答(OPTIONS)→ 周期心跳,直到 `shutdown` 完成。
@@ -368,6 +466,8 @@ mod tests {
                 model: "Sim".into(),
                 firmware: "0.1.0".into(),
             },
+            video_source: None,
+            video_fps: 25,
         }
     }
 

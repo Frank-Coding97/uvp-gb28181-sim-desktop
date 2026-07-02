@@ -182,6 +182,8 @@ mod tests {
                 model: "Sim".into(),
                 firmware: "0.1".into(),
             },
+            video_source: None,
+            video_fps: 25,
         }
     }
 

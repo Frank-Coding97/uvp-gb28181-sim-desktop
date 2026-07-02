@@ -69,6 +69,8 @@ async fn main() {
             model: "Desktop-Sim".into(),
             firmware: "0.1.0-dev".into(),
         },
+        video_source: std::env::var("VIDEO_SOURCE").ok(),
+        video_fps: std::env::var("VIDEO_FPS").ok().and_then(|s| s.parse().ok()).unwrap_or(25),
     };
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。
