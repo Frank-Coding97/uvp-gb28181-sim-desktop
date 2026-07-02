@@ -14,7 +14,7 @@ use std::net::UdpSocket as StdUdp;
 use std::sync::Arc;
 
 use common::{DeviceId, Transport};
-use gb28181_simulator::{DeviceConfig, DeviceSimulator};
+use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use sip_core::UdpTransport;
 
 /// 读环境变量,缺省用给定默认值。
@@ -43,6 +43,16 @@ async fn main() {
     let password = env_or("PASSWORD", "12345678");
 
     let device_id = DeviceId::new(device_id_str.clone()).expect("DEVICE_ID 非法(需 20 位数字)");
+
+    // 构造一个通道(通道 ID = 设备 ID 基础上改最后 3 位为 132)。
+    let channel_id_str = format!("{}132", &device_id_str[..17]);
+    let channel_id = DeviceId::new(channel_id_str).expect("通道 ID 非法");
+    let channels = vec![ChannelConfig {
+        channel_id,
+        name: "Camera-1".into(),
+        status: "ON".into(),
+    }];
+
     let cfg = DeviceConfig {
         device_id: device_id.clone(),
         username: device_id_str.clone(),
@@ -52,6 +62,13 @@ async fn main() {
         server_domain,
         transport: Transport::Udp,
         heartbeat_interval_secs: 60,
+        channels,
+        device_info: DeviceInfo {
+            device_name: "UVP-Sim-Desktop".into(),
+            manufacturer: "UVP".into(),
+            model: "Desktop-Sim".into(),
+            firmware: "0.1.0-dev".into(),
+        },
     };
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。

@@ -6,5 +6,5 @@
 pub mod builder;
 pub mod device;
 
-pub use device::{DeviceConfig, DeviceSimulator, DeviceState};
+pub use device::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator, DeviceState};
 

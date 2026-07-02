@@ -165,6 +165,7 @@ mod tests {
     use common::{DeviceId, Transport};
 
     fn cfg() -> DeviceConfig {
+        use crate::device::DeviceInfo;
         DeviceConfig {
             device_id: DeviceId::new("34020000001320000001").unwrap(),
             username: "34020000001320000001".into(),
@@ -174,6 +175,13 @@ mod tests {
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
+            channels: vec![],
+            device_info: DeviceInfo {
+                device_name: "Test".into(),
+                manufacturer: "UVP".into(),
+                model: "Sim".into(),
+                firmware: "0.1".into(),
+            },
         }
     }
 

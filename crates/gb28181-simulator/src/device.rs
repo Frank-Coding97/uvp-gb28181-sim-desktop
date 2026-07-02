@@ -33,6 +33,30 @@ pub struct DeviceConfig {
     pub transport: Transport,
     /// 心跳间隔(秒)。
     pub heartbeat_interval_secs: u64,
+    /// 通道列表(目录查询应答用)。
+    pub channels: Vec<ChannelConfig>,
+    /// 设备信息(DeviceInfo 查询应答用)。
+    pub device_info: DeviceInfo,
+}
+
+/// 通道配置(对应目录查询中的一个 Item)。
+#[derive(Debug, Clone)]
+pub struct ChannelConfig {
+    /// 通道国标 ID(设备侧通道 ID 规则:设备 ID + 通道序号后缀)。
+    pub channel_id: DeviceId,
+    /// 通道名称。
+    pub name: String,
+    /// 状态:ON / OFF。
+    pub status: String,
+}
+
+/// 设备信息(DeviceInfo 查询应答字段)。
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub device_name: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub firmware: String,
 }
 
 /// 设备状态(与 docs/10-functional/device-simulation.md#2、UI DTO 对齐)。
@@ -155,7 +179,7 @@ impl DeviceSimulator {
         Ok(resp.status)
     }
 
-    /// 处理一条入站请求:对 OPTIONS(及 M1 阶段的简单 MESSAGE)回 200 OK。
+    /// 处理一条入站请求:OPTIONS 简单回 200;MESSAGE 解析 XML 查询并应答。
     /// 返回是否已应答(true=已回,false=暂不处理)。
     pub async fn answer_inbound(
         &self,
@@ -164,16 +188,88 @@ impl DeviceSimulator {
     ) -> Result<bool> {
         if let sip_core::SipMessage::Request(req) = &incoming.message {
             match req.method {
-                sip_core::Method::Options | sip_core::Method::Message => {
+                sip_core::Method::Options => {
                     let resp = sip_core::SipMessage::Response(builder::response_ok(req));
                     transport.send_to(&resp, incoming.from).await?;
                     Ok(true)
                 }
-                // 其它请求(INVITE 等)M2 处理。
+                sip_core::Method::Message => {
+                    // 解析查询(Catalog / DeviceInfo / DeviceStatus),生成应答 XML。
+                    if let Ok(body_str) = std::str::from_utf8(&req.body) {
+                        if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str) {
+                            let xml = self.handle_query(&query)?;
+                            // 回 MESSAGE(应答 XML)。
+                            let resp_body = xml.as_bytes().to_vec();
+                            let mut resp_msg = builder::response_ok(req);
+                            resp_msg.headers.set("Content-Type", "Application/MANSCDP+xml");
+                            resp_msg.body = resp_body;
+                            let resp = sip_core::SipMessage::Response(resp_msg);
+                            transport.send_to(&resp, incoming.from).await?;
+                            return Ok(true);
+                        }
+                    }
+                    // 无法解析或非 Query,仍回 200(平台不会重发)。
+                    let resp = sip_core::SipMessage::Response(builder::response_ok(req));
+                    transport.send_to(&resp, incoming.from).await?;
+                    Ok(true)
+                }
+                // INVITE 等待 M2 集成处理。
                 _ => Ok(false),
             }
         } else {
             Ok(false)
+        }
+    }
+
+    /// 处理 Query,返回应答 XML。
+    fn handle_query(&self, query: &gb28181_protocol::manscdp::Query) -> Result<String> {
+        use gb28181_protocol::manscdp::*;
+        match query.cmd_type.as_str() {
+            "Catalog" => {
+                let items: Vec<CatalogItem> = self
+                    .config
+                    .channels
+                    .iter()
+                    .map(|ch| CatalogItem {
+                        device_id: ch.channel_id.to_string(),
+                        name: ch.name.clone(),
+                        manufacturer: Some(self.config.device_info.manufacturer.clone()),
+                        model: Some(self.config.device_info.model.clone()),
+                        civil_code: None,
+                        parental: Some(0),
+                        parent_id: Some(self.config.device_id.to_string()),
+                        status: ch.status.clone(),
+                    })
+                    .collect();
+                let resp = CatalogResponse::new(&query.device_id, query.sn, items);
+                resp.to_xml()
+            }
+            "DeviceInfo" => {
+                let resp = DeviceInfoResponse {
+                    cmd_type: "DeviceInfo".into(),
+                    sn: query.sn,
+                    device_id: query.device_id.clone(),
+                    result: "OK".into(),
+                    device_name: self.config.device_info.device_name.clone(),
+                    manufacturer: self.config.device_info.manufacturer.clone(),
+                    model: self.config.device_info.model.clone(),
+                    firmware: self.config.device_info.firmware.clone(),
+                    channel: self.config.channels.len() as u32,
+                };
+                resp.to_xml()
+            }
+            "DeviceStatus" => {
+                let resp = DeviceStatusResponse {
+                    cmd_type: "DeviceStatus".into(),
+                    sn: query.sn,
+                    device_id: query.device_id.clone(),
+                    result: "OK".into(),
+                    online: "ONLINE".into(),
+                    status: "OK".into(),
+                };
+                resp.to_xml()
+            }
+            _ => Err(Error::Gb28181(format!("未实现的查询类型: {}", query.cmd_type))),
         }
     }
 
@@ -265,6 +361,13 @@ mod tests {
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
+            channels: vec![],
+            device_info: DeviceInfo {
+                device_name: "Test Device".into(),
+                manufacturer: "UVP".into(),
+                model: "Sim".into(),
+                firmware: "0.1.0".into(),
+            },
         }
     }
 
@@ -349,6 +452,65 @@ mod tests {
             SipMessage::Response(r) => {
                 assert_eq!(r.status, 200);
                 assert_eq!(r.headers.call_id(), Some("opt-call-1"));
+            }
+            _ => panic!("应为响应"),
+        }
+    }
+
+    #[tokio::test]
+    async fn 目录查询应答含通道() {
+        use sip_core::Method;
+
+        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+
+        let mut cfg = test_cfg("127.0.0.1", platform_addr.port());
+        cfg.channels.push(ChannelConfig {
+            channel_id: DeviceId::new("34020000001320000132").unwrap(),
+            name: "Camera-1".into(),
+            status: "ON".into(),
+        });
+        let sim = DeviceSimulator::new(cfg);
+
+        let query_xml = r#"<?xml version="1.0"?>
+<Query><CmdType>Catalog</CmdType><SN>999</SN><DeviceID>34020000001320000001</DeviceID></Query>"#;
+
+        let mut h = Headers::new();
+        h.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcat");
+        h.set("From", "<sip:34020000002000000001@3402>;tag=p2");
+        h.set("To", "<sip:34020000001320000001@3402>");
+        h.set("Call-ID", "cat-call-1");
+        h.set("CSeq", "2 MESSAGE");
+        h.set("Content-Type", "Application/MANSCDP+xml");
+        let query_msg = sip_core::Request {
+            method: Method::Message,
+            uri: format!("sip:{}@127.0.0.1", sim.config().device_id),
+            headers: h,
+            body: query_xml.as_bytes().to_vec(),
+        };
+        let mut presp = platform_tp.register("cat-call-1");
+
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(query_msg),
+            from: platform_addr,
+        };
+        let answered = sim.answer_inbound(&device_tp, &incoming).await.unwrap();
+        assert!(answered);
+
+        // 平台收到 200 + Catalog 应答 XML。
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), presp.recv())
+            .await
+            .expect("超时")
+            .expect("关闭");
+        match got.message {
+            SipMessage::Response(r) => {
+                assert_eq!(r.status, 200);
+                let body_str = std::str::from_utf8(&r.body).unwrap();
+                assert!(body_str.contains("<CmdType>Catalog</CmdType>"));
+                assert!(body_str.contains("<SN>999</SN>"));
+                assert!(body_str.contains("34020000001320000132")); // 通道 ID
+                assert!(body_str.contains("<Name>Camera-1</Name>"));
             }
             _ => panic!("应为响应"),
         }
