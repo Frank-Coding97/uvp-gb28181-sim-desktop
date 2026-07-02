@@ -2,7 +2,7 @@
 
 **状态:开发中(M1)** · worktree `feat/protocol` · 与 GB28181 无关的通用 SIP 协议栈。
 
-> 进度:`message`(消息解析/序列化)✅ 已实现 · `auth`/`transport`/`transaction` 🚧 开发中。
+> 进度:`message` ✅ · `auth`(Digest MD5)✅ · `transport`(UDP 共享 socket + Call-ID 路由)✅ · `transaction`(客户端事务 + T1 退避重传)✅。M1 四层就绪,INVITE 事务待 M2。
 
 ## 职责
 
