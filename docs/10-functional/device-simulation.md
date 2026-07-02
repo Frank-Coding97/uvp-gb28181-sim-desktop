@@ -69,3 +69,18 @@
 - WVP-Pro 控制台单设备显示**在线**(FR-1/2/4)。
 - 平台目录树看到本设备通道(FR-5)。
 - 平台点播看到**实时画面**(FR-7/8)。
+
+### 5.1 M1 联调运行方式
+
+用 `gb28181-simulator` 的示例 `register_one` 对真实 WVP 验证单设备上线:
+
+```bash
+# 1) 起 WVP-Pro(见 40-protocol/gb28181-联调.md)
+# 2) 运行单设备示例(参数经环境变量传入)
+SERVER_HOST=<WVP主机IP> SERVER_PORT=5060 \
+SERVER_DOMAIN=34020000002000000001 \
+DEVICE_ID=34020000001320000001 PASSWORD=<与WVP一致> \
+cargo run -p gb28181-simulator --example register_one
+```
+
+预期:控制台日志出现"注册成功",WVP「国标设备」列表中该设备变为**在线**,并周期收到心跳。
