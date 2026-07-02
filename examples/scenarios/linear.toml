@@ -1,0 +1,32 @@
+# 线性压测场景示例:批量注册 N 台设备到上级平台。
+# 用法:stress-engine examples/scenarios/linear.toml 100
+
+# 起始设备 ID(20 位),后续设备 ID 递增。
+base_device_id = "34020000001320000001"
+# 所有设备共享的 SIP 认证密码。
+password = "12345678"
+
+# 上级平台(如 WVP-Pro)。
+server_host = "127.0.0.1"
+server_port = 5060
+server_domain = "34020000002000000001"
+
+# 信令传输:UDP / TCP。
+transport = "UDP"
+# 心跳间隔(秒)。
+heartbeat_interval_secs = 60
+# 每台设备的通道数。
+channels_per_device = 1
+
+# 媒体档:A=空媒体(仅信令) / B=轻量 / C=真实码流。
+media_profile = "A"
+# C 档时的 H.264 文件路径。
+# video_source = "./assets/media/test.h264"
+video_fps = 25
+
+# 设备信息模板(DeviceInfo 查询应答)。
+[device_info]
+device_name = "UVP-Sim"
+manufacturer = "UVP"
+model = "Desktop-Sim"
+firmware = "0.1.0-dev"

@@ -17,5 +17,7 @@ path = "src/main.rs"
 common = { path = "../common" }
 scenario = { path = "../scenario" }
 gb28181-simulator = { path = "../gb28181-simulator" }
+sip-core = { path = "../sip-core" }
 tokio.workspace = true
 tracing.workspace = true
+serde.workspace = true

@@ -4,7 +4,7 @@
 //! 实现足够解析平台 INVITE 的 SDP(提取 RTP 目标地址与 SSRC)、
 //! 构造设备侧 200 OK 的 SDP(声明本端 RTP 端口与 SSRC)。
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use common::{Error, Result};
 
