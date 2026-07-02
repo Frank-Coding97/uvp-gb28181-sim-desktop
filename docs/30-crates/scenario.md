@@ -1,6 +1,10 @@
 # crate: scenario
 
-**状态:部分实现(M0)** · worktree `feat/protocol` → 引擎 · 压测场景模型与 YAML 解析。
+**状态:M3 完成** · 压测场景模型与设备批量生成。
+
+> 变更:配置格式由 YAML 改为 **TOML**(与 Rust 生态更契合,示例见 examples/scenarios/linear.toml)。
+> `LinearScenario` 从基础 20 位 ID 用 u128 递增生成 N 个 `DeviceConfig`,支持媒体档 A/B/C、
+> 每设备多通道;`Scenario` trait 便于未来扩展其它生成策略。单测 2 个。
 
 ## 职责
 
