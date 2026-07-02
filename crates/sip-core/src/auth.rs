@@ -38,6 +38,7 @@ impl Challenge {
 ///
 /// - `method`:SIP 方法名(如 REGISTER)
 /// - `uri`:Request-URI(与请求行一致)
+///
 /// 返回形如 `Digest username="...", realm="...", nonce="...", uri="...", response="..."`。
 pub fn authorization(
     challenge: &Challenge,
