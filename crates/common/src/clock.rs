@@ -59,8 +59,8 @@ pub fn epoch_to_iso8601(epoch_secs: i64) -> String {
 /// (GB28181/WVP 常用,无时区)。解析失败返回 None。
 pub fn parse_iso8601(s: &str) -> Option<i64> {
     let s = s.trim();
-    // 切掉毫秒/时区尾巴,只取到秒。
-    let core = &s[..s.len().min(19)];
+    // 切掉毫秒/时区尾巴,只取到秒。按字符边界安全截取,避免多字节 UTF-8 越界 panic。
+    let core = s.get(..19).unwrap_or(s);
     let (date, time) = core.split_once('T')?;
     let mut dp = date.split('-');
     let y: i64 = dp.next()?.parse().ok()?;
@@ -153,5 +153,12 @@ mod tests {
         assert!(parse_iso8601("").is_none());
         assert!(parse_iso8601("2026-13-01T00:00:00").is_none());
         assert!(parse_iso8601("garbage").is_none());
+    }
+
+    #[test]
+    fn 多字节字符不panic() {
+        // 含多字节 UTF-8(19 字节处可能落在字符中间)不应 panic,返回 None。
+        assert!(parse_iso8601("2026-07-04T00:23:5中文乱码尾巴").is_none());
+        assert!(parse_iso8601("中文中文中文").is_none());
     }
 }
