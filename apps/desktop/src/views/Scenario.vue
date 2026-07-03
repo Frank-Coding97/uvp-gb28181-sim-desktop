@@ -20,6 +20,7 @@ const form = ref({
   heartbeat_interval:   60,
   channels_per_device:  1,
   media_profile:        "A",
+  ramp_per_second:      50,
 });
 
 const mediaOptions = [
@@ -56,6 +57,7 @@ function buildToml(): string {
     `heartbeat_interval_secs = ${form.value.heartbeat_interval}`,
     `channels_per_device = ${form.value.channels_per_device}`,
     `media_profile = "${form.value.media_profile}"`,
+    `ramp_per_second = ${form.value.ramp_per_second}`,
     `video_fps = 25`,
     `[device_info]`,
     `device_name = "UVP-Sim"`,
@@ -109,6 +111,9 @@ async function stopStress() {
         </n-form-item>
         <n-form-item label="每设备通道数">
           <n-input-number v-model:value="form.channels_per_device" :min="1" :max="8" />
+        </n-form-item>
+        <n-form-item label="爬坡(台/秒)">
+          <n-input-number v-model:value="form.ramp_per_second" :min="0" :max="1000" />
         </n-form-item>
         <n-form-item label="媒体档">
           <n-select v-model:value="form.media_profile" :options="mediaOptions" />

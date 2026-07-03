@@ -17,6 +17,8 @@ transport = "UDP"
 heartbeat_interval_secs = 60
 # 每台设备的通道数。
 channels_per_device = 1
+# 爬坡速率:每秒拉起多少台(0 = 一次性全拉起)。避免瞬时注册风暴。
+ramp_per_second = 50
 
 # 媒体档:A=空媒体(仅信令) / B=轻量 / C=真实码流。
 media_profile = "A"

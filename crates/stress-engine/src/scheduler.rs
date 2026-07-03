@@ -13,12 +13,15 @@ pub struct Orchestrator {
     devices: Vec<Arc<DeviceSimulator>>,
     /// 所有设备共享的原子指标,可随时 snapshot 读取。
     pub metrics: Arc<Metrics>,
+    /// 爬坡速率:每秒拉起多少台(0 = 一次性)。
+    ramp_per_second: u32,
 }
 
 impl Orchestrator {
     /// 用场景批量创建设备实例(含共享 Metrics 注入)。
     pub fn new(scenario: &dyn Scenario, count: usize) -> Result<Self> {
         let configs = scenario.generate(count)?;
+        let ramp_per_second = scenario.ramp_per_second();
         let metrics = Arc::new(Metrics::default());
         let devices: Vec<Arc<DeviceSimulator>> = configs
             .into_iter()
@@ -27,8 +30,16 @@ impl Orchestrator {
                 Arc::new(DeviceSimulator::with_observer(cfg, m))
             })
             .collect();
-        tracing::info!(device_count = devices.len(), "编排器已创建设备实例");
-        Ok(Orchestrator { devices, metrics })
+        tracing::info!(
+            device_count = devices.len(),
+            ramp_per_second,
+            "编排器已创建设备实例"
+        );
+        Ok(Orchestrator {
+            devices,
+            metrics,
+            ramp_per_second,
+        })
     }
 
     /// 启动所有设备的 run 任务(注册+心跳+入站应答)。
@@ -42,9 +53,17 @@ impl Orchestrator {
         let local_host = local_addr.ip().to_string();
         tracing::info!(%local_host, local_port, "共享 SIP 传输已绑定");
 
+        // 爬坡:每拉起 ramp_per_second 台后等 1 秒,避免瞬时注册风暴(FR-21)。
+        // ramp=0 表示一次性全拉起。
+        let ramp = self.ramp_per_second;
+
         // 批量启动设备 run 任务。
         let mut handles = Vec::new();
-        for dev in &self.devices {
+        for (i, dev) in self.devices.iter().enumerate() {
+            // 爬坡节流:每满一批(ramp 台)暂停 1 秒。
+            if ramp > 0 && i > 0 && (i as u32) % ramp == 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
             let dev_clone = dev.clone();
             let tp = Arc::clone(&transport);
             let host = local_host.clone();
@@ -100,6 +119,7 @@ mod tests {
             media_profile: MediaProfile::A,
             video_source: None,
             video_fps: 25,
+            ramp_per_second: 0,
         }
     }
 

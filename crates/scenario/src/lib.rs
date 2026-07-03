@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 pub trait Scenario {
     /// 生成 `count` 个设备配置。
     fn generate(&self, count: usize) -> Result<Vec<DeviceConfig>>;
+
+    /// 爬坡速率:每秒拉起多少台设备(0 = 一次性全拉起)。默认 0。
+    fn ramp_per_second(&self) -> u32 {
+        0
+    }
 }
 
 /// 线性场景:基础配置 + 连续递增 ID。
@@ -45,6 +50,9 @@ pub struct LinearScenario {
     /// 推流帧率。
     #[serde(default = "default_fps")]
     pub video_fps: u32,
+    /// 爬坡速率:每秒拉起多少台设备(0 = 一次性全拉起)。避免瞬时注册风暴(FR-21)。
+    #[serde(default)]
+    pub ramp_per_second: u32,
 }
 
 fn default_transport() -> Transport {
@@ -134,6 +142,10 @@ impl Scenario for LinearScenario {
         }
         Ok(configs)
     }
+
+    fn ramp_per_second(&self) -> u32 {
+        self.ramp_per_second
+    }
 }
 
 impl LinearScenario {
@@ -173,6 +185,7 @@ mod tests {
             media_profile: MediaProfile::A,
             video_source: None,
             video_fps: 25,
+            ramp_per_second: 0,
         };
 
         let cfgs = sc.generate(3).unwrap();
@@ -207,6 +220,7 @@ mod tests {
             media_profile: MediaProfile::C,
             video_source: Some("/tmp/test.h264".into()),
             video_fps: 25,
+            ramp_per_second: 0,
         };
 
         let cfgs = sc.generate(1).unwrap();
