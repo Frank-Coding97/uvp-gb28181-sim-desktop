@@ -79,6 +79,11 @@ async fn main() {
         light_bitrate_kbps: std::env::var("LIGHT_KBPS")
             .ok()
             .and_then(|s| s.parse().ok()),
+        gb_version: if std::env::var("GB_VERSION").as_deref() == Ok("2016") {
+            common::GbVersion::V2016
+        } else {
+            common::GbVersion::V2022
+        },
     };
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。

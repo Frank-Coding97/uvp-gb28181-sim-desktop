@@ -3,7 +3,7 @@
 //! 实现 docs/10-functional/stress-testing.md §1:从基础配置生成 N 个设备,
 //! ID 递增,分档设置媒体强度。M3 实现 LinearScenario(连续 ID),支持 TOML 配置。
 
-use common::{DeviceId, Result, Transport};
+use common::{DeviceId, GbVersion, Result, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +60,9 @@ pub struct LinearScenario {
     /// 爬坡速率:每秒拉起多少台设备(0 = 一次性全拉起)。避免瞬时注册风暴(FR-21)。
     #[serde(default)]
     pub ramp_per_second: u32,
+    /// GB28181 协议版本(2022 默认)。
+    #[serde(default)]
+    pub gb_version: GbVersion,
 }
 
 fn default_transport() -> Transport {
@@ -162,6 +165,7 @@ impl Scenario for LinearScenario {
                 video_source,
                 video_fps: self.video_fps,
                 light_bitrate_kbps,
+                gb_version: self.gb_version,
             });
         }
         Ok(configs)
@@ -212,6 +216,7 @@ mod tests {
             bitrate_kbps: 512,
             active_ratio: 1.0,
             ramp_per_second: 0,
+            gb_version: GbVersion::V2022,
         };
 
         let cfgs = sc.generate(3).unwrap();
@@ -249,6 +254,7 @@ mod tests {
             bitrate_kbps: 512,
             active_ratio: 1.0,
             ramp_per_second: 0,
+            gb_version: GbVersion::V2022,
         };
 
         let cfgs = sc.generate(1).unwrap();
@@ -283,6 +289,7 @@ mod tests {
             bitrate_kbps: 512,
             active_ratio: 0.3,
             ramp_per_second: 0,
+            gb_version: GbVersion::V2022,
         };
         let cfgs = sc.generate(10).unwrap();
         let active = cfgs.iter().filter(|c| c.video_source.is_some()).count();

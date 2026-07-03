@@ -43,6 +43,8 @@ pub struct DeviceConfig {
     pub video_fps: u32,
     /// B 档轻量伪流码率(kbps);Some 且无 video_source 时用 LightSource。
     pub light_bitrate_kbps: Option<u32>,
+    /// GB28181 协议版本(影响 MANSCDP 应答字段集,2022 默认)。
+    pub gb_version: common::GbVersion,
 }
 
 /// 通道配置(对应目录查询中的一个 Item)。
@@ -682,6 +684,7 @@ mod tests {
             video_source: None,
             video_fps: 25,
             light_bitrate_kbps: None,
+            gb_version: common::GbVersion::V2022,
         }
     }
 
