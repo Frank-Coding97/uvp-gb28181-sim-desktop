@@ -122,6 +122,17 @@ pub struct CatalogItem {
     /// 注册/在线状态:ON / OFF。
     #[serde(rename = "Status")]
     pub status: String,
+    // ── 以下为 GB/T 28181-2022 相对 2016 新增的目录项字段(附录 A.2.1.9)。
+    //     2016 版应答不输出这些字段(置 None)。──
+    /// 摄像机安全能力等级代码(A/B/C,GB35114,2022 新增,可选)。
+    #[serde(rename = "SecurityLevelCode", skip_serializing_if = "Option::is_none")]
+    pub security_level_code: Option<String>,
+    /// 设备 IPv4/IPv6 地址(2022 新增,可选)。
+    #[serde(rename = "IPAddress", skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    /// 设备端口(2022 新增,可选)。
+    #[serde(rename = "Port", skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// 目录查询应答(设备 → 平台)。
@@ -414,11 +425,16 @@ mod tests {
             parental: Some(0),
             parent_id: Some("34020000001320000001".into()),
             status: "ON".into(),
+            security_level_code: Some("A".into()),
+            ip_address: Some("10.0.0.2".into()),
+            port: Some(5060),
         }];
         let resp = CatalogResponse::new("34020000001320000001", 17, items);
         assert_eq!(resp.sum_num, 1);
         let xml = resp.to_xml().unwrap();
         assert!(xml.contains("<CmdType>Catalog</CmdType>"));
+        assert!(xml.contains("<SecurityLevelCode>A</SecurityLevelCode>"));
+        assert!(xml.contains("<IPAddress>10.0.0.2</IPAddress>"));
         assert!(xml.contains("<SumNum>1</SumNum>"));
         assert!(xml.contains("Num=\"1\""));
         assert!(xml.contains("<DeviceID>34020000001320000002</DeviceID>"));
