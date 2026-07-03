@@ -7,10 +7,10 @@
 | 阶段 | 目标 | 覆盖需求 | 验收 | 状态 |
 |---|---|---|---|---|
 | **M0 骨架** | Cargo workspace + 各 crate 骨架 + Tauri+Vue 壳 + 全套文档 | FR-45 | `cargo build/test/clippy` 全绿;`tauri dev` 起窗口 | ✅ 完成 |
-| **M1 单设备注册** | sip-core 收发 + Digest;单设备 REGISTER/心跳/OPTIONS | FR-1~4 | WVP 控制台 1 台设备**在线**(UC-1) | ✅ 代码完成待 WVP 验收 |
-| **M2 查询与点播** | 目录/设备信息应答;INVITE→RTP 推流(真实 H.264) | FR-5~8, FR-11 | WVP 看到目录 + **实时画面**(UC-1) | ✅ 代码完成待 WVP 验收 |
-| **M3 压测引擎** | scenario 场景 + 编排器 + CLI;批量并发注册 + 原子指标 | FR-20~27 | 多设备批量注册(UC-2) | ✅ 核心完成(爬坡速率待补) |
-| **M4 UI 完善** | 平台配置、场景编排、监控大盘(ECharts) | FR-40~44 | 非技术用户独立跑一次压测 | ✅ 核心完成(报告导出待补) |
+| **M1 单设备注册** | sip-core 收发 + Digest;单设备 REGISTER/心跳/OPTIONS/SUBSCRIBE | FR-1~4 | WVP 控制台 1 台设备**在线**(UC-1) | ✅ **WVP 验证通过** |
+| **M2 查询与点播** | 目录/设备信息/录像应答;INVITE→RTP/TCP 推流(真实 H.264) | FR-5~8, FR-10 | WVP 看到目录 + **实时画面**(UC-1) | ✅ **WVP 验证通过(出 FLV 流)** |
+| **M3 压测引擎** | scenario 场景 + 编排器 + CLI;批量并发注册 + 原子指标 | FR-20~27 | 多设备批量注册(UC-2) | ✅ 核心完成 |
+| **M4 UI 完善** | 平台配置、场景编排、监控大盘(ECharts)+ 报告导出 | FR-40~44, FR-28 | 非技术用户独立跑一次压测 | ✅ 核心完成 |
 | **M5 打包分发** | 三平台安装包 + 签名/公证 | NFR-1/2 | Win/macOS/Linux 下载即用 | 🚧 macOS dmg 已验证,Win/Linux 靠 CI |
 
 ---
