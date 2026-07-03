@@ -302,6 +302,74 @@ impl AlarmNotify {
     }
 }
 
+/// 录像文件项(RecordInfo 应答中一段录像)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct RecordItem {
+    /// 通道 ID。
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 录像名称。
+    #[serde(rename = "Name")]
+    pub name: String,
+    /// 开始时间(ISO8601)。
+    #[serde(rename = "StartTime")]
+    pub start_time: String,
+    /// 结束时间(ISO8601)。
+    #[serde(rename = "EndTime")]
+    pub end_time: String,
+    /// 录像类型:time(定时)/ alarm / manual。
+    #[serde(rename = "Type")]
+    pub kind: String,
+}
+
+/// 录像列表查询应答(RecordInfo,设备 → 平台,FR-10)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct RecordInfoResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 录像总数。
+    #[serde(rename = "SumNum")]
+    pub sum_num: u32,
+    #[serde(rename = "RecordList")]
+    pub record_list: RecordList,
+}
+
+/// 录像列表容器。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordList {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<RecordItem>,
+}
+
+impl RecordInfoResponse {
+    /// 用设备 ID、SN、录像段构造应答。
+    pub fn new(device_id: impl Into<String>, sn: u32, items: Vec<RecordItem>) -> Self {
+        let num = items.len() as u32;
+        RecordInfoResponse {
+            cmd_type: "RecordInfo".into(),
+            sn,
+            device_id: device_id.into(),
+            sum_num: num,
+            record_list: RecordList { num, items },
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("RecordInfoResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +466,23 @@ mod tests {
         assert!(xml.contains("<AlarmMethod>5</AlarmMethod>"));
         assert!(xml.contains("<AlarmDescription>移动侦测</AlarmDescription>"));
         assert!(xml.contains("<DeviceID>35020000001310000132</DeviceID>"));
+    }
+
+    #[test]
+    fn 录像列表应答含段() {
+        let items = vec![RecordItem {
+            device_id: "35020000001310000132".into(),
+            name: "rec1".into(),
+            start_time: "2026-07-03T10:00:00".into(),
+            end_time: "2026-07-03T10:05:00".into(),
+            kind: "time".into(),
+        }];
+        let resp = RecordInfoResponse::new("35020000001310000132", 12, items);
+        assert_eq!(resp.sum_num, 1);
+        let xml = resp.to_xml().unwrap();
+        assert!(xml.contains("<CmdType>RecordInfo</CmdType>"));
+        assert!(xml.contains("Num=\"1\""));
+        assert!(xml.contains("<StartTime>2026-07-03T10:00:00</StartTime>"));
+        assert!(xml.contains("<Type>time</Type>"));
     }
 }

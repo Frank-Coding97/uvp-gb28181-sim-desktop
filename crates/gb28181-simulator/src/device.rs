@@ -430,6 +430,18 @@ impl DeviceSimulator {
                 };
                 resp.to_xml()
             }
+            "RecordInfo" => {
+                // 返回一段模拟录像(FR-10)。真实实现应按查询时间范围列举本地录像。
+                let items = vec![RecordItem {
+                    device_id: query.device_id.clone(),
+                    name: "record".into(),
+                    start_time: "2026-07-03T10:00:00".into(),
+                    end_time: "2026-07-03T10:05:00".into(),
+                    kind: "time".into(),
+                }];
+                let resp = RecordInfoResponse::new(&query.device_id, query.sn, items);
+                resp.to_xml()
+            }
             _ => Err(Error::Gb28181(format!(
                 "未实现的查询类型: {}",
                 query.cmd_type
