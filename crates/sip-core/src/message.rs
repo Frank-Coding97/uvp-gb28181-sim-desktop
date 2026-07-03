@@ -28,6 +28,10 @@ pub enum Method {
     Bye,
     /// 探活。
     Options,
+    /// 平台订阅(目录/位置/报警)。设备回 200 后周期 NOTIFY。
+    Subscribe,
+    /// 通知(设备 → 平台,订阅的增量推送)。
+    Notify,
 }
 
 impl Method {
@@ -40,6 +44,8 @@ impl Method {
             Method::Ack => "ACK",
             Method::Bye => "BYE",
             Method::Options => "OPTIONS",
+            Method::Subscribe => "SUBSCRIBE",
+            Method::Notify => "NOTIFY",
         }
     }
 
@@ -52,6 +58,8 @@ impl Method {
             "ACK" => Method::Ack,
             "BYE" => Method::Bye,
             "OPTIONS" => Method::Options,
+            "SUBSCRIBE" => Method::Subscribe,
+            "NOTIFY" => Method::Notify,
             other => return Err(Error::Sip(format!("不支持的 SIP 方法: {other}"))),
         })
     }

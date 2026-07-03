@@ -311,6 +311,13 @@ impl DeviceSimulator {
                     // ACK 无需响应,但标志会话已确认。
                     Ok(true)
                 }
+                sip_core::Method::Subscribe => {
+                    // 平台订阅(Catalog/MobilePosition/Alarm):回 200 OK 建立订阅。
+                    // 周期 NOTIFY 由 run 循环推送(见 subscription 处理)。
+                    let resp = sip_core::SipMessage::Response(builder::response_ok(req));
+                    transport.send_to(&resp, incoming.from).await?;
+                    Ok(true)
+                }
                 _ => Ok(false),
             }
         } else {
