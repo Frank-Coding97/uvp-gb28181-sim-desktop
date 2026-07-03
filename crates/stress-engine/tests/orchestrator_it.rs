@@ -78,6 +78,7 @@ fn scenario_for(port: u16) -> LinearScenario {
         video_source: None,
         video_fps: 25,
         bitrate_kbps: 512,
+        active_ratio: 1.0,
         ramp_per_second: 0,
     }
 }

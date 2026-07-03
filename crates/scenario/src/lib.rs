@@ -53,6 +53,10 @@ pub struct LinearScenario {
     /// 目标码率(kbps),B 档轻量伪流用;C 档由文件决定,可忽略。
     #[serde(default = "default_bitrate")]
     pub bitrate_kbps: u32,
+    /// 真推流设备占比(0.0~1.0,FR-24)。仅前 count×ratio 台带媒体源,其余只维持信令。
+    /// 默认 1.0(全部推流)。A 档忽略此项(本就不推流)。
+    #[serde(default = "default_active_ratio")]
+    pub active_ratio: f32,
     /// 爬坡速率:每秒拉起多少台设备(0 = 一次性全拉起)。避免瞬时注册风暴(FR-21)。
     #[serde(default)]
     pub ramp_per_second: u32,
@@ -72,6 +76,9 @@ fn default_fps() -> u32 {
 }
 fn default_bitrate() -> u32 {
     512
+}
+fn default_active_ratio() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,8 +110,13 @@ impl Scenario for LinearScenario {
             .parse()
             .map_err(|_| common::Error::Gb28181("基础设备 ID 非纯数字".into()))?;
 
+        // FR-24:仅前 active_count 台带媒体源真推流,其余只维持信令。
+        let ratio = self.active_ratio.clamp(0.0, 1.0);
+        let active_count = (count as f32 * ratio).ceil() as usize;
+
         let mut configs = Vec::with_capacity(count);
         for i in 0..count {
+            let is_active = i < active_count;
             let device_num = base_num + i as u128;
             let device_id_str = format!("{:020}", device_num);
             let device_id = DeviceId::new(&device_id_str)?;
@@ -122,12 +134,12 @@ impl Scenario for LinearScenario {
                 .collect();
 
             let video_source = match self.media_profile {
-                MediaProfile::C => self.video_source.clone(),
+                MediaProfile::C if is_active => self.video_source.clone(),
                 _ => None,
             };
-            // B 档用轻量伪流(按码率合成);A/C 档不用。
+            // B 档用轻量伪流(按码率合成);A/C 档不用。仅活跃设备推流(FR-24)。
             let light_bitrate_kbps = match self.media_profile {
-                MediaProfile::B => Some(self.bitrate_kbps),
+                MediaProfile::B if is_active => Some(self.bitrate_kbps),
                 _ => None,
             };
 
@@ -198,6 +210,7 @@ mod tests {
             video_source: None,
             video_fps: 25,
             bitrate_kbps: 512,
+            active_ratio: 1.0,
             ramp_per_second: 0,
         };
 
@@ -234,6 +247,7 @@ mod tests {
             video_source: Some("/tmp/test.h264".into()),
             video_fps: 25,
             bitrate_kbps: 512,
+            active_ratio: 1.0,
             ramp_per_second: 0,
         };
 
@@ -243,5 +257,37 @@ mod tests {
         sc.media_profile = MediaProfile::A;
         let cfgs_a = sc.generate(1).unwrap();
         assert_eq!(cfgs_a[0].video_source, None);
+    }
+
+    #[test]
+    fn active_ratio_仅部分设备推流() {
+        // C 档 + 30% 采样:10 台里前 ceil(10*0.3)=3 台带视频源,其余 None。
+        let sc = LinearScenario {
+            base_device_id: "34020000001320000001".into(),
+            password: "p".into(),
+            server_host: "1.2.3.4".into(),
+            server_port: 5060,
+            server_domain: "34020000002000000001".into(),
+            transport: Transport::Udp,
+            heartbeat_interval_secs: 60,
+            channels_per_device: 1,
+            device_info: DeviceInfoTemplate {
+                device_name: "D".into(),
+                manufacturer: "U".into(),
+                model: "S".into(),
+                firmware: "0.1".into(),
+            },
+            media_profile: MediaProfile::C,
+            video_source: Some("/tmp/t.h264".into()),
+            video_fps: 25,
+            bitrate_kbps: 512,
+            active_ratio: 0.3,
+            ramp_per_second: 0,
+        };
+        let cfgs = sc.generate(10).unwrap();
+        let active = cfgs.iter().filter(|c| c.video_source.is_some()).count();
+        assert_eq!(active, 3, "10 台 @ 30% 应有 3 台推流");
+        assert!(cfgs[0].video_source.is_some());
+        assert!(cfgs[3].video_source.is_none());
     }
 }

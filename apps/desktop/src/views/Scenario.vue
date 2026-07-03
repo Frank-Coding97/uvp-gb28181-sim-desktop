@@ -21,6 +21,7 @@ const form = ref({
   channels_per_device:  1,
   media_profile:        "A",
   ramp_per_second:      50,
+  active_ratio:         100,
 });
 
 const mediaOptions = [
