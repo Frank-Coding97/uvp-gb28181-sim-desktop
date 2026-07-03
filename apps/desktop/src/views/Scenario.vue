@@ -2,8 +2,8 @@
 // 压测场景编排页：生成 TOML 场景内容并启动/停止压测（FR-41）。
 import { ref } from "vue";
 import {
-  NCard, NForm, NFormItem, NInput, NInputNumber,
-  NButton, NSpace, NSelect, NText, useMessage,
+  NForm, NFormItem, NInput, NInputNumber,
+  NButton, NSpace, NSelect, useMessage,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { useRouter } from "vue-router";
@@ -99,44 +99,59 @@ async function stopStress() {
 </script>
 
 <template>
-  <n-space vertical size="large">
-    <n-card title="压测场景编排">
-      <n-form :model="form" label-placement="left" label-width="120">
-        <n-form-item label="起始设备 ID">
-          <n-input v-model:value="form.base_device_id" placeholder="20位国标设备ID" />
-        </n-form-item>
-        <n-form-item label="设备数量">
-          <n-input-number v-model:value="form.count" :min="1" :max="10000" />
-        </n-form-item>
-        <n-form-item label="心跳间隔(秒)">
-          <n-input-number v-model:value="form.heartbeat_interval" :min="10" :max="600" />
-        </n-form-item>
-        <n-form-item label="每设备通道数">
-          <n-input-number v-model:value="form.channels_per_device" :min="1" :max="8" />
-        </n-form-item>
-        <n-form-item label="爬坡(台/秒)">
-          <n-input-number v-model:value="form.ramp_per_second" :min="0" :max="1000" />
-        </n-form-item>
-        <n-form-item label="媒体档">
-          <n-select v-model:value="form.media_profile" :options="mediaOptions" />
-        </n-form-item>
-        <n-form-item label="推流占比(%)">
-          <n-input-number v-model:value="form.active_ratio" :min="0" :max="100" />
-        </n-form-item>
+  <div class="page">
+    <div class="page-header">
+      <div>
+        <div class="page-title">压测场景编排</div>
+        <div class="page-sub">批量虚拟设备并发注册/心跳/推流 · 核心差异化能力</div>
+      </div>
+      <span class="status-chip">{{ statusText }}</span>
+    </div>
+
+    <div class="glass-card panel">
+      <n-form :model="form" label-placement="top">
+        <div class="grid3">
+          <n-form-item label="起始设备 ID">
+            <n-input v-model:value="form.base_device_id" placeholder="20 位国标 ID" />
+          </n-form-item>
+          <n-form-item label="设备数量">
+            <n-input-number v-model:value="form.count" :min="1" :max="10000" style="width:100%" />
+          </n-form-item>
+          <n-form-item label="爬坡(台/秒)">
+            <n-input-number v-model:value="form.ramp_per_second" :min="0" :max="1000" style="width:100%" />
+          </n-form-item>
+          <n-form-item label="心跳间隔(秒)">
+            <n-input-number v-model:value="form.heartbeat_interval" :min="10" :max="600" style="width:100%" />
+          </n-form-item>
+          <n-form-item label="每设备通道数">
+            <n-input-number v-model:value="form.channels_per_device" :min="1" :max="8" style="width:100%" />
+          </n-form-item>
+          <n-form-item label="推流占比(%)">
+            <n-input-number v-model:value="form.active_ratio" :min="0" :max="100" style="width:100%" />
+          </n-form-item>
+          <n-form-item label="媒体档">
+            <n-select v-model:value="form.media_profile" :options="mediaOptions" />
+          </n-form-item>
+        </div>
       </n-form>
 
-      <n-space style="margin-top:16px">
-        <n-button type="primary" :disabled="running" @click="startStress">
-          启动压测
-        </n-button>
-        <n-button type="error" :disabled="!running" @click="stopStress">
-          停止压测
-        </n-button>
+      <n-space style="margin-top:8px">
+        <n-button type="primary" :disabled="running" @click="startStress">启动压测</n-button>
+        <n-button type="error" secondary :disabled="!running" @click="stopStress">停止压测</n-button>
       </n-space>
-
-      <n-text depth="3" style="display:block; margin-top:12px;">
-        状态：{{ statusText }}
-      </n-text>
-    </n-card>
-  </n-space>
+    </div>
+  </div>
 </template>
+
+<style scoped>
+.page { max-width: 900px; }
+.page-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
+.page-title { font-size: 24px; font-weight: 700; color: var(--text-primary); }
+.page-sub { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; }
+.status-chip {
+  padding: 5px 14px; border-radius: 999px; font-size: 12.5px; color: var(--text-secondary);
+  background: rgba(255,255,255,0.6); border: 1px solid var(--border-subtle);
+}
+.panel { padding: 24px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 18px; }
+</style>

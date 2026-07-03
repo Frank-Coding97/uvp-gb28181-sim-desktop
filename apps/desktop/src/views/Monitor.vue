@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 运行监控大盘：订阅 metrics_tick 事件，用 ECharts 绘制实时曲线（FR-42）。
 import { ref, onMounted, onUnmounted, shallowRef } from "vue";
-import { NCard, NGrid, NGi, NStatistic, NSpace, NText, NButton, useMessage } from "naive-ui";
+import { NButton, useMessage } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import * as echarts from "echarts";
@@ -106,50 +106,68 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <n-space vertical size="large">
+  <div class="page">
+    <div class="page-header">
+      <div>
+        <div class="page-title">运行监控</div>
+        <div class="page-sub">压测实时指标 · 每秒刷新</div>
+      </div>
+      <n-button size="small" tertiary @click="exportReport">导出报告</n-button>
+    </div>
+
     <!-- 关键指标卡 -->
-    <n-grid :cols="3" :x-gap="12" :y-gap="12">
-      <n-gi>
-        <n-card>
-          <n-statistic
-            label="注册成功率"
-            :value="latest ? (latest.register_success_rate * 100).toFixed(1) + '%' : '—'"
-          />
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card>
-          <n-statistic
-            label="注册成功"
-            :value="latest?.register_succeeded ?? '—'"
-          />
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card>
-          <n-statistic
-            label="活跃推流"
-            :value="latest?.active_streams ?? '—'"
-          />
-        </n-card>
-      </n-gi>
-    </n-grid>
+    <div class="metrics">
+      <div class="glass-card metric">
+        <div class="m-label">注册成功率</div>
+        <div class="m-value" style="color: var(--success)">
+          {{ latest ? (latest.register_success_rate * 100).toFixed(1) + "%" : "—" }}
+        </div>
+      </div>
+      <div class="glass-card metric">
+        <div class="m-label">注册成功</div>
+        <div class="m-value">{{ latest?.register_succeeded ?? "—" }}</div>
+      </div>
+      <div class="glass-card metric">
+        <div class="m-label">活跃推流</div>
+        <div class="m-value" style="color: var(--accent)">{{ latest?.active_streams ?? "—" }}</div>
+      </div>
+      <div class="glass-card metric">
+        <div class="m-label">心跳失败</div>
+        <div class="m-value" style="color: var(--warning)">{{ latest?.heartbeat_failed ?? "—" }}</div>
+      </div>
+    </div>
 
     <!-- ECharts 实时曲线 -->
-    <n-card title="实时指标曲线">
+    <div class="glass-card panel">
+      <div class="panel-title">实时指标曲线</div>
       <div ref="chartEl" style="height: 320px;" />
-    </n-card>
+    </div>
 
-    <!-- 失败归因 + 报告导出 -->
-    <n-card title="失败归因" v-if="latest">
-      <n-space vertical>
-        <n-space>
-          <n-text>超时: {{ latest.fail_timeout }}</n-text>
-          <n-text>被拒: {{ latest.fail_rejected }}</n-text>
-          <n-text>其它: {{ latest.fail_other }}</n-text>
-        </n-space>
-        <n-button size="small" @click="exportReport">导出报告</n-button>
-      </n-space>
-    </n-card>
-  </n-space>
+    <!-- 失败归因 -->
+    <div v-if="latest" class="glass-card panel">
+      <div class="panel-title">失败归因</div>
+      <div class="fails">
+        <div class="fail-item"><span>超时</span><b>{{ latest.fail_timeout }}</b></div>
+        <div class="fail-item"><span>被拒</span><b>{{ latest.fail_rejected }}</b></div>
+        <div class="fail-item"><span>其它</span><b>{{ latest.fail_other }}</b></div>
+      </div>
+    </div>
+  </div>
 </template>
+
+<style scoped>
+.page { max-width: 1000px; }
+.page-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
+.page-title { font-size: 24px; font-weight: 700; color: var(--text-primary); }
+.page-sub { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 18px; }
+.metric { padding: 16px 18px; }
+.m-label { font-size: 12px; color: var(--text-tertiary); }
+.m-value { font-size: 22px; font-weight: 700; margin-top: 8px; color: var(--text-primary); }
+.panel { padding: 20px 22px; margin-bottom: 18px; }
+.panel-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin-bottom: 14px; }
+.fails { display: flex; gap: 28px; }
+.fail-item { display: flex; flex-direction: column; gap: 4px; }
+.fail-item span { font-size: 12px; color: var(--text-tertiary); }
+.fail-item b { font-size: 20px; color: var(--text-primary); }
+</style>
