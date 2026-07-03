@@ -20,8 +20,12 @@ channels_per_device = 1
 # 爬坡速率:每秒拉起多少台(0 = 一次性全拉起)。避免瞬时注册风暴。
 ramp_per_second = 50
 
-# 媒体档:A=空媒体(仅信令) / B=轻量 / C=真实码流。
+# 媒体档:A=空媒体(仅信令) / B=轻量伪流 / C=真实码流。
 media_profile = "A"
+# B 档目标码率(kbps)。
+bitrate_kbps = 512
+# 真推流设备占比(0.0~1.0):仅前 count×ratio 台带媒体源,其余只维持信令。
+active_ratio = 1.0
 # C 档时的 H.264 文件路径。
 # video_source = "./assets/media/test.h264"
 video_fps = 25

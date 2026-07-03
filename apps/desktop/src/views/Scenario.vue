@@ -59,6 +59,7 @@ function buildToml(): string {
     `channels_per_device = ${form.value.channels_per_device}`,
     `media_profile = "${form.value.media_profile}"`,
     `ramp_per_second = ${form.value.ramp_per_second}`,
+    `active_ratio = ${(form.value.active_ratio / 100).toFixed(2)}`,
     `video_fps = 25`,
     `[device_info]`,
     `device_name = "UVP-Sim"`,
@@ -118,6 +119,9 @@ async function stopStress() {
         </n-form-item>
         <n-form-item label="媒体档">
           <n-select v-model:value="form.media_profile" :options="mediaOptions" />
+        </n-form-item>
+        <n-form-item label="推流占比(%)">
+          <n-input-number v-model:value="form.active_ratio" :min="0" :max="100" />
         </n-form-item>
       </n-form>
 
