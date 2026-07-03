@@ -1,6 +1,9 @@
 # 功能规格:压力测试
 
-**状态:草案** · 覆盖 FR-20~FR-28 · 核心差异化能力 · 实现见 `30-crates/stress-engine.md`、`scenario.md`。
+**状态:核心已实现** · 覆盖 FR-20~FR-28 · 核心差异化能力 · 实现见 `30-crates/stress-engine.md`、`scenario.md`。
+
+> 已实现:批量设备生成(FR-20)、爬坡速率(FR-21)、并发注册/心跳(FR-22)、媒体三档 A/B/C(FR-23)、TOML 场景保存加载(FR-25)、原子指标+失败归因(FR-26/27)、报告导出(FR-28)。
+> 待补:active_ratio 推流采样(FR-24 当前全量)、指标落 SQLite 持久化。
 
 ---
 

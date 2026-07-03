@@ -2,7 +2,7 @@
 
 **状态:M2 完成** · RTP/PS 封装与推流引擎。
 
-> 进度:M2(rtp 包头+切片+统计、PS 封装 H.264、FileSource Annex B 切帧循环、push_stream 驱动)✅ · 单测 10 个全绿。M3 补充 NoneSource/LightSource(A/B 档)与 TCP 推流。
+> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · 单测 12 个全绿。待补:TCP(RFC 4571)推流。
 
 ## 职责
 
