@@ -4,7 +4,7 @@
 
 ## 消息子集
 
-只实现 GB28181 必需的方法:`REGISTER`(注册/注销)、`MESSAGE`(MANSCDP 载体:心跳/查询/应答/通知)、`INVITE`/`ACK`/`BYE`(点播会话)、`OPTIONS`(探活)。
+只实现 GB28181 必需的方法:`REGISTER`(注册/注销)、`MESSAGE`(MANSCDP 载体:心跳/查询/应答/通知)、`INVITE`/`ACK`/`BYE`(点播会话)、`OPTIONS`(探活)、`SUBSCRIBE`/`NOTIFY`(订阅与对话内通知)、`INFO`(会话内回放控制)。
 
 ## 头字段
 
@@ -42,3 +42,7 @@
  │──MESSAGE(Keepalive)──────►│   每 60s
  │◄─200 OK───────────────────│
 ```
+
+## 网络校时(SIP Date 头)
+
+平台在 REGISTER 200 OK 携带 `Date` 头(如 `2026-07-04T00:23:58.186`,平台本地时间、无时区)。设备据此校时:`common::clock::sync_from_date_header` 解析并记录“平台时间 − 本地时间”偏移(不改操作系统时钟),生成 MANSCDP 时间戳(心跳/报警/位置)时统一叠加,使设备上报时间与平台对齐。实测偏移 +28794s(本机 UTC ↔ 平台 UTC+8)。
