@@ -30,6 +30,10 @@ pub struct Query {
     /// 目标设备/通道 ID。
     #[serde(rename = "DeviceID")]
     pub device_id: String,
+    /// 订阅周期(秒)。仅移动位置订阅(SUBSCRIBE + MobilePosition)携带,
+    /// 指示设备按此间隔周期上报位置 NOTIFY;普通查询不含此字段(None)。
+    #[serde(rename = "Interval", default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u64>,
 }
 
 impl Query {
@@ -524,6 +528,200 @@ impl RecordInfoResponse {
     }
 }
 
+/// 基本参数(ConfigDownload/BasicParam 的内容,GB/T 28181 附录 A.2.3)。
+/// 设备返回自身注册/心跳相关的基本配置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "BasicParam")]
+pub struct BasicParam {
+    /// 设备名称。
+    #[serde(rename = "Name")]
+    pub name: String,
+    /// 注册有效期(秒)。
+    #[serde(rename = "Expiration")]
+    pub expiration: u32,
+    /// 心跳间隔(秒)。
+    #[serde(rename = "HeartBeatInterval")]
+    pub heartbeat_interval: u32,
+    /// 心跳超时次数(连续未应答判定掉线的阈值)。
+    #[serde(rename = "HeartBeatCount")]
+    pub heartbeat_count: u32,
+}
+
+/// 设备配置查询应答(ConfigDownload,设备 → 平台)。
+///
+/// 平台下发 `<Query><CmdType>ConfigDownload</CmdType>...<ConfigType>BasicParam</ConfigType></Query>`,
+/// 设备回 `<Response><CmdType>ConfigDownload</CmdType>...<BasicParam>...</BasicParam></Response>`。
+/// 目前仅实现最常用的 BasicParam;其它 ConfigType(视频参数/SVAC 等)按需扩展。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct ConfigDownloadResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "Result")]
+    pub result: String,
+    /// 基本参数(ConfigType=BasicParam 时携带)。
+    #[serde(rename = "BasicParam", skip_serializing_if = "Option::is_none")]
+    pub basic_param: Option<BasicParam>,
+}
+
+impl ConfigDownloadResponse {
+    /// 构造一个 BasicParam 配置应答。
+    pub fn basic(
+        device_id: impl Into<String>,
+        sn: u32,
+        name: impl Into<String>,
+        expiration: u32,
+        heartbeat_interval: u32,
+        heartbeat_count: u32,
+    ) -> Self {
+        ConfigDownloadResponse {
+            cmd_type: "ConfigDownload".into(),
+            sn,
+            device_id: device_id.into(),
+            result: "OK".into(),
+            basic_param: Some(BasicParam {
+                name: name.into(),
+                expiration,
+                heartbeat_interval,
+                heartbeat_count,
+            }),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("ConfigDownloadResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 预置位项(PresetQuery 应答中的一个预置位)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct PresetItem {
+    /// 预置位编号。
+    #[serde(rename = "PresetID")]
+    pub preset_id: u32,
+    /// 预置位名称。
+    #[serde(rename = "PresetName")]
+    pub preset_name: String,
+}
+
+/// 预置位列表容器(带 Num 属性)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetList {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<PresetItem>,
+}
+
+/// 预置位查询应答(PresetQuery,设备 → 平台,GB/T 28181 附录 A.2.5.5)。
+///
+/// 平台下发 `<Query><CmdType>PresetQuery</CmdType>...</Query>`,
+/// 设备回 `<Response><CmdType>PresetQuery</CmdType>...<PresetList Num="N">...</PresetList></Response>`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct PresetQueryResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "PresetList")]
+    pub preset_list: PresetList,
+}
+
+impl PresetQueryResponse {
+    /// 用预置位列表构造应答。
+    pub fn new(device_id: impl Into<String>, sn: u32, items: Vec<PresetItem>) -> Self {
+        let num = items.len() as u32;
+        PresetQueryResponse {
+            cmd_type: "PresetQuery".into(),
+            sn,
+            device_id: device_id.into(),
+            preset_list: PresetList { num, items },
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("PresetQueryResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 目录订阅通知项:在目录项基础上多一个 `Event` 字段(ON/OFF/ADD/DEL/UPDATE)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct CatalogNotifyItem {
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    /// 变更事件:ON(上线)/OFF(离线)/ADD/DEL/UPDATE。
+    #[serde(rename = "Event")]
+    pub event: String,
+    #[serde(rename = "Status")]
+    pub status: String,
+}
+
+/// 目录订阅通知列表容器。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogNotifyList {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<CatalogNotifyItem>,
+}
+
+/// 目录订阅变更通知(设备 → 平台,`<Notify>` 根元素)。
+///
+/// 平台 `SUBSCRIBE + Catalog` 后,设备用本通知上报目录项的上线/离线/增删。
+/// 与 [`CatalogResponse`] 的区别:根元素是 `Notify`(非 `Response`),每项带 `Event`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct CatalogNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SumNum")]
+    pub sum_num: u32,
+    #[serde(rename = "DeviceList")]
+    pub device_list: CatalogNotifyList,
+}
+
+impl CatalogNotify {
+    /// 用设备 ID、SN、变更项列表构造目录通知。
+    pub fn new(device_id: impl Into<String>, sn: u32, items: Vec<CatalogNotifyItem>) -> Self {
+        let num = items.len() as u32;
+        CatalogNotify {
+            cmd_type: "Catalog".into(),
+            sn,
+            device_id: device_id.into(),
+            sum_num: num,
+            device_list: CatalogNotifyList { num, items },
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("CatalogNotify 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +841,71 @@ mod tests {
         assert!(xml.contains("Num=\"1\""));
         assert!(xml.contains("<StartTime>2026-07-03T10:00:00</StartTime>"));
         assert!(xml.contains("<Type>time</Type>"));
+    }
+
+    #[test]
+    fn 配置查询应答含基本参数() {
+        let resp = ConfigDownloadResponse::basic(
+            "35020000001310000001",
+            21,
+            "UVP-Sim-Desktop",
+            3600,
+            60,
+            3,
+        );
+        let xml = resp.to_xml().unwrap();
+        assert!(xml.contains("<CmdType>ConfigDownload</CmdType>"));
+        assert!(xml.contains("<SN>21</SN>"));
+        assert!(xml.contains("<Result>OK</Result>"));
+        assert!(xml.contains("<BasicParam>"));
+        assert!(xml.contains("<Name>UVP-Sim-Desktop</Name>"));
+        assert!(xml.contains("<Expiration>3600</Expiration>"));
+        assert!(xml.contains("<HeartBeatInterval>60</HeartBeatInterval>"));
+        assert!(xml.contains("<HeartBeatCount>3</HeartBeatCount>"));
+    }
+
+    #[test]
+    fn 预置位查询应答含列表() {
+        let resp = PresetQueryResponse::new(
+            "35020000001310000001",
+            88,
+            vec![
+                PresetItem {
+                    preset_id: 1,
+                    preset_name: "大门".into(),
+                },
+                PresetItem {
+                    preset_id: 2,
+                    preset_name: "停车场".into(),
+                },
+            ],
+        );
+        let xml = resp.to_xml().unwrap();
+        assert!(xml.contains("<CmdType>PresetQuery</CmdType>"));
+        assert!(xml.contains("<PresetList Num=\"2\">"));
+        assert!(xml.contains("<PresetID>1</PresetID>"));
+        assert!(xml.contains("<PresetName>大门</PresetName>"));
+        assert!(xml.contains("<PresetID>2</PresetID>"));
+    }
+
+    #[test]
+    fn 目录订阅通知含事件字段() {
+        let notify = CatalogNotify::new(
+            "35020000001310000001",
+            5,
+            vec![CatalogNotifyItem {
+                device_id: "35020000001310000001".into(),
+                name: "Camera-1".into(),
+                event: "ON".into(),
+                status: "ON".into(),
+            }],
+        );
+        let xml = notify.to_xml().unwrap();
+        assert!(xml.contains("<Notify>"));
+        assert!(xml.contains("<CmdType>Catalog</CmdType>"));
+        assert!(xml.contains("<SumNum>1</SumNum>"));
+        assert!(xml.contains("<DeviceList Num=\"1\">"));
+        assert!(xml.contains("<Event>ON</Event>"));
     }
 
     #[test]
