@@ -41,7 +41,40 @@
 | H.264 文件循环推流(C 档) | FR-8 | ✅ |
 | 历史回放流推送 | FR-10 | 🟢 复用点播 INVITE 推流路径 |
 | 倍速 / 下载 | FR-10 | ⬜ |
-| 强制关键帧(IFrameCmd) | FR-8 | ⬜ |
+| 强制关键帧(IFrameCmd) | FR-8 | 🚧 见设备控制 |
+
+## 设备控制(平台 → 设备,MANSCDP Control)
+
+平台下发 `<Control>` 命令,设备回 200 + 结果 Notify。对标 uvp-gb28181-sim 的关键补齐项。
+
+| 功能 | CmdType/字段 | 优先级 | 状态 |
+|---|---|---|---|
+| PTZ 云台控制 | DeviceControl / PTZCmd | P0 | 🚧 开发中 |
+| 强制关键帧 | DeviceControl / IFameCmd | P0 | 🚧 开发中 |
+| 录像控制(录制/停止) | DeviceControl / RecordCmd | P1 | 🚧 开发中 |
+| 布防/撤防 | DeviceControl / GuardCmd | P1 | 🚧 开发中 |
+| 报警复位 | DeviceControl / AlarmCmd | P1 | 🚧 开发中 |
+| 远程启动 | DeviceControl / TeleBoot | P2 | 🚧 开发中 |
+| 设备配置(基本参数) | DeviceConfig / BasicParam | P2 | ⬜ |
+
+## 订阅与通知(平台订阅 → 设备周期 NOTIFY)
+
+| 功能 | 说明 | 优先级 | 状态 |
+|---|---|---|---|
+| SUBSCRIBE 应答 200 | 建立订阅 | — | ✅ |
+| 移动位置订阅 + 周期 NOTIFY(GPS) | MobilePosition | P0 | 🚧 开发中 |
+| 目录订阅 + 变更 NOTIFY | Catalog 订阅 | P1 | ⬜ |
+| 报警订阅 | Alarm 订阅 | P1 | ⬜ |
+
+## 其它设备能力
+
+| 功能 | CmdType | 优先级 | 状态 |
+|---|---|---|---|
+| 网络校时 | DeviceControl / 校时 | P1 | ⬜ |
+| 语音广播 | Broadcast | P2 | ⬜ |
+| 设备配置查询 | ConfigDownload | P2 | ⬜ |
+| 预置位查询 | PresetQuery | P2 | ⬜ |
+| 设备软件升级 | — | P2(边缘) | 🚫 暂不 |
 
 ## 主动上报(设备 → 平台)
 
