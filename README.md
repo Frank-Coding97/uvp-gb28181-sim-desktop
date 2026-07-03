@@ -69,6 +69,10 @@ npm run tauri dev
 npm run tauri build
 ```
 
+> **macOS 打包**:`tauri build` 的 dmg 步骤在无图形会话(SSH/CI 无桌面)下会因
+> Finder AppleScript 失败。用 `apps/desktop/build-macos-dmg.sh` 出 `.app` + 朴素 `.dmg`
+> (hdiutil,可靠)。`.app` 双击即运行,dmg 拖拽安装。
+
 ---
 
 ## 文档
