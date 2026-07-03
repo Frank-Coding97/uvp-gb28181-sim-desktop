@@ -287,6 +287,33 @@ impl DeviceSimulator {
         }
     }
 
+    /// 发送一条无对话的 MANSCDP MESSAGE(心跳/报警/位置等)并等平台响应。
+    ///
+    /// 每次事务用**全新** [`DialogIds`](独立 Call-ID):同一设备的心跳、报警、
+    /// 位置上报可能并发(周期任务 + 手动触发),若共用注册 Call-ID 会在共享传输上
+    /// 互相覆盖接收路由、抢走对方的响应导致误判超时。独立 Call-ID 彻底隔离,
+    /// 事务结束即注销路由。
+    async fn send_message_xml(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+        xml: &str,
+    ) -> Result<u16> {
+        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
+            .parse()
+            .map_err(|_| Error::Config("平台地址非法".into()))?;
+        let ids = DialogIds::new();
+        let cseq = self.next_cseq();
+        let req = builder::message_xml(&self.config, &ids, cseq, local_host, local_port, xml);
+        let mut rx = transport.register(ids.call_id.clone());
+        let result =
+            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
+                .await;
+        transport.unregister(&ids.call_id);
+        Ok(result?.status)
+    }
+
     /// 发送一次心跳(MESSAGE + Keepalive XML)。返回平台响应状态码。
     pub async fn send_keepalive(
         &self,
@@ -294,24 +321,19 @@ impl DeviceSimulator {
         local_host: &str,
         local_port: u16,
     ) -> Result<u16> {
-        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
-            .parse()
-            .map_err(|_| Error::Config("平台地址非法".into()))?;
         let sn = self.next_cseq();
         let ka = Keepalive::ok(self.config.device_id.as_str(), sn);
         let xml = ka.to_xml()?;
-        let cseq = self.next_cseq();
-        let req = builder::message_xml(&self.config, &self.ids, cseq, local_host, local_port, &xml);
-        let mut rx = transport.register(self.ids.call_id.clone());
-        let resp =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await?;
-        if resp.status == 200 {
+        let status = self
+            .send_message_xml(transport, local_host, local_port, &xml)
+            .await?;
+        let resp_status = status;
+        if resp_status == 200 {
             self.observer.on_event(common::DeviceEvent::HeartbeatOk);
         } else {
             self.observer.on_event(common::DeviceEvent::HeartbeatFail);
         }
-        Ok(resp.status)
+        Ok(resp_status)
     }
 
     /// 主动上报一条视频侦测报警(FR-9)。设备 → 平台 MESSAGE + Alarm Notify XML。
@@ -323,9 +345,6 @@ impl DeviceSimulator {
         local_port: u16,
         description: &str,
     ) -> Result<u16> {
-        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
-            .parse()
-            .map_err(|_| Error::Config("平台地址非法".into()))?;
         let sn = self.next_cseq();
         // 报警时间用校时后的 ISO8601(与平台时间对齐,见 common::clock)。
         let time = common::clock::synced_iso8601();
@@ -338,7 +357,7 @@ impl DeviceSimulator {
         let xml = alarm.to_xml()?;
 
         // 若存在报警订阅对话:在对话内以 SIP NOTIFY 上报(GB28181 订阅语义);
-        // 否则(如手动触发、平台未订阅)退化为独立 MESSAGE。
+        // 否则(如手动触发、平台未订阅)退化为独立 MESSAGE(全新 Call-ID)。
         let alarm_dialog = self.alarm_dialog.lock().await.clone();
         if let Some((dialog, sub_dst)) = alarm_dialog {
             let cseq = self.next_cseq();
@@ -363,13 +382,8 @@ impl DeviceSimulator {
             return Ok(result?.status);
         }
 
-        let cseq = self.next_cseq();
-        let req = builder::message_xml(&self.config, &self.ids, cseq, local_host, local_port, &xml);
-        let mut rx = transport.register(self.ids.call_id.clone());
-        let resp =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await?;
-        Ok(resp.status)
+        self.send_message_xml(transport, local_host, local_port, &xml)
+            .await
     }
 
     /// 主动上报一条移动位置(GPS,MobilePosition NOTIFY)。设备 → 平台。
@@ -386,9 +400,6 @@ impl DeviceSimulator {
         if let Ok(mut p) = self.position.lock() {
             *p = (longitude, latitude);
         }
-        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
-            .parse()
-            .map_err(|_| Error::Config("平台地址非法".into()))?;
         let sn = self.next_cseq();
         // 位置上报时间用校时后的 ISO8601(与平台时间对齐)。
         let time = common::clock::synced_iso8601();
@@ -400,13 +411,8 @@ impl DeviceSimulator {
             latitude,
         );
         let xml = notify.to_xml()?;
-        let cseq = self.next_cseq();
-        let req = builder::message_xml(&self.config, &self.ids, cseq, local_host, local_port, &xml);
-        let mut rx = transport.register(self.ids.call_id.clone());
-        let resp =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await?;
-        Ok(resp.status)
+        self.send_message_xml(transport, local_host, local_port, &xml)
+            .await
     }
 
     /// 在订阅对话内向平台回发目录变更通知(Catalog Notify)。
