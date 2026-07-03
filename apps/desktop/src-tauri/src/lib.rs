@@ -65,6 +65,45 @@ impl DeviceObserver for StateEmitter {
     }
 }
 
+/// SIP 信令追踪观察者(FR-43):把每条收发报文结构化为 `sip_trace` 事件推给前端。
+struct TraceEmitter {
+    app: AppHandle,
+}
+
+impl sip_core::TraceObserver for TraceEmitter {
+    fn on_trace(&self, trace: sip_core::SipTrace<'_>) {
+        let (method, status, cseq, call_id, summary) = match trace.message {
+            sip_core::SipMessage::Request(r) => (
+                r.method.as_str().to_string(),
+                None,
+                r.headers.cseq().map(str::to_string),
+                r.headers.call_id().map(str::to_string),
+                format!("{} {}", r.method.as_str(), r.uri),
+            ),
+            sip_core::SipMessage::Response(r) => (
+                "SIP/2.0".to_string(),
+                Some(r.status),
+                r.headers.cseq().map(str::to_string),
+                r.headers.call_id().map(str::to_string),
+                format!("SIP/2.0 {} {}", r.status, r.reason),
+            ),
+        };
+        let entry = serde_json::json!({
+            "ts_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64).unwrap_or(0),
+            "direction": if matches!(trace.dir, sip_core::TraceDir::In) { "in" } else { "out" },
+            "method": method,
+            "status": status,
+            "cseq": cseq,
+            "call_id": call_id,
+            "peer": trace.peer.to_string(),
+            "summary": summary,
+        });
+        let _ = self.app.emit("sip_trace", entry);
+    }
+}
+
 // ── IPC 命令 ─────────────────────────────────────────────
 
 /// 引擎连通性自检（M0 已有，保留）。
@@ -287,6 +326,9 @@ async fn start_device(
     let local_port = udp.local_addr().map_err(|e| e.to_string())?.port();
     let local_host = discover_local_ip(&format!("{}:{}", config.server_host, config.server_port));
 
+    // 单设备联调默认开启 SIP 信令追踪(FR-43),把收发报文推给前端。
+    udp.set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
+
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
     let sim = Arc::new(DeviceSimulator::with_observer(cfg, observer));
@@ -379,6 +421,29 @@ async fn fire_position(
     }
 }
 
+/// 开关 SIP 信令追踪(FR-43)。开启后每条收发报文以 `sip_trace` 事件推给前端。
+#[tauri::command]
+async fn set_sip_trace(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let guard = state.device.lock().await;
+    match &*guard {
+        Some(h) => {
+            if enabled {
+                h.transport
+                    .set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
+                Ok("信令追踪已开启".into())
+            } else {
+                h.transport.set_tracer(None);
+                Ok("信令追踪已关闭".into())
+            }
+        }
+        None => Err("设备未启动".into()),
+    }
+}
+
 // ── 数据传输对象 ──────────────────────────────────────────
 
 #[derive(serde::Serialize)]
@@ -407,6 +472,7 @@ pub fn run() {
             stop_device,
             fire_alarm,
             fire_position,
+            set_sip_trace,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

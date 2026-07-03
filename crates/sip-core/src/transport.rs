@@ -25,6 +25,28 @@ pub struct Incoming {
     pub from: SocketAddr,
 }
 
+/// SIP 报文追踪方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceDir {
+    /// 收到平台报文。
+    In,
+    /// 发往平台。
+    Out,
+}
+
+/// 一条 SIP 追踪:方向 + 报文 + 对端地址。观察者负责结构化/转发(如推给 UI)。
+pub struct SipTrace<'a> {
+    pub dir: TraceDir,
+    pub message: &'a SipMessage,
+    pub peer: SocketAddr,
+}
+
+/// SIP 追踪观察者(FR-43)。挂上后每条收发报文回调一次;默认无(零开销)。
+/// 压测大规模时不挂,避免热路径回调开销。
+pub trait TraceObserver: Send + Sync {
+    fn on_trace(&self, trace: SipTrace<'_>);
+}
+
 /// 共享 UDP 传输。多设备复用一个 socket,按 Call-ID 分发收到的消息。
 ///
 /// 用法:
@@ -37,6 +59,8 @@ pub struct UdpTransport {
     routes: Arc<DashMap<String, mpsc::UnboundedSender<Incoming>>>,
     /// 设备 AOR(device_id)→ 该设备的入站请求投递端。
     aor_routes: Arc<DashMap<String, mpsc::UnboundedSender<Incoming>>>,
+    /// 可选 SIP 追踪观察者(FR-43);None 时零开销。
+    tracer: std::sync::RwLock<Option<Arc<dyn TraceObserver>>>,
 }
 
 impl UdpTransport {
@@ -47,9 +71,26 @@ impl UdpTransport {
             socket: Arc::new(socket),
             routes: Arc::new(DashMap::new()),
             aor_routes: Arc::new(DashMap::new()),
+            tracer: std::sync::RwLock::new(None),
         });
         transport.clone().spawn_recv_loop();
         Ok(transport)
+    }
+
+    /// 挂载 SIP 追踪观察者(FR-43),开始接收收发报文回调。传 None 关闭。
+    pub fn set_tracer(&self, tracer: Option<Arc<dyn TraceObserver>>) {
+        if let Ok(mut g) = self.tracer.write() {
+            *g = tracer;
+        }
+    }
+
+    /// 内部:若挂了追踪观察者,回调一条。
+    fn trace(&self, dir: TraceDir, message: &SipMessage, peer: SocketAddr) {
+        if let Ok(g) = self.tracer.read() {
+            if let Some(t) = g.as_ref() {
+                t.on_trace(SipTrace { dir, message, peer });
+            }
+        }
     }
 
     /// 本地实际绑定地址(端口由系统分配时用于回填 Contact/Via)。
@@ -96,6 +137,7 @@ impl UdpTransport {
 
     /// 发送一条 SIP 消息到目标地址。
     pub async fn send_to(&self, msg: &SipMessage, dst: SocketAddr) -> Result<()> {
+        self.trace(TraceDir::Out, msg, dst);
         let bytes = msg.to_bytes();
         self.socket.send_to(&bytes, dst).await.map_err(Error::Io)?;
         Ok(())
@@ -123,6 +165,7 @@ impl UdpTransport {
     /// 分发:响应按 Call-ID 路由到事务队列;若 Call-ID 无匹配且是请求,
     /// 则按 Request-URI 的 AOR(user 部分)路由到设备入站队列。
     fn dispatch(&self, incoming: Incoming) {
+        self.trace(TraceDir::In, &incoming.message, incoming.from);
         // 先按 Call-ID 尝试(响应、以及在对话内的请求)。
         let call_id = match &incoming.message {
             SipMessage::Request(r) => r.headers.call_id(),

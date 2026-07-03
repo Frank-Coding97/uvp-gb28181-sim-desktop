@@ -91,7 +91,25 @@ interface RunStatus {
   started_at_ms: number;
   metrics: MetricsSnapshot;
 }
+
+// SIP 信令追踪条目(FR-43)。单设备联调默认开;压测大规模默认关。
+interface SipTraceEntry {
+  ts_ms: number;              // 捕获时刻(毫秒)
+  direction: "in" | "out";    // in=收到平台报文,out=发往平台
+  method: string;             // 请求方法(REGISTER/MESSAGE/INVITE…)或 "SIP/2.0"(响应)
+  status?: number;            // 响应状态码(仅响应)
+  cseq?: string;              // CSeq 头(如 "1 REGISTER")
+  call_id?: string;           // Call-ID
+  peer: string;               // 对端地址 host:port
+  summary: string;            // 首行摘要(请求行 / 状态行)
+}
 ```
+
+### 单设备信令追踪命令
+
+| 命令 | 入参 | 返回 | 说明 | 里程碑 |
+|---|---|---|---|---|
+| `set_sip_trace` | `{ enabled: bool }` | `string` | 开关 `sip_trace` 事件推送(默认开;压测不启用) | M4 |
 
 ---
 
