@@ -389,6 +389,8 @@ impl DeviceSimulator {
         use gb28181_protocol::manscdp::*;
         match query.cmd_type.as_str() {
             "Catalog" => {
+                // GB-2022 输出新增字段(安全能力/IP/端口),GB-2016 置 None 不输出。
+                let is_2022 = self.config.gb_version.is_2022();
                 let items: Vec<CatalogItem> = self
                     .config
                     .channels
@@ -402,6 +404,9 @@ impl DeviceSimulator {
                         parental: Some(0),
                         parent_id: Some(self.config.device_id.to_string()),
                         status: ch.status.clone(),
+                        security_level_code: is_2022.then(|| "A".to_string()),
+                        ip_address: None,
+                        port: None,
                     })
                     .collect();
                 let resp = CatalogResponse::new(&query.device_id, query.sn, items);
@@ -870,5 +875,41 @@ mod tests {
             }
             _ => panic!("应为独立 MESSAGE 应答"),
         }
+    }
+
+    #[test]
+    fn 目录应答按gb版本差异化字段() {
+        use gb28181_protocol::manscdp::Query;
+
+        let query = Query {
+            cmd_type: "Catalog".into(),
+            sn: 1,
+            device_id: "35020000001310000001".into(),
+        };
+        let ch = ChannelConfig {
+            channel_id: DeviceId::new("35020000001310000132").unwrap(),
+            name: "Camera-1".into(),
+            status: "ON".into(),
+        };
+
+        // 2022:输出 SecurityLevelCode。
+        let mut cfg = test_cfg("127.0.0.1", 5060);
+        cfg.channels.push(ch.clone());
+        cfg.gb_version = common::GbVersion::V2022;
+        let xml = DeviceSimulator::new(cfg).handle_query(&query).unwrap();
+        assert!(
+            xml.contains("<SecurityLevelCode>"),
+            "2022 应含 SecurityLevelCode"
+        );
+
+        // 2016:不输出该 2022 新增字段。
+        let mut cfg16 = test_cfg("127.0.0.1", 5060);
+        cfg16.channels.push(ch);
+        cfg16.gb_version = common::GbVersion::V2016;
+        let xml16 = DeviceSimulator::new(cfg16).handle_query(&query).unwrap();
+        assert!(
+            !xml16.contains("SecurityLevelCode"),
+            "2016 不应含 2022 新增字段"
+        );
     }
 }
