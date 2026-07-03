@@ -5,8 +5,12 @@
 
 use std::sync::Arc;
 
+use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
+use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
+use serde::Deserialize;
+use sip_core::UdpTransport;
 use stress_engine::{Metrics, Orchestrator};
-use tauri::Emitter; // Tauri 2 emit 需要此 trait
+use tauri::{AppHandle, Emitter}; // Tauri 2 emit 需要 Emitter trait
 use tokio::sync::{broadcast, Mutex};
 
 /// 应用全局状态（托管在 Tauri managed state）。
@@ -17,6 +21,17 @@ struct AppState {
     metrics: Mutex<Option<Arc<Metrics>>>,
     /// 最近一次启动使用的场景 TOML 与设备数（报告导出用）。
     last_scenario: Mutex<Option<(String, usize)>>,
+    /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
+    device: Mutex<Option<DeviceHandle>>,
+}
+
+/// 单设备运行句柄。
+struct DeviceHandle {
+    sim: Arc<DeviceSimulator>,
+    transport: Arc<UdpTransport>,
+    local_host: String,
+    local_port: u16,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 impl AppState {
@@ -25,7 +40,28 @@ impl AppState {
             stop_tx: Mutex::new(None),
             metrics: Mutex::new(None),
             last_scenario: Mutex::new(None),
+            device: Mutex::new(None),
         }
+    }
+}
+
+/// 把设备事件映射成 `device_state` 字符串,通过 Tauri 事件推给前端(状态灯)。
+struct StateEmitter {
+    app: AppHandle,
+}
+
+impl DeviceObserver for StateEmitter {
+    fn on_event(&self, event: DeviceEvent) {
+        let state = match event {
+            DeviceEvent::RegisterAttempt => "Registering",
+            DeviceEvent::RegisterSuccess => "Registered",
+            DeviceEvent::RegisterFailure(_) => "Failed",
+            DeviceEvent::StreamStart => "InCall",
+            DeviceEvent::StreamStop => "Registered",
+            // 心跳事件不改变状态灯。
+            DeviceEvent::HeartbeatOk | DeviceEvent::HeartbeatFail => return,
+        };
+        let _ = self.app.emit("device_state", state);
     }
 }
 
@@ -156,6 +192,166 @@ async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, Stri
     Ok(path.to_string_lossy().to_string())
 }
 
+// ── 单设备联调命令 ────────────────────────────────────────
+
+/// 前端传入的单设备配置。
+#[derive(Deserialize)]
+struct DeviceCfg {
+    server_host: String,
+    server_port: u16,
+    server_domain: String,
+    device_id: String,
+    password: String,
+    #[serde(default)]
+    transport: String, // "UDP" / "TCP"
+    #[serde(default)]
+    gb_version: String, // "2016" / "2022"
+    #[serde(default)]
+    channel_name: String,
+    #[serde(default)]
+    video_source: Option<String>,
+}
+
+/// 通过"向平台发起 UDP connect"发现本机对外 IP(不真正发包)。
+fn discover_local_ip(server: &str) -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect(server)?;
+            Ok(s.local_addr()?.ip().to_string())
+        })
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// 启动一台设备:注册 + 心跳 + 入站应答,后台常驻。状态经 `device_state` 事件推送。
+#[tauri::command]
+async fn start_device(
+    config: DeviceCfg,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let mut guard = state.device.lock().await;
+    if guard.is_some() {
+        return Err("已有设备在运行,请先停止".into());
+    }
+
+    let device_id = DeviceId::new(config.device_id.clone()).map_err(|e| e.to_string())?;
+    // 通道 ID:设备 ID 前 17 位 + 132(视频通道类型码)。
+    let channel_id_str = format!("{}132", &config.device_id[..17]);
+    let channel_id = DeviceId::new(channel_id_str).map_err(|e| e.to_string())?;
+    let gb_version = if config.gb_version == "2016" {
+        GbVersion::V2016
+    } else {
+        GbVersion::V2022
+    };
+    let transport = if config.transport.eq_ignore_ascii_case("TCP") {
+        Transport::Tcp
+    } else {
+        Transport::Udp
+    };
+    let channel_name = if config.channel_name.is_empty() {
+        "Camera-1".to_string()
+    } else {
+        config.channel_name.clone()
+    };
+
+    let cfg = DeviceConfig {
+        device_id: device_id.clone(),
+        username: config.device_id.clone(),
+        password: config.password.clone(),
+        server_host: config.server_host.clone(),
+        server_port: config.server_port,
+        server_domain: config.server_domain.clone(),
+        transport,
+        heartbeat_interval_secs: 60,
+        channels: vec![ChannelConfig {
+            channel_id,
+            name: channel_name,
+            status: "ON".into(),
+        }],
+        device_info: DeviceInfo {
+            device_name: "UVP-Sim-Desktop".into(),
+            manufacturer: "UVP".into(),
+            model: "Desktop-Sim".into(),
+            firmware: "0.1.0".into(),
+        },
+        video_source: config.video_source.clone(),
+        video_fps: 25,
+        light_bitrate_kbps: None,
+        gb_version,
+    };
+
+    // 共享 UDP 传输 + 本端地址发现。
+    let udp = UdpTransport::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| e.to_string())?;
+    let local_port = udp.local_addr().map_err(|e| e.to_string())?.port();
+    let local_host = discover_local_ip(&format!("{}:{}", config.server_host, config.server_port));
+
+    // 带状态观察者的设备实例。
+    let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
+    let sim = Arc::new(DeviceSimulator::with_observer(cfg, observer));
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let sim_run = sim.clone();
+    let tp_run = udp.clone();
+    let host_run = local_host.clone();
+    tokio::spawn(async move {
+        sim_run
+            .run(tp_run, host_run, local_port, async move {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+
+    *guard = Some(DeviceHandle {
+        sim,
+        transport: udp,
+        local_host,
+        local_port,
+        stop_tx,
+    });
+    Ok("设备已启动".into())
+}
+
+/// 停止当前设备。
+#[tauri::command]
+async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+    let mut guard = state.device.lock().await;
+    match guard.take() {
+        Some(h) => {
+            let _ = h.stop_tx.send(());
+            let _ = app.emit("device_state", "Disconnected");
+            Ok("设备已停止".into())
+        }
+        None => Err("没有正在运行的设备".into()),
+    }
+}
+
+/// 主动上报一条报警。
+#[tauri::command]
+async fn fire_alarm(
+    description: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let guard = state.device.lock().await;
+    match &*guard {
+        Some(h) => {
+            let desc = if description.is_empty() {
+                "移动侦测报警".to_string()
+            } else {
+                description
+            };
+            let code = h
+                .sim
+                .report_alarm(&h.transport, &h.local_host, h.local_port, &desc)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!("报警上报完成(平台响应 {code})"))
+        }
+        None => Err("设备未启动".into()),
+    }
+}
+
 // ── 数据传输对象 ──────────────────────────────────────────
 
 #[derive(serde::Serialize)]
@@ -180,6 +376,9 @@ pub fn run() {
             stop_stress,
             get_metrics,
             export_report,
+            start_device,
+            stop_device,
+            fire_alarm,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
