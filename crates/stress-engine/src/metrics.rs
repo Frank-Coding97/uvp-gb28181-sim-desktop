@@ -76,9 +76,11 @@ impl Metrics {
 
     /// 推流结束(活跃数 -1,不低于 0)。
     pub fn on_stream_stop(&self) {
-        let _ = self.active_streams.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(1))
-        });
+        let _ = self
+            .active_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     /// 读取聚合快照(供 CLI/UI/落库)。
@@ -127,16 +129,16 @@ impl DeviceObserver for Metrics {
             DeviceEvent::RegisterSuccess => self.on_register_success(),
             DeviceEvent::RegisterFailure(k) => {
                 let kind = match k {
-                    CommonKind::Timeout   => FailureKind::Timeout,
-                    CommonKind::Rejected  => FailureKind::Rejected,
-                    CommonKind::Other     => FailureKind::Other,
+                    CommonKind::Timeout => FailureKind::Timeout,
+                    CommonKind::Rejected => FailureKind::Rejected,
+                    CommonKind::Other => FailureKind::Other,
                 };
                 self.on_register_failure(kind);
             }
-            DeviceEvent::HeartbeatOk   => self.on_heartbeat_success(),
+            DeviceEvent::HeartbeatOk => self.on_heartbeat_success(),
             DeviceEvent::HeartbeatFail => self.on_heartbeat_failure(),
-            DeviceEvent::StreamStart   => self.on_stream_start(),
-            DeviceEvent::StreamStop    => self.on_stream_stop(),
+            DeviceEvent::StreamStart => self.on_stream_start(),
+            DeviceEvent::StreamStop => self.on_stream_stop(),
         }
     }
 }

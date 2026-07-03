@@ -42,9 +42,7 @@ pub struct UdpTransport {
 impl UdpTransport {
     /// 绑定本地地址(如 "0.0.0.0:0" 由系统分配端口),启动后台接收循环。
     pub async fn bind(local: &str) -> Result<Arc<Self>> {
-        let socket = UdpSocket::bind(local)
-            .await
-            .map_err(Error::Io)?;
+        let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
         let transport = Arc::new(UdpTransport {
             socket: Arc::new(socket),
             routes: Arc::new(DashMap::new()),
@@ -96,12 +94,10 @@ impl UdpTransport {
             let mut buf = vec![0u8; 65535];
             loop {
                 match self.socket.recv_from(&mut buf).await {
-                    Ok((n, from)) => {
-                        match SipMessage::parse(&buf[..n]) {
-                            Ok(message) => self.dispatch(Incoming { message, from }),
-                            Err(e) => tracing::warn!(%from, error=%e, "SIP 报文解析失败,丢弃"),
-                        }
-                    }
+                    Ok((n, from)) => match SipMessage::parse(&buf[..n]) {
+                        Ok(message) => self.dispatch(Incoming { message, from }),
+                        Err(e) => tracing::warn!(%from, error=%e, "SIP 报文解析失败,丢弃"),
+                    },
                     Err(e) => {
                         tracing::error!(error=%e, "UDP 接收错误,接收循环退出");
                         break;
@@ -219,8 +215,14 @@ mod tests {
 
     #[test]
     fn uri_user_提取() {
-        assert_eq!(uri_user("sip:34020000001320000001@h:5060"), Some("34020000001320000001"));
-        assert_eq!(uri_user("34020000001320000001@h"), Some("34020000001320000001"));
+        assert_eq!(
+            uri_user("sip:34020000001320000001@h:5060"),
+            Some("34020000001320000001")
+        );
+        assert_eq!(
+            uri_user("34020000001320000001@h"),
+            Some("34020000001320000001")
+        );
         assert_eq!(uri_user("sip:@h"), None);
     }
 }

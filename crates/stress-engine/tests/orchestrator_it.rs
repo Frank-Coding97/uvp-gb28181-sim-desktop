@@ -103,5 +103,8 @@ async fn 编排器批量注册_平台收到全部() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), run).await;
 
     // 平台应至少收到 N 个 REGISTER(可能因重传更多)。
-    assert!(seen >= N as u32, "平台仅收到 {seen} 个 REGISTER,期望 >= {N}");
+    assert!(
+        seen >= N as u32,
+        "平台仅收到 {seen} 个 REGISTER,期望 >= {N}"
+    );
 }

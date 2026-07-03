@@ -77,7 +77,10 @@ mod tests {
         // 高帧率快速产包;100ms 后停。
         let (tx_stop, rx_stop) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            push_stream(source, rx_addr, 0x2233, 50, async { let _ = rx_stop.await; }).await
+            push_stream(source, rx_addr, 0x2233, 50, async {
+                let _ = rx_stop.await;
+            })
+            .await
         });
 
         // 收到至少一个 RTP 包。

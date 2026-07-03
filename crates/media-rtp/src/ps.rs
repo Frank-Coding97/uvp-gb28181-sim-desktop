@@ -26,7 +26,7 @@ fn write_pack_header(out: &mut Vec<u8>, scr: u32) {
     out.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
     // MPEG-2 PS:'01' + SCR(33bit,这里用 scr 低位近似)+ mux_rate + stuffing。
     let s = scr as u64;
-    let b0 = 0x44u8 | ((((s >> 30) & 0x07) as u8) << 3) | (0x04) ; // 简化:'01' + SCR 高位
+    let b0 = 0x44u8 | ((((s >> 30) & 0x07) as u8) << 3) | (0x04); // 简化:'01' + SCR 高位
     out.push(b0);
     out.push(((s >> 22) & 0xff) as u8);
     out.push((((s >> 15) & 0x7f) as u8) << 1 | 0x04 | (((s >> 20) & 0x03) as u8));
@@ -66,10 +66,14 @@ fn write_psm(out: &mut Vec<u8>) {
 /// 写入一个视频 PES 包,承载 `data`(可能是一帧的一部分)。
 fn write_pes(out: &mut Vec<u8>, data: &[u8], pts: u32, with_pts: bool) {
     out.extend_from_slice(&[0x00, 0x00, 0x01, STREAM_ID_VIDEO]);
-    let header = if with_pts { encode_pts(pts, 0b0010) } else { [0u8; 5] };
+    let header = if with_pts {
+        encode_pts(pts, 0b0010)
+    } else {
+        [0u8; 5]
+    };
     let header_len = if with_pts { 5u8 } else { 0 };
     let pes_len = data.len() + 3 + header_len as usize; // 3 = 后续两个标志字节 + header_len 字段
-    // PES_packet_length(可为 0 表示未指定,视频常见;这里给真实值,超 65535 则置 0)
+                                                        // PES_packet_length(可为 0 表示未指定,视频常见;这里给真实值,超 65535 则置 0)
     let len_field = if pes_len > 0xffff { 0 } else { pes_len as u16 };
     out.extend_from_slice(&len_field.to_be_bytes());
     out.push(0x80); // '10' + 各标志=0

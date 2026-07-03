@@ -27,6 +27,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "GB28181 国标设备模拟器 + 压测工具",
+    "longDescription": "把电脑模拟成 GB/T 28181-2022 下级设备(IPC),注册到国标上级平台联调,并支持海量虚拟设备并发压力测试。支持 Windows / macOS / Linux。",
+    "publisher": "UVP",
+    "copyright": "Copyright © 2026 UVP. MIT License.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

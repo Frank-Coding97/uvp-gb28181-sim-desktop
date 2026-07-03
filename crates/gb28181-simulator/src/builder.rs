@@ -50,7 +50,10 @@ fn device_aor(cfg: &DeviceConfig) -> String {
 /// 这里以 domain 作为 server_id 前缀不可得时退化为 domain 本身)。
 fn platform_uri(cfg: &DeviceConfig) -> String {
     // Request-URI 指向平台:sip:<domain>@<host:port>
-    format!("sip:{}@{}:{}", cfg.server_domain, cfg.server_host, cfg.server_port)
+    format!(
+        "sip:{}@{}:{}",
+        cfg.server_domain, cfg.server_host, cfg.server_port
+    )
 }
 
 /// 构造 REGISTER 请求。`authorization` 为 None 时是首次(无鉴权)请求;
@@ -110,11 +113,17 @@ pub fn message_xml(
         "Via",
         format!(
             "SIP/2.0/{} {}:{};rport;branch={}",
-            cfg.transport, local_host, local_port, rand_token("z9hG4bK")
+            cfg.transport,
+            local_host,
+            local_port,
+            rand_token("z9hG4bK")
         ),
     );
     headers.append("From", format!("<{aor}>;tag={}", ids.from_tag));
-    headers.append("To", format!("<sip:{}@{}>", cfg.server_domain, cfg.server_domain));
+    headers.append(
+        "To",
+        format!("<sip:{}@{}>", cfg.server_domain, cfg.server_domain),
+    );
     headers.append("Call-ID", ids.call_id.clone());
     headers.append("CSeq", format!("{cseq} MESSAGE"));
     headers.append("Max-Forwards", "70");

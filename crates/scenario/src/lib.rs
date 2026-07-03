@@ -69,9 +69,10 @@ pub struct DeviceInfoTemplate {
 }
 
 /// 媒体档(对应压测强度,docs/10-functional/stress-testing.md#2)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MediaProfile {
-    /// A 档:空媒体,不推流(仅信令)。
+    /// A 档:空媒体,不推流(仅信令)。默认档。
+    #[default]
     A,
     /// B 档:轻量伪包(待实现)。
     B,
@@ -79,17 +80,13 @@ pub enum MediaProfile {
     C,
 }
 
-impl Default for MediaProfile {
-    fn default() -> Self {
-        MediaProfile::A
-    }
-}
-
 impl Scenario for LinearScenario {
     fn generate(&self, count: usize) -> Result<Vec<DeviceConfig>> {
         let _base = DeviceId::new(&self.base_device_id)?;
         // 20 位 ID 超出 u64 范围(~1.8e19),用 u128 承载递增。
-        let base_num: u128 = self.base_device_id.parse()
+        let base_num: u128 = self
+            .base_device_id
+            .parse()
             .map_err(|_| common::Error::Gb28181("基础设备 ID 非纯数字".into()))?;
 
         let mut configs = Vec::with_capacity(count);
@@ -142,16 +139,13 @@ impl Scenario for LinearScenario {
 impl LinearScenario {
     /// 从 TOML 文件路径加载场景。
     pub fn from_toml(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(common::Error::Io)?;
-        toml::from_str(&content)
-            .map_err(|e| common::Error::Config(format!("TOML 解析失败: {e}")))
+        let content = std::fs::read_to_string(path).map_err(common::Error::Io)?;
+        toml::from_str(&content).map_err(|e| common::Error::Config(format!("TOML 解析失败: {e}")))
     }
 
     /// 从 TOML 字符串解析场景（桌面端 IPC 调用时使用）。
     pub fn from_toml_str(text: &str) -> Result<Self> {
-        toml::from_str(text)
-            .map_err(|e| common::Error::Config(format!("TOML 解析失败: {e}")))
+        toml::from_str(text).map_err(|e| common::Error::Config(format!("TOML 解析失败: {e}")))
     }
 }
 
@@ -187,7 +181,10 @@ mod tests {
         assert_eq!(cfgs[1].device_id.as_str(), "34020000001320000002");
         assert_eq!(cfgs[2].device_id.as_str(), "34020000001320000003");
         assert_eq!(cfgs[0].channels.len(), 1);
-        assert_eq!(cfgs[0].channels[0].channel_id.as_str(), "34020000001320000132");
+        assert_eq!(
+            cfgs[0].channels[0].channel_id.as_str(),
+            "34020000001320000132"
+        );
     }
 
     #[test]

@@ -37,7 +37,9 @@ async fn main() {
     common::logging::init();
 
     let server_host = env_or("SERVER_HOST", "127.0.0.1");
-    let server_port: u16 = env_or("SERVER_PORT", "5060").parse().expect("SERVER_PORT 非法");
+    let server_port: u16 = env_or("SERVER_PORT", "5060")
+        .parse()
+        .expect("SERVER_PORT 非法");
     let server_domain = env_or("SERVER_DOMAIN", "34020000002000000001");
     let device_id_str = env_or("DEVICE_ID", "34020000001320000001");
     let password = env_or("PASSWORD", "12345678");
@@ -70,12 +72,17 @@ async fn main() {
             firmware: "0.1.0-dev".into(),
         },
         video_source: std::env::var("VIDEO_SOURCE").ok(),
-        video_fps: std::env::var("VIDEO_FPS").ok().and_then(|s| s.parse().ok()).unwrap_or(25),
+        video_fps: std::env::var("VIDEO_FPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(25),
     };
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。
     let local_ip = discover_local_ip(&format!("{server_host}:{server_port}"));
-    let transport = UdpTransport::bind("0.0.0.0:0").await.expect("绑定 UDP 失败");
+    let transport = UdpTransport::bind("0.0.0.0:0")
+        .await
+        .expect("绑定 UDP 失败");
     let local_port = transport.local_addr().expect("取本地端口失败").port();
     tracing::info!(%local_ip, local_port, "本端信令地址");
 

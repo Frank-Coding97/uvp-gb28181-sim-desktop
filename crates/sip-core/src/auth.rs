@@ -117,12 +117,21 @@ mod tests {
             realm: "testrealm@host.com".into(),
             nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093".into(),
         };
-        let auth = authorization(&challenge, "Mufasa", "Circle Of Life", "GET", "/dir/index.html");
+        let auth = authorization(
+            &challenge,
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+        );
         assert!(auth.contains("response=\"670fd8c2df070c60b045671b8b24ff02\""));
     }
 
     #[test]
     fn 提取不带引号参数() {
-        assert_eq!(extract_param("algorithm=MD5, x=1", "algorithm"), Some("MD5".into()));
+        assert_eq!(
+            extract_param("algorithm=MD5, x=1", "algorithm"),
+            Some("MD5".into())
+        );
     }
 }

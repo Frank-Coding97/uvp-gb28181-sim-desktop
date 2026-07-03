@@ -4,6 +4,7 @@
 //! 实现足够解析平台 INVITE 的 SDP(提取 RTP 目标地址与 SSRC)、
 //! 构造设备侧 200 OK 的 SDP(声明本端 RTP 端口与 SSRC)。
 
+use std::fmt;
 use std::net::IpAddr;
 
 use common::{Error, Result};
@@ -110,41 +111,6 @@ impl SessionDescription {
         })
     }
 
-    /// 序列化为 SDP 文本。
-    pub fn to_string(&self) -> String {
-        let mut s = String::new();
-        s.push_str("v=0\r\n");
-        s.push_str(&format!(
-            "o={} {} {} {} {} {}\r\n",
-            self.origin.username,
-            self.origin.sess_id,
-            self.origin.sess_version,
-            self.origin.net_type,
-            self.origin.addr_type,
-            self.origin.addr
-        ));
-        s.push_str(&format!("s={}\r\n", self.session_name));
-        s.push_str(&format!(
-            "c={} {} {}\r\n",
-            self.connection.net_type, self.connection.addr_type, self.connection.addr
-        ));
-        s.push_str(&format!("t={} {}\r\n", self.timing.start, self.timing.stop));
-        s.push_str(&format!(
-            "m={} {} {} {}\r\n",
-            self.media.media,
-            self.media.port,
-            self.media.proto,
-            self.media.fmt.join(" ")
-        ));
-        if let Some(ref rm) = self.media.rtpmap {
-            s.push_str(&format!("a=rtpmap:{}\r\n", rm));
-        }
-        if let Some(ssrc) = self.media.ssrc {
-            s.push_str(&format!("y={}\r\n", ssrc));
-        }
-        s
-    }
-
     /// 构造一个最简 GB28181 SDP(设备侧 200 OK):本端媒体地址、端口、SSRC。
     pub fn new_device_response(local_ip: IpAddr, rtp_port: u16, ssrc: u32) -> Self {
         let ip_str = local_ip.to_string();
@@ -173,6 +139,45 @@ impl SessionDescription {
                 ssrc: Some(ssrc),
             },
         }
+    }
+}
+
+/// 序列化为 SDP 文本(通过 Display,`.to_string()` 自动可用)。
+impl fmt::Display for SessionDescription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v=0\r\n")?;
+        write!(
+            f,
+            "o={} {} {} {} {} {}\r\n",
+            self.origin.username,
+            self.origin.sess_id,
+            self.origin.sess_version,
+            self.origin.net_type,
+            self.origin.addr_type,
+            self.origin.addr
+        )?;
+        write!(f, "s={}\r\n", self.session_name)?;
+        write!(
+            f,
+            "c={} {} {}\r\n",
+            self.connection.net_type, self.connection.addr_type, self.connection.addr
+        )?;
+        write!(f, "t={} {}\r\n", self.timing.start, self.timing.stop)?;
+        write!(
+            f,
+            "m={} {} {} {}\r\n",
+            self.media.media,
+            self.media.port,
+            self.media.proto,
+            self.media.fmt.join(" ")
+        )?;
+        if let Some(ref rm) = self.media.rtpmap {
+            write!(f, "a=rtpmap:{}\r\n", rm)?;
+        }
+        if let Some(ssrc) = self.media.ssrc {
+            write!(f, "y={}\r\n", ssrc)?;
+        }
+        Ok(())
     }
 }
 
@@ -221,7 +226,9 @@ fn parse_media(s: &str) -> Result<MediaDescription> {
     }
     Ok(MediaDescription {
         media: parts[0].into(),
-        port: parts[1].parse().map_err(|_| Error::Sip("m= 端口非法".into()))?,
+        port: parts[1]
+            .parse()
+            .map_err(|_| Error::Sip("m= 端口非法".into()))?,
         proto: parts[2].into(),
         fmt: parts[3..].iter().map(|&s| s.to_string()).collect(),
         rtpmap: None,

@@ -12,10 +12,10 @@ use super::{Method, Request, Response, SipMessage};
 /// 解析一条完整 SIP 消息。
 pub fn parse_message(bytes: &[u8]) -> Result<SipMessage> {
     // 找到头部与 body 的分界(空行 \r\n\r\n)。
-    let sep = find_double_crlf(bytes)
-        .ok_or_else(|| Error::Sip("SIP 报文缺少头/体分隔空行".into()))?;
-    let head = std::str::from_utf8(&bytes[..sep])
-        .map_err(|_| Error::Sip("SIP 头部非 UTF-8".into()))?;
+    let sep =
+        find_double_crlf(bytes).ok_or_else(|| Error::Sip("SIP 报文缺少头/体分隔空行".into()))?;
+    let head =
+        std::str::from_utf8(&bytes[..sep]).map_err(|_| Error::Sip("SIP 头部非 UTF-8".into()))?;
     let body_start = sep + 4;
 
     let mut lines = head.split("\r\n");
@@ -50,7 +50,10 @@ pub fn parse_message(bytes: &[u8]) -> Result<SipMessage> {
     }
 
     // body 长度:以 Content-Length 为准,缺失取剩余全部。
-    let body = match headers.get("Content-Length").and_then(|s| s.trim().parse::<usize>().ok()) {
+    let body = match headers
+        .get("Content-Length")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
         Some(len) => {
             let end = (body_start + len).min(bytes.len());
             bytes[body_start..end].to_vec()

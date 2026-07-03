@@ -171,14 +171,25 @@ impl DeviceSimulator {
     ) -> Result<DeviceState> {
         let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
             .parse()
-            .map_err(|_| Error::Config(format!("平台地址非法: {}:{}", self.config.server_host, self.config.server_port)))?;
+            .map_err(|_| {
+                Error::Config(format!(
+                    "平台地址非法: {}:{}",
+                    self.config.server_host, self.config.server_port
+                ))
+            })?;
         let mut rx = transport.register(self.ids.call_id.clone());
         let timing = sip_core::Timing::default();
 
         // 首发 REGISTER(无鉴权)。
         let cseq1 = self.next_cseq();
         let req1 = builder::register(
-            &self.config, &self.ids, cseq1, local_host, local_port, None, 3600,
+            &self.config,
+            &self.ids,
+            cseq1,
+            local_host,
+            local_port,
+            None,
+            3600,
         );
         let resp = sip_core::client_transact(transport, dst, &req1, &mut rx, timing).await?;
 
@@ -200,13 +211,23 @@ impl DeviceSimulator {
                 );
                 let cseq2 = self.next_cseq();
                 let req2 = builder::register(
-                    &self.config, &self.ids, cseq2, local_host, local_port, Some(&auth), 3600,
+                    &self.config,
+                    &self.ids,
+                    cseq2,
+                    local_host,
+                    local_port,
+                    Some(&auth),
+                    3600,
                 );
-                let resp2 = sip_core::client_transact(transport, dst, &req2, &mut rx, timing).await?;
+                let resp2 =
+                    sip_core::client_transact(transport, dst, &req2, &mut rx, timing).await?;
                 if resp2.status == 200 {
                     Ok(DeviceState::Registered)
                 } else {
-                    Err(Error::Sip(format!("鉴权后注册被拒: {} {}", resp2.status, resp2.reason)))
+                    Err(Error::Sip(format!(
+                        "鉴权后注册被拒: {} {}",
+                        resp2.status, resp2.reason
+                    )))
                 }
             }
             other => Err(Error::Sip(format!("注册被拒: {} {}", other, resp.reason))),
@@ -229,7 +250,9 @@ impl DeviceSimulator {
         let cseq = self.next_cseq();
         let req = builder::message_xml(&self.config, &self.ids, cseq, local_host, local_port, &xml);
         let mut rx = transport.register(self.ids.call_id.clone());
-        let resp = sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default()).await?;
+        let resp =
+            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
+                .await?;
         if resp.status == 200 {
             self.observer.on_event(common::DeviceEvent::HeartbeatOk);
         } else {
@@ -260,7 +283,9 @@ impl DeviceSimulator {
                             // 回 MESSAGE(应答 XML)。
                             let resp_body = xml.as_bytes().to_vec();
                             let mut resp_msg = builder::response_ok(req);
-                            resp_msg.headers.set("Content-Type", "Application/MANSCDP+xml");
+                            resp_msg
+                                .headers
+                                .set("Content-Type", "Application/MANSCDP+xml");
                             resp_msg.body = resp_body;
                             let resp = sip_core::SipMessage::Response(resp_msg);
                             transport.send_to(&resp, incoming.from).await?;
@@ -339,7 +364,10 @@ impl DeviceSimulator {
                 };
                 resp.to_xml()
             }
-            _ => Err(Error::Gb28181(format!("未实现的查询类型: {}", query.cmd_type))),
+            _ => Err(Error::Gb28181(format!(
+                "未实现的查询类型: {}",
+                query.cmd_type
+            ))),
         }
     }
 
@@ -356,13 +384,21 @@ impl DeviceSimulator {
         let body_str = std::str::from_utf8(&req.body)
             .map_err(|_| Error::Sip("INVITE body 非 UTF-8".into()))?;
         let platform_sdp = sip_core::SessionDescription::parse(body_str)?;
-        let rtp_host: IpAddr = platform_sdp.connection.addr.parse()
+        let rtp_host: IpAddr = platform_sdp
+            .connection
+            .addr
+            .parse()
             .map_err(|_| Error::Sip("SDP c= 地址非法".into()))?;
         let rtp_port = platform_sdp.media.port;
         let rtp_dst = SocketAddr::new(rtp_host, rtp_port);
 
         // 生成本端 SSRC(简化:用设备 ID hash)。
-        let ssrc = self.config.device_id.as_str().bytes().fold(0u32, |a, b| a.wrapping_add(b as u32));
+        let ssrc = self
+            .config
+            .device_id
+            .as_str()
+            .bytes()
+            .fold(0u32, |a, b| a.wrapping_add(b as u32));
 
         // 启动推流任务(若配置了视频源)。
         let mut sess_guard = self.session.lock().await;
@@ -378,9 +414,13 @@ impl DeviceSimulator {
             let task = tokio::spawn(async move {
                 let _ = media_rtp::push_stream(Box::new(source), rtp_dst, ssrc, fps, async {
                     let _ = stop_rx.await;
-                }).await;
+                })
+                .await;
             });
-            *sess_guard = Some(PushSession { _task: task, stop_tx });
+            *sess_guard = Some(PushSession {
+                _task: task,
+                stop_tx,
+            });
         }
         drop(sess_guard);
 
@@ -516,7 +556,11 @@ mod tests {
     }
 
     /// mock 平台:收到首个 REGISTER 回 401(带挑战),第二个回 200。
-    async fn mock_platform_register(platform: Arc<UdpTransport>, device_addr: SocketAddr, call_id: String) {
+    async fn mock_platform_register(
+        platform: Arc<UdpTransport>,
+        device_addr: SocketAddr,
+        call_id: String,
+    ) {
         let mut prx = platform.register(call_id.clone());
         let mut seen = 0;
         while let Some(inc) = prx.recv().await {
@@ -526,13 +570,28 @@ mod tests {
                 h.set("Call-ID", call_id.clone());
                 h.set("CSeq", cseq);
                 let resp = if seen == 0 {
-                    h.set("WWW-Authenticate", r#"Digest realm="3402000000", nonce="abc123""#);
-                    Response { status: 401, reason: "Unauthorized".into(), headers: h, body: Vec::new() }
+                    h.set(
+                        "WWW-Authenticate",
+                        r#"Digest realm="3402000000", nonce="abc123""#,
+                    );
+                    Response {
+                        status: 401,
+                        reason: "Unauthorized".into(),
+                        headers: h,
+                        body: Vec::new(),
+                    }
                 } else {
-                    Response { status: 200, reason: "OK".into(), headers: h, body: Vec::new() }
+                    Response {
+                        status: 200,
+                        reason: "OK".into(),
+                        headers: h,
+                        body: Vec::new(),
+                    }
                 };
                 seen += 1;
-                let _ = platform.send_to(&SipMessage::Response(resp), device_addr).await;
+                let _ = platform
+                    .send_to(&SipMessage::Response(resp), device_addr)
+                    .await;
             }
         }
     }
@@ -545,7 +604,11 @@ mod tests {
         let device_addr = device_tp.local_addr().unwrap();
 
         let sim = DeviceSimulator::new(test_cfg("127.0.0.1", platform_addr.port()));
-        tokio::spawn(mock_platform_register(platform_tp.clone(), device_addr, sim.call_id().to_string()));
+        tokio::spawn(mock_platform_register(
+            platform_tp.clone(),
+            device_addr,
+            sim.call_id().to_string(),
+        ));
 
         let state = sim
             .register(&device_tp, "127.0.0.1", device_addr.port())

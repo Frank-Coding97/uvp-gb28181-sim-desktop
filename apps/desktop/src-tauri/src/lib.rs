@@ -37,8 +37,7 @@ fn engine_version() -> String {
 /// 校验场景 YAML/TOML 并返回摘要，不启动压测。
 #[tauri::command]
 async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
-    let sc = scenario::LinearScenario::from_toml_str(&toml)
-        .map_err(|e| e.to_string())?;
+    let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
     Ok(ScenarioSummary {
         name: sc.device_info.device_name.clone(),
         device_count: 0, // 由前端传 count 参数
@@ -61,10 +60,8 @@ async fn start_stress(
         return Err("已有压测在运行，请先停止".into());
     }
 
-    let sc = scenario::LinearScenario::from_toml_str(&toml)
-        .map_err(|e| e.to_string())?;
-    let orch = Orchestrator::new(&sc, count)
-        .map_err(|e| e.to_string())?;
+    let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
+    let orch = Orchestrator::new(&sc, count).map_err(|e| e.to_string())?;
 
     let (tx, _) = broadcast::channel::<()>(1);
     *stop_guard = Some(tx.clone());

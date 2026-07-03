@@ -15,4 +15,3 @@ pub use message::{Headers, Method, Request, Response, SipMessage};
 pub use sdp::SessionDescription;
 pub use transaction::{client_transact, Timing};
 pub use transport::{Incoming, UdpTransport};
-

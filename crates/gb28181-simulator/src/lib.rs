@@ -7,4 +7,3 @@ pub mod builder;
 pub mod device;
 
 pub use device::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator, DeviceState};
-

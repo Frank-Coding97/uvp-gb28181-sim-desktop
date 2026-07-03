@@ -78,8 +78,8 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scenario::{DeviceInfoTemplate, LinearScenario, MediaProfile};
     use common::Transport;
+    use scenario::{DeviceInfoTemplate, LinearScenario, MediaProfile};
 
     fn test_scenario() -> LinearScenario {
         LinearScenario {

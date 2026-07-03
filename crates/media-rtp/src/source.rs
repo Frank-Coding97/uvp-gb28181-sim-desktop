@@ -101,7 +101,11 @@ fn split_annex_b(data: &[u8]) -> Vec<Nal<'_>> {
     let mut nals = Vec::new();
     for idx in 0..positions.len() {
         let start = positions[idx];
-        let end = if idx + 1 < positions.len() { positions[idx + 1] } else { data.len() };
+        let end = if idx + 1 < positions.len() {
+            positions[idx + 1]
+        } else {
+            data.len()
+        };
         let bytes = &data[start..end];
         // 起始码后第一个字节是 NAL 头,type = 低 5 位。
         let nal_type = bytes.get(3).map(|b| b & 0x1f).unwrap_or(0);
@@ -123,7 +127,10 @@ fn group_into_frames(nals: Vec<Nal<'_>>) -> Vec<Frame> {
         let is_vcl = t == 1 || t == 5;
         // 已有一个含 VCL 的帧,又来新 VCL → 切帧。
         if is_vcl && has_vcl {
-            frames.push(Frame { data: std::mem::take(&mut cur), key_frame: cur_key });
+            frames.push(Frame {
+                data: std::mem::take(&mut cur),
+                key_frame: cur_key,
+            });
             cur_key = false;
             has_vcl = false;
         }
@@ -136,7 +143,10 @@ fn group_into_frames(nals: Vec<Nal<'_>>) -> Vec<Frame> {
         cur.extend_from_slice(nal.bytes);
     }
     if !cur.is_empty() {
-        frames.push(Frame { data: cur, key_frame: cur_key });
+        frames.push(Frame {
+            data: cur,
+            key_frame: cur_key,
+        });
     }
     frames
 }

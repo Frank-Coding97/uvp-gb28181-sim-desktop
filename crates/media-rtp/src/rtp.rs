@@ -50,7 +50,10 @@ pub struct SendStats {
 impl SendStats {
     /// 读取 (包数, 字节数) 快照。
     pub fn snapshot(&self) -> (u64, u64) {
-        (self.packets.load(Ordering::Relaxed), self.bytes.load(Ordering::Relaxed))
+        (
+            self.packets.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -108,10 +111,15 @@ impl RtpSender {
                 self.ssrc,
                 chunk,
             );
-            self.socket.send_to(&pkt, self.dst).await.map_err(Error::Io)?;
+            self.socket
+                .send_to(&pkt, self.dst)
+                .await
+                .map_err(Error::Io)?;
             self.seq = self.seq.wrapping_add(1);
             self.stats.packets.fetch_add(1, Ordering::Relaxed);
-            self.stats.bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+            self.stats
+                .bytes
+                .fetch_add(pkt.len() as u64, Ordering::Relaxed);
         }
         Ok(())
     }
