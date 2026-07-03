@@ -352,6 +352,27 @@ async fn fire_alarm(
     }
 }
 
+/// 主动上报一条 GPS 位置。
+#[tauri::command]
+async fn fire_position(
+    longitude: f64,
+    latitude: f64,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let guard = state.device.lock().await;
+    match &*guard {
+        Some(h) => {
+            let code = h
+                .sim
+                .report_position(&h.transport, &h.local_host, h.local_port, longitude, latitude)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!("位置上报完成(平台响应 {code})"))
+        }
+        None => Err("设备未启动".into()),
+    }
+}
+
 // ── 数据传输对象 ──────────────────────────────────────────
 
 #[derive(serde::Serialize)]
@@ -379,6 +400,7 @@ pub fn run() {
             start_device,
             stop_device,
             fire_alarm,
+            fire_position,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

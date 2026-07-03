@@ -83,6 +83,20 @@ async function fireAlarm() {
   }
 }
 
+async function firePosition() {
+  try {
+    // 北京天安门附近坐标(WGS-84),演示 GPS 位置上报。
+    const msg = await invoke<string>("fire_position", { longitude: 116.397, latitude: 39.908 });
+    message.success(msg);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+const canReport = computed(
+  () => deviceState.value === "Registered" || deviceState.value === "InCall",
+);
+
 // 订阅后端推送的状态变化。
 let unlisten: UnlistenFn | null = null;
 onMounted(async () => {
@@ -179,12 +193,11 @@ onUnmounted(() => unlisten?.());
             <n-button type="error" secondary block :disabled="!running" @click="stopDevice">
               注销
             </n-button>
-            <n-button
-              block
-              :disabled="deviceState !== 'Registered' && deviceState !== 'InCall'"
-              @click="fireAlarm"
-            >
+            <n-button block :disabled="!canReport" @click="fireAlarm">
               上报报警
+            </n-button>
+            <n-button block :disabled="!canReport" @click="firePosition">
+              上报 GPS 位置
             </n-button>
           </n-space>
 
