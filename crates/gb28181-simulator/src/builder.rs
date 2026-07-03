@@ -194,6 +194,7 @@ mod tests {
             video_source: None,
             video_fps: 25,
             light_bitrate_kbps: None,
+            gb_version: common::GbVersion::V2022,
         }
     }
 

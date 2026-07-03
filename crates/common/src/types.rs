@@ -25,6 +25,37 @@ impl fmt::Display for Transport {
     }
 }
 
+/// GB/T 28181 协议版本。影响 MANSCDP XML 的字段集(2022 是 2016 的扩展超集)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GbVersion {
+    /// GB/T 28181-2016。
+    V2016,
+    /// GB/T 28181-2022(默认,新增更多目录/能力字段)。
+    #[default]
+    V2022,
+}
+
+impl GbVersion {
+    /// 是否为 2022 版(用于决定是否输出 2022 新增字段)。
+    pub fn is_2022(&self) -> bool {
+        matches!(self, GbVersion::V2022)
+    }
+
+    /// 协议版本标识字符串(附录 I,用于 SIP/XML 标注)。
+    pub fn tag(&self) -> &'static str {
+        match self {
+            GbVersion::V2016 => "GB/T 28181-2016",
+            GbVersion::V2022 => "GB/T 28181-2022",
+        }
+    }
+}
+
+impl fmt::Display for GbVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
 /// GB28181 设备/通道国标 ID。
 ///
 /// 20 位数字:中心编码(8) + 行业(2) + 类型(3) + 序号(7)。
@@ -74,5 +105,13 @@ mod tests {
     fn transport_默认为_udp() {
         assert_eq!(Transport::default(), Transport::Udp);
         assert_eq!(Transport::Udp.to_string(), "UDP");
+    }
+
+    #[test]
+    fn gb版本默认_2022() {
+        assert_eq!(GbVersion::default(), GbVersion::V2022);
+        assert!(GbVersion::V2022.is_2022());
+        assert!(!GbVersion::V2016.is_2022());
+        assert_eq!(GbVersion::V2016.tag(), "GB/T 28181-2016");
     }
 }

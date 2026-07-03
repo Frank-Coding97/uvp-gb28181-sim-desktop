@@ -10,4 +10,4 @@ pub mod types;
 
 pub use error::{Error, Result};
 pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver};
-pub use types::{DeviceId, Transport};
+pub use types::{DeviceId, GbVersion, Transport};
