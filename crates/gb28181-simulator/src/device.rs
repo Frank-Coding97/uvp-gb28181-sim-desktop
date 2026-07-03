@@ -748,24 +748,40 @@ mod tests {
             message: SipMessage::Request(query_msg),
             from: platform_addr,
         };
+        // 应答 MESSAGE 的 Request-URI 指向平台域,平台按 AOR 收独立应答。
+        let mut preply = platform_tp.register_inbound("34020000002000000001");
+
         let answered = sim.answer_inbound(&device_tp, &incoming).await.unwrap();
         assert!(answered);
 
-        // 平台收到 200 + Catalog 应答 XML。
-        let got = tokio::time::timeout(std::time::Duration::from_secs(2), presp.recv())
+        // (1) 平台先收到对查询的空 200 OK(事务应答)。
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(2), presp.recv())
             .await
             .expect("超时")
             .expect("关闭");
-        match got.message {
+        match ack.message {
             SipMessage::Response(r) => {
                 assert_eq!(r.status, 200);
+                assert!(r.body.is_empty(), "查询 200 OK 应为空 body");
+            }
+            _ => panic!("应先收到 200 响应"),
+        }
+
+        // (2) 平台再收到独立的 Catalog 应答 MESSAGE。
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), preply.recv())
+            .await
+            .expect("超时未收到应答 MESSAGE")
+            .expect("关闭");
+        match reply.message {
+            SipMessage::Request(r) => {
+                assert_eq!(r.method, Method::Message);
                 let body_str = std::str::from_utf8(&r.body).unwrap();
                 assert!(body_str.contains("<CmdType>Catalog</CmdType>"));
                 assert!(body_str.contains("<SN>999</SN>"));
                 assert!(body_str.contains("34020000001320000132")); // 通道 ID
                 assert!(body_str.contains("<Name>Camera-1</Name>"));
             }
-            _ => panic!("应为响应"),
+            _ => panic!("应为独立 MESSAGE 应答"),
         }
     }
 }
