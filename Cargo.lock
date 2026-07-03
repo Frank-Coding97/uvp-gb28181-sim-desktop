@@ -3879,6 +3879,7 @@ name = "uvp-desktop"
 version = "0.1.0"
 dependencies = [
  "common",
+ "scenario",
  "serde",
  "serde_json",
  "stress-engine",

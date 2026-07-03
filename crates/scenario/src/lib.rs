@@ -140,11 +140,17 @@ impl Scenario for LinearScenario {
 }
 
 impl LinearScenario {
-    /// 从 TOML 文件加载场景。
+    /// 从 TOML 文件路径加载场景。
     pub fn from_toml(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| common::Error::Io(e))?;
+            .map_err(common::Error::Io)?;
         toml::from_str(&content)
+            .map_err(|e| common::Error::Config(format!("TOML 解析失败: {e}")))
+    }
+
+    /// 从 TOML 字符串解析场景（桌面端 IPC 调用时使用）。
+    pub fn from_toml_str(text: &str) -> Result<Self> {
+        toml::from_str(text)
             .map_err(|e| common::Error::Config(format!("TOML 解析失败: {e}")))
     }
 }

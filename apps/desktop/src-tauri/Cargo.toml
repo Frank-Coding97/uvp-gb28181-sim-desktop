@@ -17,7 +17,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # 桌面端后端直接内嵌压测引擎(第一阶段同进程;后续可拆为独立 engine)。
 stress-engine = { path = "../../../crates/stress-engine" }
-common = { path = "../../../crates/common" }
+scenario    = { path = "../../../crates/scenario" }
+common      = { path = "../../../crates/common" }
 tauri = { version = "2", features = [] }
 serde.workspace = true
 serde_json.workspace = true
