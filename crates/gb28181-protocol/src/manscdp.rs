@@ -238,6 +238,70 @@ impl DeviceStatusResponse {
     }
 }
 
+/// 报警通知(设备 → 平台,主动上报,FR-9)。
+///
+/// 对应 XML:
+/// ```xml
+/// <Notify>
+///   <CmdType>Alarm</CmdType>
+///   <SN>1</SN>
+///   <DeviceID>3502...132</DeviceID>
+///   <AlarmPriority>1</AlarmPriority>
+///   <AlarmMethod>5</AlarmMethod>
+///   <AlarmTime>2026-07-03T11:00:00</AlarmTime>
+///   <AlarmDescription>移动侦测</AlarmDescription>
+/// </Notify>
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct AlarmNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 报警级别 1-4(1 最高)。
+    #[serde(rename = "AlarmPriority")]
+    pub priority: u8,
+    /// 报警方式:1 电话/2 设备/3 短信/4 GPS/5 视频/6 设备故障/7 其它。
+    #[serde(rename = "AlarmMethod")]
+    pub method: u8,
+    /// 报警时间(ISO8601)。
+    #[serde(rename = "AlarmTime")]
+    pub time: String,
+    /// 报警描述。
+    #[serde(rename = "AlarmDescription", skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl AlarmNotify {
+    /// 构造一条视频侦测报警(method=5)。
+    pub fn video(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        desc: impl Into<String>,
+    ) -> Self {
+        AlarmNotify {
+            cmd_type: "Alarm".into(),
+            sn,
+            device_id: device_id.into(),
+            priority: 1,
+            method: 5,
+            time: time.into(),
+            description: Some(desc.into()),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("AlarmNotify 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +388,15 @@ mod tests {
         };
         let xml = resp.to_xml().unwrap();
         assert!(xml.contains("<Online>ONLINE</Online>"));
+    }
+
+    #[test]
+    fn 报警通知含字段() {
+        let a = AlarmNotify::video("35020000001310000132", 7, "2026-07-03T11:00:00", "移动侦测");
+        let xml = a.to_xml().unwrap();
+        assert!(xml.contains("<CmdType>Alarm</CmdType>"));
+        assert!(xml.contains("<AlarmMethod>5</AlarmMethod>"));
+        assert!(xml.contains("<AlarmDescription>移动侦测</AlarmDescription>"));
+        assert!(xml.contains("<DeviceID>35020000001310000132</DeviceID>"));
     }
 }

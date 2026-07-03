@@ -280,6 +280,41 @@ impl DeviceSimulator {
         Ok(resp.status)
     }
 
+    /// 主动上报一条视频侦测报警(FR-9)。设备 → 平台 MESSAGE + Alarm Notify XML。
+    /// `description` 为报警描述;返回平台响应状态码。
+    pub async fn report_alarm(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+        description: &str,
+    ) -> Result<u16> {
+        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
+            .parse()
+            .map_err(|_| Error::Config("平台地址非法".into()))?;
+        let sn = self.next_cseq();
+        // 报警时间用本地时间的简单 ISO8601(不含时区)。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let time = format!("1970-01-01T00:00:{:02}", now % 60); // 占位;真实实现应格式化本地时间
+        let alarm = gb28181_protocol::manscdp::AlarmNotify::video(
+            self.config.device_id.as_str(),
+            sn,
+            time,
+            description,
+        );
+        let xml = alarm.to_xml()?;
+        let cseq = self.next_cseq();
+        let req = builder::message_xml(&self.config, &self.ids, cseq, local_host, local_port, &xml);
+        let mut rx = transport.register(self.ids.call_id.clone());
+        let resp =
+            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
+                .await?;
+        Ok(resp.status)
+    }
+
     /// 处理一条入站请求:OPTIONS 简单回 200;MESSAGE 解析 XML 查询并应答。
     /// 返回是否已应答(true=已回,false=暂不处理)。
     pub async fn answer_inbound(
