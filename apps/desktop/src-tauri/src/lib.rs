@@ -364,7 +364,13 @@ async fn fire_position(
         Some(h) => {
             let code = h
                 .sim
-                .report_position(&h.transport, &h.local_host, h.local_port, longitude, latitude)
+                .report_position(
+                    &h.transport,
+                    &h.local_host,
+                    h.local_port,
+                    longitude,
+                    latitude,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(format!("位置上报完成(平台响应 {code})"))

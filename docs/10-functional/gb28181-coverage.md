@@ -40,7 +40,8 @@
 | PS 封装 H.264(Pack/System/PSM/PES) | FR-8 | ✅ WVP 转 FLV 出画面 |
 | H.264 文件循环推流(C 档) | FR-8 | ✅ |
 | 历史回放流推送 | FR-10 | 🟢 复用点播 INVITE 推流路径 |
-| 倍速 / 下载 | FR-10 | ⬜ |
+| 回放控制(会话内 INFO/MANSRTSP:PLAY/PAUSE/Scale 倍速) | FR-10 | 🟢 INFO 回 200 + 运行时调速/暂停/恢复(单测+真机 INFO 注入回 200);全链路倍速需活跃回放会话 |
+| 下载(INVITE s=Download + a=downloadspeed:N) | FR-10 | ✅ 按 N 倍速推流(实测:4× → 100 包/s = 4×25fps,1× → ~29/s) |
 | 强制关键帧(IFrameCmd) | FR-8 | 🚧 见设备控制 |
 
 ## 设备控制(平台 → 设备,MANSCDP Control)
@@ -62,18 +63,19 @@
 | 功能 | 说明 | 优先级 | 状态 |
 |---|---|---|---|
 | SUBSCRIBE 应答 200 | 建立订阅 | — | ✅ |
-| 移动位置上报 NOTIFY(GPS) | MobilePosition | P0 | ✅ WVP 接受(code 200) |
-| 目录订阅 + 变更 NOTIFY | Catalog 订阅 | P1 | ⬜ |
-| 报警订阅 | Alarm 订阅 | P1 | ⬜ |
+| 移动位置主动上报 NOTIFY(GPS) | MobilePosition | P0 | ✅ WVP 接受(code 200) |
+| 移动位置**订阅** + 周期 NOTIFY | SUBSCRIBE MobilePosition + Interval | P1 | ✅ WVP 下发订阅(Interval=5)→ 设备每 5s 上报位置 NOTIFY,WVP 逐条 code=200 |
+| 目录订阅 + 变更 NOTIFY | Catalog 订阅 | P1 | ✅ 订阅回带 tag 的 200 + 对话内 SIP NOTIFY(全通道 Event=ON,带 Event/Subscription-State),WVP code=200 |
+| 报警订阅 | Alarm 订阅 | P1 | ✅ 订阅回带 tag 的 200 + 记录对话;report_alarm 有订阅时走对话内 SIP NOTIFY(WVP code=200),无订阅退化独立 MESSAGE |
 
 ## 其它设备能力
 
 | 功能 | CmdType | 优先级 | 状态 |
 |---|---|---|---|
-| 网络校时 | DeviceControl / 校时 | P1 | ⬜ |
-| 语音广播 | Broadcast | P2 | ⬜ |
-| 设备配置查询 | ConfigDownload | P2 | ⬜ |
-| 预置位查询 | PresetQuery | P2 | ⬜ |
+| 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
+| 语音广播 | Broadcast | P2 | ⬜ 未做:需设备侧反向 INVITE(UAC)+ 音频接收。WVP broadcast API 返回成功但未观察到向设备发 SIP Broadcast Notify(疑需设备声明音频输出能力),本环境无法验证,故不盲写 |
+| 设备配置查询 | ConfigDownload / BasicParam | P2 | 🟢 回 200 + ConfigDownload Response(Name/Expiration/HeartBeat*),实 SIP UDP 注入验证 |
+| 预置位查询 | PresetQuery | P2 | 🟢 回 200 + PresetQuery Response(PresetList),实 SIP UDP 注入验证 |
 | 设备软件升级 | — | P2(边缘) | 🚫 暂不 |
 
 ## 主动上报(设备 → 平台)
