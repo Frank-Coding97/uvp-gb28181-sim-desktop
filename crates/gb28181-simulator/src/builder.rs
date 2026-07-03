@@ -137,8 +137,16 @@ pub fn message_xml(
 }
 
 /// 为入站请求构造 200 OK 响应。按 SIP 规则回显 Via/From/To/Call-ID/CSeq
-/// (若 To 无 tag 则补一个),用于应答平台的 OPTIONS / 简单 MESSAGE。
+/// (若 To 无 tag 则补一个随机 tag),用于应答平台的 OPTIONS / 简单 MESSAGE。
 pub fn response_ok(request: &sip_core::Request) -> sip_core::Response {
+    response_ok_tagged(request, &rand_token(""))
+}
+
+/// 同 [`response_ok`],但当 To 无 tag 时用指定 `to_tag` 补(UAS 生成)。
+///
+/// 订阅场景需要:200 里的 To-tag 必须与后续对话内 NOTIFY 的 From-tag 一致,
+/// 才能与平台的订阅对话匹配,故由调用方指定同一个 tag。
+pub fn response_ok_tagged(request: &sip_core::Request, to_tag: &str) -> sip_core::Response {
     let mut headers = Headers::new();
     for via in request.headers.get_all("Via") {
         headers.append("Via", via.to_string());
@@ -147,11 +155,10 @@ pub fn response_ok(request: &sip_core::Request) -> sip_core::Response {
         headers.append("From", from.to_string());
     }
     if let Some(to) = request.headers.get("To") {
-        // To 无 tag 则补一个(UAS 生成)。
         if to.contains("tag=") {
             headers.append("To", to.to_string());
         } else {
-            headers.append("To", format!("{to};tag={}", rand_token("")));
+            headers.append("To", format!("{to};tag={to_tag}"));
         }
     }
     if let Some(cid) = request.headers.call_id() {
@@ -165,6 +172,71 @@ pub fn response_ok(request: &sip_core::Request) -> sip_core::Response {
         reason: "OK".into(),
         headers,
         body: Vec::new(),
+    }
+}
+
+/// 对话内 NOTIFY 所需的对话标识(从平台的 SUBSCRIBE 请求 + 本端 200 应答中提取)。
+#[derive(Debug, Clone)]
+pub struct NotifyDialog {
+    /// 订阅对话 Call-ID(沿用 SUBSCRIBE 的)。
+    pub call_id: String,
+    /// 本端(设备)在 200 应答里生成的 To-tag,作为 NOTIFY 的 From-tag。
+    pub local_tag: String,
+    /// 平台侧完整 From 头值(如 `<sip:平台@域>;tag=xxx`),作为 NOTIFY 的 To。
+    pub remote_from: String,
+    /// 订阅事件包(Event 头,如 `Catalog` / `presence`);缺省回 `Catalog`。
+    pub event: String,
+    /// 订阅有效期(秒),写入 Subscription-State。
+    pub expires: u32,
+}
+
+/// 构造对话内 NOTIFY 请求(设备 → 平台,承载 MANSCDP XML)。
+///
+/// 目录/报警订阅的变更通知须在 SUBSCRIBE 建立的对话内发送:沿用订阅 Call-ID,
+/// From/To 相对 SUBSCRIBE 反转(本端为 From 带 local_tag,平台为 To),
+/// 并带 `Event` 与 `Subscription-State: active;expires=N` 头。
+#[allow(clippy::too_many_arguments)]
+pub fn notify_in_dialog(
+    cfg: &DeviceConfig,
+    dialog: &NotifyDialog,
+    cseq: u32,
+    local_host: &str,
+    local_port: u16,
+    xml: &str,
+) -> Request {
+    let aor = device_aor(cfg);
+    let mut headers = Headers::new();
+    headers.append(
+        "Via",
+        format!(
+            "SIP/2.0/{} {}:{};rport;branch={}",
+            cfg.transport,
+            local_host,
+            local_port,
+            rand_token("z9hG4bK")
+        ),
+    );
+    // From = 本端设备(带本端 tag);To = 平台(沿用 SUBSCRIBE 的 From,含其 tag)。
+    headers.append("From", format!("<{aor}>;tag={}", dialog.local_tag));
+    headers.append("To", dialog.remote_from.clone());
+    headers.append("Call-ID", dialog.call_id.clone());
+    headers.append("CSeq", format!("{cseq} NOTIFY"));
+    headers.append(
+        "Contact",
+        format!("<sip:{}@{}:{}>", cfg.device_id, local_host, local_port),
+    );
+    headers.append("Event", dialog.event.clone());
+    headers.append(
+        "Subscription-State",
+        format!("active;expires={}", dialog.expires),
+    );
+    headers.append("Max-Forwards", "70");
+    headers.append("Content-Type", "Application/MANSCDP+xml");
+    Request {
+        method: Method::Notify,
+        uri: platform_uri(cfg),
+        headers,
+        body: xml.as_bytes().to_vec(),
     }
 }
 
@@ -227,5 +299,26 @@ mod tests {
         assert!(text.contains("Content-Type: Application/MANSCDP+xml"));
         assert!(text.contains("Content-Length: 9"));
         assert!(text.ends_with("<Notify/>"));
+    }
+
+    #[test]
+    fn 对话内_notify_含事件与订阅状态头() {
+        let dialog = NotifyDialog {
+            call_id: "sub-call-xyz@plat".into(),
+            local_tag: "devtag123".into(),
+            remote_from: "<sip:34020000002000000001@34020000002000000001>;tag=plat99".into(),
+            event: "Catalog".into(),
+            expires: 3600,
+        };
+        let req = notify_in_dialog(&cfg(), &dialog, 7, "5.6.7.8", 5070, "<Notify/>");
+        let text = String::from_utf8(req.to_bytes()).unwrap();
+        assert!(text.starts_with("NOTIFY sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"));
+        // 沿用订阅 Call-ID;From 带本端 tag;To 为平台 From(带其 tag)。
+        assert!(text.contains("Call-ID: sub-call-xyz@plat"));
+        assert!(text.contains(";tag=devtag123"));
+        assert!(text.contains("tag=plat99"));
+        assert!(text.contains("CSeq: 7 NOTIFY"));
+        assert!(text.contains("Event: Catalog"));
+        assert!(text.contains("Subscription-State: active;expires=3600"));
     }
 }

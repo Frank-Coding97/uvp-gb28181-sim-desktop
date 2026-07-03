@@ -2,7 +2,7 @@
 
 **状态:核心完成并 WVP 验证** · 单设备完整状态机 = 组合 sip-core + gb28181-protocol + media-rtp。
 
-> 进度(均对真实 WVP 验证):注册闭环+心跳+OPTIONS+SUBSCRIBE 应答、run 循环 ✅ · Catalog/DeviceInfo/DeviceStatus/RecordInfo 查询(独立 MESSAGE 应答)✅ · INVITE/ACK/BYE 会话 + UDP/TCP 推流(WVP 出 FLV 流)✅ · report_alarm 报警上报 ✅ · 单测 6。待补:强制关键帧、录像下载。
+> 进度(均对真实 WVP 验证):注册闭环+心跳+OPTIONS+SUBSCRIBE 应答、run 循环 ✅ · Catalog/DeviceInfo/DeviceStatus/RecordInfo/ConfigDownload/PresetQuery 查询(独立 MESSAGE 应答)✅ · INVITE/ACK/BYE 会话 + UDP/TCP 推流(WVP 出 FLV 流)✅ · report_alarm 报警上报 ✅ · report_position 移动位置上报 ✅ · **移动位置订阅**(SUBSCRIBE MobilePosition + Interval → 周期 NOTIFY)✅ WVP 验证(每 5s 上报,逐条 code=200) · **目录订阅**(SUBSCRIBE Catalog → 对话内 SIP NOTIFY)✅ WVP code=200 · **报警订阅**(SUBSCRIBE Alarm → 记录对话,report_alarm 走对话内 NOTIFY)✅ WVP code=200 · **回放控制**(会话内 INFO/MANSRTSP → 倍速/暂停/恢复)🟢 单测+真机 INFO 回 200 · **录像下载**(INVITE s=Download + downloadspeed → N 倍速推流)✅ 实测 4× · 单测 12。待补:强制关键帧。
 
 ## 职责
 
