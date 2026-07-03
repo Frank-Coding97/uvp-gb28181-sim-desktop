@@ -9,6 +9,9 @@
 set -e
 cd "$(dirname "$0")"
 
+# 确保 cargo 在 PATH(rustup 安装的 cargo 常不在非交互 shell 的 PATH)。
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
 VERSION="0.1.0"
 ARCH="$(uname -m | sed 's/x86_64/x64/;s/arm64/aarch64/')"
 APP_DIR="../../target/release/bundle/macos/UVP GB28181 Desktop.app"
