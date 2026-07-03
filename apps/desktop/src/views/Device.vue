@@ -4,7 +4,7 @@
 import { ref, onMounted, onUnmounted, computed } from "vue";
 import {
   NCard, NForm, NFormItem, NInput, NInputNumber, NSelect,
-  NButton, NSpace, NTag, NText, useMessage,
+  NButton, NSpace, NText, NGrid, NGi, NDivider, useMessage,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -40,11 +40,11 @@ const deviceState = ref<"Disconnected" | "Registering" | "Registered" | "InCall"
 
 const stateMeta = computed(() => {
   switch (deviceState.value) {
-    case "Registering": return { text: "注册中",  type: "warning" as const };
-    case "Registered":  return { text: "已注册",  type: "success" as const };
-    case "InCall":      return { text: "推流中",  type: "info" as const };
-    case "Failed":      return { text: "注册失败", type: "error" as const };
-    default:            return { text: "未连接",  type: "default" as const };
+    case "Registering": return { text: "注册中",   color: "#fa8c16", type: "warning" as const };
+    case "Registered":  return { text: "已注册",   color: "#52c41a", type: "success" as const };
+    case "InCall":      return { text: "推流中",   color: "#1890ff", type: "info" as const };
+    case "Failed":      return { text: "注册失败",  color: "#ff4d4f", type: "error" as const };
+    default:            return { text: "未连接",   color: "#c0c4cc", type: "default" as const };
   }
 });
 
@@ -94,56 +94,122 @@ onUnmounted(() => unlisten?.());
 </script>
 
 <template>
-  <n-space vertical size="large">
-    <n-card title="单设备联调">
-      <template #header-extra>
-        <n-tag :type="stateMeta.type" round>{{ stateMeta.text }}</n-tag>
-      </template>
+  <div class="page">
+    <div class="page-header">
+      <div>
+        <div class="page-title">单设备联调</div>
+        <div class="page-sub">把本机模拟成一台国标 IPC,注册到上级平台联调点播与报警</div>
+      </div>
+    </div>
 
-      <n-form :model="form" label-placement="left" label-width="110">
-        <n-form-item label="平台地址">
-          <n-input v-model:value="form.server_host" placeholder="WVP 主机 IP" />
-        </n-form-item>
-        <n-form-item label="SIP 端口">
-          <n-input-number v-model:value="form.server_port" :min="1" :max="65535" />
-        </n-form-item>
-        <n-form-item label="SIP 域">
-          <n-input v-model:value="form.server_domain" placeholder="如 3502000000" />
-        </n-form-item>
-        <n-form-item label="设备 ID">
-          <n-input v-model:value="form.device_id" placeholder="20 位国标 ID" />
-        </n-form-item>
-        <n-form-item label="密码">
-          <n-input v-model:value="form.password" type="password" show-password-on="click" />
-        </n-form-item>
-        <n-form-item label="传输">
-          <n-select v-model:value="form.transport" :options="transportOptions" />
-        </n-form-item>
-        <n-form-item label="国标版本">
-          <n-select v-model:value="form.gb_version" :options="versionOptions" />
-        </n-form-item>
-        <n-form-item label="通道名">
-          <n-input v-model:value="form.channel_name" />
-        </n-form-item>
-        <n-form-item label="视频源文件">
-          <n-input v-model:value="form.video_source"
-                   placeholder="可空;填 H.264 文件路径则点播可出画面" />
-        </n-form-item>
-      </n-form>
+    <n-grid :cols="3" :x-gap="18" responsive="screen" item-responsive>
+      <!-- 左:配置表单(占 2 列) -->
+      <n-gi :span="2">
+        <n-card title="连接配置" class="card">
+          <n-form :model="form" label-placement="left" label-width="92" size="small">
+            <n-divider title-placement="left" class="grp">上级平台</n-divider>
+            <n-grid :cols="2" :x-gap="16">
+              <n-gi>
+                <n-form-item label="平台地址">
+                  <n-input v-model:value="form.server_host" placeholder="WVP 主机 IP" />
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="SIP 端口">
+                  <n-input-number v-model:value="form.server_port" :min="1" :max="65535" style="width:100%" />
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="SIP 域">
+                  <n-input v-model:value="form.server_domain" placeholder="如 3502000000" />
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="传输">
+                  <n-select v-model:value="form.transport" :options="transportOptions" />
+                </n-form-item>
+              </n-gi>
+            </n-grid>
 
-      <n-space style="margin-top:8px">
-        <n-button type="primary" :disabled="running" @click="startDevice">注册上线</n-button>
-        <n-button type="error" :disabled="!running" @click="stopDevice">注销</n-button>
-        <n-button :disabled="deviceState !== 'Registered' && deviceState !== 'InCall'"
-                  @click="fireAlarm">上报报警</n-button>
-      </n-space>
-    </n-card>
+            <n-divider title-placement="left" class="grp">设备</n-divider>
+            <n-grid :cols="2" :x-gap="16">
+              <n-gi>
+                <n-form-item label="设备 ID">
+                  <n-input v-model:value="form.device_id" placeholder="20 位国标 ID" />
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="密码">
+                  <n-input v-model:value="form.password" type="password" show-password-on="click" />
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="国标版本">
+                  <n-select v-model:value="form.gb_version" :options="versionOptions" />
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="通道名">
+                  <n-input v-model:value="form.channel_name" />
+                </n-form-item>
+              </n-gi>
+            </n-grid>
 
-    <n-card title="说明">
-      <n-text depth="3">
-        填入上级平台(WVP/LiveGBS/EasyGBS)的 SIP 参数,点「注册上线」→ 状态变「已注册」后
-        平台即可见设备在线。配置视频源文件后,平台点播可出画面(状态转「推流中」)。
-      </n-text>
-    </n-card>
-  </n-space>
+            <n-divider title-placement="left" class="grp">媒体(可选)</n-divider>
+            <n-form-item label="视频源">
+              <n-input v-model:value="form.video_source"
+                       placeholder="填 H.264 文件路径则平台点播可出画面;留空仅信令" />
+            </n-form-item>
+          </n-form>
+        </n-card>
+      </n-gi>
+
+      <!-- 右:状态面板 -->
+      <n-gi :span="1">
+        <n-card title="设备状态" class="card status-card">
+          <div class="status-light">
+            <span class="dot" :style="{ background: stateMeta.color, boxShadow: `0 0 0 6px ${stateMeta.color}22` }" />
+            <div class="status-text" :style="{ color: stateMeta.color }">{{ stateMeta.text }}</div>
+          </div>
+
+          <n-space vertical size="medium" style="margin-top: 20px">
+            <n-button type="primary" block :disabled="running" @click="startDevice">
+              注册上线
+            </n-button>
+            <n-button type="error" secondary block :disabled="!running" @click="stopDevice">
+              注销
+            </n-button>
+            <n-button
+              block
+              :disabled="deviceState !== 'Registered' && deviceState !== 'InCall'"
+              @click="fireAlarm"
+            >
+              上报报警
+            </n-button>
+          </n-space>
+
+          <n-divider style="margin: 18px 0 12px" />
+          <n-text depth="3" style="font-size:12px; line-height:1.6">
+            状态变「已注册」后平台即见设备在线;配视频源后点播出画面(转「推流中」)。
+          </n-text>
+        </n-card>
+      </n-gi>
+    </n-grid>
+  </div>
 </template>
+
+<style scoped>
+.page { max-width: 1000px; }
+.page-header { margin-bottom: 18px; }
+.page-title { font-size: 20px; font-weight: 700; color: #1f2937; }
+.page-sub { font-size: 12.5px; color: #8a93a3; margin-top: 5px; }
+.card { border-radius: 12px; }
+.grp :deep(.n-divider__title) { font-size: 12px; color: #8a93a3; font-weight: 600; }
+.status-card { text-align: center; }
+.status-light { padding: 18px 0 4px; }
+.dot {
+  display: inline-block; width: 20px; height: 20px; border-radius: 50%;
+  transition: all .3s;
+}
+.status-text { font-size: 22px; font-weight: 700; margin-top: 14px; }
+</style>
