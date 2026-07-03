@@ -91,6 +91,26 @@ async fn main() {
 
     let sim = Arc::new(DeviceSimulator::new(cfg));
 
+    // 可选:ALARM_AFTER_SECS 秒后主动上报一条报警(联调 FR-9 用)。
+    if let Some(secs) = std::env::var("ALARM_AFTER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        let sim2 = sim.clone();
+        let tp2 = transport.clone();
+        let host = local_ip.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            match sim2
+                .report_alarm(&tp2, &host, local_port, "移动侦测报警")
+                .await
+            {
+                Ok(code) => tracing::info!(code, "报警上报完成"),
+                Err(e) => tracing::warn!(error=%e, "报警上报失败"),
+            }
+        });
+    }
+
     // Ctrl-C 触发优雅退出。
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
