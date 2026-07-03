@@ -5,7 +5,9 @@
 
 pub mod error;
 pub mod logging;
+pub mod observer;
 pub mod types;
 
 pub use error::{Error, Result};
+pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver};
 pub use types::{DeviceId, Transport};

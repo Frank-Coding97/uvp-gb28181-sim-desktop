@@ -78,13 +78,15 @@ pub enum DeviceState {
     Failed,
 }
 
-/// 设备仿真运行时状态机。持有配置 + 会话标识 + CSeq 计数 + 会话状态(推流任务)。
+/// 设备仿真运行时状态机。持有配置 + 会话标识 + CSeq 计数 + 会话状态 + 事件观察者。
 pub struct DeviceSimulator {
     config: DeviceConfig,
     ids: DialogIds,
     cseq: AtomicU32,
     /// 当前活跃的推流会话(INVITE → 推流中,BYE → 停止)。
     session: tokio::sync::Mutex<Option<PushSession>>,
+    /// 事件观察者(上报注册/心跳/推流事件给压测指标)。默认 Noop。
+    observer: Arc<dyn common::DeviceObserver>,
 }
 
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
@@ -96,13 +98,25 @@ struct PushSession {
 }
 
 impl DeviceSimulator {
-    /// 用配置创建一个待运行的设备仿真实例。
+    /// 用配置创建一个待运行的设备仿真实例(无观察者)。
     pub fn new(config: DeviceConfig) -> Self {
         Self {
             config,
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
+            observer: Arc::new(common::NoopObserver),
+        }
+    }
+
+    /// 带事件观察者创建(压测时由编排器注入共享 Metrics)。
+    pub fn with_observer(config: DeviceConfig, observer: Arc<dyn common::DeviceObserver>) -> Self {
+        Self {
+            config,
+            ids: DialogIds::new(),
+            cseq: AtomicU32::new(1),
+            session: tokio::sync::Mutex::new(None),
+            observer,
         }
     }
 
@@ -125,6 +139,31 @@ impl DeviceSimulator {
     /// `transport` 为共享 UDP 传输;`local_host/local_port` 为本端对外地址(填 Via/Contact);
     /// 成功返回 [`DeviceState::Registered`],鉴权/拒绝失败返回 [`DeviceState::Failed`] 对应错误。
     pub async fn register(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+    ) -> Result<DeviceState> {
+        use common::{DeviceEvent, FailureKind};
+        self.observer.on_event(DeviceEvent::RegisterAttempt);
+        let result = self.register_inner(transport, local_host, local_port).await;
+        match &result {
+            Ok(_) => self.observer.on_event(DeviceEvent::RegisterSuccess),
+            Err(e) => {
+                // 按错误信息归因:超时 → Timeout,含状态码拒绝 → Rejected,其余 Other。
+                let kind = match e {
+                    Error::Sip(msg) if msg.contains("超时") => FailureKind::Timeout,
+                    Error::Sip(msg) if msg.contains("被拒") => FailureKind::Rejected,
+                    _ => FailureKind::Other,
+                };
+                self.observer.on_event(DeviceEvent::RegisterFailure(kind));
+            }
+        }
+        result
+    }
+
+    /// 注册核心逻辑(不含事件上报)。
+    async fn register_inner(
         &self,
         transport: &Arc<UdpTransport>,
         local_host: &str,
@@ -191,6 +230,11 @@ impl DeviceSimulator {
         let req = builder::message_xml(&self.config, &self.ids, cseq, local_host, local_port, &xml);
         let mut rx = transport.register(self.ids.call_id.clone());
         let resp = sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default()).await?;
+        if resp.status == 200 {
+            self.observer.on_event(common::DeviceEvent::HeartbeatOk);
+        } else {
+            self.observer.on_event(common::DeviceEvent::HeartbeatFail);
+        }
         Ok(resp.status)
     }
 

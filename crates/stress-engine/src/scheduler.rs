@@ -1,30 +1,34 @@
 //! 压测调度器(编排器):批量拉起设备 + 生命周期管理 + 指标聚合。
-//!
-//! M3 实现:LinearScenario 生成配置 → 批量创建 DeviceSimulator → 启动 run 任务 →
-//! 聚合状态/指标 → 优雅停止。按 `rate_per_second` 爬坡拉起(后续优化)。
 
 use std::sync::Arc;
 
 use common::Result;
 use gb28181_simulator::DeviceSimulator;
-
 use scenario::Scenario;
 
-/// 压测编排器:持有场景、批量设备、任务句柄。
+use crate::metrics::Metrics;
+
+/// 压测编排器:持有场景、批量设备、共享指标。
 pub struct Orchestrator {
     devices: Vec<Arc<DeviceSimulator>>,
+    /// 所有设备共享的原子指标,可随时 snapshot 读取。
+    pub metrics: Arc<Metrics>,
 }
 
 impl Orchestrator {
-    /// 用场景批量创建设备实例。
+    /// 用场景批量创建设备实例(含共享 Metrics 注入)。
     pub fn new(scenario: &dyn Scenario, count: usize) -> Result<Self> {
         let configs = scenario.generate(count)?;
+        let metrics = Arc::new(Metrics::default());
         let devices: Vec<Arc<DeviceSimulator>> = configs
             .into_iter()
-            .map(|cfg| Arc::new(DeviceSimulator::new(cfg)))
+            .map(|cfg| {
+                let m: Arc<dyn common::DeviceObserver> = Arc::clone(&metrics) as _;
+                Arc::new(DeviceSimulator::with_observer(cfg, m))
+            })
             .collect();
         tracing::info!(device_count = devices.len(), "编排器已创建设备实例");
-        Ok(Orchestrator { devices })
+        Ok(Orchestrator { devices, metrics })
     }
 
     /// 启动所有设备的 run 任务(注册+心跳+入站应答)。
