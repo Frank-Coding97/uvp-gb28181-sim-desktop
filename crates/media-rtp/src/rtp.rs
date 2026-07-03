@@ -8,7 +8,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::net::UdpSocket;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpStream, UdpSocket};
 
 use common::{Error, Result};
 
@@ -57,10 +58,16 @@ impl SendStats {
     }
 }
 
-/// UDP RTP 发送器。持有目标地址、SSRC 与自增的序号,按 MTU 切片发送 PS 包。
+/// 发送通道:UDP 数据报,或 TCP(RFC 4571,每包前置 2 字节大端长度)。
+enum Channel {
+    Udp { socket: UdpSocket, dst: SocketAddr },
+    Tcp { stream: TcpStream },
+}
+
+/// RTP 发送器。持有 SSRC 与自增序号,按 MTU 切片发送 PS 包。
+/// 支持 UDP(`RTP/AVP`)与 TCP-ACTIVE(`TCP/RTP/AVP`,主动连平台)两种。
 pub struct RtpSender {
-    socket: UdpSocket,
-    dst: SocketAddr,
+    channel: Channel,
     ssrc: u32,
     payload_type: u8,
     seq: u16,
@@ -70,12 +77,11 @@ pub struct RtpSender {
 }
 
 impl RtpSender {
-    /// 绑定本地随机端口,面向 `dst` 发送,使用给定 SSRC。
+    /// UDP 模式:绑定本地随机端口,面向 `dst` 发送。
     pub async fn new(dst: SocketAddr, ssrc: u32) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(Error::Io)?;
         Ok(RtpSender {
-            socket,
-            dst,
+            channel: Channel::Udp { socket, dst },
             ssrc,
             payload_type: PT_PS,
             seq: 0,
@@ -84,9 +90,18 @@ impl RtpSender {
         })
     }
 
-    /// 本地绑定端口。
-    pub fn local_port(&self) -> u16 {
-        self.socket.local_addr().map(|a| a.port()).unwrap_or(0)
+    /// TCP-ACTIVE 模式:主动连接平台(WVP 的 TCP-PASSIVE 监听端),RFC 4571 分帧。
+    pub async fn new_tcp(dst: SocketAddr, ssrc: u32) -> Result<Self> {
+        let stream = TcpStream::connect(dst).await.map_err(Error::Io)?;
+        stream.set_nodelay(true).ok();
+        Ok(RtpSender {
+            channel: Channel::Tcp { stream },
+            ssrc,
+            payload_type: PT_PS,
+            seq: 0,
+            max_payload: 1400,
+            stats: Arc::new(SendStats::default()),
+        })
     }
 
     /// 共享的发送统计句柄。
@@ -111,10 +126,17 @@ impl RtpSender {
                 self.ssrc,
                 chunk,
             );
-            self.socket
-                .send_to(&pkt, self.dst)
-                .await
-                .map_err(Error::Io)?;
+            match &mut self.channel {
+                Channel::Udp { socket, dst } => {
+                    socket.send_to(&pkt, *dst).await.map_err(Error::Io)?;
+                }
+                Channel::Tcp { stream } => {
+                    // RFC 4571:2 字节大端长度前缀 + RTP 包。
+                    let len = (pkt.len() as u16).to_be_bytes();
+                    stream.write_all(&len).await.map_err(Error::Io)?;
+                    stream.write_all(&pkt).await.map_err(Error::Io)?;
+                }
+            }
             self.seq = self.seq.wrapping_add(1);
             self.stats.packets.fetch_add(1, Ordering::Relaxed);
             self.stats

@@ -71,6 +71,19 @@ impl UdpTransport {
         rx
     }
 
+    /// 为多个 AOR(设备 ID + 各通道 ID)注册到同一入站队列。
+    /// WVP 点播 INVITE 的 Request-URI 是通道 ID,需一并注册才能收到。
+    pub fn register_inbound_many(
+        &self,
+        aors: impl IntoIterator<Item = String>,
+    ) -> mpsc::UnboundedReceiver<Incoming> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for aor in aors {
+            self.aor_routes.insert(aor, tx.clone());
+        }
+        rx
+    }
+
     /// 注销某 Call-ID 的响应路由(事务结束时可调)。
     pub fn unregister(&self, call_id: &str) {
         self.routes.remove(call_id);
@@ -128,7 +141,11 @@ impl UdpTransport {
                     let _ = tx.send(incoming);
                     return;
                 }
-                tracing::debug!(aor=%aor, "无匹配 AOR 入站路由,丢弃请求");
+                let method = match &incoming.message {
+                    SipMessage::Request(r) => r.method.as_str(),
+                    _ => "?",
+                };
+                tracing::warn!(aor=%aor, method=%method, "无匹配 AOR 入站路由,丢弃请求");
                 return;
             }
         }

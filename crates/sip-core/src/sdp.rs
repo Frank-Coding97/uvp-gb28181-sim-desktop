@@ -112,28 +112,42 @@ impl SessionDescription {
     }
 
     /// 构造一个最简 GB28181 SDP(设备侧 200 OK):本端媒体地址、端口、SSRC。
-    pub fn new_device_response(local_ip: IpAddr, rtp_port: u16, ssrc: u32) -> Self {
+    ///
+    /// - `username`:o= 行用户名,填设备/通道 ID(平台 ACK 会据此定位)。
+    /// - `tcp`:true 时 m= proto 用 `TCP/RTP/AVP`(与平台一致),否则 `RTP/AVP`。
+    pub fn new_device_response(
+        username: &str,
+        local_ip: IpAddr,
+        rtp_port: u16,
+        ssrc: u32,
+        tcp: bool,
+    ) -> Self {
         let ip_str = local_ip.to_string();
+        let addr_type = if local_ip.is_ipv4() { "IP4" } else { "IP6" };
         SessionDescription {
             origin: Origin {
-                username: "Device".into(),
+                username: username.to_string(),
                 sess_id: "0".into(),
                 sess_version: "0".into(),
                 net_type: "IN".into(),
-                addr_type: if local_ip.is_ipv4() { "IP4" } else { "IP6" }.into(),
+                addr_type: addr_type.into(),
                 addr: ip_str.clone(),
             },
             session_name: "Play".into(),
             connection: Connection {
                 net_type: "IN".into(),
-                addr_type: if local_ip.is_ipv4() { "IP4" } else { "IP6" }.into(),
+                addr_type: addr_type.into(),
                 addr: ip_str,
             },
             timing: Timing { start: 0, stop: 0 },
             media: MediaDescription {
                 media: "video".into(),
                 port: rtp_port,
-                proto: "RTP/AVP".into(),
+                proto: if tcp {
+                    "TCP/RTP/AVP".into()
+                } else {
+                    "RTP/AVP".into()
+                },
                 fmt: vec!["96".into()],
                 rtpmap: Some("96 PS/90000".into()),
                 ssrc: Some(ssrc),
@@ -262,11 +276,22 @@ y=1234567890\r
     #[test]
     fn 构造设备侧_sdp() {
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
-        let sdp = SessionDescription::new_device_response(ip, 8000, 0xAABBCCDD);
+        let sdp = SessionDescription::new_device_response(
+            "34020000001320000132",
+            ip,
+            8000,
+            0xAABBCCDD,
+            false,
+        );
         let text = sdp.to_string();
+        assert!(text.contains("o=34020000001320000132 "));
         assert!(text.contains("c=IN IP4 10.0.0.2"));
         assert!(text.contains("m=video 8000 RTP/AVP 96"));
         assert!(text.contains("y=2864434397")); // 0xAABBCCDD
+
+        // TCP 模式 proto 应为 TCP/RTP/AVP。
+        let sdp_tcp = SessionDescription::new_device_response("dev", ip, 8000, 1, true);
+        assert!(sdp_tcp.to_string().contains("m=video 8000 TCP/RTP/AVP 96"));
     }
 
     #[test]

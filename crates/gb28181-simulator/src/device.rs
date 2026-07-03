@@ -415,6 +415,7 @@ impl DeviceSimulator {
         let body_str = std::str::from_utf8(&req.body)
             .map_err(|_| Error::Sip("INVITE body 非 UTF-8".into()))?;
         let platform_sdp = sip_core::SessionDescription::parse(body_str)?;
+        tracing::info!(proto=%platform_sdp.media.proto, "INVITE SDP 媒体协议");
         let rtp_host: IpAddr = platform_sdp
             .connection
             .addr
@@ -423,19 +424,25 @@ impl DeviceSimulator {
         let rtp_port = platform_sdp.media.port;
         let rtp_dst = SocketAddr::new(rtp_host, rtp_port);
 
-        // 生成本端 SSRC(简化:用设备 ID hash)。
-        let ssrc = self
-            .config
-            .device_id
-            .as_str()
-            .bytes()
-            .fold(0u32, |a, b| a.wrapping_add(b as u32));
+        // SSRC 必须用平台 SDP 的 y= 行指定值(GB28181),平台据此识别本条流。
+        // 缺失时退化为设备 ID hash。
+        let ssrc = platform_sdp.media.ssrc.unwrap_or_else(|| {
+            self.config
+                .device_id
+                .as_str()
+                .bytes()
+                .fold(0u32, |a, b| a.wrapping_add(b as u32))
+        });
+        tracing::info!(%rtp_dst, ssrc, "INVITE:开始向平台推流");
 
         // 启动推流任务(若配置了视频源)。
         let mut sess_guard = self.session.lock().await;
         if sess_guard.is_some() {
             return Err(Error::Gb28181("已有活跃会话".into()));
         }
+
+        // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 TCP-ACTIVE(RFC 4571)。
+        let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
 
         // 按配置选择视频源:C 档(文件)优先,其次 B 档(轻量伪流),否则 A 档(不推流)。
         let fps = self.config.video_fps;
@@ -451,13 +458,43 @@ impl DeviceSimulator {
                     .map(|kbps| Box::new(media_rtp::LightSource::new(kbps, fps)) as _)
             };
 
+        // 先构造并发送 200 OK(带本端 SDP,SSRC 回显平台值)。
+        // TCP-PASSIVE 下平台收到 200 后才开始监听,故推流必须在 200 之后再连接。
+        let local_ip: std::net::IpAddr = self
+            .local_host()
+            .parse()
+            .unwrap_or_else(|_| transport.local_addr().map(|a| a.ip()).unwrap_or(rtp_host));
+        // o= 用户名填被点播的通道 ID(取 INVITE Request-URI 的 user 部分)。
+        let channel = req
+            .uri
+            .strip_prefix("sip:")
+            .and_then(|s| s.split('@').next())
+            .unwrap_or(self.config.device_id.as_str());
+        let local_sdp =
+            sip_core::SessionDescription::new_device_response(channel, local_ip, 0, ssrc, use_tcp);
+        let sdp_body = local_sdp.to_string();
+
+        let mut resp = builder::response_ok(req);
+        resp.headers.set("Content-Type", "application/sdp");
+        resp.body = sdp_body.as_bytes().to_vec();
+        transport
+            .send_to(&sip_core::SipMessage::Response(resp), from)
+            .await?;
+
+        // 200 OK 已发,启动推流(TCP 模式给平台一点时间建监听 + 收 ACK)。
         if let Some(source) = source {
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
-                let _ = media_rtp::push_stream(source, rtp_dst, ssrc, fps, async {
+                if use_tcp {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                if let Err(e) = media_rtp::push_stream(source, rtp_dst, ssrc, fps, use_tcp, async {
                     let _ = stop_rx.await;
                 })
-                .await;
+                .await
+                {
+                    tracing::warn!(error=%e, "推流结束(错误)");
+                }
             });
             *sess_guard = Some(PushSession {
                 _task: task,
@@ -465,17 +502,6 @@ impl DeviceSimulator {
             });
         }
         drop(sess_guard);
-
-        // 构造 200 OK(带本端 SDP)。
-        let local_ip = transport.local_addr()?.ip();
-        let local_sdp = sip_core::SessionDescription::new_device_response(local_ip, 0, ssrc);
-        let sdp_body = local_sdp.to_string();
-
-        let mut resp = builder::response_ok(req);
-        resp.headers.set("Content-Type", "application/sdp");
-        resp.body = sdp_body.as_bytes().to_vec();
-        let msg = sip_core::SipMessage::Response(resp);
-        transport.send_to(&msg, from).await?;
         Ok(true)
     }
 
@@ -514,12 +540,23 @@ impl DeviceSimulator {
         // 记录本端信令地址(应答 MESSAGE / NOTIFY 构造 Via/From/Contact 用)。
         let _ = self.local_addr.set((local_host.clone(), local_port));
 
-        // 入站请求应答任务(OPTIONS)。
-        let mut inbound = transport.register_inbound(self.config.device_id.as_str().to_string());
+        // 入站请求应答任务:注册设备 ID + 全部通道 ID(点播 INVITE 的
+        // Request-URI 是通道 ID,需一并注册才能收到)。
+        let mut aors = vec![self.config.device_id.as_str().to_string()];
+        aors.extend(
+            self.config
+                .channels
+                .iter()
+                .map(|c| c.channel_id.as_str().to_string()),
+        );
+        let mut inbound = transport.register_inbound_many(aors);
         let inbound_sim = self.clone();
         let inbound_tp = transport.clone();
         let inbound_task = tokio::spawn(async move {
             while let Some(inc) = inbound.recv().await {
+                if let sip_core::SipMessage::Request(r) = &inc.message {
+                    tracing::info!(method=%r.method, uri=%r.uri, "收到入站请求");
+                }
                 if let Err(e) = inbound_sim.answer_inbound(&inbound_tp, &inc).await {
                     tracing::warn!(error=%e, "入站请求应答失败");
                 }

@@ -16,6 +16,7 @@ use crate::source::VideoSource;
 ///
 /// - `ssrc`:RTP SSRC(与 SDP 的 y= 一致)
 /// - `fps`:帧率(决定取帧间隔与时间戳步进)
+/// - `use_tcp`:true=TCP-ACTIVE(RFC 4571,连平台 TCP-PASSIVE);false=UDP
 /// - `stop`:该 future 完成时优雅停流
 ///
 /// 返回停流原因(正常停返回 Ok)。
@@ -24,9 +25,14 @@ pub async fn push_stream(
     dst: SocketAddr,
     ssrc: u32,
     fps: u32,
+    use_tcp: bool,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
-    let mut sender = RtpSender::new(dst, ssrc).await?;
+    let mut sender = if use_tcp {
+        RtpSender::new_tcp(dst, ssrc).await?
+    } else {
+        RtpSender::new(dst, ssrc).await?
+    };
     let mux = PsMuxer::new();
     let fps = fps.max(1);
     let ts_step = CLOCK_HZ / fps;
@@ -77,7 +83,7 @@ mod tests {
         // 高帧率快速产包;100ms 后停。
         let (tx_stop, rx_stop) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            push_stream(source, rx_addr, 0x2233, 50, async {
+            push_stream(source, rx_addr, 0x2233, 50, false, async {
                 let _ = rx_stop.await;
             })
             .await
