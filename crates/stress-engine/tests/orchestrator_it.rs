@@ -77,6 +77,7 @@ fn scenario_for(port: u16) -> LinearScenario {
         media_profile: MediaProfile::A,
         video_source: None,
         video_fps: 25,
+        bitrate_kbps: 512,
         ramp_per_second: 0,
     }
 }

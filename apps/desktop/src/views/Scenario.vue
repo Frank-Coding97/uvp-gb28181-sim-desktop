@@ -24,8 +24,8 @@ const form = ref({
 });
 
 const mediaOptions = [
-  { label: "A - 空媒体（仅信令）",      value: "A" },
-  { label: "B - 轻量 RTP（待实现）", value: "B" },
+  { label: "A - 空媒体（仅信令）",   value: "A" },
+  { label: "B - 轻量 RTP（伪流）",  value: "B" },
   { label: "C - 真实 H.264 文件",  value: "C" },
 ];
 

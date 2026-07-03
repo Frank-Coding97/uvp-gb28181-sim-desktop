@@ -50,6 +50,9 @@ pub struct LinearScenario {
     /// 推流帧率。
     #[serde(default = "default_fps")]
     pub video_fps: u32,
+    /// 目标码率(kbps),B 档轻量伪流用;C 档由文件决定,可忽略。
+    #[serde(default = "default_bitrate")]
+    pub bitrate_kbps: u32,
     /// 爬坡速率:每秒拉起多少台设备(0 = 一次性全拉起)。避免瞬时注册风暴(FR-21)。
     #[serde(default)]
     pub ramp_per_second: u32,
@@ -66,6 +69,9 @@ fn default_channels() -> usize {
 }
 fn default_fps() -> u32 {
     25
+}
+fn default_bitrate() -> u32 {
+    512
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +125,11 @@ impl Scenario for LinearScenario {
                 MediaProfile::C => self.video_source.clone(),
                 _ => None,
             };
+            // B 档用轻量伪流(按码率合成);A/C 档不用。
+            let light_bitrate_kbps = match self.media_profile {
+                MediaProfile::B => Some(self.bitrate_kbps),
+                _ => None,
+            };
 
             configs.push(DeviceConfig {
                 device_id,
@@ -138,6 +149,7 @@ impl Scenario for LinearScenario {
                 },
                 video_source,
                 video_fps: self.video_fps,
+                light_bitrate_kbps,
             });
         }
         Ok(configs)
@@ -185,6 +197,7 @@ mod tests {
             media_profile: MediaProfile::A,
             video_source: None,
             video_fps: 25,
+            bitrate_kbps: 512,
             ramp_per_second: 0,
         };
 
@@ -220,6 +233,7 @@ mod tests {
             media_profile: MediaProfile::C,
             video_source: Some("/tmp/test.h264".into()),
             video_fps: 25,
+            bitrate_kbps: 512,
             ramp_per_second: 0,
         };
 

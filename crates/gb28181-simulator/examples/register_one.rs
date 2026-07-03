@@ -76,6 +76,9 @@ async fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(25),
+        light_bitrate_kbps: std::env::var("LIGHT_KBPS")
+            .ok()
+            .and_then(|s| s.parse().ok()),
     };
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。

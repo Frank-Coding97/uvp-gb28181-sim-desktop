@@ -193,6 +193,7 @@ mod tests {
             },
             video_source: None,
             video_fps: 25,
+            light_bitrate_kbps: None,
         }
     }
 

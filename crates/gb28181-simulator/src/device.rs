@@ -37,10 +37,12 @@ pub struct DeviceConfig {
     pub channels: Vec<ChannelConfig>,
     /// 设备信息(DeviceInfo 查询应答用)。
     pub device_info: DeviceInfo,
-    /// 视频源文件路径(H.264 Annex B);None 表示不推流(A 档)。
+    /// 视频源文件路径(H.264 Annex B,C 档);None 且无 light_bitrate 时不推流(A 档)。
     pub video_source: Option<String>,
     /// 推流帧率(fps)。
     pub video_fps: u32,
+    /// B 档轻量伪流码率(kbps);Some 且无 video_source 时用 LightSource。
+    pub light_bitrate_kbps: Option<u32>,
 }
 
 /// 通道配置(对应目录查询中的一个 Item)。
@@ -406,13 +408,24 @@ impl DeviceSimulator {
             return Err(Error::Gb28181("已有活跃会话".into()));
         }
 
-        if let Some(ref path) = self.config.video_source {
-            let source = media_rtp::FileSource::from_path(path)
-                .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))?;
+        // 按配置选择视频源:C 档(文件)优先,其次 B 档(轻量伪流),否则 A 档(不推流)。
+        let fps = self.config.video_fps;
+        let source: Option<Box<dyn media_rtp::VideoSource>> =
+            if let Some(ref path) = self.config.video_source {
+                Some(Box::new(
+                    media_rtp::FileSource::from_path(path)
+                        .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))?,
+                ))
+            } else {
+                self.config
+                    .light_bitrate_kbps
+                    .map(|kbps| Box::new(media_rtp::LightSource::new(kbps, fps)) as _)
+            };
+
+        if let Some(source) = source {
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-            let fps = self.config.video_fps;
             let task = tokio::spawn(async move {
-                let _ = media_rtp::push_stream(Box::new(source), rtp_dst, ssrc, fps, async {
+                let _ = media_rtp::push_stream(source, rtp_dst, ssrc, fps, async {
                     let _ = stop_rx.await;
                 })
                 .await;
@@ -552,6 +565,7 @@ mod tests {
             },
             video_source: None,
             video_fps: 25,
+            light_bitrate_kbps: None,
         }
     }
 

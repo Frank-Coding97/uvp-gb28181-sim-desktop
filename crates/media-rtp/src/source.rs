@@ -2,10 +2,8 @@
 //!
 //! 对应压测三档媒体强度(docs/10-functional/stress-testing.md#2):
 //! - `NoneSource`:空媒体(不产帧)—— A 档
+//! - `LightSource`:合成低码率伪包 —— B 档(测 RTP 通道/带宽,内容不要求可解码)
 //! - `FileSource`:H.264 文件循环 —— C 档 / 单设备联调
-//! - 轻量伪包源(B 档)后续补充
-//!
-//! M2 实现 `FileSource` 与 `NoneSource`。
 
 use common::{Error, Result};
 
@@ -30,6 +28,42 @@ pub struct NoneSource;
 impl VideoSource for NoneSource {
     fn next_frame(&mut self) -> Option<Frame> {
         None
+    }
+}
+
+/// 轻量伪包源(B 档):按目标码率合成固定大小伪 NAL 帧,无限循环。
+///
+/// 用途:压测平台 RTP 端口/会话/带宽调度,不追求可解码内容。
+/// 每帧字节数 = bitrate_kbps*1000/8/fps(下限 64);约每秒一个关键帧标记。
+pub struct LightSource {
+    frame_bytes: usize,
+    keyframe_interval: u32,
+    counter: u32,
+}
+
+impl LightSource {
+    /// 按目标码率(kbps)与帧率构造。
+    pub fn new(bitrate_kbps: u32, fps: u32) -> Self {
+        let fps = fps.max(1);
+        let frame_bytes = ((bitrate_kbps as usize * 1000) / 8 / fps as usize).max(64);
+        LightSource {
+            frame_bytes,
+            keyframe_interval: fps,
+            counter: 0,
+        }
+    }
+}
+
+impl VideoSource for LightSource {
+    fn next_frame(&mut self) -> Option<Frame> {
+        let key_frame = self.counter % self.keyframe_interval == 0;
+        self.counter = self.counter.wrapping_add(1);
+        // 伪 NAL:Annex B 起始码 + NAL 头(IDR type5 / slice type1)+ 填充占位。
+        let nal_type: u8 = if key_frame { 0x65 } else { 0x61 };
+        let mut data = Vec::with_capacity(self.frame_bytes + 5);
+        data.extend_from_slice(&[0, 0, 0, 1, nal_type]);
+        data.resize(self.frame_bytes + 5, 0xAB);
+        Some(Frame { data, key_frame })
     }
 }
 
@@ -195,5 +229,25 @@ mod tests {
     #[test]
     fn 空流报错() {
         assert!(FileSource::from_bytes(&[0xFF, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn 轻量源按码率产帧() {
+        // 200kbps @ 25fps → 每帧 200*1000/8/25 = 1000 字节。
+        let mut s = LightSource::new(200, 25);
+        let f0 = s.next_frame().unwrap();
+        assert!(f0.key_frame); // 首帧为关键帧
+        assert_eq!(f0.data.len(), 1000 + 5); // 起始码+NAL头+填充
+        assert_eq!(&f0.data[..5], &[0, 0, 0, 1, 0x65]); // IDR
+        let f1 = s.next_frame().unwrap();
+        assert!(!f1.key_frame); // 第二帧非关键帧
+        assert_eq!(&f1.data[..5], &[0, 0, 0, 1, 0x61]); // slice
+    }
+
+    #[test]
+    fn 轻量源最小帧下限() {
+        let mut s = LightSource::new(1, 25); // 极低码率 → 命中 64 字节下限
+        let f = s.next_frame().unwrap();
+        assert_eq!(f.data.len(), 64 + 5);
     }
 }
