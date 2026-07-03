@@ -40,6 +40,149 @@ impl Query {
     }
 }
 
+/// 平台 → 设备的控制命令(Control)。GB28181 §A.2.4:PTZ/录像/布防/校时/重启/关键帧等。
+/// 各命令是可选子元素,按出现的字段判断具体控制类型。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Control")]
+pub struct Control {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// PTZ 云台控制码(8 字节十六进制串)。
+    #[serde(rename = "PTZCmd", skip_serializing_if = "Option::is_none")]
+    pub ptz_cmd: Option<String>,
+    /// 强制关键帧,值 "Send"。
+    #[serde(rename = "IFameCmd", skip_serializing_if = "Option::is_none")]
+    pub iframe_cmd: Option<String>,
+    /// 录像控制:Record / StopRecord。
+    #[serde(rename = "RecordCmd", skip_serializing_if = "Option::is_none")]
+    pub record_cmd: Option<String>,
+    /// 布防/撤防:SetGuard / ResetGuard。
+    #[serde(rename = "GuardCmd", skip_serializing_if = "Option::is_none")]
+    pub guard_cmd: Option<String>,
+    /// 报警复位。
+    #[serde(rename = "AlarmCmd", skip_serializing_if = "Option::is_none")]
+    pub alarm_cmd: Option<String>,
+    /// 远程启动,值 "Boot"。
+    #[serde(rename = "TeleBoot", skip_serializing_if = "Option::is_none")]
+    pub tele_boot: Option<String>,
+}
+
+impl Control {
+    /// 从 XML 解析控制命令。
+    pub fn parse(xml: &str) -> Result<Self> {
+        quick_xml::de::from_str(strip_xml_decl(xml))
+            .map_err(|e| Error::Gb28181(format!("Control 解析失败: {e}")))
+    }
+
+    /// 人类可读的控制类型(日志/UI 用)。
+    pub fn kind(&self) -> &'static str {
+        if self.ptz_cmd.is_some() {
+            "PTZ 云台控制"
+        } else if self.iframe_cmd.is_some() {
+            "强制关键帧"
+        } else if self.record_cmd.is_some() {
+            "录像控制"
+        } else if self.guard_cmd.is_some() {
+            "布防/撤防"
+        } else if self.alarm_cmd.is_some() {
+            "报警复位"
+        } else if self.tele_boot.is_some() {
+            "远程启动"
+        } else {
+            "未知控制"
+        }
+    }
+}
+
+/// 设备控制应答(设备 → 平台,DeviceControl 结果)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct ControlResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "Result")]
+    pub result: String,
+}
+
+impl ControlResponse {
+    /// 构造 OK 应答。
+    pub fn ok(device_id: impl Into<String>, sn: u32) -> Self {
+        ControlResponse {
+            cmd_type: "DeviceControl".into(),
+            sn,
+            device_id: device_id.into(),
+            result: "OK".into(),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("ControlResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 移动位置通知(设备 → 平台,GPS 周期上报,MobilePosition 订阅)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct MobilePositionNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 时间(ISO8601)。
+    #[serde(rename = "Time")]
+    pub time: String,
+    /// 经度(WGS-84)。
+    #[serde(rename = "Longitude")]
+    pub longitude: f64,
+    /// 纬度(WGS-84)。
+    #[serde(rename = "Latitude")]
+    pub latitude: f64,
+    /// 速度(km/h,可选)。
+    #[serde(rename = "Speed", skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+}
+
+impl MobilePositionNotify {
+    /// 构造一条位置通知。
+    pub fn new(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        lon: f64,
+        lat: f64,
+    ) -> Self {
+        MobilePositionNotify {
+            cmd_type: "MobilePosition".into(),
+            sn,
+            device_id: device_id.into(),
+            time: time.into(),
+            longitude: lon,
+            latitude: lat,
+            speed: Some(0.0),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("MobilePosition 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
 /// 心跳通知(设备 → 平台,周期发送)。
 ///
 /// 对应 XML:
@@ -500,5 +643,42 @@ mod tests {
         assert!(xml.contains("Num=\"1\""));
         assert!(xml.contains("<StartTime>2026-07-03T10:00:00</StartTime>"));
         assert!(xml.contains("<Type>time</Type>"));
+    }
+
+    #[test]
+    fn 解析ptz控制并识别类型() {
+        let xml = "<?xml version=\"1.0\"?><Control><CmdType>DeviceControl</CmdType>\
+            <SN>5</SN><DeviceID>35020000001310000132</DeviceID>\
+            <PTZCmd>A50F01000000FF</PTZCmd></Control>";
+        let c = Control::parse(xml).unwrap();
+        assert_eq!(c.cmd_type, "DeviceControl");
+        assert_eq!(c.sn, 5);
+        assert_eq!(c.ptz_cmd.as_deref(), Some("A50F01000000FF"));
+        assert_eq!(c.kind(), "PTZ 云台控制");
+    }
+
+    #[test]
+    fn 解析强制关键帧() {
+        let xml = "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+            <DeviceID>x</DeviceID><IFameCmd>Send</IFameCmd></Control>";
+        let c = Control::parse(xml).unwrap();
+        assert_eq!(c.kind(), "强制关键帧");
+        let resp = ControlResponse::ok("x", 1).to_xml().unwrap();
+        assert!(resp.contains("<Result>OK</Result>"));
+    }
+
+    #[test]
+    fn 移动位置通知含经纬度() {
+        let p = MobilePositionNotify::new(
+            "35020000001310000001",
+            3,
+            "2026-07-03T11:00:00",
+            116.397,
+            39.908,
+        );
+        let xml = p.to_xml().unwrap();
+        assert!(xml.contains("<CmdType>MobilePosition</CmdType>"));
+        assert!(xml.contains("<Longitude>116.397</Longitude>"));
+        assert!(xml.contains("<Latitude>39.908</Latitude>"));
     }
 }
