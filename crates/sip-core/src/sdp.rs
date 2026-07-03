@@ -22,6 +22,20 @@ pub struct SessionDescription {
     pub timing: Timing,
     /// 媒体描述(m=video ...)。
     pub media: MediaDescription,
+    /// 下载倍速(GB28181 录像下载 `a=downloadspeed:N`;仅下载模式携带)。
+    pub download_speed: Option<u32>,
+}
+
+impl SessionDescription {
+    /// 是否为录像下载会话(会话名 `s=Download`)。
+    pub fn is_download(&self) -> bool {
+        self.session_name.eq_ignore_ascii_case("Download")
+    }
+
+    /// 是否为历史回放会话(会话名 `s=Playback`)。
+    pub fn is_playback(&self) -> bool {
+        self.session_name.eq_ignore_ascii_case("Playback")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +87,7 @@ impl SessionDescription {
         let mut media_desc = None;
         let mut rtpmap = None;
         let mut ssrc = None;
+        let mut download_speed = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -92,6 +107,9 @@ impl SessionDescription {
             } else if let Some(rest) = line.strip_prefix("a=") {
                 if rest.starts_with("rtpmap:") {
                     rtpmap = Some(rest.trim_start_matches("rtpmap:").to_string());
+                } else if let Some(spd) = rest.strip_prefix("downloadspeed:") {
+                    // 下载倍速可能写成 "4" 或 "4:1",取首段。
+                    download_speed = spd.split(':').next().and_then(|s| s.trim().parse().ok());
                 }
             } else if let Some(rest) = line.strip_prefix("y=") {
                 ssrc = rest.trim().parse::<u32>().ok();
@@ -108,6 +126,7 @@ impl SessionDescription {
             connection: connection.ok_or_else(|| Error::Sip("SDP 缺少 c= 行".into()))?,
             timing: timing.unwrap_or(Timing { start: 0, stop: 0 }),
             media,
+            download_speed,
         })
     }
 
@@ -152,6 +171,7 @@ impl SessionDescription {
                 rtpmap: Some("96 PS/90000".into()),
                 ssrc: Some(ssrc),
             },
+            download_speed: None,
         }
     }
 }
@@ -300,5 +320,30 @@ y=1234567890\r
         let text = sdp.to_string();
         let back = SessionDescription::parse(&text).unwrap();
         assert_eq!(sdp, back);
+    }
+
+    #[test]
+    fn 解析下载会话_倍速与会话名() {
+        let dl = "v=0\r\n\
+o=34020000001320000001 0 0 IN IP4 192.168.1.100\r\n\
+s=Download\r\n\
+c=IN IP4 192.168.1.100\r\n\
+t=0 0\r\n\
+m=video 30000 RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+a=downloadspeed:4\r\n\
+y=1234567890\r\n";
+        let sdp = SessionDescription::parse(dl).unwrap();
+        assert!(sdp.is_download());
+        assert!(!sdp.is_playback());
+        assert_eq!(sdp.download_speed, Some(4));
+    }
+
+    #[test]
+    fn 普通点播非下载非回放() {
+        let sdp = SessionDescription::parse(SAMPLE_SDP).unwrap();
+        assert!(!sdp.is_download());
+        assert!(!sdp.is_playback());
+        assert_eq!(sdp.download_speed, None);
     }
 }

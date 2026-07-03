@@ -32,6 +32,8 @@ pub enum Method {
     Subscribe,
     /// 通知(设备 → 平台,订阅的增量推送)。
     Notify,
+    /// 会话内控制(回放倍速/暂停/恢复,承载 MANSRTSP 体)。
+    Info,
 }
 
 impl Method {
@@ -46,6 +48,7 @@ impl Method {
             Method::Options => "OPTIONS",
             Method::Subscribe => "SUBSCRIBE",
             Method::Notify => "NOTIFY",
+            Method::Info => "INFO",
         }
     }
 
@@ -60,6 +63,7 @@ impl Method {
             "OPTIONS" => Method::Options,
             "SUBSCRIBE" => Method::Subscribe,
             "NOTIFY" => Method::Notify,
+            "INFO" => Method::Info,
             other => return Err(Error::Sip(format!("不支持的 SIP 方法: {other}"))),
         })
     }
