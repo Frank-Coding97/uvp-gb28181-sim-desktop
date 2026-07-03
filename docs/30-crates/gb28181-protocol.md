@@ -1,8 +1,8 @@
 # crate: gb28181-protocol
 
-**状态:开发中(M1)** · worktree `feat/protocol` · GB28181 应用层:MANSCDP XML + ID 编码。纯数据编解码,无网络/状态机。
+**状态:核心完成** · GB28181 应用层:MANSCDP XML + ID 编码。纯数据编解码,无网络/状态机。
 
-> 进度:`id_codec`(拆解/组装/批量生成)✅ · `manscdp` Keepalive ✅ · Catalog/DeviceInfo 🚧 M2。
+> 进度:`id_codec`(拆解/组装/批量生成)✅ · `manscdp`:Keepalive / Query / Catalog / DeviceInfo / DeviceStatus / AlarmNotify / RecordInfo ✅(均对 WVP 验证)· 单测 11。
 
 ## 职责
 
