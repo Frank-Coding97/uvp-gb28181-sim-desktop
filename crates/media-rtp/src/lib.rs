@@ -14,7 +14,7 @@ pub mod rtp;
 pub mod source;
 
 pub use ps::PsMuxer;
-pub use pusher::push_stream;
+pub use pusher::{push_stream, push_stream_controlled, PlaybackControl};
 pub use rtp::{RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{FileSource, Frame, LightSource, NoneSource, VideoSource};
 
