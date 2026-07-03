@@ -9,6 +9,7 @@ const router = createRouter({
   routes: [
     { path: "/", redirect: "/dashboard" },
     { path: "/dashboard", component: () => import("./views/Dashboard.vue") },
+    { path: "/device",    component: () => import("./views/Device.vue") },
     { path: "/config",    component: () => import("./views/Config.vue") },
     { path: "/scenario",  component: () => import("./views/Scenario.vue") },
     { path: "/monitor",   component: () => import("./views/Monitor.vue") },

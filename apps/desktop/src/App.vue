@@ -13,10 +13,11 @@ const router = useRouter();
 
 // 侧边栏菜单项（与 routes 对应）。
 const menuOptions: MenuOption[] = [
-  { label: "仪表盘",  key: "/dashboard" },
-  { label: "平台配置", key: "/config" },
-  { label: "压测场景", key: "/scenario" },
-  { label: "运行监控", key: "/monitor" },
+  { label: "仪表盘",   key: "/dashboard" },
+  { label: "单设备联调", key: "/device" },
+  { label: "平台配置",  key: "/config" },
+  { label: "压测场景",  key: "/scenario" },
+  { label: "运行监控",  key: "/monitor" },
 ];
 
 const activeKey = computed(() => route.path);

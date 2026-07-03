@@ -29,13 +29,13 @@ onMounted(async () => {
     <n-card title="快速操作">
       <n-grid :cols="2" :x-gap="12" :y-gap="12">
         <n-gi>
-          <n-button block type="primary" @click="router.push('/config')">
-            配置平台
+          <n-button block type="primary" @click="router.push('/device')">
+            单设备联调
           </n-button>
         </n-gi>
         <n-gi>
           <n-button block @click="router.push('/scenario')">
-            编排场景
+            压测编排
           </n-button>
         </n-gi>
         <n-gi>
