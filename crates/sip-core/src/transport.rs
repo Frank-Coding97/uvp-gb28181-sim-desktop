@@ -285,4 +285,55 @@ mod tests {
         );
         assert_eq!(uri_user("sip:@h"), None);
     }
+
+    #[tokio::test]
+    async fn 追踪观察者捕获收发方向() {
+        use crate::message::{Method, Request};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counter {
+            ins: AtomicUsize,
+            outs: AtomicUsize,
+        }
+        impl TraceObserver for Counter {
+            fn on_trace(&self, t: SipTrace<'_>) {
+                match t.dir {
+                    TraceDir::In => self.ins.fetch_add(1, Ordering::Relaxed),
+                    TraceDir::Out => self.outs.fetch_add(1, Ordering::Relaxed),
+                };
+            }
+        }
+
+        let sender = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let receiver = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let dst = receiver.local_addr().unwrap();
+
+        let sc = Arc::new(Counter::default());
+        let rc = Arc::new(Counter::default());
+        sender.set_tracer(Some(sc.clone()));
+        receiver.set_tracer(Some(rc.clone()));
+        let _rx = receiver.register("call-trace");
+
+        let mut h = Headers::new();
+        h.set("Call-ID", "call-trace");
+        h.set("CSeq", "1 MESSAGE");
+        let req = SipMessage::Request(Request {
+            method: Method::Message,
+            uri: "sip:x@h".into(),
+            headers: h,
+            body: Vec::new(),
+        });
+        sender.send_to(&req, dst).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(sc.outs.load(Ordering::Relaxed), 1, "发送侧应记一条 out");
+        assert_eq!(sc.ins.load(Ordering::Relaxed), 0);
+        assert_eq!(rc.ins.load(Ordering::Relaxed), 1, "接收侧应记一条 in");
+
+        // 关闭追踪后不再回调。
+        sender.set_tracer(None);
+        sender.send_to(&req, dst).await.unwrap();
+        assert_eq!(sc.outs.load(Ordering::Relaxed), 1, "关闭后不应再增");
+    }
 }
