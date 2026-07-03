@@ -15,6 +15,8 @@ struct AppState {
     stop_tx: Mutex<Option<broadcast::Sender<()>>>,
     /// 当前压测的实时指标；None 表示空闲。
     metrics: Mutex<Option<Arc<Metrics>>>,
+    /// 最近一次启动使用的场景 TOML 与设备数（报告导出用）。
+    last_scenario: Mutex<Option<(String, usize)>>,
 }
 
 impl AppState {
@@ -22,6 +24,7 @@ impl AppState {
         AppState {
             stop_tx: Mutex::new(None),
             metrics: Mutex::new(None),
+            last_scenario: Mutex::new(None),
         }
     }
 }
@@ -68,6 +71,7 @@ async fn start_stress(
 
     let metrics = Arc::clone(&orch.metrics);
     *state.metrics.lock().await = Some(Arc::clone(&metrics));
+    *state.last_scenario.lock().await = Some((toml.clone(), count));
     drop(stop_guard);
 
     // 压测任务。
@@ -121,6 +125,37 @@ async fn get_metrics(state: tauri::State<'_, AppState>) -> Result<String, String
     }
 }
 
+/// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
+/// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
+#[tauri::command]
+async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let snap = match &*state.metrics.lock().await {
+        Some(m) => m.snapshot(),
+        None => return Err("无压测数据可导出".into()),
+    };
+    let scenario = state.last_scenario.lock().await.clone();
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let report = serde_json::json!({
+        "generated_at_epoch_secs": ts,
+        "scenario_toml": scenario.as_ref().map(|(t, _)| t),
+        "device_count": scenario.as_ref().map(|(_, c)| c),
+        "metrics": snap,
+    });
+
+    let dir = std::env::temp_dir().join("uvp-reports");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建报告目录失败: {e}"))?;
+    let path = dir.join(format!("report-{ts}.json"));
+    let content = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    std::fs::write(&path, content).map_err(|e| format!("写报告失败: {e}"))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
 // ── 数据传输对象 ──────────────────────────────────────────
 
 #[derive(serde::Serialize)]
@@ -144,6 +179,7 @@ pub fn run() {
             start_stress,
             stop_stress,
             get_metrics,
+            export_report,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

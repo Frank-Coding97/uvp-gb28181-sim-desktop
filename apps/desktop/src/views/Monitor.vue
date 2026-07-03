@@ -1,9 +1,22 @@
 <script setup lang="ts">
 // 运行监控大盘：订阅 metrics_tick 事件，用 ECharts 绘制实时曲线（FR-42）。
 import { ref, onMounted, onUnmounted, shallowRef } from "vue";
-import { NCard, NGrid, NGi, NStatistic, NSpace, NText } from "naive-ui";
+import { NCard, NGrid, NGi, NStatistic, NSpace, NText, NButton, useMessage } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import * as echarts from "echarts";
+
+const message = useMessage();
+
+// 导出报告(FR-28)。
+async function exportReport() {
+  try {
+    const path = await invoke<string>("export_report");
+    message.success(`报告已导出:${path}`);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
 
 // ── 数据模型（对应 MetricsSnapshot）──────────────────────
 interface MetricsSnapshot {
@@ -127,12 +140,15 @@ onUnmounted(() => {
       <div ref="chartEl" style="height: 320px;" />
     </n-card>
 
-    <!-- 失败归因 -->
+    <!-- 失败归因 + 报告导出 -->
     <n-card title="失败归因" v-if="latest">
-      <n-space>
-        <n-text>超时: {{ latest.fail_timeout }}</n-text>
-        <n-text>被拒: {{ latest.fail_rejected }}</n-text>
-        <n-text>其它: {{ latest.fail_other }}</n-text>
+      <n-space vertical>
+        <n-space>
+          <n-text>超时: {{ latest.fail_timeout }}</n-text>
+          <n-text>被拒: {{ latest.fail_rejected }}</n-text>
+          <n-text>其它: {{ latest.fail_other }}</n-text>
+        </n-space>
+        <n-button size="small" @click="exportReport">导出报告</n-button>
       </n-space>
     </n-card>
   </n-space>
