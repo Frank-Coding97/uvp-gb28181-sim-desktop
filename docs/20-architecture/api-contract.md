@@ -29,6 +29,17 @@
 | `save_scenario` | `{ name: string, yaml: string }` | `{ id: string }` | 保存场景 | M3 |
 | `list_scenarios` | — | `ScenarioMeta[]` | 场景列表 | M4 |
 
+### 单设备联调命令(桌面版核心)
+
+| 命令 | 入参 | 返回 | 说明 | 里程碑 |
+|---|---|---|---|---|
+| `start_device` | `{ config: DeviceCfg }` | `string` | 启动一台设备(注册+心跳+应答+入站),后台常驻 | M4 |
+| `stop_device` | — | `string` | 停止当前设备 | M4 |
+| `device_state` | — | `string`(状态枚举) | 查询当前设备状态 | M4 |
+| `fire_alarm` | `{ description: string }` | `string` | 主动上报一条报警 | M4 |
+
+`DeviceCfg` JSON 字段:`server_host`/`server_port`/`server_domain`/`device_id`/`password`/`transport`("UDP"/"TCP")/`gb_version`("2016"/"2022")/`channel_name`/`video_source`(可空,C 档文件路径)。
+
 命令失败统一返回错误对象 `{ code: string, message: string }`(code 对应 `common::Error` 变体)。
 
 ---
@@ -40,6 +51,7 @@
 | 事件名 | 负载 | 频率 | 说明 |
 |---|---|---|---|
 | `metrics_tick` | `MetricsSnapshot` | 1 Hz | 实时指标,喂 ECharts |
+| `device_state` | `string`(Disconnected/Registering/Registered/InCall/Failed) | 状态变更时 | 单设备联调状态灯 |
 | `run_state` | `{ run_id, state }` | 状态变更时 | 压测生命周期(启动中/运行/完成/失败) |
 | `sip_trace` | `SipTraceEntry` | 可开关 | 结构化 SIP 报文(大规模默认关) |
 | `engine_log` | `LogEntry` | 按需 | 引擎日志转发 |
