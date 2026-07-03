@@ -1,19 +1,19 @@
 <script setup lang="ts">
-// 主应用壳:品牌侧边栏导航 + 路由视图。
-// 关键:必须用 n-message-provider / n-dialog-provider / n-notification-provider 包裹,
-// 否则子页面 useMessage() 会抛错导致整页不渲染(务必保留)。
-import { computed, h } from "vue";
+// 主应用壳(frost-blue 磨砂风,对齐参考原型):
+// 顶栏右侧状态胶囊 + 磨砂侧边栏 + 内容区路由视图。
+// 必须保留 message/dialog/notification provider,否则子页 useMessage() 抛错致空白。
+import { computed, h, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
-  NLayout, NLayoutSider, NLayoutContent, NMenu, NIcon,
-  zhCN, dateZhCN,
+  NMenu, NIcon, zhCN, dateZhCN,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
 import {
   SpeedometerOutline, HardwareChipOutline, ServerOutline,
   LayersOutline, PulseOutline,
 } from "@vicons/ionicons5";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const route = useRoute();
 const router = useRouter();
@@ -35,13 +35,35 @@ function onMenuSelect(key: string) {
   router.push(key);
 }
 
-// 品牌主色主题(企业蓝)。
+// 全局设备状态(顶栏胶囊),订阅 device_state 事件。
+type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
+const deviceState = ref<DState>("Disconnected");
+const statusMeta = computed(() => {
+  switch (deviceState.value) {
+    case "Registering": return { text: "注册中", color: "var(--warning)" };
+    case "Registered":  return { text: "已注册", color: "var(--success)" };
+    case "InCall":      return { text: "推流中", color: "var(--accent)" };
+    case "Failed":      return { text: "注册失败", color: "var(--error)" };
+    default:            return { text: "未连接", color: "var(--text-tertiary)" };
+  }
+});
+let unlisten: UnlistenFn | null = null;
+onMounted(async () => {
+  unlisten = await listen<string>("device_state", (e) => {
+    deviceState.value = e.payload as DState;
+  });
+});
+onUnmounted(() => unlisten?.());
+
 const themeOverrides = {
   common: {
-    primaryColor: "#1890ff",
-    primaryColorHover: "#40a9ff",
-    primaryColorPressed: "#096dd9",
+    primaryColor: "#3884ff",
+    primaryColorHover: "#5a9bff",
+    primaryColorPressed: "#1e63dc",
+    borderRadius: "8px",
+    fontSize: "13px",
   },
+  Card: { color: "rgba(255,255,255,0.5)", borderRadius: "16px" },
 };
 </script>
 
@@ -54,38 +76,38 @@ const themeOverrides = {
     <n-message-provider>
       <n-dialog-provider>
         <n-notification-provider>
-          <n-layout has-sider style="height: 100vh">
-            <n-layout-sider
-              bordered
-              :width="216"
-              :native-scrollbar="false"
-              content-style="display:flex; flex-direction:column; height:100%;"
-            >
-              <!-- 品牌区 -->
+          <div class="shell">
+            <!-- 侧边栏 -->
+            <aside class="sidebar">
               <div class="brand">
                 <div class="brand-logo">GB</div>
-                <div class="brand-text">
+                <div>
                   <div class="brand-title">GB28181 Sim</div>
                   <div class="brand-sub">国标设备模拟 · 压测</div>
                 </div>
               </div>
-
               <n-menu
                 :value="activeKey"
                 :options="menuOptions"
-                :indent="20"
+                :indent="18"
                 @update:value="onMenuSelect"
               />
-
               <div class="sidebar-footer">v0.1.0 · UVP</div>
-            </n-layout-sider>
+            </aside>
 
-            <n-layout-content
-              content-style="padding: 24px 28px; overflow-y: auto; background:#f5f7fa;"
-            >
-              <router-view />
-            </n-layout-content>
-          </n-layout>
+            <!-- 主区 -->
+            <main class="main">
+              <header class="topbar">
+                <div class="status-pill">
+                  <span class="pill-dot" :style="{ background: statusMeta.color }" />
+                  <span class="pill-text">{{ statusMeta.text }}</span>
+                </div>
+              </header>
+              <section class="content">
+                <router-view />
+              </section>
+            </main>
+          </div>
         </n-notification-provider>
       </n-dialog-provider>
     </n-message-provider>
@@ -93,41 +115,42 @@ const themeOverrides = {
 </template>
 
 <style scoped>
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 18px 20px 16px;
+.shell { display: flex; height: 100vh; }
+.sidebar {
+  width: 216px; flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.45);
+  border-right: 1px solid var(--border-default);
+  backdrop-filter: var(--blur-light);
+  display: flex; flex-direction: column;
 }
+.brand { display: flex; align-items: center; gap: 12px; padding: 20px 20px 18px; }
 .brand-logo {
-  width: 36px;
-  height: 36px;
-  border-radius: 9px;
-  background: linear-gradient(135deg, #1890ff, #096dd9);
-  color: #fff;
-  font-weight: 700;
-  font-size: 15px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 2px 8px rgba(24, 144, 255, 0.35);
+  width: 38px; height: 38px; border-radius: 10px;
+  background: linear-gradient(135deg, #3884ff, #1e63dc);
+  color: #fff; font-weight: 700; font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 4px 12px var(--accent-glow);
 }
-.brand-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: #1f2937;
-  line-height: 1.2;
-}
-.brand-sub {
-  font-size: 11px;
-  color: #9ca3af;
-  margin-top: 2px;
-}
+.brand-title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
+.brand-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
 .sidebar-footer {
-  margin-top: auto;
-  padding: 14px 20px;
-  font-size: 11px;
-  color: #b0b7c3;
-  border-top: 1px solid #f0f0f0;
+  margin-top: auto; padding: 14px 20px; font-size: 11px;
+  color: var(--text-tertiary); border-top: 1px solid var(--border-default);
 }
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.topbar {
+  height: 48px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: flex-end;
+  padding: 0 24px;
+}
+.status-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 5px 14px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid var(--border-subtle);
+  backdrop-filter: var(--blur-light);
+  font-size: 12.5px; color: var(--text-secondary);
+}
+.pill-dot { width: 8px; height: 8px; border-radius: 50%; transition: background var(--transition); }
+.content { flex: 1; overflow-y: auto; padding: 4px 28px 28px; }
 </style>

@@ -1,0 +1,61 @@
+/* 设计令牌 —— 取自参考原型 prototype-frost-blue(浅蓝磨砂玻璃)。
+   全局引入,Vue 组件用 var(--xxx) 复用,保证与原型一致。 */
+:root {
+  --bg-base: #eaf2fb;
+  --bg-surface: rgba(255, 255, 255, 0.55);
+  --bg-card: rgba(255, 255, 255, 0.5);
+  --bg-elevated: rgba(255, 255, 255, 0.65);
+  --bg-hover: rgba(255, 255, 255, 0.78);
+  --border-subtle: rgba(255, 255, 255, 0.55);
+  --border-default: rgba(120, 160, 210, 0.2);
+  --border-accent: rgba(56, 132, 255, 0.4);
+  --text-primary: #0e2747;
+  --text-secondary: #4c6385;
+  --text-tertiary: #8fa1bd;
+  --accent: #3884ff;
+  --accent-deep: #1e63dc;
+  --accent-pale: #d9e7ff;
+  --accent-dim: rgba(56, 132, 255, 0.1);
+  --accent-glow: rgba(56, 132, 255, 0.3);
+  --cyan: #00b9d6;
+  --violet: #7a6cff;
+  --success: #08b388;
+  --warning: #e89320;
+  --error: #e5485c;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --shadow-card: 0 1px 1px rgba(255, 255, 255, 0.7) inset,
+    0 6px 20px rgba(16, 46, 98, 0.06), 0 1px 2px rgba(16, 46, 98, 0.04);
+  --shadow-elevated: 0 1px 1px rgba(255, 255, 255, 0.7) inset,
+    0 18px 40px rgba(16, 46, 98, 0.12);
+  --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  --blur-light: blur(18px) saturate(160%);
+}
+
+/* 浅蓝渐变主背景 */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(122, 108, 255, 0.1), transparent 60%),
+    radial-gradient(1000px 500px at -10% 10%, rgba(0, 185, 214, 0.08), transparent 55%),
+    var(--bg-base);
+  color: var(--text-primary);
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+}
+
+/* 磨砂玻璃卡片(供 Vue 组件用 class 复用) */
+.glass-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  backdrop-filter: var(--blur-light);
+  -webkit-backdrop-filter: var(--blur-light);
+}
