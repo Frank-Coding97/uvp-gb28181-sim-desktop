@@ -62,7 +62,7 @@
 | 功能 | 说明 | 优先级 | 状态 |
 |---|---|---|---|
 | SUBSCRIBE 应答 200 | 建立订阅 | — | ✅ |
-| 移动位置订阅 + 周期 NOTIFY(GPS) | MobilePosition | P0 | 🚧 开发中 |
+| 移动位置上报 NOTIFY(GPS) | MobilePosition | P0 | ✅ WVP 接受(code 200) |
 | 目录订阅 + 变更 NOTIFY | Catalog 订阅 | P1 | ⬜ |
 | 报警订阅 | Alarm 订阅 | P1 | ⬜ |
 

@@ -317,6 +317,42 @@ impl DeviceSimulator {
         Ok(resp.status)
     }
 
+    /// 主动上报一条移动位置(GPS,MobilePosition NOTIFY)。设备 → 平台。
+    /// 位置订阅场景下由周期任务调用;也可手动触发。返回平台响应状态码。
+    pub async fn report_position(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+        longitude: f64,
+        latitude: f64,
+    ) -> Result<u16> {
+        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
+            .parse()
+            .map_err(|_| Error::Config("平台地址非法".into()))?;
+        let sn = self.next_cseq();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let time = format!("1970-01-01T00:00:{:02}", now % 60);
+        let notify = gb28181_protocol::manscdp::MobilePositionNotify::new(
+            self.config.device_id.as_str(),
+            sn,
+            time,
+            longitude,
+            latitude,
+        );
+        let xml = notify.to_xml()?;
+        let cseq = self.next_cseq();
+        let req = builder::message_xml(&self.config, &self.ids, cseq, local_host, local_port, &xml);
+        let mut rx = transport.register(self.ids.call_id.clone());
+        let resp =
+            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
+                .await?;
+        Ok(resp.status)
+    }
+
     /// 处理一条入站请求:OPTIONS 简单回 200;MESSAGE 解析 XML 查询并应答。
     /// 返回是否已应答(true=已回,false=暂不处理)。
     pub async fn answer_inbound(

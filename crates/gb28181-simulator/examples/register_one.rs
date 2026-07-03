@@ -116,6 +116,26 @@ async fn main() {
         });
     }
 
+    // 可选:POSITION_AFTER_SECS 秒后上报一条 GPS 位置(联调位置订阅用)。
+    if let Some(secs) = std::env::var("POSITION_AFTER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        let sim2 = sim.clone();
+        let tp2 = transport.clone();
+        let host = local_ip.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            match sim2
+                .report_position(&tp2, &host, local_port, 116.397, 39.908)
+                .await
+            {
+                Ok(code) => tracing::info!(code, "位置上报完成"),
+                Err(e) => tracing::warn!(error=%e, "位置上报失败"),
+            }
+        });
+    }
+
     // Ctrl-C 触发优雅退出。
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
