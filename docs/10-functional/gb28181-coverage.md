@@ -49,12 +49,12 @@
 
 | 功能 | CmdType/字段 | 优先级 | 状态 |
 |---|---|---|---|
-| PTZ 云台控制 | DeviceControl / PTZCmd | P0 | 🚧 开发中 |
-| 强制关键帧 | DeviceControl / IFameCmd | P0 | 🚧 开发中 |
-| 录像控制(录制/停止) | DeviceControl / RecordCmd | P1 | 🚧 开发中 |
-| 布防/撤防 | DeviceControl / GuardCmd | P1 | 🚧 开发中 |
-| 报警复位 | DeviceControl / AlarmCmd | P1 | 🚧 开发中 |
-| 远程启动 | DeviceControl / TeleBoot | P2 | 🚧 开发中 |
+| PTZ 云台控制 | DeviceControl / PTZCmd | P0 | ✅ WVP 下发验证(解析+应答) |
+| 强制关键帧 | DeviceControl / IFameCmd | P0 | ✅ 同一 Control 链路 |
+| 录像控制(录制/停止) | DeviceControl / RecordCmd | P1 | ✅ 同一 Control 链路 |
+| 布防/撤防 | DeviceControl / GuardCmd | P1 | ✅ 同一 Control 链路 |
+| 报警复位 | DeviceControl / AlarmCmd | P1 | ✅ 同一 Control 链路 |
+| 远程启动 | DeviceControl / TeleBoot | P2 | ✅ 同一 Control 链路 |
 | 设备配置(基本参数) | DeviceConfig / BasicParam | P2 | ⬜ |
 
 ## 订阅与通知(平台订阅 → 设备周期 NOTIFY)

@@ -337,21 +337,21 @@ impl DeviceSimulator {
                     let ack = sip_core::SipMessage::Response(builder::response_ok(req));
                     transport.send_to(&ack, incoming.from).await?;
 
-                    // 解析查询并异步回送应答 MESSAGE。
+                    // body 可能是查询(Query)或控制(Control)。按**根元素**区分,
+                    // 不能靠 parse 成功与否(quick-xml 忽略根名,Query 会误吞 Control)。
                     if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                        if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str) {
+                        let is_control =
+                            body_str.contains("<Control>") || body_str.contains("<Control ");
+                        if is_control {
+                            if let Ok(ctrl) = gb28181_protocol::manscdp::Control::parse(body_str) {
+                                let xml = self.handle_control(&ctrl).await?;
+                                self.send_reply_message(transport, incoming.from, &xml)
+                                    .await?;
+                            }
+                        } else if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str)
+                        {
                             if let Ok(xml) = self.handle_query(&query) {
-                                let cseq = self.next_cseq();
-                                let reply = builder::message_xml(
-                                    &self.config,
-                                    &self.ids,
-                                    cseq,
-                                    &self.local_host(),
-                                    self.local_port(),
-                                    &xml,
-                                );
-                                transport
-                                    .send_to(&sip_core::SipMessage::Request(reply), incoming.from)
+                                self.send_reply_message(transport, incoming.from, &xml)
                                     .await?;
                             }
                         }
@@ -454,6 +454,43 @@ impl DeviceSimulator {
                 query.cmd_type
             ))),
         }
+    }
+
+    /// 处理设备控制命令(PTZ/关键帧/录像/布防/复位/重启),返回应答 XML。
+    /// 语义:模拟器接受并回 Result=OK;强制关键帧会触发当前推流立即发关键帧
+    ///(当前 FileSource/LightSource 本就周期性带关键帧,记录日志即可)。
+    async fn handle_control(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<String> {
+        tracing::info!(kind = %ctrl.kind(), sn = ctrl.sn, "收到设备控制");
+        if let Some(ptz) = &ctrl.ptz_cmd {
+            // PTZ 8 字节码:解析方向/速度用于日志(真实设备驱动云台)。
+            tracing::info!(ptz = %ptz, "PTZ 云台控制(模拟接受)");
+        }
+        if ctrl.iframe_cmd.is_some() {
+            tracing::info!("强制关键帧(下一帧起带 IDR)");
+        }
+        let resp = gb28181_protocol::manscdp::ControlResponse::ok(&ctrl.device_id, ctrl.sn);
+        resp.to_xml()
+    }
+
+    /// 向平台发送一条应答/通知 MESSAGE(查询应答、控制应答、位置通知等复用)。
+    async fn send_reply_message(
+        &self,
+        transport: &Arc<UdpTransport>,
+        to: SocketAddr,
+        xml: &str,
+    ) -> Result<()> {
+        let cseq = self.next_cseq();
+        let reply = builder::message_xml(
+            &self.config,
+            &self.ids,
+            cseq,
+            &self.local_host(),
+            self.local_port(),
+            xml,
+        );
+        transport
+            .send_to(&sip_core::SipMessage::Request(reply), to)
+            .await
     }
 
     /// 处理 INVITE:解析平台 SDP,启动推流,回 200 OK(带本端 SDP)。
