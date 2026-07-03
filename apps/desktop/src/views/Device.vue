@@ -75,7 +75,27 @@ async function firePosition() {
   catch (e) { message.error(String(e)); }
 }
 
+// SIP 信令追踪(FR-43):订阅 sip_trace 事件,滚动展示最近 N 条。
+interface TraceEntry {
+  ts_ms: number; direction: "in" | "out"; method: string;
+  status?: number; cseq?: string; call_id?: string; peer: string; summary: string;
+}
+const traces = ref<TraceEntry[]>([]);
+const traceOn = ref(true);
+const MAX_TRACE = 200;
+function fmtTs(ms: number) {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")}`;
+}
+async function toggleTrace() {
+  try {
+    await invoke<string>("set_sip_trace", { enabled: traceOn.value });
+  } catch (e) { message.error(String(e)); }
+}
+function clearTraces() { traces.value = []; }
+
 let unlisten: UnlistenFn | null = null;
+let unlistenTrace: UnlistenFn | null = null;
 onMounted(async () => {
   unlisten = await listen<string>("device_state", (e) => {
     const s = e.payload as DState;
@@ -83,9 +103,14 @@ onMounted(async () => {
     if (s === "Registered" && !startedAt.value) startedAt.value = Date.now();
     if (s === "Disconnected" || s === "Failed") startedAt.value = null;
   });
+  unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
+    if (!traceOn.value) return;
+    traces.value.push(e.payload);
+    if (traces.value.length > MAX_TRACE) traces.value.splice(0, traces.value.length - MAX_TRACE);
+  });
   timer = window.setInterval(fmtUptime, 1000);
 });
-onUnmounted(() => { unlisten?.(); if (timer) clearInterval(timer); });
+onUnmounted(() => { unlisten?.(); unlistenTrace?.(); if (timer) clearInterval(timer); });
 
 const metrics = computed(() => [
   { label: "注册状态", value: stateMeta.value.text, color: stateMeta.value.color, dot: true },
@@ -178,6 +203,28 @@ const metrics = computed(() => [
         </n-space>
       </div>
     </div>
+
+    <!-- SIP 信令实时追踪(FR-43) -->
+    <div class="glass-card panel trace-panel">
+      <div class="trace-head">
+        <div class="panel-title" style="margin: 0">SIP 信令追踪</div>
+        <div class="trace-ctl">
+          <label class="trace-toggle">
+            <input type="checkbox" v-model="traceOn" @change="toggleTrace" /> 追踪
+          </label>
+          <button class="trace-clear" @click="clearTraces">清空</button>
+        </div>
+      </div>
+      <div class="trace-log">
+        <div v-if="!traces.length" class="trace-empty">注册上线后,收发的 SIP 报文将实时显示在这里</div>
+        <div v-for="(t, i) in traces" :key="i" class="trace-row" :class="t.direction">
+          <span class="trace-ts">{{ fmtTs(t.ts_ms) }}</span>
+          <span class="trace-dir" :class="t.direction">{{ t.direction === "in" ? "◀ 收" : "▶ 发" }}</span>
+          <span class="trace-sum">{{ t.summary }}</span>
+          <span class="trace-cseq" v-if="t.cseq">{{ t.cseq }}</span>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -223,4 +270,30 @@ const metrics = computed(() => [
   font-size: 13px; color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
 }
 .seg button.on { background: var(--accent); color: #fff; box-shadow: 0 2px 6px var(--accent-glow); }
+
+/* SIP 信令追踪面板 */
+.trace-panel { margin-top: 18px; }
+.trace-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.trace-ctl { display: inline-flex; align-items: center; gap: 14px; }
+.trace-toggle { font-size: 13px; color: var(--text-secondary); cursor: pointer; user-select: none; }
+.trace-clear {
+  border: 1px solid var(--border-default); background: rgba(255,255,255,0.5);
+  border-radius: 6px; padding: 3px 12px; font-size: 12px; color: var(--text-secondary); cursor: pointer;
+}
+.trace-log {
+  height: 240px; overflow-y: auto; border-radius: var(--radius-sm);
+  background: rgba(15, 23, 42, 0.03); border: 1px solid var(--border-default);
+  padding: 8px 10px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+}
+.trace-empty { color: var(--text-secondary); padding: 12px; text-align: center; }
+.trace-row {
+  display: flex; align-items: baseline; gap: 8px; padding: 2px 4px;
+  border-bottom: 1px solid rgba(15,23,42,0.04); white-space: nowrap;
+}
+.trace-ts { color: var(--text-secondary); flex: 0 0 auto; }
+.trace-dir { flex: 0 0 auto; font-weight: 600; }
+.trace-dir.in { color: #0891b2; }
+.trace-dir.out { color: #7c3aed; }
+.trace-sum { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; color: var(--text-primary); }
+.trace-cseq { flex: 0 0 auto; color: var(--text-secondary); }
 </style>
