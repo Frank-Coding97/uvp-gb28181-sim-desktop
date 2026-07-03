@@ -27,7 +27,7 @@
 | 设备信息(DeviceInfo) | FR-6 | ✅ |
 | 设备状态(DeviceStatus) | FR-6 | ✅ |
 | 录像列表(RecordInfo) | FR-10 | ✅ WVP 显示录像段 |
-| GB-2016 / GB-2022 版本切换 | FR-11 | 🚧 仅 GB-2022 |
+| GB-2016 / GB-2022 版本切换 | FR-11 | ✅ 两版 WVP 验证(2022 输出 SecurityLevelCode/IPAddress/Port,2016 省略) |
 
 ## 实时音视频 / 回放
 
