@@ -89,6 +89,8 @@ pub struct DeviceSimulator {
     session: tokio::sync::Mutex<Option<PushSession>>,
     /// 事件观察者(上报注册/心跳/推流事件给压测指标)。默认 Noop。
     observer: Arc<dyn common::DeviceObserver>,
+    /// 本端对外信令地址 (host, port),run() 启动时设置;应答 MESSAGE 填 Via/From 用。
+    local_addr: std::sync::OnceLock<(String, u16)>,
 }
 
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
@@ -108,6 +110,7 @@ impl DeviceSimulator {
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
             observer: Arc::new(common::NoopObserver),
+            local_addr: std::sync::OnceLock::new(),
         }
     }
 
@@ -119,7 +122,21 @@ impl DeviceSimulator {
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
             observer,
+            local_addr: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 本端信令 host(run 启动后有效,未设时回退 0.0.0.0)。
+    fn local_host(&self) -> String {
+        self.local_addr
+            .get()
+            .map(|(h, _)| h.clone())
+            .unwrap_or_else(|| "0.0.0.0".into())
+    }
+
+    /// 本端信令端口(run 启动后有效,未设时回退 0)。
+    fn local_port(&self) -> u16 {
+        self.local_addr.get().map(|(_, p)| *p).unwrap_or(0)
     }
 
     /// 只读访问配置。
@@ -278,25 +295,30 @@ impl DeviceSimulator {
                     Ok(true)
                 }
                 sip_core::Method::Message => {
-                    // 解析查询(Catalog / DeviceInfo / DeviceStatus),生成应答 XML。
+                    // GB28181 规范:先对查询 MESSAGE 回空 200 OK(事务应答),
+                    // 再由设备发一条独立的 MESSAGE 把应答 XML 送回平台(新事务)。
+                    let ack = sip_core::SipMessage::Response(builder::response_ok(req));
+                    transport.send_to(&ack, incoming.from).await?;
+
+                    // 解析查询并异步回送应答 MESSAGE。
                     if let Ok(body_str) = std::str::from_utf8(&req.body) {
                         if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str) {
-                            let xml = self.handle_query(&query)?;
-                            // 回 MESSAGE(应答 XML)。
-                            let resp_body = xml.as_bytes().to_vec();
-                            let mut resp_msg = builder::response_ok(req);
-                            resp_msg
-                                .headers
-                                .set("Content-Type", "Application/MANSCDP+xml");
-                            resp_msg.body = resp_body;
-                            let resp = sip_core::SipMessage::Response(resp_msg);
-                            transport.send_to(&resp, incoming.from).await?;
-                            return Ok(true);
+                            if let Ok(xml) = self.handle_query(&query) {
+                                let cseq = self.next_cseq();
+                                let reply = builder::message_xml(
+                                    &self.config,
+                                    &self.ids,
+                                    cseq,
+                                    &self.local_host(),
+                                    self.local_port(),
+                                    &xml,
+                                );
+                                transport
+                                    .send_to(&sip_core::SipMessage::Request(reply), incoming.from)
+                                    .await?;
+                            }
                         }
                     }
-                    // 无法解析或非 Query,仍回 200(平台不会重发)。
-                    let resp = sip_core::SipMessage::Response(builder::response_ok(req));
-                    transport.send_to(&resp, incoming.from).await?;
                     Ok(true)
                 }
                 sip_core::Method::Invite => {
@@ -488,6 +510,9 @@ impl DeviceSimulator {
     ) {
         use std::time::Duration;
         tokio::pin!(shutdown);
+
+        // 记录本端信令地址(应答 MESSAGE / NOTIFY 构造 Via/From/Contact 用)。
+        let _ = self.local_addr.set((local_host.clone(), local_port));
 
         // 入站请求应答任务(OPTIONS)。
         let mut inbound = transport.register_inbound(self.config.device_id.as_str().to_string());
