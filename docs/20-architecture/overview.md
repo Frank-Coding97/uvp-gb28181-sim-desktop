@@ -25,11 +25,11 @@
 │  桌面 UI      Tauri 2 + Vue 3 + Naive UI       │
 │  配置向导 / 场景编排 / 实时监控 / 日志 / 报表   │
 └───────────────────────┬──────────────────────┘
-                        │ 本地 HTTP + WebSocket（JSON）
+                        │ Tauri IPC 命令 + 事件流（JSON）
                         ▼
 ┌──────────────────────────────────────────────┐
 │  App Core（stress-engine 对外服务层）           │
-│  任务管理 / 配置 / 状态 / SQLite / 日志 / 指标  │
+│  任务管理 / 配置 / 状态 / 报告导出 / 日志 / 指标 │
 └───────────────────────┬──────────────────────┘
                         ▼
 ┌──────────────────────────────────────────────┐
@@ -57,7 +57,7 @@ gb28181-protocol← common
 media-rtp       ← common
 gb28181-simulator ← common, sip-core, gb28181-protocol, media-rtp
 scenario        ← common, gb28181-simulator
-stress-engine   ← common, scenario, gb28181-simulator（+ 服务层 axum/ws）
+stress-engine   ← common, scenario, gb28181-simulator, sip-core
 apps/desktop/src-tauri ← stress-engine（或通过子进程 HTTP 调用）
 ```
 
@@ -66,10 +66,10 @@ apps/desktop/src-tauri ← stress-engine（或通过子进程 HTTP 调用）
 | `common` | 跨模块公共设施 | `Error`, `Result`, `DeviceId`, `Transport`, 日志初始化 |
 | `sip-core` | 与 GB 无关的 SIP 协议栈 | `SipMessage`, `Request`, `Response`, `Transaction`, `SipTransport`(UDP/TCP), Digest 认证 |
 | `gb28181-protocol` | MANSCDP XML + 编码规则 | `Catalog`, `DeviceInfo`, `Alarm`, `RecordInfo`, `IdCodec` |
-| `media-rtp` | RTP 打包与推流 | `RtpSender`, `PsMuxer`, `H264Source`, `RtpMode` |
+| `media-rtp` | RTP 打包与推流 | `RtpSender`, `PsMuxer`, `FileSource`/`NoneSource`/`LightSource`, `RtpMode` |
 | `gb28181-simulator` | 单设备完整状态机 | `DeviceSimulator`, `ChannelSimulator`, `PlatformSession` |
-| `scenario` | 压测场景模型 | `Scenario`, `DevicePlan`, `RegisterPlan`, `MediaPlan` |
-| `stress-engine` | 调度 + 指标 + 服务 | `Scheduler`, `Metrics`, `EngineServer`(HTTP/WS) |
+| `scenario` | 压测场景模型 | trait `Scenario`, `LinearScenario`, `MediaProfile{A,B,C}` |
+| `stress-engine` | 调度 + 指标 + 服务 | `Orchestrator`, `Metrics` |
 
 ---
 
@@ -89,11 +89,11 @@ apps/desktop/src-tauri ← stress-engine（或通过子进程 HTTP 调用）
 
 ## 5. 关键数据流
 
-**压测启动**：UI 提交 `Scenario`(JSON) → engine 校验 → `Scheduler` 按 `rate_per_second` 分批创建 `DeviceSimulator` → 每设备独立 Tokio task 跑注册/心跳 → 指标聚合 → WS 推送实时统计给 UI。
+**压测启动**：UI 提交场景 TOML（`from_toml_str`）→ engine 校验 → `Orchestrator` 按 `ramp_per_second` 分批创建 `DeviceSimulator` → 每设备独立 Tokio task 跑注册/心跳 → 指标聚合 → `metrics_tick` 事件推送实时统计给 UI。
 
-**实时监控**：engine 每秒聚合 `Metrics`（注册成功数、心跳成功率、INVITE 成功率、活跃推流路数、带宽）→ WebSocket 帧 → UI ECharts 曲线。
+**实时监控**：engine 每秒聚合 `Metrics`（注册成功数、心跳成功率、INVITE 成功率、活跃推流路数、带宽）→ `metrics_tick` 事件 → UI ECharts 曲线。
 
-**SIP 信令查看**：可选开启抓包模式，engine 把结构化 SIP 报文经 WS 推给 UI（压测大规模时默认关闭，避免刷屏）。
+**SIP 信令查看**：可选开启抓包模式，engine 把结构化 SIP 报文经 `sip_trace` 事件推给 UI（压测大规模时默认关闭，避免刷屏）。
 
 ---
 

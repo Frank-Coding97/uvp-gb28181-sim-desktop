@@ -20,25 +20,28 @@
 | 命令 | 入参 | 返回 | 说明 | 里程碑 |
 |---|---|---|---|---|
 | `engine_version` | — | `string` | 引擎版本自检 | M0 ✅ |
-| `validate_scenario` | `{ yaml: string }` | `ScenarioSummary` | 校验并预览场景 | M3 |
-| `start_stress` | `{ toml, count, positionInterval, alarmInterval }` | `string` | 启动压测;position/alarmInterval>0 时批量周期主动上报定位/报警(0=关) | M3/M4 |
-| `stop_stress` | `{ run_id: string }` | `{ ok: bool }` | 停止压测 | M3 |
-| `get_run_status` | `{ run_id: string }` | `RunStatus` | 查询某次运行状态 | M3 |
-| `get_stress_status` | — | `{ running: bool, device_count: number }` | 查压测运行态(页面切换后与引擎对账,防组件重建丢状态) | M4 |
-| `list_runs` | — | `RunSummary[]` | 历史运行列表 | M4 |
-| `export_report` | `{ run_id: string, format: string }` | `{ path: string }` | 导出报告 | M4 |
-| `save_scenario` | `{ name: string, yaml: string }` | `{ id: string }` | 保存场景 | M3 |
-| `list_scenarios` | — | `ScenarioMeta[]` | 场景列表 | M4 |
+| `validate_scenario` | `{ toml: string }` | `ScenarioSummary` | 校验并预览场景 | ✅ |
+| `start_stress` | `{ toml, count, position_interval, alarm_interval }` | `string` | 启动压测;position/alarm_interval>0 时批量周期主动上报定位/报警(0=关) | ✅ |
+| `stop_stress` | — | `string` | 停止当前压测(无入参,返回提示文案) | ✅ |
+| `get_metrics` | — | `string`(JSON) | 按需查询当前 `MetricsSnapshot`(实时更新走 `metrics_tick` 事件) | ✅ |
+| `get_stress_status` | — | `{ running: bool, device_count: number }` | 查压测运行态(页面切换后与引擎对账,防组件重建丢状态) | ✅ |
+| `export_report` | — | `string`(文件路径) | 导出报告:把场景 TOML + 设备数 + 最终快照写成 JSON 到系统临时目录,返回路径 | ✅ |
+| `get_run_status`(规划,未实现) | `{ run_id: string }` | `RunStatus` | 查询某次运行状态 | ⬜ |
+| `list_runs`(规划,未实现) | — | `RunSummary[]` | 历史运行列表 | ⬜ |
+| `save_scenario`(规划,未实现) | `{ name: string, toml: string }` | `{ id: string }` | 保存场景 | ⬜ |
+| `list_scenarios`(规划,未实现) | — | `ScenarioMeta[]` | 场景列表 | ⬜ |
 
 ### 单设备联调命令(桌面版核心)
 
 | 命令 | 入参 | 返回 | 说明 | 里程碑 |
 |---|---|---|---|---|
-| `start_device` | `{ config: DeviceCfg }` | `string` | 启动一台设备(注册+心跳+应答+入站),后台常驻 | M4 |
-| `stop_device` | — | `string` | 停止当前设备 | M4 |
-| `get_device_status` | — | `{ running: bool }` | 查设备运行态(页面切换后与引擎对账) | M4 |
-| `device_state` | — | `string`(状态枚举) | 查询当前设备状态 | M4 |
-| `fire_alarm` | `{ description: string }` | `string` | 主动上报一条报警 | M4 |
+| `start_device` | `{ config: DeviceCfg }` | `string` | 启动一台设备(注册+心跳+应答+入站),后台常驻 | ✅ |
+| `stop_device` | — | `string` | 停止当前设备 | ✅ |
+| `get_device_status` | — | `{ running: bool }` | 查设备运行态(页面切换后与引擎对账) | ✅ |
+| `fire_alarm` | `{ description: string }` | `string` | 主动上报一条报警 | ✅ |
+| `fire_position` | `{ longitude: number, latitude: number }` | `string` | 主动上报一条 GPS 位置 | ✅ |
+
+> 当前设备状态**只经 `device_state` 事件**推送(见 §3),没有同名查询命令。
 
 `DeviceCfg` JSON 字段:`server_host`/`server_port`/`server_domain`/`device_id`/`password`/`transport`("UDP"/"TCP")/`gb_version`("2016"/"2022")/`channel_name`/`video_source`(可空,C 档文件路径)。
 
@@ -52,11 +55,13 @@
 
 | 事件名 | 负载 | 频率 | 说明 |
 |---|---|---|---|
-| `metrics_tick` | `MetricsSnapshot` | 1 Hz | 实时指标,喂 ECharts |
+| `metrics_tick` | `MetricsSnapshot`(JSON 字符串) | 1 Hz | 实时指标,喂 ECharts |
 | `device_state` | `string`(Disconnected/Registering/Registered/InCall/Failed) | 状态变更时 | 单设备联调状态灯 |
-| `run_state` | `{ run_id, state }` | 状态变更时 | 压测生命周期(启动中/运行/完成/失败) |
 | `sip_trace` | `SipTraceEntry` | 可开关 | 结构化 SIP 报文(大规模默认关) |
-| `engine_log` | `LogEntry` | 按需 | 引擎日志转发 |
+| `ptz_action` | `{ up, down, left, right, zoom_in, zoom_out, pan_speed, tilt_speed, zoom_speed }` | PTZ 控制到达时 | 前端云台动画 |
+| `ptz_preset` | 预置位号(number) | 预置位调用时 | 前端预置位调用演示 |
+| `run_state`(规划,未实现) | `{ run_id, state }` | — | 压测生命周期(当前未发出) |
+| `engine_log`(规划,未实现) | `LogEntry` | — | 引擎日志转发(当前未发出) |
 
 ---
 
@@ -83,11 +88,10 @@ interface MetricsSnapshot {
 }
 
 interface ScenarioSummary {
-  name: string;
-  device_count: number;
-  ramp_per_second: number;
-  media_mode: "none" | "light" | "real";
-  estimated_duration_secs: number;
+  name: string;          // 取自场景 device_info.device_name
+  device_count: number;  // 由前端传 count 决定,校验时返回 0
+  server_host: string;
+  server_port: number;
 }
 
 interface RunStatus {

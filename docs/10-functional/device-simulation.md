@@ -1,6 +1,6 @@
 # 功能规格:设备模拟
 
-**状态:草案** · 覆盖 FR-1~FR-11 · 实现见 `30-crates/gb28181-simulator.md`、`sip-core.md`、`gb28181-protocol.md`。
+**状态:已实现(核心真机验证)** · 覆盖 FR-1~FR-11 及后续设备控制/订阅/校时/媒体扩展 · 实现见 `30-crates/gb28181-simulator.md`、`sip-core.md`、`gb28181-protocol.md`。
 
 ---
 
@@ -52,7 +52,7 @@
 - DeviceStatus 查询 → 回在线/时间/工作状态等。
 
 ### 3.7 实时点播(FR-7、FR-8)
-- 收到 INVITE(带 SDP,含平台接收 IP/端口/SSRC) → 回 200 OK(带本端 SDP) → 收到 ACK 后开始推流。
+- 收到 INVITE(带 SDP,含平台接收 IP/端口/SSRC) → 回 200 OK(带本端 SDP) → **发完 200 即启动推流**(TCP 模式短暂延时等平台建监听);ACK 到达仅记录、不作为推流触发。BYE/CANCEL 停流。
 - 推流:读视频源 → PS 封装 → RTP 打包 → 按 SDP 目标发送。
 - 收到 BYE → 停流,回 200 OK。
 - 媒体细节见 `40-protocol/media-ps-rtp.md`。
@@ -60,9 +60,29 @@
 ### 3.8 版本切换(FR-11)
 - GB-2016 / GB-2022 影响 XML 字段集与部分命令,配置项切换。
 
+### 3.9 设备控制(平台 → 设备,DeviceControl)
+- PTZ 云台方向/变倍控制(8 字节码,位映射见 `40-protocol/manscdp.md`)。
+- 预置位设置/调用/删除(有状态,PresetQuery 反映);看守位 HomePosition;拉框 DragZoom。
+- 强制关键帧、录像控制、布防/撤防、报警复位、远程启动。
+
+### 3.10 查询扩展
+- 设备配置查询 ConfigDownload(BasicParam:名称/有效期/心跳)、预置位查询 PresetQuery。
+
+### 3.11 订阅与通知
+- 平台 SUBSCRIBE:Catalog / Alarm → 设备在订阅对话内回 SIP NOTIFY;MobilePosition → 按 Interval 周期上报位置。
+- 设备主动上报:报警(report_alarm)、GPS 位置(report_position)。
+
+### 3.12 网络校时
+- 解析平台 REGISTER 200 OK 的 `Date` 头,记录时钟偏移,后续 MANSCDP 时间戳(心跳/报警/位置)对齐平台时间(见 `common::clock`)。
+
+### 3.13 回放控制与媒体扩展
+- 会话内 SIP INFO(MANSRTSP):PLAY/PAUSE + Scale 倍速、暂停/恢复。
+- 录像下载:INVITE `s=Download` + `downloadspeed` → 按倍速推流。
+- 音视频复合流:视频源含音频轨时 PS 复用 G.711A 音频;支持 MP4/FLV/MKV/MOV 容器(ffmpeg 转封装,见 `40-protocol/media-ps-rtp.md`)。
+
 ## 4. 单设备配置项
 
-见 `30-crates/gb28181-simulator.md` 的 `DeviceConfig`:device_id、username、password、server_host/port/domain、transport、heartbeat_interval,以及视频源配置(媒体档、码流文件、码率)。
+见 `30-crates/gb28181-simulator.md` 的 `DeviceConfig`:device_id、username、password、server_host/port/domain、transport、heartbeat_interval_secs、channels(通道列表)、device_info、video_source、video_fps、light_bitrate_kbps(B 档伪流码率)、gb_version。
 
 ## 5. 验收
 

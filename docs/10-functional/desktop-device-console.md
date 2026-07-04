@@ -13,19 +13,22 @@
 | 区域 | 内容 |
 |---|---|
 | 平台配置 | server_host、SIP 端口、SIP 域(domain)、传输(UDP/TCP)、GB 版本(2016/2022) |
-| 设备配置 | device_id、密码、通道名、视频源文件(可空,填则点播可真出画面) |
-| 操作 | 「注册」「注销」按钮;「上报报警」「上报 GPS」按钮(注册后可用) |
-| 状态灯 | 实时显示:未连接/注册中/已注册/推流中/失败(订阅 `device_state` 事件) |
+| 设备配置 | device_id、密码(眼睛图标可切换明文/掩码)、通道名、视频源文件(可空,填则点播出画面;支持 H.264/H.265 裸流及 MP4/FLV/MKV/MOV 容器,容器需系统 ffmpeg) |
+| 操作 | 「注册」「注销」按钮(注销与设备实例存在与否挂钩,注册失败/重试中也可点停止);「上报报警」「上报 GPS」按钮(注册后可用) |
+| 状态灯 | 实时显示:未连接/注册中/已注册/推流中/失败(订阅 `device_state` 事件,由常驻 App 统一维护,切页不丢) |
+| 云台可视化 | 平台下发 PTZ 时,拟态摇杆随方向/变倍推移、预置位调用平滑巡航到目标位;显示当前朝向/速度/状态(订阅 `ptz_action`/`ptz_preset` 事件) |
 | SIP 信令追踪(FR-43) | 实时滚动收发报文(方向/首行摘要/CSeq,默认开,可开关/清空;订阅 `sip_trace` 事件,`set_sip_trace` 开关) |
-| 提示 | 注册成功/失败、报警上报结果的 toast |
+| 提示 | 注册成功/失败、报警/位置上报结果的 toast |
 
 ## 3. 交互流程(对应 IPC,见 `20-architecture/api-contract.md`)
 
 1. 填表 → 点「注册」→ 前端调 `start_device({config})`。
 2. 后端构造 `DeviceConfig`,启动设备 run 循环(注册+心跳+入站应答),后台常驻。
 3. 后端在设备状态变化时 emit `device_state` 事件 → 前端状态灯实时更新。
-4. 「上报报警」→ `fire_alarm({description})` → 设备发 Alarm Notify。
-5. 「注销」→ `stop_device()` → 停止 run 循环。
+4. 「上报报警」→ `fire_alarm({description})` → 设备发 Alarm Notify;「上报 GPS」→ `fire_position({longitude, latitude})` → 发 MobilePosition。
+5. 平台下发 PTZ/预置位 → 后端 emit `ptz_action`/`ptz_preset` → 前端云台摇杆动画。
+6. 信令追踪开关 → `set_sip_trace({enabled})`;开启时后端 emit `sip_trace` 事件流。
+7. 「注销」→ `stop_device()` → 停止 run 循环。
 
 ## 4. 与压测页的关系
 

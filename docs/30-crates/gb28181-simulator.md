@@ -16,11 +16,21 @@ pub struct DeviceSimulator { /* 状态机 */ }
 
 impl DeviceSimulator {
     pub fn new(config: DeviceConfig) -> Self;
-    pub async fn run(&self, transport: SharedTransport) -> Result<()>; // 注册→心跳→应答
+    pub fn with_observer(config: DeviceConfig, observer: Arc<dyn DeviceObserver>) -> Self;
+    // 注册 → 启动入站应答(OPTIONS/查询/控制/订阅)→ 周期心跳,直到 shutdown 完成。
+    pub async fn run(
+        self: Arc<Self>,
+        transport: Arc<UdpTransport>,
+        local_host: String,
+        local_port: u16,
+        shutdown: impl Future<Output = ()>,
+    );
+    pub async fn register(&self, transport, local_host, local_port) -> Result<DeviceState>;
     pub fn state(&self) -> DeviceState;         // Disconnected/Registering/Registered/InCall/Failed
-    pub async fn shutdown(&self);
 }
 ```
+
+除注册/心跳外,已实现:Catalog/DeviceInfo/DeviceStatus/RecordInfo/ConfigDownload/PresetQuery 查询应答、预置位 CRUD(设置/调用/删除,有状态)、PTZ 及设备控制、目录/报警/移动位置订阅 + 周期 NOTIFY、网络校时、回放 INFO 倍速/暂停/恢复、录像下载。`report_alarm`/`report_position` 支持主动上报(有订阅走对话内 NOTIFY,否则独立 MESSAGE)。
 
 ## 数据类型
 
@@ -41,6 +51,7 @@ common、sip-core、gb28181-protocol、media-rtp、tokio、tracing。
 ## 里程碑
 - M1:注册 + 心跳 + OPTIONS(单设备 WVP 上线)。
 - M2:目录/设备信息应答 + INVITE 推流。
+- M3+:订阅通知(目录/报警/移动位置周期 NOTIFY)、预置位 CRUD + PTZ/看守位/拉框控制、回放 INFO 倍速控制、录像下载、网络校时。
 
 ## 测试
 状态机转移单测(mock 传输,注入 401/200/超时);心跳超时→重注册退避时序;点播 INVITE→ACK→推流→BYE 流程。

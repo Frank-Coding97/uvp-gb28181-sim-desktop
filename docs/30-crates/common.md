@@ -12,7 +12,10 @@
 
 ```rust
 pub use error::{Error, Result};
-pub use types::{DeviceId, Transport};
+pub use types::{DeviceId, GbVersion, Transport};
+pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver};
+pub mod clock;     // 民用历法换算 + 网络校时
+pub mod observer;  // 设备事件观察者
 pub mod logging;   // logging::init()
 ```
 

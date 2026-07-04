@@ -55,6 +55,7 @@
 | PTZ 云台控制 | DeviceControl / PTZCmd | P0 | ✅ WVP 下发验证(解析+应答) |
 | 预置位设置/调用/删除 | DeviceControl / PTZCmd 指令码 81/82/83 | P1 | ✅ 解析 8 字节码预置位操作,有状态增删,实 SIP 注入验证(设置/删除后 PresetQuery 反映) |
 | 看守位设置 | DeviceControl / HomePosition | P1 | 🟢 解析 Enabled/ResetTime/PresetIndex + 应答 |
+| 拉框放大/缩小 | DeviceControl / DragZoomIn / DragZoomOut(`Control::kind()`=拉框放大/缩小) | P1 | 🟢 解析 DragZoom 参数 + 应答 |
 | 强制关键帧 | DeviceControl / IFameCmd | P0 | ✅ 命令解析+应答;文件回放源自带周期 IDR,无法"强制"再生成一帧(硬标关键帧会产出坏流),故仅应答,符合回放模拟器语义 |
 | 录像控制(录制/停止) | DeviceControl / RecordCmd | P1 | ✅ 同一 Control 链路 |
 | 布防/撤防 | DeviceControl / GuardCmd | P1 | ✅ 同一 Control 链路 |

@@ -1,8 +1,8 @@
 # crate: sip-core
 
-**状态:开发中(M1)** · worktree `feat/protocol` · 与 GB28181 无关的通用 SIP 协议栈。
+**状态:核心完成** · 与 GB28181 无关的通用 SIP 协议栈。
 
-> 进度:`message` ✅ · `auth`(Digest MD5)✅ · `transport`(UDP 共享 socket + Call-ID 路由)✅ · `transaction`(客户端事务 + T1 退避重传)✅。M1 四层就绪,INVITE 事务待 M2。
+> 进度:`message` ✅ · `auth`(Digest MD5)✅ · `transport`(UDP 共享 socket + Call-ID 路由)✅ · `transaction`(客户端事务 + T1 退避重传)✅ · INVITE/ACK/BYE 会话事务已实现并验证 ✅ · `sdp` 模块 ✅。
 
 ## 职责
 
@@ -15,10 +15,11 @@ pub mod message;      // SIP 消息解析/构造
 pub mod transaction;  // 事务状态机 + 重传
 pub mod transport;    // UDP/TCP 传输
 pub mod auth;         // Digest MD5
+pub mod sdp;          // SDP 协商(点播/回放)
 ```
 
 ### message
-- `SipMessage`(Request/Response)、`Method`(REGISTER/INVITE/ACK/BYE/MESSAGE/OPTIONS)。
+- `SipMessage`(Request/Response)、`Method`(REGISTER/INVITE/ACK/BYE/MESSAGE/OPTIONS/CANCEL/SUBSCRIBE/NOTIFY/INFO)。
 - 头字段:`Via`/`From`/`To`/`CSeq`/`Call-ID`/`Contact`/`Expires`/`WWW-Authenticate`/`Authorization`。
 - `parse(&[u8]) -> Result<SipMessage>` 与 `to_bytes(&self) -> Vec<u8>`。
 
