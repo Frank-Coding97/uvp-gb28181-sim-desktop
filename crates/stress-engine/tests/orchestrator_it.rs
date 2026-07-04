@@ -96,7 +96,7 @@ async fn 编排器批量注册_平台收到全部() {
     // 启动编排器,运行片刻后停止。
     let (stop_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let stop_for_run = stop_tx.clone();
-    let run = tokio::spawn(async move { orch.run(stop_for_run).await });
+    let run = tokio::spawn(async move { orch.run(stop_for_run, 0, 0).await });
 
     // 给设备时间完成注册。
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
