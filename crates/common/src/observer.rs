@@ -21,6 +21,19 @@ pub enum DeviceEvent {
     StreamStart,
     /// 推流结束。
     StreamStop,
+    /// 平台下发云台控制(供 UI 云台动画)。字段为方向/变倍开关 + 速度。
+    /// 全 false 表示停止。用原始字段而非 protocol 层类型,避免 common 反向依赖。
+    Ptz {
+        up: bool,
+        down: bool,
+        left: bool,
+        right: bool,
+        zoom_in: bool,
+        zoom_out: bool,
+        pan_speed: u8,
+        tilt_speed: u8,
+        zoom_speed: u8,
+    },
 }
 
 /// 失败归因(与 docs/20-architecture/data-model.md#4 对齐)。

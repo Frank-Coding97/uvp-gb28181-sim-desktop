@@ -157,6 +157,8 @@ impl DeviceObserver for Metrics {
             DeviceEvent::HeartbeatFail => self.on_heartbeat_failure(),
             DeviceEvent::StreamStart => self.on_stream_start(),
             DeviceEvent::StreamStop => self.on_stream_stop(),
+            // 压测不关心云台动作(UI 动画用),忽略。
+            DeviceEvent::Ptz { .. } => {}
         }
     }
 }

@@ -167,6 +167,62 @@ impl Control {
         };
         Some((action, bytes[4]))
     }
+
+    /// 解析 PTZ 8 字节码的方向/变倍运动(GB/T 28181 附录 A.3.1)。
+    ///
+    /// 字节结构:`A5 组合(0F) 地址 指令码 水平速度 垂直速度 变倍速度|校验`。
+    /// 指令码(byte[3])位定义:bit0=上、bit1=下、bit2=左、bit3=右、bit4=放大、bit5=缩小;
+    /// 全 0 为停止。byte[4]=水平速度、byte[5]=垂直速度、byte[6] 高 4 位=变倍速度(0-15)。
+    /// 预置位指令(0x8x)返回 None(用 [`preset_op`](Self::preset_op) 解析)。
+    /// 实测 WVP:左 A50F0104...、右 A50F0102... —— 见测试。
+    pub fn ptz_motion(&self) -> Option<PtzMotion> {
+        let hex = self.ptz_cmd.as_ref()?;
+        let bytes = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        if bytes.len() < 7 {
+            return None;
+        }
+        let cmd = bytes[3];
+        if cmd & 0x80 != 0 {
+            return None; // 预置位等扩展指令,不是运动
+        }
+        Some(PtzMotion {
+            up: cmd & 0x01 != 0,
+            down: cmd & 0x02 != 0,
+            left: cmd & 0x04 != 0,
+            right: cmd & 0x08 != 0,
+            zoom_in: cmd & 0x10 != 0,
+            zoom_out: cmd & 0x20 != 0,
+            pan_speed: bytes[4],
+            tilt_speed: bytes[5],
+            zoom_speed: bytes[6] >> 4,
+        })
+    }
+}
+
+/// PTZ 方向/变倍运动(供 UI 云台动画;全 false 为停止)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct PtzMotion {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub zoom_in: bool,
+    pub zoom_out: bool,
+    /// 水平速度(0-255)。
+    pub pan_speed: u8,
+    /// 垂直速度(0-255)。
+    pub tilt_speed: u8,
+    /// 变倍速度(0-15)。
+    pub zoom_speed: u8,
+}
+
+impl PtzMotion {
+    /// 是否为停止(无任何方向/变倍)。
+    pub fn is_stop(&self) -> bool {
+        !(self.up || self.down || self.left || self.right || self.zoom_in || self.zoom_out)
+    }
 }
 
 /// 预置位操作类型(PTZ 指令码解析结果)。
@@ -1013,6 +1069,31 @@ mod tests {
         assert_eq!(mk("A50F01810300EA").preset_op(), Some((Set, 3)));
         assert_eq!(mk("A50F01820300EB").preset_op(), Some((Call, 3)));
         assert_eq!(mk("A50F01830300EC").preset_op(), Some((Delete, 3)));
+    }
+
+    #[test]
+    fn 解析ptz方向变倍_实测wvp码() {
+        // 实测 WVP 下发码(horizonSpeed/verticalSpeed=150=0x96):
+        let mk = |cmd: &str| {
+            Control::parse(&format!(
+                "<?xml version=\"1.0\"?><Control><CmdType>DeviceControl</CmdType>\
+                 <SN>1</SN><DeviceID>d</DeviceID><PTZCmd>{cmd}</PTZCmd></Control>"
+            ))
+            .unwrap()
+        };
+        assert!(mk("A50F0100000000B5").ptz_motion().unwrap().is_stop()); // 停止
+        let up = mk("A50F0101969610F2").ptz_motion().unwrap();
+        assert!(up.up && !up.down && up.pan_speed == 0x96);
+        let down = mk("A50F0102969610F3").ptz_motion().unwrap();
+        assert!(down.down && !down.up);
+        let left = mk("A50F0104969610F5").ptz_motion().unwrap();
+        assert!(left.left && !left.right);
+        let right = mk("A50F0108969610F9").ptz_motion().unwrap();
+        assert!(right.right && !right.left);
+        assert!(mk("A50F011096961001").ptz_motion().unwrap().zoom_in);
+        assert!(mk("A50F012096961011").ptz_motion().unwrap().zoom_out);
+        // 预置位码不算运动。
+        assert_eq!(mk("A50F01810300EA").ptz_motion(), None);
     }
 
     #[test]
