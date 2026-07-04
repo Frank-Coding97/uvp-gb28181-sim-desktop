@@ -194,6 +194,11 @@ pub trait VideoSource: Send {
     fn has_audio(&self) -> bool {
         false
     }
+
+    /// 视频编码(决定 PSM stream_type)。默认 H.264;H.265 源覆盖。
+    fn codec(&self) -> crate::ps::VideoCodec {
+        crate::ps::VideoCodec::H264
+    }
 }
 
 /// 空媒体源:永不产帧(A 档,只维持信令)。
@@ -249,6 +254,8 @@ const G711_PACKET_BYTES: usize = 160;
 pub struct FileSource {
     frames: Vec<Frame>,
     cursor: usize,
+    /// 视频编码(从 NAL 类型探测:H.264 或 H.265)。
+    codec: crate::ps::VideoCodec,
     /// G.711A 音频分包(每包 20ms/160B);空表示无音频轨。
     audio: Vec<Vec<u8>>,
     audio_cursor: usize,
@@ -292,10 +299,12 @@ impl FileSource {
         if nals.is_empty() {
             return Err(Error::Media("H.264 流为空或无起始码".into()));
         }
-        let frames = group_into_frames(nals);
+        let codec = detect_codec(&nals);
+        let frames = group_into_frames(nals, codec);
         Ok(FileSource {
             frames,
             cursor: 0,
+            codec,
             audio: Vec::new(),
             audio_cursor: 0,
             audio_per_frame: 0,
@@ -338,6 +347,25 @@ impl VideoSource for FileSource {
         }
         out
     }
+
+    fn codec(&self) -> crate::ps::VideoCodec {
+        self.codec
+    }
+}
+
+/// 从 NAL 流探测视频编码。H.265 存在 VPS(nal_type=32),H.264 无此类型;
+/// 以此区分。NAL 头首字节 = bytes[3](起始码后),H.265 type=(b>>1)&0x3F。
+fn detect_codec(nals: &[Nal<'_>]) -> crate::ps::VideoCodec {
+    for nal in nals {
+        if let Some(&b) = nal.bytes.get(3) {
+            let h265_type = (b >> 1) & 0x3F;
+            // VPS(32)/SPS(33)/PPS(34) 为 H.265 参数集;VPS 在 H.264 中不存在,最可靠。
+            if h265_type == 32 {
+                return crate::ps::VideoCodec::H265;
+            }
+        }
+    }
+    crate::ps::VideoCodec::H264
 }
 
 /// 一个带起始码位置的 NAL 单元(含起始码)。
@@ -374,17 +402,30 @@ fn split_annex_b(data: &[u8]) -> Vec<Nal<'_>> {
     nals
 }
 
-/// 把 NAL 聚成访问单元(帧)。遇到新的 VCL slice(type 1/5)作为帧起点。
-/// SPS(7)/PPS(8)/IDR(5) 出现的帧标记为关键帧。
-fn group_into_frames(nals: Vec<Nal<'_>>) -> Vec<Frame> {
+/// 把 NAL 聚成访问单元(帧)。遇到新的 VCL slice 作为帧起点。
+///
+/// H.264:type=低5位,VCL=1/5,关键帧含 5(IDR)/7(SPS)/8(PPS)。
+/// H.265:type=(b>>1)&0x3F,VCL=0..=31,关键帧含 IDR/CRA(16-21)或 VPS/SPS/PPS(32/33/34)。
+fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Frame> {
+    let is_h265 = codec == crate::ps::VideoCodec::H265;
     let mut frames = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
     let mut cur_key = false;
     let mut has_vcl = false;
 
     for nal in nals {
-        let t = nal.nal_type;
-        let is_vcl = t == 1 || t == 5;
+        // 按编码取 NAL 类型。
+        let t = if is_h265 {
+            nal.bytes.get(3).map(|b| (b >> 1) & 0x3F).unwrap_or(0)
+        } else {
+            nal.nal_type
+        };
+        let is_vcl = if is_h265 { t <= 31 } else { t == 1 || t == 5 };
+        let is_key = if is_h265 {
+            (16..=21).contains(&t) || (32..=34).contains(&t)
+        } else {
+            t == 5 || t == 7 || t == 8
+        };
         // 已有一个含 VCL 的帧,又来新 VCL → 切帧。
         if is_vcl && has_vcl {
             frames.push(Frame {
@@ -394,7 +435,7 @@ fn group_into_frames(nals: Vec<Nal<'_>>) -> Vec<Frame> {
             cur_key = false;
             has_vcl = false;
         }
-        if t == 5 || t == 7 || t == 8 {
+        if is_key {
             cur_key = true;
         }
         if is_vcl {
