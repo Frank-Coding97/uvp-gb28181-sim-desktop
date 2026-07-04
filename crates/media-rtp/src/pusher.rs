@@ -136,7 +136,9 @@ pub async fn push_stream_controlled(
                     continue; // 暂停中,不取帧。
                 }
                 if let Some(frame) = source.next_frame() {
-                    let ps = mux.mux_frame(&frame.data, timestamp, frame.key_frame);
+                    // 音视频复合流:取该帧时间窗的音频包,与视频一起封进 PS。
+                    let audio = source.next_audio();
+                    let ps = mux.mux_frame_av(&frame.data, timestamp, frame.key_frame, &audio);
                     sender.send_frame(&ps, timestamp).await?;
                     timestamp = timestamp.wrapping_add(ts_step);
                 } else {

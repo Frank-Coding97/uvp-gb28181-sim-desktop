@@ -871,8 +871,9 @@ impl DeviceSimulator {
         let fps = self.config.video_fps;
         let source: Option<Box<dyn media_rtp::VideoSource>> =
             if let Some(ref path) = self.config.video_source {
+                // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
                 Some(Box::new(
-                    media_rtp::FileSource::from_path(path)
+                    media_rtp::FileSource::from_path_av(path, fps)
                         .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))?,
                 ))
             } else {

@@ -122,6 +122,53 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// 从视频文件抽音频轨为 G.711A(PCMA)8kHz 单声道裸流,返回字节;无音频轨返回空 Vec。
+///
+/// 用系统 ffmpeg(`-vn -c:a pcm_alaw -ar 8000 -ac 1 -f alaw`),结果按源路径+mtime 缓存。
+/// ffmpeg 缺失或无音频轨时返回空(调用方据此退化为纯视频)。
+fn extract_g711a(src: &str) -> Result<Vec<u8>> {
+    use std::process::Command;
+
+    let meta = std::fs::metadata(src).map_err(Error::Io)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(src, mtime, "g711a"), &mut hasher);
+    let key = std::hash::Hasher::finish(&hasher);
+    let out = std::env::temp_dir().join(format!("uvp-g711a-{key:016x}.alaw"));
+    if out.exists() {
+        return std::fs::read(&out).map_err(Error::Io);
+    }
+
+    let has_ffmpeg = Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_ffmpeg {
+        return Ok(Vec::new()); // 无 ffmpeg:静默退化为纯视频。
+    }
+
+    let res = Command::new("ffmpeg")
+        .args([
+            "-y", "-i", src, "-vn", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1", "-f", "alaw",
+        ])
+        .arg(&out)
+        .output()
+        .map_err(|e| Error::Media(format!("ffmpeg 抽音频失败: {e}")))?;
+    // 无音频轨时 ffmpeg 会失败或产空文件 —— 都按"无音频"处理,不报错。
+    if res.status.success() && out.exists() {
+        std::fs::read(&out).map_err(Error::Io)
+    } else {
+        let _ = std::fs::remove_file(&out);
+        Ok(Vec::new())
+    }
+}
+
 /// 一帧编码数据(H.264 Annex B 访问单元,含起始码)。
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -135,6 +182,18 @@ pub struct Frame {
 pub trait VideoSource: Send {
     /// 取下一帧;返回 `None` 表示无更多帧(有限源)。循环源永不返回 None。
     fn next_frame(&mut self) -> Option<Frame>;
+
+    /// 取与"下一帧视频"同时间窗的音频包(G.711A,每包 20ms/160B)。
+    /// 默认无音频(纯视频源);含音频轨的源(FileSource)覆盖此方法。
+    /// 每次 `next_frame` 后调用一次,返回该帧期间应发送的音频分包(可为空)。
+    fn next_audio(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// 本源是否带音频轨(决定 PS 是否声明音频 ES)。
+    fn has_audio(&self) -> bool {
+        false
+    }
 }
 
 /// 空媒体源:永不产帧(A 档,只维持信令)。
@@ -182,35 +241,65 @@ impl VideoSource for LightSource {
     }
 }
 
+/// G.711A 每 20ms 分包的字节数(8kHz × 0.02s × 1B)。
+const G711_PACKET_BYTES: usize = 160;
+
 /// H.264 Annex B 文件循环源。加载时按起始码切成访问单元,循环产出。
+/// 若源含音频轨,同时持 G.711A 音频分包,与视频同步循环产出(音视频复合流)。
 pub struct FileSource {
     frames: Vec<Frame>,
     cursor: usize,
+    /// G.711A 音频分包(每包 20ms/160B);空表示无音频轨。
+    audio: Vec<Vec<u8>>,
+    audio_cursor: usize,
+    /// 每个视频帧对应几个音频包(按帧率折算:25fps→40ms/帧→2 包)。
+    audio_per_frame: usize,
 }
 
 impl FileSource {
-    /// 从视频文件加载并切帧。
+    /// 从视频文件加载并切帧(纯视频,不抽音频)。
     ///
-    /// 直接支持 H.264/H.265 **Annex B 裸流**(按起始码切帧)。若文件是容器
-    /// (MP4/FLV/MKV/MOV,即开头不是 Annex B 起始码),自动经系统 ffmpeg 转封装为
-    /// Annex B 裸流再加载(见 [`ensure_annexb`])。
+    /// 直接支持 H.264/H.265 **Annex B 裸流**;容器(MP4/FLV/MKV/MOV)自动经 ffmpeg
+    /// 转封装为 Annex B(见 [`ensure_annexb`])。要音视频复合流用 [`from_path_av`](Self::from_path_av)。
     pub fn from_path(path: &str) -> Result<Self> {
-        // 解析为 Annex B 裸流路径(容器则转封装,带缓存),再切帧。
         let annexb = prepare_video_source(path)?;
         let bytes = std::fs::read(&annexb).map_err(Error::Io)?;
         Self::from_bytes(&bytes)
     }
 
-    /// 从内存中的 Annex B 字节切帧。
+    /// 从视频文件加载视频 + 音频(音视频复合流)。`fps` 用于折算每帧音频包数。
+    ///
+    /// 视频同 [`from_path`](Self::from_path);另经 ffmpeg 抽音频轨为 G.711A 8kHz 单声道裸流
+    /// (`-c:a pcm_alaw -ar 8000 -ac 1 -f alaw`),按 160B/20ms 分包。源无音频轨时音频为空,
+    /// 退化为纯视频。裸流(.h264)无音频。
+    pub fn from_path_av(path: &str, fps: u32) -> Result<Self> {
+        let mut s = Self::from_path(path)?;
+        // 裸流无容器音频;仅对容器源尝试抽音频。
+        if let Ok(alaw) = extract_g711a(path) {
+            if !alaw.is_empty() {
+                s.audio = alaw.chunks(G711_PACKET_BYTES).map(|c| c.to_vec()).collect();
+                // 每帧时长 = 1/fps 秒;每音频包 20ms;每帧音频包数 = (1000/fps)/20。
+                let fps = fps.max(1);
+                s.audio_per_frame = ((1000 / fps) / 20).max(1) as usize;
+            }
+        }
+        Ok(s)
+    }
+
+    /// 从内存中的 Annex B 字节切帧(纯视频)。
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let nals = split_annex_b(bytes);
         if nals.is_empty() {
             return Err(Error::Media("H.264 流为空或无起始码".into()));
         }
-        // 简化的成帧:把连续 NAL 聚成访问单元 —— 遇到 VCL 帧(slice)边界切帧。
-        // 关键帧判定:该帧含 IDR(type 5)或 SPS(7)/PPS(8)。
         let frames = group_into_frames(nals);
-        Ok(FileSource { frames, cursor: 0 })
+        Ok(FileSource {
+            frames,
+            cursor: 0,
+            audio: Vec::new(),
+            audio_cursor: 0,
+            audio_per_frame: 0,
+        })
     }
 
     /// 帧总数。
@@ -232,6 +321,22 @@ impl VideoSource for FileSource {
         let f = self.frames[self.cursor].clone();
         self.cursor = (self.cursor + 1) % self.frames.len(); // 循环
         Some(f)
+    }
+
+    fn has_audio(&self) -> bool {
+        !self.audio.is_empty()
+    }
+
+    fn next_audio(&mut self) -> Vec<Vec<u8>> {
+        if self.audio.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.audio_per_frame);
+        for _ in 0..self.audio_per_frame {
+            out.push(self.audio[self.audio_cursor].clone());
+            self.audio_cursor = (self.audio_cursor + 1) % self.audio.len(); // 循环
+        }
+        out
     }
 }
 
