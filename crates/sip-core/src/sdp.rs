@@ -215,6 +215,38 @@ impl fmt::Display for SessionDescription {
     }
 }
 
+/// 构造语音广播的 SDP offer(设备作接收方,收平台下行 G.711A)。
+///
+/// 设备为 UAC 主叫,`a=recvonly`,`m=audio {port} RTP/AVP 8 0`,
+/// 首选 PCMA(G.711A,pt=8),兼容 PCMU(pt=0);`y={ssrc}`。TCP 时用 `TCP/RTP/AVP`。
+pub fn build_broadcast_offer(
+    username: &str,
+    local_ip: IpAddr,
+    port: u16,
+    ssrc: u32,
+    tcp: bool,
+) -> String {
+    let ip = local_ip.to_string();
+    let at = if local_ip.is_ipv4() { "IP4" } else { "IP6" };
+    let proto = if tcp { "TCP/RTP/AVP" } else { "RTP/AVP" };
+    let mut sdp = String::new();
+    sdp.push_str("v=0\r\n");
+    sdp.push_str(&format!("o={username} 0 0 IN {at} {ip}\r\n"));
+    sdp.push_str("s=Broadcast\r\n");
+    sdp.push_str(&format!("c=IN {at} {ip}\r\n"));
+    sdp.push_str("t=0 0\r\n");
+    sdp.push_str(&format!("m=audio {port} {proto} 8 0\r\n"));
+    sdp.push_str("a=rtpmap:8 PCMA/8000\r\n");
+    sdp.push_str("a=rtpmap:0 PCMU/8000\r\n");
+    sdp.push_str("a=recvonly\r\n");
+    if tcp {
+        sdp.push_str("a=setup:active\r\n");
+        sdp.push_str("a=connection:new\r\n");
+    }
+    sdp.push_str(&format!("y={ssrc}\r\n"));
+    sdp
+}
+
 fn parse_origin(s: &str) -> Result<Origin> {
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.len() < 6 {
@@ -273,6 +305,22 @@ fn parse_media(s: &str) -> Result<MediaDescription> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 广播offer_recvonly与g711() {
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        let sdp = build_broadcast_offer("34020000001320000001", ip, 30000, 0x1234, false);
+        assert!(sdp.contains("s=Broadcast\r\n"));
+        assert!(sdp.contains("m=audio 30000 RTP/AVP 8 0\r\n"));
+        assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"));
+        assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(sdp.contains("a=recvonly\r\n"));
+        assert!(sdp.contains("y=4660\r\n")); // 0x1234
+                                             // TCP 变体带 setup/connection + TCP/RTP/AVP。
+        let tcp = build_broadcast_offer("d", ip, 30000, 1, true);
+        assert!(tcp.contains("m=audio 30000 TCP/RTP/AVP 8 0\r\n"));
+        assert!(tcp.contains("a=setup:active\r\n"));
+    }
 
     const SAMPLE_SDP: &str = "v=0\r
 o=Platform 0 0 IN IP4 192.168.1.100\r
