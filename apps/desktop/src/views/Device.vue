@@ -240,8 +240,11 @@ const metrics = computed(() => [
           <div class="fg">
             <label>视频源(可选)</label>
             <div class="file-row">
-              <input v-model="form.video_source" class="inp" placeholder="H.264 文件路径(点右侧选择)" />
+              <input v-model="form.video_source" class="inp" placeholder="H.264/MP4 文件路径(点右侧选择)" />
               <button class="file-btn" @click="pickVideoSource">选择文件</button>
+            </div>
+            <div class="fg-hint">
+              留空则只做信令联调(注册/目录/心跳),平台点播会收流超时;要点播出画面请选一个 H.264/MP4 文件。
             </div>
           </div>
         </div>
@@ -336,6 +339,7 @@ const metrics = computed(() => [
 /* 视频源文件选择 */
 .file-row { display: flex; gap: 8px; align-items: stretch; }
 .file-row .inp { flex: 1 1 auto; }
+.fg-hint { font-size: 11.5px; color: var(--text-tertiary); margin-top: 6px; line-height: 1.5; }
 .file-btn {
   flex: 0 0 auto; border: 1px solid var(--border-default); background: rgba(255,255,255,0.6);
   border-radius: var(--radius-sm); padding: 0 14px; font-size: 13px; color: var(--text-secondary);

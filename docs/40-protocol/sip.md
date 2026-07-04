@@ -4,7 +4,7 @@
 
 ## 消息子集
 
-只实现 GB28181 必需的方法:`REGISTER`(注册/注销)、`MESSAGE`(MANSCDP 载体:心跳/查询/应答/通知)、`INVITE`/`ACK`/`BYE`(点播会话)、`OPTIONS`(探活)、`SUBSCRIBE`/`NOTIFY`(订阅与对话内通知)、`INFO`(会话内回放控制)。
+只实现 GB28181 必需的方法:`REGISTER`(注册/注销)、`MESSAGE`(MANSCDP 载体:心跳/查询/应答/通知)、`INVITE`/`ACK`/`BYE`/`CANCEL`(点播会话建立/停止/取消)、`OPTIONS`(探活)、`SUBSCRIBE`/`NOTIFY`(订阅与对话内通知)、`INFO`(会话内回放控制)。
 
 ## 头字段
 

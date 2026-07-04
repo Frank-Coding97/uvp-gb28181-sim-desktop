@@ -26,6 +26,8 @@ pub enum Method {
     Ack,
     /// 结束会话(停流)。
     Bye,
+    /// 取消尚未最终响应的 INVITE(点播取消)。
+    Cancel,
     /// 探活。
     Options,
     /// 平台订阅(目录/位置/报警)。设备回 200 后周期 NOTIFY。
@@ -45,6 +47,7 @@ impl Method {
             Method::Invite => "INVITE",
             Method::Ack => "ACK",
             Method::Bye => "BYE",
+            Method::Cancel => "CANCEL",
             Method::Options => "OPTIONS",
             Method::Subscribe => "SUBSCRIBE",
             Method::Notify => "NOTIFY",
@@ -60,6 +63,7 @@ impl Method {
             "INVITE" => Method::Invite,
             "ACK" => Method::Ack,
             "BYE" => Method::Bye,
+            "CANCEL" => Method::Cancel,
             "OPTIONS" => Method::Options,
             "SUBSCRIBE" => Method::Subscribe,
             "NOTIFY" => Method::Notify,
@@ -159,7 +163,11 @@ mod tests {
             Method::Invite,
             Method::Ack,
             Method::Bye,
+            Method::Cancel,
             Method::Options,
+            Method::Subscribe,
+            Method::Notify,
+            Method::Info,
         ] {
             assert_eq!(Method::parse(m.as_str()).unwrap(), m);
         }

@@ -343,6 +343,22 @@ async fn start_device(
         gb_version,
     };
 
+    // 预热视频源:容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会阻塞
+    // 200 OK 与首包推流,导致平台收流超时。这里在设备上线前先转好、缓存,
+    // INVITE 时命中缓存瞬时加载。ffmpeg 是阻塞调用,放 spawn_blocking。
+    if let Some(ref vs) = config.video_source {
+        if !vs.trim().is_empty() {
+            let vs = vs.clone();
+            let prepared =
+                tokio::task::spawn_blocking(move || gb28181_simulator::prepare_video_source(&vs))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if let Err(e) = prepared {
+                return Err(format!("视频源准备失败:{e}"));
+            }
+        }
+    }
+
     // 共享 UDP 传输 + 本端地址发现。
     let udp = UdpTransport::bind("0.0.0.0:0")
         .await

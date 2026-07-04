@@ -12,6 +12,27 @@ fn starts_with_annexb(b: &[u8]) -> bool {
     b.starts_with(&[0, 0, 1]) || b.starts_with(&[0, 0, 0, 1])
 }
 
+/// 把视频源解析为可直接切帧的 **Annex B 裸流文件路径**。
+///
+/// 裸流(.h264/.h265)原样返回;容器(MP4/FLV/MKV/MOV)经 ffmpeg 转封装并缓存后返回。
+/// **应在设备启动时预调用一次**(预热缓存):容器转封装可能耗时数秒,若放到 INVITE
+/// 处理里同步执行,会阻塞 200 OK 与首包推流,导致平台收流超时。预热后 INVITE 时
+/// [`FileSource::from_path`] 命中缓存瞬时返回。
+pub fn prepare_video_source(path: &str) -> Result<std::path::PathBuf> {
+    let head = {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).map_err(Error::Io)?;
+        let mut buf = [0u8; 8];
+        let n = f.read(&mut buf).map_err(Error::Io)?;
+        buf[..n].to_vec()
+    };
+    if starts_with_annexb(&head) {
+        Ok(std::path::PathBuf::from(path))
+    } else {
+        ensure_annexb(path)
+    }
+}
+
 /// 把容器视频文件(MP4/FLV/MKV/MOV 等)转封装为 H.264 Annex B 裸流,返回裸流文件路径。
 ///
 /// 用系统 `ffmpeg`:优先 `-c:v copy -bsf:v h264_mp4toannexb`(无损转封装,快);
@@ -174,15 +195,10 @@ impl FileSource {
     /// (MP4/FLV/MKV/MOV,即开头不是 Annex B 起始码),自动经系统 ffmpeg 转封装为
     /// Annex B 裸流再加载(见 [`ensure_annexb`])。
     pub fn from_path(path: &str) -> Result<Self> {
-        let bytes = std::fs::read(path).map_err(Error::Io)?;
-        // 已是 Annex B 裸流:直接切帧。
-        if starts_with_annexb(&bytes) {
-            return Self::from_bytes(&bytes);
-        }
-        // 容器格式:转封装为 Annex B 后加载。
-        let converted = ensure_annexb(path)?;
-        let out = std::fs::read(&converted).map_err(Error::Io)?;
-        Self::from_bytes(&out)
+        // 解析为 Annex B 裸流路径(容器则转封装,带缓存),再切帧。
+        let annexb = prepare_video_source(path)?;
+        let bytes = std::fs::read(&annexb).map_err(Error::Io)?;
+        Self::from_bytes(&bytes)
     }
 
     /// 从内存中的 Annex B 字节切帧。

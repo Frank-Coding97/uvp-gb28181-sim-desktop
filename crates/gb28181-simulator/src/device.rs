@@ -568,6 +568,10 @@ impl DeviceSimulator {
                     // 停止推流,回 200 OK。
                     self.handle_bye(transport, req, incoming.from).await
                 }
+                sip_core::Method::Cancel => {
+                    // 取消点播:停掉可能已起的推流,回 200 OK(与 BYE 同处理)。
+                    self.handle_bye(transport, req, incoming.from).await
+                }
                 sip_core::Method::Ack => {
                     // ACK 无需响应,但标志会话已确认。
                     Ok(true)
