@@ -44,7 +44,15 @@ impl Orchestrator {
 
     /// 启动所有设备的 run 任务(注册+心跳+入站应答)。
     /// 从 `stop` 广播接收停止信号:发送一次即令所有设备优雅停止。
-    pub async fn run(&self, stop: tokio::sync::broadcast::Sender<()>) -> Result<()> {
+    ///
+    /// `position_secs`/`alarm_secs` > 0 时,每台设备额外周期主动上报定位/报警(施压平台);
+    /// 0 表示不上报。
+    pub async fn run(
+        &self,
+        stop: tokio::sync::broadcast::Sender<()>,
+        position_secs: u64,
+        alarm_secs: u64,
+    ) -> Result<()> {
         // 单个共享 transport(所有设备复用一个 UDP socket)。bind 已返回 Arc。
         let transport = sip_core::UdpTransport::bind("0.0.0.0:0").await?;
         let local_addr = transport.local_addr()?;
@@ -76,6 +84,28 @@ impl Orchestrator {
                     .await;
             });
             handles.push(handle);
+
+            // 主动上报施压:为该设备挂一个周期任务(定位/报警),随 stop 退出。
+            if position_secs > 0 || alarm_secs > 0 {
+                let dev_rep = dev.clone();
+                let tp_rep = Arc::clone(&transport);
+                let host_rep = local_host.clone();
+                let metrics = Arc::clone(&self.metrics);
+                let mut stop_rep = stop.subscribe();
+                handles.push(tokio::spawn(async move {
+                    Self::report_loop(
+                        dev_rep,
+                        tp_rep,
+                        host_rep,
+                        local_port,
+                        position_secs,
+                        alarm_secs,
+                        metrics,
+                        &mut stop_rep,
+                    )
+                    .await;
+                }));
+            }
         }
 
         tracing::info!(task_count = handles.len(), "所有设备 run 任务已启动");
@@ -86,6 +116,54 @@ impl Orchestrator {
         }
         tracing::info!("所有设备已停止");
         Ok(())
+    }
+
+    /// 单设备的周期主动上报循环(定位/报警),用于压测施压。随 stop 广播退出。
+    #[allow(clippy::too_many_arguments)]
+    async fn report_loop(
+        dev: Arc<DeviceSimulator>,
+        transport: Arc<sip_core::UdpTransport>,
+        local_host: String,
+        local_port: u16,
+        position_secs: u64,
+        alarm_secs: u64,
+        metrics: Arc<Metrics>,
+        stop: &mut tokio::sync::broadcast::Receiver<()>,
+    ) {
+        // 用较小的 tick 轮询,各自按间隔触发;间隔为 0 的类型不触发。
+        let mut pos_acc = 0u64;
+        let mut alarm_acc = 0u64;
+        let tick = std::time::Duration::from_secs(1);
+        loop {
+            tokio::select! {
+                _ = stop.recv() => break,
+                _ = tokio::time::sleep(tick) => {
+                    if position_secs > 0 {
+                        pos_acc += 1;
+                        if pos_acc >= position_secs {
+                            pos_acc = 0;
+                            // 北京附近固定坐标(压测只关心上报承载,不关心真实轨迹)。
+                            if dev.report_position(&transport, &local_host, local_port, 116.397, 39.908)
+                                .await.map(|c| c == 200).unwrap_or(false)
+                            {
+                                metrics.on_position_reported();
+                            }
+                        }
+                    }
+                    if alarm_secs > 0 {
+                        alarm_acc += 1;
+                        if alarm_acc >= alarm_secs {
+                            alarm_acc = 0;
+                            if dev.report_alarm(&transport, &local_host, local_port, "压测报警")
+                                .await.map(|c| c == 200).unwrap_or(false)
+                            {
+                                metrics.on_alarm_reported();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 设备数量。

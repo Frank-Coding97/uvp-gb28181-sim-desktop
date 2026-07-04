@@ -28,6 +28,10 @@ pub struct Metrics {
     pub fail_rejected: AtomicU64,
     /// 失败归因:网络/其它。
     pub fail_other: AtomicU64,
+    /// 批量定位上报成功次数(主动上报施压)。
+    pub position_reported: AtomicU64,
+    /// 批量报警上报成功次数(主动上报施压)。
+    pub alarm_reported: AtomicU64,
 }
 
 /// 失败归因分类(对应 docs/20-architecture/data-model.md#4)。
@@ -102,7 +106,19 @@ impl Metrics {
             fail_timeout: self.fail_timeout.load(Ordering::Relaxed),
             fail_rejected: self.fail_rejected.load(Ordering::Relaxed),
             fail_other: self.fail_other.load(Ordering::Relaxed),
+            position_reported: self.position_reported.load(Ordering::Relaxed),
+            alarm_reported: self.alarm_reported.load(Ordering::Relaxed),
         }
+    }
+
+    /// 记一次定位上报成功。
+    pub fn on_position_reported(&self) {
+        self.position_reported.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次报警上报成功。
+    pub fn on_alarm_reported(&self) {
+        self.alarm_reported.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -119,6 +135,8 @@ pub struct MetricsSnapshot {
     pub fail_timeout: u64,
     pub fail_rejected: u64,
     pub fail_other: u64,
+    pub position_reported: u64,
+    pub alarm_reported: u64,
 }
 
 /// Metrics 实现 DeviceObserver，可直接注入 DeviceSimulator::with_observer。

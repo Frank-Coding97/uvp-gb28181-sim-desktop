@@ -60,7 +60,8 @@ async fn main() -> ExitCode {
     });
 
     tracing::info!("压测启动");
-    if let Err(e) = orch.run(stop_tx).await {
+    // CLI 默认不做主动上报施压(0/0);后续可加 --position/--alarm 参数。
+    if let Err(e) = orch.run(stop_tx, 0, 0).await {
         eprintln!("压测运行错误: {e}");
         return ExitCode::FAILURE;
     }
