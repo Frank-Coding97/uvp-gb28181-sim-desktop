@@ -19,8 +19,12 @@ INVITE 携平台侧 SDP(平台接收 IP/端口、期望的 payload type、SSRC�
 ## PS 封装
 
 - PS 包 = Pack Header + System Header(关键帧处)+ 若干 PES。
-- 视频 PES 复用 H.264/H.265 NAL;音频(G.711A 等)后续复用。
-- 时间戳(PTS/DTS)基于 90kHz 时钟递增。
+- 视频 PES 复用 H.264/H.265 NAL(stream_id 0xE0);**音频 PES 复用 G.711A(stream_id 0xC0)**。
+- 音视频复合流:视频源含音频轨时,PSM 同时声明视频(stream_type 0x1B)与音频(G.711A=0x90),
+  每个视频帧后按 PTS 就近插入该时间窗内的音频 PES(0xC0);无音频轨则退化为纯视频(行为不变)。
+- 音频来源:`FileSource` 从容器(MP4 等)经 ffmpeg 抽 G.711A(`-c:a pcm_alaw -ar 8000 -ac 1`)裸流,
+  按 20ms 分包(160 字节/包)。裸流视频源无音频。
+- 时间戳(PTS/DTS)基于 90kHz 时钟递增(音频 8kHz 采样按 90kHz 折算)。
 
 ## RTP 打包
 

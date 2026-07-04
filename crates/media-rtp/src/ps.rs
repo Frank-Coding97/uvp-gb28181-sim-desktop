@@ -6,6 +6,8 @@
 
 /// 视频流 ID(PES stream_id,视频为 0xE0)。
 const STREAM_ID_VIDEO: u8 = 0xE0;
+/// 音频流 ID(PES stream_id,音频为 0xC0)。
+const STREAM_ID_AUDIO: u8 = 0xC0;
 
 /// 把 90kHz 时间戳编码为 PES 里的 5 字节 PTS/DTS 结构。
 /// `marker_bits` 为高 4 位标志(PTS-only=0b0010,PTS+DTS 时 PTS=0b0011)。
@@ -88,9 +90,32 @@ fn write_psm(out: &mut Vec<u8>) {
     out.extend_from_slice(&[0x00, 0x00]); // CRC32 后 2 字节占位
 }
 
-/// 写入一个视频 PES 包,承载 `data`(可能是一帧的一部分)。
+/// 写入含音频的 PSM:声明视频 H.264(0x1B/0xE0)+ 音频 G.711A(0x90/0xC0)。
+fn write_psm_av(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0x00, 0x00, 0x01, 0xBC]);
+    // elementary_stream_map_length = 8(两条 ES 映射,各 4 字节)。
+    let body: [u8; 16] = [
+        0xE1, 0xFF, // marker/version
+        0x00, 0x00, // program_stream_info_length = 0
+        0x00, 0x08, // elementary_stream_map_length = 8
+        0x1B, 0xE0, 0x00, 0x00, // ES map: H.264 视频(0xE0)
+        0x90, 0xC0, 0x00, 0x00, // ES map: G.711A 音频(stream_type 0x90, 0xC0)
+        0x00, 0x00, // CRC32 前 2 字节占位
+    ];
+    let psm_len = (body.len() + 2) as u16;
+    out.extend_from_slice(&psm_len.to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&[0x00, 0x00]); // CRC32 后 2 字节占位
+}
+
+/// 写入一个视频 PES 包(stream_id 0xE0),承载 `data`(可能是一帧的一部分)。
 fn write_pes(out: &mut Vec<u8>, data: &[u8], pts: u32, with_pts: bool) {
-    out.extend_from_slice(&[0x00, 0x00, 0x01, STREAM_ID_VIDEO]);
+    write_pes_stream(out, STREAM_ID_VIDEO, data, pts, with_pts);
+}
+
+/// 写入一个 PES 包,指定 stream_id(视频 0xE0 / 音频 0xC0)。
+fn write_pes_stream(out: &mut Vec<u8>, stream_id: u8, data: &[u8], pts: u32, with_pts: bool) {
+    out.extend_from_slice(&[0x00, 0x00, 0x01, stream_id]);
     let header = if with_pts {
         encode_pts(pts, 0b0010)
     } else {
@@ -146,6 +171,34 @@ impl PsMuxer {
         }
         out
     }
+
+    /// 封装一帧视频 + 其后紧随的音频包(G.711A 音视频复合流)。
+    /// `audio` 为该帧时间窗内的若干 G.711A 分包(每包一个音频 PES);为空则等价于 [`mux_frame`]。
+    /// 关键帧处 PSM 声明音视频两条 ES。
+    pub fn mux_frame_av(&self, au: &[u8], pts: u32, key_frame: bool, audio: &[Vec<u8>]) -> Vec<u8> {
+        let has_audio = !audio.is_empty();
+        let mut out = Vec::with_capacity(au.len() + 128);
+        write_pack_header(&mut out, pts as u64);
+        if key_frame {
+            write_system_header(&mut out);
+            if has_audio {
+                write_psm_av(&mut out);
+            } else {
+                write_psm(&mut out);
+            }
+        }
+        // 视频 PES(大帧拆分,首个带 PTS)。
+        let mut first = true;
+        for chunk in au.chunks(self.pes_max.max(1)) {
+            write_pes(&mut out, chunk, pts, first);
+            first = false;
+        }
+        // 音频 PES(stream_id 0xC0),各带 PTS,紧随视频后。
+        for a in audio {
+            write_pes_stream(&mut out, STREAM_ID_AUDIO, a, pts, true);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +226,28 @@ mod tests {
         assert_eq!(&ps[0..4], &[0x00, 0x00, 0x01, 0xBA]);
         assert!(!ps.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xBB])); // 无 System Header
         assert!(ps.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xE0])); // 有 PES
+    }
+
+    #[test]
+    fn 音视频复合流含音频pes与音频psm() {
+        let mux = PsMuxer::new();
+        let au = &[0x00, 0x00, 0x00, 0x01, 0x65, 0x11]; // 伪 IDR
+        let audio = vec![vec![0xD5u8; 160], vec![0xD5u8; 160]]; // 两个 G.711A 包
+        let ps = mux.mux_frame_av(au, 900, true, &audio);
+        // 含视频 PES(E0)与音频 PES(C0)。
+        assert!(ps.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xE0]));
+        assert!(ps.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xC0]));
+        // PSM(BC)含音频 ES 映射(0x90 0xC0)。
+        assert!(ps.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xBC]));
+        assert!(ps.windows(2).any(|w| w == [0x90, 0xC0]));
+    }
+
+    #[test]
+    fn 无音频时av等价纯视频_不含c0() {
+        let mux = PsMuxer::new();
+        let ps = mux.mux_frame_av(&[0x00, 0x00, 0x01, 0x61], 1800, false, &[]);
+        assert!(!ps.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xC0])); // 无音频 PES
+        assert!(ps.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xE0])); // 有视频 PES
     }
 
     #[test]
