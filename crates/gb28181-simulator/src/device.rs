@@ -203,10 +203,17 @@ pub struct DeviceSimulator {
     /// 报警订阅对话(平台 `SUBSCRIBE + Alarm` 时记录:对话标识 + 平台地址)。
     /// 存在时,report_alarm 走对话内 NOTIFY;否则退化为独立 MESSAGE(如手动触发)。
     alarm_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
+    /// 目录订阅对话(平台 `SUBSCRIBE + Catalog` 时记录):CRUD 变更后据此发对话内增量 NOTIFY。
+    catalog_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
     /// 预置位表(编号 → 名称)。PTZ 预置位设置/删除命令更新,PresetQuery 返回。
     presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
     /// 设备控制态(布防/看守位/巡航/精准姿态)。扩展查询与控制命令共同维护(FR-17/18)。
     control_state: std::sync::Mutex<ControlState>,
+    /// 多通道目录树(FR-34)。为空时用 `config.channels` 扁平列表出目录;
+    /// 非空时用此树(含业务分组/虚拟组织/报警通道层级)出目录,支持 CRUD + 增量 NOTIFY。
+    catalog_tree: std::sync::Mutex<Vec<gb28181_protocol::id_codec::CatalogNode>>,
+    /// 上次推给平台的目录快照(用于计算增量 NOTIFY 的 diff)。
+    catalog_snapshot: std::sync::Mutex<gb28181_protocol::manscdp::CatalogSnapshot>,
 }
 
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
@@ -271,8 +278,13 @@ impl DeviceSimulator {
             position: std::sync::Mutex::new((116.397_428, 39.909_230)),
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
+            catalog_dialog: tokio::sync::Mutex::new(None),
             presets: std::sync::Mutex::new(default_presets()),
             control_state: std::sync::Mutex::new(ControlState::default()),
+            catalog_tree: std::sync::Mutex::new(Vec::new()),
+            catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
+                channels: std::collections::BTreeMap::new(),
+            }),
         }
     }
 
@@ -288,8 +300,13 @@ impl DeviceSimulator {
             position: std::sync::Mutex::new((116.397_428, 39.909_230)),
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
+            catalog_dialog: tokio::sync::Mutex::new(None),
             presets: std::sync::Mutex::new(default_presets()),
             control_state: std::sync::Mutex::new(ControlState::default()),
+            catalog_tree: std::sync::Mutex::new(Vec::new()),
+            catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
+                channels: std::collections::BTreeMap::new(),
+            }),
         }
     }
 
@@ -309,6 +326,71 @@ impl DeviceSimulator {
     /// 只读访问配置。
     pub fn config(&self) -> &DeviceConfig {
         &self.config
+    }
+
+    /// 载入一个内置目录模板(single/nvr-8ch/civil-3x2/large-16ch),替换现有目录树(FR-34)。
+    pub fn load_catalog_template(&self, template: &str) {
+        let tree = gb28181_protocol::id_codec::catalog_template(
+            template,
+            self.config.device_id.as_str(),
+            &self.config.device_info.device_name,
+            &self.config.server_domain,
+        );
+        *self.catalog_tree.lock().unwrap() = tree;
+    }
+
+    /// 直接设置目录树节点(FR-34)。首节点应为根设备。
+    pub fn set_catalog_tree(&self, nodes: Vec<gb28181_protocol::id_codec::CatalogNode>) {
+        *self.catalog_tree.lock().unwrap() = nodes;
+    }
+
+    /// 当前目录树快照(空表示用 config.channels 扁平列表)。
+    pub fn catalog_tree(&self) -> Vec<gb28181_protocol::id_codec::CatalogNode> {
+        self.catalog_tree.lock().unwrap().clone()
+    }
+
+    /// 新增/更新一个目录通道节点(按 id 覆盖)。返回是否为新增。
+    pub fn upsert_channel(&self, node: gb28181_protocol::id_codec::CatalogNode) -> bool {
+        let mut tree = self.catalog_tree.lock().unwrap();
+        if let Some(existing) = tree.iter_mut().find(|n| n.id == node.id) {
+            *existing = node;
+            false
+        } else {
+            tree.push(node);
+            true
+        }
+    }
+
+    /// 删除一个目录通道节点(按 id)。返回是否删除了节点。
+    pub fn remove_channel(&self, id: &str) -> bool {
+        let mut tree = self.catalog_tree.lock().unwrap();
+        let before = tree.len();
+        tree.retain(|n| n.id != id);
+        tree.len() != before
+    }
+
+    /// 目录节点(树非空时)或扁平通道(树空时)映射为 (id, name, status) 快照三元组,
+    /// 供目录应答与增量 diff 复用。根设备节点(parent==self)不作为通道项。
+    fn catalog_publishable(&self) -> Vec<(String, String, String)> {
+        let tree = self.catalog_tree.lock().unwrap();
+        if tree.is_empty() {
+            self.config
+                .channels
+                .iter()
+                .map(|c| {
+                    (
+                        c.channel_id.as_str().to_string(),
+                        c.name.clone(),
+                        c.status.clone(),
+                    )
+                })
+                .collect()
+        } else {
+            tree.iter()
+                .filter(|n| n.id != n.parent_id) // 过滤根设备自引用
+                .map(|n| (n.id.clone(), n.name.clone(), n.status.clone()))
+                .collect()
+        }
     }
 
     /// 本设备注册用的 Call-ID(用于在共享传输上注册接收路由)。
@@ -566,18 +648,20 @@ impl DeviceSimulator {
         dialog: &builder::NotifyDialog,
         sn: u32,
     ) -> Result<u16> {
-        use gb28181_protocol::manscdp::{CatalogNotify, CatalogNotifyItem};
-        let items: Vec<CatalogNotifyItem> = self
-            .config
-            .channels
+        use gb28181_protocol::manscdp::{CatalogNotify, CatalogNotifyItem, CatalogSnapshot};
+        // 全量目录:多通道树优先,否则扁平通道。全量后刷新快照基线供后续增量 diff。
+        let publishable = self.catalog_publishable();
+        let items: Vec<CatalogNotifyItem> = publishable
             .iter()
-            .map(|ch| CatalogNotifyItem {
-                device_id: ch.channel_id.as_str().to_string(),
-                name: ch.name.clone(),
+            .map(|(id, name, status)| CatalogNotifyItem {
+                device_id: id.clone(),
+                name: name.clone(),
                 event: "ON".into(),
-                status: ch.status.clone(),
+                status: status.clone(),
             })
             .collect();
+        *self.catalog_snapshot.lock().unwrap() =
+            CatalogSnapshot::from_items(publishable.iter().cloned());
         let notify = CatalogNotify::new(self.config.device_id.as_str(), sn, items);
         let xml = notify.to_xml()?;
 
@@ -597,6 +681,49 @@ impl DeviceSimulator {
                 .await;
         transport.unregister(&dialog.call_id);
         Ok(result?.status)
+    }
+
+    /// 目录变更后推送增量 NOTIFY(FR-32/34)。
+    ///
+    /// 计算当前目录相对上次快照的 diff(ADD/DEL/UPDATE/ON/OFF),若有变更且存在活跃目录订阅,
+    /// 在订阅对话内发一条只含变更项的 Catalog NOTIFY,并刷新快照基线。无订阅/无变更时不发。
+    /// CRUD(upsert_channel/remove_channel)或状态切换后调用。
+    pub async fn notify_catalog_changed(&self, transport: &Arc<UdpTransport>) -> Result<()> {
+        use gb28181_protocol::manscdp::{CatalogNotify, CatalogSnapshot};
+        let next = CatalogSnapshot::from_items(self.catalog_publishable());
+        let changes = {
+            let snap = self.catalog_snapshot.lock().unwrap();
+            snap.diff(&next)
+        };
+        if changes.is_empty() {
+            return Ok(());
+        }
+        // 刷新基线(无论有无订阅,快照都应跟上当前目录)。
+        *self.catalog_snapshot.lock().unwrap() = next;
+
+        let dialog = self.catalog_dialog.lock().await.clone();
+        let Some((dialog, dst)) = dialog else {
+            return Ok(()); // 无目录订阅,平台会在下次全量查询时同步
+        };
+        let sn = self.next_cseq();
+        let notify = CatalogNotify::new(self.config.device_id.as_str(), sn, changes);
+        let xml = notify.to_xml()?;
+        let cseq = self.next_cseq();
+        let req = builder::notify_in_dialog(
+            &self.config,
+            &dialog,
+            cseq,
+            &self.local_host(),
+            self.local_port(),
+            &xml,
+        );
+        let mut rx = transport.register(dialog.call_id.clone());
+        let result =
+            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
+                .await;
+        transport.unregister(&dialog.call_id);
+        result?;
+        Ok(())
     }
 
     /// 启动(或重建)移动位置订阅的周期上报任务。
@@ -653,6 +780,7 @@ impl DeviceSimulator {
             let _ = sub.stop_tx.send(());
         }
         *self.alarm_dialog.lock().await = None;
+        *self.catalog_dialog.lock().await = None;
     }
 
     /// 处理一条入站请求:OPTIONS 简单回 200;MESSAGE 解析 XML 查询并应答;
@@ -761,8 +889,10 @@ impl DeviceSimulator {
                                     self.start_position_subscription(transport, query.interval)
                                         .await;
                                 }
-                                // 目录订阅:在订阅对话内回发一条目录 NOTIFY(全通道 Event=ON)。
+                                // 目录订阅:记录对话供 CRUD 增量 NOTIFY,并回发一条全量目录 NOTIFY。
                                 "Catalog" => {
+                                    *self.catalog_dialog.lock().await =
+                                        Some((dialog.clone(), incoming.from));
                                     let sim = Arc::clone(self);
                                     let tp = Arc::clone(transport);
                                     let sn = query.sn;
@@ -843,24 +973,45 @@ impl DeviceSimulator {
             "Catalog" => {
                 // GB-2022 输出新增字段(安全能力/IP/端口),GB-2016 置 None 不输出。
                 let is_2022 = self.config.gb_version.is_2022();
-                let items: Vec<CatalogItem> = self
-                    .config
-                    .channels
-                    .iter()
-                    .map(|ch| CatalogItem {
-                        device_id: ch.channel_id.to_string(),
-                        name: ch.name.clone(),
-                        manufacturer: Some(self.config.device_info.manufacturer.clone()),
-                        model: Some(self.config.device_info.model.clone()),
-                        civil_code: None,
-                        parental: Some(0),
-                        parent_id: Some(self.config.device_id.to_string()),
-                        status: ch.status.clone(),
-                        security_level_code: is_2022.then(|| "A".to_string()),
-                        ip_address: None,
-                        port: None,
-                    })
-                    .collect();
+                let tree = self.catalog_tree.lock().unwrap();
+                let items: Vec<CatalogItem> = if tree.is_empty() {
+                    // 扁平通道(单通道兼容路径)。
+                    self.config
+                        .channels
+                        .iter()
+                        .map(|ch| CatalogItem {
+                            device_id: ch.channel_id.to_string(),
+                            name: ch.name.clone(),
+                            manufacturer: Some(self.config.device_info.manufacturer.clone()),
+                            model: Some(self.config.device_info.model.clone()),
+                            civil_code: None,
+                            parental: Some(0),
+                            parent_id: Some(self.config.device_id.to_string()),
+                            status: ch.status.clone(),
+                            security_level_code: is_2022.then(|| "A".to_string()),
+                            ip_address: None,
+                            port: None,
+                        })
+                        .collect()
+                } else {
+                    // 多通道目录树(FR-34):根设备自引用节点不作为通道项。
+                    tree.iter()
+                        .filter(|n| n.id != n.parent_id)
+                        .map(|n| CatalogItem {
+                            device_id: n.id.clone(),
+                            name: n.name.clone(),
+                            manufacturer: Some(self.config.device_info.manufacturer.clone()),
+                            model: Some(self.config.device_info.model.clone()),
+                            civil_code: n.civil_code.clone(),
+                            parental: Some(n.node_type.parental()),
+                            parent_id: Some(n.parent_id.clone()),
+                            status: n.status.clone(),
+                            security_level_code: is_2022.then(|| "A".to_string()),
+                            ip_address: None,
+                            port: None,
+                        })
+                        .collect()
+                };
                 let resp = CatalogResponse::new(&query.device_id, query.sn, items);
                 resp.to_xml()
             }
@@ -1943,6 +2094,40 @@ mod tests {
         assert!(http_put_jpeg(&format!("http://{addr}/x.jpg"), jpeg)
             .await
             .is_err());
+    }
+
+    /// 多通道目录(FR-34):载入模板后 Catalog 查询枚举全部节点,含层级 ParentID/Parental。
+    #[test]
+    fn 多通道目录_模板与crud() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.load_catalog_template("nvr-8ch");
+        let q = gb28181_protocol::manscdp::Query {
+            cmd_type: "Catalog".into(),
+            sn: 1,
+            device_id: sim.config().device_id.to_string(),
+            interval: None,
+            group_id: None,
+            config_type: None,
+        };
+        let xml = sim.handle_query(&q).unwrap();
+        // 8 视频通道 + 1 业务分组 = 9 项(根设备自引用被过滤)。
+        assert!(xml.contains("<DeviceList Num=\"9\">"));
+        assert!(xml.contains("<Name>NVR-8</Name>"));
+        assert!(xml.contains("<Name>通道-01</Name>"));
+        assert!(xml.contains("<Parental>1</Parental>")); // 业务分组
+        assert!(xml.contains("<Parental>0</Parental>")); // 视频通道
+
+        // CRUD:新增一个通道 → 树 +1;删除 → 复原。
+        let node = gb28181_protocol::id_codec::CatalogNode::new(
+            "34020000001320000099",
+            gb28181_protocol::id_codec::CatalogNodeType::VideoChannel,
+            "新增通道",
+            sim.config().device_id.to_string(),
+        );
+        assert!(sim.upsert_channel(node.clone()));
+        assert!(!sim.upsert_channel(node)); // 再次 upsert 为更新非新增
+        assert!(sim.remove_channel("34020000001320000099"));
+        assert!(!sim.remove_channel("34020000001320000099")); // 已删
     }
 
     /// 语音广播(FR-36):TargetID 属本设备回 Broadcast Response OK。
