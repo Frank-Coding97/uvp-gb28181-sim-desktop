@@ -54,14 +54,20 @@
 |---|---|---|---|
 | PTZ 云台控制 | DeviceControl / PTZCmd | P0 | ✅ WVP 下发验证(解析+应答) |
 | 预置位设置/调用/删除 | DeviceControl / PTZCmd 指令码 81/82/83 | P1 | ✅ 解析 8 字节码预置位操作,有状态增删,实 SIP 注入验证(设置/删除后 PresetQuery 反映) |
-| 看守位设置 | DeviceControl / HomePosition | P1 | 🟢 解析 Enabled/ResetTime/PresetIndex + 应答 |
+| 看守位设置 | DeviceControl / HomePosition | P1 | 🟢 解析 Enabled/ResetTime/PresetIndex + 应答;更新看守位启用/已设标志供 HomePositionQuery 读回(FR-18) |
 | 拉框放大/缩小 | DeviceControl / DragZoomIn / DragZoomOut(`Control::kind()`=拉框放大/缩小) | P1 | 🟢 解析 DragZoom 参数 + 应答 |
 | 强制关键帧 | DeviceControl / IFameCmd | P0 | ✅ 命令解析+应答;文件回放源自带周期 IDR,无法"强制"再生成一帧(硬标关键帧会产出坏流),故仅应答,符合回放模拟器语义 |
 | 录像控制(录制/停止) | DeviceControl / RecordCmd | P1 | ✅ 同一 Control 链路 |
-| 布防/撤防 | DeviceControl / GuardCmd | P1 | ✅ 同一 Control 链路 |
+| 布防/撤防 | DeviceControl / GuardCmd | P1 | ✅ 同一 Control 链路;更新报警值守态供 AlarmStatus 读回(FR-18) |
 | 报警复位 | DeviceControl / AlarmCmd | P1 | ✅ 同一 Control 链路 |
 | 远程启动 | DeviceControl / TeleBoot | P2 | ✅ 同一 Control 链路 |
-| 设备配置(基本参数) | DeviceConfig / BasicParam | P2 | ⬜ |
+| 精确云台控制 | DeviceControl / PTZPreciseCtrl(Pan/Tilt/Zoom) | P1 | 🟢 解析浮点姿态并记录,供 PTZPreciseStatusQuery 读回(FR-18,单测) |
+| 巡航轨迹控制 | DeviceControl / PTZCmd 0x84-0x88(增点/删点/速度/停留/启动) | P1 | 🟢 解析字节码维护有状态巡航轨迹,供 CruiseTrack* 查询读回(FR-18,单测) |
+| 辅助控制 | DeviceControl / PTZCmd 0x89·0x8A(雨刷/红外/加热/除雾/制冷) | P1 | 🟢 解析开关+辅助号并应答(FR-18,单测) |
+| 聚焦/光圈 | DeviceControl / PTZCmd byte3 聚焦位 | P2 | 🟢 最小识别(0x40 近/0x80 远)+ 应答;⚠️ 未真机核对字节位(FR-18) |
+| 目标跟踪 | DeviceControl / TargetTrack(Mode/ObjectID/Speed) | P2 | 🟢 白名单模式解析+应答,模式外忽略仍 200(FR-18,单测) |
+| 格式化 SD 卡 | DeviceControl / FormatSDCard + DiskNum | P2 | 🟢 解析+应答(模拟设备无实际存储)(FR-18,单测) |
+| 设备配置(基本参数) | DeviceConfig / BasicParam | P2 | ⬜ 修改暂未做(查询见 ConfigDownload) |
 
 ## 订阅与通知(平台订阅 → 设备周期 NOTIFY)
 

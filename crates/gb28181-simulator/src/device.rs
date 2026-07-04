@@ -931,8 +931,15 @@ impl DeviceSimulator {
                         .on_event(common::DeviceEvent::PtzPresetCall { preset: idx });
                 }
                 None => {
-                    // 方向/变倍运动:解析后上报观察者(供 UI 云台动画)。
-                    if let Some(m) = ctrl.ptz_motion() {
+                    // 先识别巡航/辅助/聚焦(均 0x8x/聚焦位),否则按方向/变倍运动。
+                    if let Some(op) = ctrl.cruise_op() {
+                        self.apply_cruise_op(op);
+                    } else if let Some(aux) = ctrl.aux_op() {
+                        tracing::info!(func = aux.function.label(), on = aux.on, "辅助控制");
+                    } else if let Some((near, far)) = ctrl.focus_op() {
+                        tracing::info!(near, far, "聚焦/光圈控制");
+                    } else if let Some(m) = ctrl.ptz_motion() {
+                        // 方向/变倍运动:解析后上报观察者(供 UI 云台动画)。
                         tracing::info!(ptz = %ptz, up=m.up, down=m.down, left=m.left, right=m.right,
                             zoom_in=m.zoom_in, zoom_out=m.zoom_out, "PTZ 云台运动");
                         self.observer.on_event(common::DeviceEvent::Ptz {
@@ -952,7 +959,41 @@ impl DeviceSimulator {
                 }
             }
         }
+        // 精确云台控制(GB-2022):记录姿态供 PTZPreciseStatusQuery 读回。
+        if let Some(p) = &ctrl.ptz_precise_ctrl {
+            tracing::info!(pan = p.pan, tilt = p.tilt, zoom = p.zoom, "精确云台控制");
+            if let Ok(mut s) = self.control_state.lock() {
+                s.precise_pose = (p.pan, p.tilt, p.zoom);
+            }
+        }
+        // 目标跟踪:白名单模式外忽略,仍应答 200/OK。
+        if let Some(t) = &ctrl.target_track {
+            let mode = t.mode.trim();
+            if matches!(mode, "Auto" | "Manual" | "Stop") {
+                tracing::info!(mode, object = ?t.object_id, "目标跟踪");
+            } else {
+                tracing::info!(mode, "目标跟踪(模式未识别,忽略)");
+            }
+        }
+        // 格式化 SD 卡:模拟设备无实际存储,仅记录应答。
+        if ctrl.format_sd_card.is_some() {
+            let disk = ctrl.disk_num.unwrap_or(0);
+            tracing::info!(disk, "格式化 SD 卡(模拟接受)");
+        }
+        // 布防/撤防:更新报警值守态(供 AlarmStatus 查询读回)。
+        if let Some(g) = &ctrl.guard_cmd {
+            let arm = g.eq_ignore_ascii_case("SetGuard");
+            if let Ok(mut s) = self.control_state.lock() {
+                s.alarming = arm;
+            }
+            tracing::info!(guard = %g, "布防/撤防");
+        }
+        // 看守位设置:更新启用/已设标志(供 HomePositionQuery 读回)。
         if let Some(hp) = &ctrl.home_position {
+            if let Ok(mut s) = self.control_state.lock() {
+                s.home_enabled = hp.enabled != 0;
+                s.home_set = hp.enabled != 0;
+            }
             tracing::info!(enabled = hp.enabled, preset = hp.preset_index, "看守位设置");
         }
         if ctrl.iframe_cmd.is_some() {
@@ -960,6 +1001,45 @@ impl DeviceSimulator {
         }
         let resp = gb28181_protocol::manscdp::ControlResponse::ok(&ctrl.device_id, ctrl.sn);
         resp.to_xml()
+    }
+
+    /// 应用巡航轨迹控制操作到设备控制态(供 CruiseTrack* 查询读回)。
+    fn apply_cruise_op(&self, op: gb28181_protocol::manscdp::CruiseOp) {
+        use gb28181_protocol::manscdp::CruiseOp;
+        let Ok(mut s) = self.control_state.lock() else {
+            return;
+        };
+        match op {
+            CruiseOp::SetPoint { track, preset } => {
+                let pts = s.cruise_tracks.entry(track).or_default();
+                if !pts.contains(&preset) {
+                    pts.push(preset);
+                }
+                tracing::info!(track, preset, "巡航增点");
+            }
+            CruiseOp::DelPoint { track, preset } => {
+                if let Some(pts) = s.cruise_tracks.get_mut(&track) {
+                    pts.retain(|&p| p != preset);
+                }
+                tracing::info!(track, preset, "巡航删点");
+            }
+            CruiseOp::SetSpeed { track, speed } => {
+                s.cruise_tracks.entry(track).or_default();
+                tracing::info!(track, speed, "巡航设速");
+            }
+            CruiseOp::SetDwell { track, dwell } => {
+                s.cruise_tracks.entry(track).or_default();
+                tracing::info!(track, dwell, "巡航设停留");
+            }
+            CruiseOp::Start { track } => {
+                if track == 0 {
+                    tracing::info!("巡航停止");
+                } else {
+                    s.cruise_tracks.entry(track).or_default();
+                    tracing::info!(track, "巡航启动");
+                }
+            }
+        }
     }
 
     /// 向平台发送一条应答/通知 MESSAGE(查询应答、控制应答、位置通知等复用)。
@@ -1519,6 +1599,53 @@ mod tests {
             .handle_query(&mk("PTZPreciseStatusQuery", None))
             .unwrap();
         assert!(precise.contains("<Zoom>1.00</Zoom>"));
+    }
+
+    /// 扩展控制(FR-18):巡航增点→列表查询可见;精确云台→精准状态查询读回;布防→报警状态。
+    #[tokio::test]
+    async fn 扩展控制_更新状态供查询读回() {
+        use gb28181_protocol::manscdp::Control;
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+
+        // 巡航增点:轨迹 1 加预置 5(byte3=0x84 track=1 preset=5)。
+        let cruise = Control {
+            cmd_type: "DeviceControl".into(),
+            device_id: "d".into(),
+            sn: 1,
+            ptz_cmd: Some("A50F0184010500".into()),
+            ..Default::default()
+        };
+        sim.handle_control(&cruise).await.unwrap();
+        assert!(sim.control_state.lock().unwrap().cruise_tracks[&1].contains(&5));
+
+        // 精确云台:pan=90 tilt=10 zoom=2。
+        let precise = Control {
+            cmd_type: "DeviceControl".into(),
+            device_id: "d".into(),
+            sn: 2,
+            ptz_precise_ctrl: Some(gb28181_protocol::manscdp::PtzPreciseCtrl {
+                pan: 90.0,
+                tilt: 10.0,
+                zoom: 2.0,
+            }),
+            ..Default::default()
+        };
+        sim.handle_control(&precise).await.unwrap();
+        assert_eq!(
+            sim.control_state.lock().unwrap().precise_pose,
+            (90.0, 10.0, 2.0)
+        );
+
+        // 布防 → alarming=true。
+        let guard = Control {
+            cmd_type: "DeviceControl".into(),
+            device_id: "d".into(),
+            sn: 3,
+            guard_cmd: Some("SetGuard".into()),
+            ..Default::default()
+        };
+        sim.handle_control(&guard).await.unwrap();
+        assert!(sim.control_state.lock().unwrap().alarming);
     }
 
     #[tokio::test]

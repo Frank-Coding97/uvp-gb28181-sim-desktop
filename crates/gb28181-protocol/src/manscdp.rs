@@ -56,7 +56,7 @@ impl Query {
 
 /// 平台 → 设备的控制命令(Control)。GB28181 §A.2.4:PTZ/录像/布防/校时/重启/关键帧等。
 /// 各命令是可选子元素,按出现的字段判断具体控制类型。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "Control")]
 pub struct Control {
     #[serde(rename = "CmdType")]
@@ -91,6 +91,51 @@ pub struct Control {
     pub drag_zoom_in: Option<DragZoom>,
     #[serde(rename = "DragZoomOut", skip_serializing_if = "Option::is_none")]
     pub drag_zoom_out: Option<DragZoom>,
+    /// 精确云台控制(PTZPreciseCtrl),GB-2022:Pan/Tilt/Zoom 浮点。
+    #[serde(rename = "PTZPreciseCtrl", skip_serializing_if = "Option::is_none")]
+    pub ptz_precise_ctrl: Option<PtzPreciseCtrl>,
+    /// 目标跟踪(TargetTrack),GB-2022:Mode/ObjectID/Speed。
+    #[serde(rename = "TargetTrack", skip_serializing_if = "Option::is_none")]
+    pub target_track: Option<TargetTrack>,
+    /// 格式化 SD 卡(FormatSDCard):值为卡号或占位;卡号也可由 DiskNum 指定。
+    #[serde(rename = "FormatSDCard", skip_serializing_if = "Option::is_none")]
+    pub format_sd_card: Option<String>,
+    /// 格式化卡号(与 FormatSDCard 配套,GB-2022)。
+    #[serde(rename = "DiskNum", skip_serializing_if = "Option::is_none")]
+    pub disk_num: Option<u32>,
+}
+
+/// 精确云台控制参数(PTZPreciseCtrl 子元素,GB-2022)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PtzPreciseCtrl {
+    /// 水平角(度,0-360.00)。
+    #[serde(rename = "Pan", default)]
+    pub pan: f32,
+    /// 俯仰角(度,-30~90)。
+    #[serde(rename = "Tilt", default)]
+    pub tilt: f32,
+    /// 变倍(≥1.00)。
+    #[serde(rename = "Zoom", default = "one_f32")]
+    pub zoom: f32,
+}
+
+fn one_f32() -> f32 {
+    1.0
+}
+
+/// 目标跟踪参数(TargetTrack 子元素,GB-2022)。
+/// 平台可发结构体(Mode/ObjectID/Speed)或旧式纯文本 `<TargetTrack>Auto</TargetTrack>`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetTrack {
+    /// 跟踪模式:Auto / Manual / Stop(白名单外忽略)。
+    #[serde(rename = "Mode", default)]
+    pub mode: String,
+    /// 目标 ID(可选)。
+    #[serde(rename = "ObjectID", default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    /// 跟踪速度(1-255,可选)。
+    #[serde(rename = "Speed", default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<u32>,
 }
 
 /// 看守位设置(HomePosition 子元素)。
@@ -151,6 +196,12 @@ impl Control {
             "拉框放大"
         } else if self.drag_zoom_out.is_some() {
             "拉框缩小"
+        } else if self.ptz_precise_ctrl.is_some() {
+            "精确云台控制"
+        } else if self.target_track.is_some() {
+            "目标跟踪"
+        } else if self.format_sd_card.is_some() {
+            "格式化SD卡"
         } else {
             "未知控制"
         }
@@ -213,6 +264,146 @@ impl Control {
             zoom_speed: bytes[6] >> 4,
         })
     }
+
+    /// 解析 PTZCmd 8 字节码为字节数组(≥7 字节返回 Some)。
+    fn ptz_bytes(&self) -> Option<Vec<u8>> {
+        let hex = self.ptz_cmd.as_ref()?;
+        let bytes = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        (bytes.len() >= 7).then_some(bytes)
+    }
+
+    /// 解析巡航轨迹控制(PTZCmd byte3 = 0x84-0x88)。
+    ///
+    /// 上游 uvp-gb28181-sim 编码:0x84 增点(b4=轨迹# b5=预置#)/ 0x85 删点 /
+    /// 0x86 速度(b5=speed)/ 0x87 停留(b5=秒)/ 0x88 启动(b4=轨迹#,0=停)。
+    pub fn cruise_op(&self) -> Option<CruiseOp> {
+        let b = self.ptz_bytes()?;
+        match b[3] {
+            0x84 => Some(CruiseOp::SetPoint {
+                track: b[4] as u32,
+                preset: b[5] as u32,
+            }),
+            0x85 => Some(CruiseOp::DelPoint {
+                track: b[4] as u32,
+                preset: b[5] as u32,
+            }),
+            0x86 => Some(CruiseOp::SetSpeed {
+                track: b[4] as u32,
+                speed: b[5] as u32,
+            }),
+            0x87 => Some(CruiseOp::SetDwell {
+                track: b[4] as u32,
+                dwell: b[5] as u32,
+            }),
+            0x88 => Some(CruiseOp::Start { track: b[4] as u32 }),
+            _ => None,
+        }
+    }
+
+    /// 解析辅助控制(PTZCmd byte3 = 0x89 开 / 0x8A 关,b4=辅助号)。
+    ///
+    /// 辅助号:1=雨刷 2=红外灯 3=加热 4=除雾 5=制冷(海康/大华事实标准)。
+    pub fn aux_op(&self) -> Option<AuxOp> {
+        let b = self.ptz_bytes()?;
+        let on = match b[3] {
+            0x89 => true,
+            0x8A => false,
+            _ => return None,
+        };
+        Some(AuxOp {
+            on,
+            function: AuxFunction::from_index(b[4]),
+            index: b[4],
+        })
+    }
+
+    /// 解析聚焦/光圈(PTZCmd byte3)。
+    ///
+    /// GB/T 28181 标准 PTZ 指令码 bit6=聚焦近、bit7=聚焦远。但 bit7(0x80)与本项目
+    /// 预置位/巡航/辅助的扩展码(0x8x)高位冲突,故:仅当 byte3 恰为 0x40(纯聚焦近)
+    /// 或 0x80(纯聚焦远)时识别为聚焦,返回 (near, far);否则 None。
+    ///
+    /// ⚠️ 未在真实 WVP 抓包核对(记忆教训:PTZ 字节位不凭标准猜),仅作最小可用识别,
+    /// 后续接入真机再校正。
+    pub fn focus_op(&self) -> Option<(bool, bool)> {
+        let b = self.ptz_bytes()?;
+        match b[3] {
+            0x40 => Some((true, false)),
+            0x80 => Some((false, true)),
+            _ => None,
+        }
+    }
+}
+
+/// 巡航轨迹控制操作(PTZCmd 0x84-0x88 解析结果)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CruiseOp {
+    /// 增加巡航点。
+    SetPoint { track: u32, preset: u32 },
+    /// 删除巡航点。
+    DelPoint { track: u32, preset: u32 },
+    /// 设置巡航速度。
+    SetSpeed { track: u32, speed: u32 },
+    /// 设置停留时间(秒)。
+    SetDwell { track: u32, dwell: u32 },
+    /// 启动巡航(track=0 表示停止)。
+    Start { track: u32 },
+}
+
+/// 辅助控制功能(海康/大华事实标准索引)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxFunction {
+    /// 雨刷。
+    Wiper,
+    /// 红外灯。
+    InfraredLight,
+    /// 加热。
+    Heater,
+    /// 除雾。
+    Defog,
+    /// 制冷。
+    Cooler,
+    /// 未知辅助号。
+    Unknown,
+}
+
+impl AuxFunction {
+    /// 由辅助号映射功能。
+    pub fn from_index(idx: u8) -> Self {
+        match idx {
+            1 => AuxFunction::Wiper,
+            2 => AuxFunction::InfraredLight,
+            3 => AuxFunction::Heater,
+            4 => AuxFunction::Defog,
+            5 => AuxFunction::Cooler,
+            _ => AuxFunction::Unknown,
+        }
+    }
+
+    /// 中文名(日志/UI 用)。
+    pub fn label(&self) -> &'static str {
+        match self {
+            AuxFunction::Wiper => "雨刷",
+            AuxFunction::InfraredLight => "红外灯",
+            AuxFunction::Heater => "加热",
+            AuxFunction::Defog => "除雾",
+            AuxFunction::Cooler => "制冷",
+            AuxFunction::Unknown => "未知辅助",
+        }
+    }
+}
+
+/// 辅助控制操作(PTZCmd 0x89/0x8A 解析结果)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuxOp {
+    /// true=开,false=关。
+    pub on: bool,
+    /// 辅助功能。
+    pub function: AuxFunction,
+    /// 原始辅助号。
+    pub index: u8,
 }
 
 /// PTZ 方向/变倍运动(供 UI 云台动画;全 false 为停止)。
@@ -1646,6 +1837,63 @@ mod tests {
         assert!(xml.contains("<PresetID>7</PresetID>"));
         assert!(xml.contains("<Speed>5</Speed>"));
         assert!(xml.contains("<DwellTime>3</DwellTime>"));
+    }
+
+    #[test]
+    fn 解析巡航辅助聚焦字节码() {
+        let mk = |code: &str| Control {
+            cmd_type: "DeviceControl".into(),
+            ptz_cmd: Some(code.into()),
+            ..Default::default()
+        };
+        // 巡航增点:byte3=0x84, track=1, preset=3 → A50F01 84 01 03 00 <cksum>
+        assert_eq!(
+            mk("A50F0184010300").cruise_op(),
+            Some(CruiseOp::SetPoint {
+                track: 1,
+                preset: 3
+            })
+        );
+        // 巡航启动:byte3=0x88, track=2
+        assert_eq!(
+            mk("A50F0188020000").cruise_op(),
+            Some(CruiseOp::Start { track: 2 })
+        );
+        // 辅助控制开:byte3=0x89, aux=1(雨刷)
+        let aux = mk("A50F0189010000").aux_op().unwrap();
+        assert!(aux.on && aux.function == AuxFunction::Wiper);
+        // 辅助控制关:byte3=0x8A, aux=2(红外灯)
+        let aux2 = mk("A50F018A020000").aux_op().unwrap();
+        assert!(!aux2.on && aux2.function == AuxFunction::InfraredLight);
+        // 聚焦近:byte3=0x40
+        assert_eq!(mk("A50F0140000000").focus_op(), Some((true, false)));
+        // 方向命令不应误判为巡航/辅助/聚焦。
+        assert!(mk("A50F0108320000").cruise_op().is_none());
+        assert!(mk("A50F0108320000").focus_op().is_none());
+    }
+
+    #[test]
+    fn 解析精确云台与目标跟踪() {
+        let xml = r#"<?xml version="1.0"?>
+<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID>
+<PTZPreciseCtrl><Pan>123.45</Pan><Tilt>-15.0</Tilt><Zoom>3.5</Zoom></PTZPreciseCtrl></Control>"#;
+        let c = Control::parse(xml).unwrap();
+        assert_eq!(c.kind(), "精确云台控制");
+        let p = c.ptz_precise_ctrl.clone().unwrap();
+        assert!((p.pan - 123.45).abs() < 0.01 && (p.zoom - 3.5).abs() < 0.01);
+
+        let xml2 = r#"<?xml version="1.0"?>
+<Control><CmdType>DeviceControl</CmdType><SN>2</SN><DeviceID>d</DeviceID>
+<TargetTrack><Mode>Auto</Mode><Speed>10</Speed></TargetTrack></Control>"#;
+        let c2 = Control::parse(xml2).unwrap();
+        assert_eq!(c2.kind(), "目标跟踪");
+        assert_eq!(c2.target_track.unwrap().mode, "Auto");
+
+        let xml3 = r#"<?xml version="1.0"?>
+<Control><CmdType>DeviceControl</CmdType><SN>3</SN><DeviceID>d</DeviceID>
+<FormatSDCard>1</FormatSDCard><DiskNum>0</DiskNum></Control>"#;
+        let c3 = Control::parse(xml3).unwrap();
+        assert_eq!(c3.kind(), "格式化SD卡");
     }
 
     #[test]
