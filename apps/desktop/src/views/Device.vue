@@ -157,12 +157,38 @@ const target = ref<{ pan: number; tilt: number; zoom: number } | null>(null);
 const seeking = ref(false);
 const activePreset = ref<number | null>(null);
 
+// 是否在方向转动(不含变焦,变焦不算"转动")。
+const moving = computed(() => {
+  const m = ptz.value;
+  return m.up || m.down || m.left || m.right;
+});
+const zoomText = computed(() =>
+  ptz.value.zoom_in ? "放大 +" : ptz.value.zoom_out ? "缩小 −" : "—");
 const dirText = computed(() => {
   if (seeking.value && activePreset.value) return `转向预置位 ${activePreset.value}`;
   const m = ptz.value;
   const v = m.up ? "上" : m.down ? "下" : "";
   const h = m.left ? "左" : m.right ? "右" : "";
   return (v + h) || "—";
+});
+// 速度:方向转动时显示水平/垂直速度(0-255),变焦时显示变焦速度(0-15)。
+const speedText = computed(() => {
+  const m = ptz.value;
+  if (m.zoom_in || m.zoom_out) return `变焦 ${m.zoom_speed}/15`;
+  if (moving.value) {
+    const parts: string[] = [];
+    if (m.left || m.right) parts.push(`水平 ${m.pan_speed}`);
+    if (m.up || m.down) parts.push(`垂直 ${m.tilt_speed}`);
+    return parts.join(" · ") || "—";
+  }
+  return "—";
+});
+// 状态:变焦单独显示"变焦中",不与转动混淆。
+const statusText = computed(() => {
+  if (seeking.value) return "巡航中";
+  if (moving.value) return "转动中";
+  if (ptz.value.zoom_in || ptz.value.zoom_out) return "变焦中";
+  return "静止";
 });
 // 摇杆偏移:反映当前 pan/tilt(相对目标视角),像真摇杆推向运动方向。
 const knobStyle = computed(() => {
@@ -404,9 +430,10 @@ const metrics = computed(() => [
         <div class="ptz-info">
           <div class="ptz-stats">
             <div class="ptz-stat"><span>当前朝向</span><b class="pose">{{ poseText }}</b></div>
-            <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking }">{{ dirText }}</b></div>
-            <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ ptz.zoom_in ? "放大 +" : ptz.zoom_out ? "缩小 −" : "—" }}</b></div>
-            <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive || seeking }">{{ seeking ? "巡航中" : ptzActive ? "转动中" : "静止" }}</b></div>
+            <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
+            <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
+            <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
+            <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive || seeking }">{{ statusText }}</b></div>
             <div class="ptz-stat presets">
               <span>预置位</span>
               <span class="preset-chips">
