@@ -57,7 +57,13 @@ const stateMeta = computed(() => {
     default:            return { text: "未连接", color: "var(--text-tertiary)" };
   }
 });
-const running = computed(() => deviceState.value !== "Disconnected" && deviceState.value !== "Failed");
+// 引擎里是否存在设备实例(与状态灯解耦):只要设备后台在跑(哪怕在重试注册),
+// 就应允许"注销"停止它。启动成功即置 true,stop/引擎对账为空时置 false。
+const deviceLive = ref(false);
+// "注册上线"禁用:设备实例存在时禁用(避免重复启动)。
+const startDisabled = computed(() => deviceLive.value);
+// "注销"禁用:设备实例不存在时禁用。注册失败/重试中设备仍在跑,注销可点。
+const stopDisabled = computed(() => !deviceLive.value);
 const canReport = computed(() => deviceState.value === "Registered" || deviceState.value === "InCall");
 
 function fmtUptime() {
@@ -73,15 +79,20 @@ async function startDevice() {
   try {
     const config = { ...form.value, video_source: form.value.video_source.trim() || null };
     const msg = await invoke<string>("start_device", { config });
+    // 设备实例已在后台运行(可能仍在注册/重试),允许注销。
+    deviceLive.value = true;
     message.success(msg);
   } catch (e) {
+    // 启动本身失败(如配置非法):后端未留下实例,保持可重新启动。
     message.error(String(e));
+    deviceLive.value = false;
     deviceState.value = "Failed";
   }
 }
 async function stopDevice() {
   try {
     await invoke<string>("stop_device");
+    deviceLive.value = false;
     deviceState.value = "Disconnected";
     startedAt.value = null;
     message.info("设备已停止");
@@ -127,14 +138,22 @@ onMounted(async () => {
 });
 onUnmounted(() => { unlistenTrace?.(); if (timer) clearInterval(timer); });
 
-// keep-alive 激活时与引擎对账:设备状态由 App 共享,这里主要兜底 running 判断。
+// keep-alive 激活时与引擎对账:以引擎真实状态为准同步 deviceLive(避免切页后按钮态错乱)。
 onActivated(async () => {
   try {
     const st = await invoke<{ running: boolean }>("get_device_status");
-    if (!st.running && (deviceState.value !== "Disconnected")) {
+    deviceLive.value = st.running;
+    if (!st.running && deviceState.value !== "Disconnected") {
       deviceState.value = "Disconnected";
       startedAt.value = null;
     }
+  } catch { /* 忽略 */ }
+});
+// 首次挂载也对账一次(app 重启后仍能反映后台是否在跑)。
+onMounted(async () => {
+  try {
+    const st = await invoke<{ running: boolean }>("get_device_status");
+    deviceLive.value = st.running;
   } catch { /* 忽略 */ }
 });
 
@@ -250,8 +269,8 @@ const metrics = computed(() => [
         </div>
 
         <n-space style="margin-top: 18px">
-          <n-button type="primary" :disabled="running" @click="startDevice">注册上线</n-button>
-          <n-button :disabled="!running" @click="stopDevice">注销</n-button>
+          <n-button type="primary" :disabled="startDisabled" @click="startDevice">注册上线</n-button>
+          <n-button :disabled="stopDisabled" @click="stopDevice">注销</n-button>
           <n-button :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
           <n-button :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
         </n-space>
