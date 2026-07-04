@@ -1,6 +1,6 @@
 # 协议规格:MANSCDP XML
 
-**状态:草案** · GB28181 应用层消息(承载在 SIP MESSAGE/INVITE 体内)。实现见 `30-crates/gb28181-protocol.md`。参考 GB/T 28181-2022 附录。
+**状态:已实现** · GB28181 应用层消息(承载在 SIP MESSAGE/INVITE 体内)。实现见 `30-crates/gb28181-protocol.md`。参考 GB/T 28181-2016 与 GB/T 28181-2022 附录标准。
 
 ## 载体
 
@@ -11,7 +11,7 @@
 ### <a id="catalog"></a>目录 Catalog
 - 查询:`<Query><CmdType>Catalog</CmdType><SN>..</SN><DeviceID>..</DeviceID></Query>`
 - 应答:`<Response><CmdType>Catalog</CmdType>...<DeviceList Num="N"><Item>..通道..</Item></DeviceList></Response>`
-- 通道 Item(GB-2022 全字段):DeviceID、Name、Manufacturer、Model、Owner、CivilCode、Address、Parental、ParentID、Status、Longitude、Latitude 等。
+- 通道 Item(与 `CatalogItem` 结构一致):DeviceID、Name、Manufacturer、Model、CivilCode、Parental、ParentID、Status;GB-2022 新增 SecurityLevelCode、IPAddress、Port(仅 2022 版输出)。
 
 ### 设备信息 DeviceInfo
 - 应答字段:DeviceName、Manufacturer、Model、Firmware、Channel(通道数)。
@@ -54,6 +54,23 @@
   - 倍速/恢复:`PLAY MANSRTSP/1.0\r\nCSeq: n\r\nScale: 2.0\r\n\r\n`(Scale 为倍速,缺省视为 1.0)
   - 暂停:`PAUSE MANSRTSP/1.0\r\nCSeq: n\r\nPauseTime: now\r\n\r\n`
 - 设备实现:`Method::Info` 入站 → 解析体首行 PLAY/PAUSE + Scale → 调整推流的 `PlaybackControl`(倍速改取帧间隔、暂停保持会话不发包)→ 回 200 OK。无活跃会话也回 200(避免平台重传)。见 `media-rtp::PlaybackControl` 与 `push_stream_controlled`。
+
+### 设备控制 DeviceControl(平台 → 设备)
+`<Control>` 消息,按出现的子元素判类型:PTZCmd / IFameCmd(强制关键帧)/ RecordCmd(录像)/ GuardCmd(布防撤防)/ AlarmCmd(报警复位)/ TeleBoot(远程启动)/ HomePosition(看守位)/ DragZoomIn·DragZoomOut(拉框)。设备解析后回 `<Response><CmdType>DeviceControl</CmdType>…<Result>OK</Result></Response>`。
+
+**PTZCmd 8 字节码(GB/T 28181-2016 附录 A.3.1,字节以十六进制串给出)**:
+`字节0=A5 | 字节1=版本+校验(0F) | 字节2=地址 | 字节3=指令码 | 字节4=水平速度 | 字节5=垂直速度 | 字节6=变倍速度(高4位) | 字节7=校验和`
+
+- **方向/变倍指令码(字节3)位定义**(实测 WVP 抓包核对,与标准一致):
+  `右=0x01 · 左=0x02 · 下=0x04 · 上=0x08 · 放大=0x10 · 缩小=0x20`;全 0 为停止。
+  速度:字节4=水平(0-255)、字节5=垂直(0-255)、字节6 高 4 位=变倍(0-15)。
+- **预置位指令(字节3 高位置 1)**:`0x81 设置 · 0x82 调用 · 0x83 删除`;**预置位编号在字节5**(字节4 恒为 0x01)。
+  例:调用预置位 7 = `A50F0182 01 07 00 3F`。⚠️ 编号在字节5 不是字节4 —— 曾因读错字节导致所有预置位识别成 1,已按真实 WVP 码修正。
+- **看守位 HomePosition**:子元素 `Enabled`(1/0)、`ResetTime`(秒)、`PresetIndex`(归位预置位号)。
+- **拉框 DragZoom**:子元素 Length/Width/MidPointX/MidPointY/LengthX/LengthY。
+- 解析见 `Control::ptz_motion()` / `preset_op()`(`gb28181-protocol/src/manscdp.rs`)。设备维护有状态预置位表(设置/删除即时生效,PresetQuery 返回);预置位调用与方向命令经 `DeviceEvent::Ptz`/`PtzPresetCall` 驱动桌面云台可视化。
+
+> **教训**:PTZ 8 字节码的位映射与字节位不要凭标准文档"推断",不同平台/文档表述有出入 —— 本项目的方向位、预置位号字节都是**在真实 WVP 上逐命令抓包核对**后才定的(修过两个方向/字节位 bug)。
 
 ### 报警订阅 Alarm(✅ WVP 验证)
 - 平台 `SUBSCRIBE + Alarm` → 设备回带 tag 的 200 并**记录订阅对话**(Call-ID/tags/Event/Expires + 平台地址)。

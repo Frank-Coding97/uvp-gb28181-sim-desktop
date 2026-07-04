@@ -2,7 +2,7 @@
 
 **状态:M2 完成** · RTP/PS 封装与推流引擎。
 
-> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · 单测 14 全绿。待补:TCP(RFC 4571)推流、音频复合流(G.711A)。
+> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · 单测 14 全绿。待补:TCP(RFC 4571)推流。
 
 ## 容器格式支持(FileSource)
 
@@ -22,6 +22,7 @@ pub enum RtpMode { Udp, TcpActive, TcpPassive }  // 已定义
 pub mod rtp;      // RTP 打包/发送
 pub mod ps;       // PS 封装
 pub mod source;   // 视频源抽象
+pub mod pusher;   // 视频源→PS→RTP 按帧率推流的驱动(push_stream / push_stream_controlled / PlaybackControl)
 ```
 
 ### rtp
@@ -32,8 +33,9 @@ pub mod source;   // 视频源抽象
 
 ### source(可插拔,对应压测三档)
 ```rust
-pub trait VideoSource {
-    fn next_frame(&mut self) -> Option<Frame>;  // 返回一帧(裸码流/伪包)
+pub trait VideoSource: Send {
+    fn next_frame(&mut self) -> Option<Frame>;   // 返回一帧(裸码流/伪包)
+    fn next_audio(&mut self) -> Vec<Vec<u8>> {}  // 该帧期间的音频分包(默认空;FileSource 覆盖为 G.711A)
 }
 ```
 - `NoneSource` — 不产帧(A 档,只维持信令)。

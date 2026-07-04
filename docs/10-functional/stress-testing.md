@@ -36,7 +36,7 @@ YAML 定义,字段与 `30-crates/scenario.md` 的 `Scenario` 结构一一对应�
 ## 4. 调度策略
 
 ### 4.1 爬坡启动(FR-21)
-按 `rate_per_second` 分批创建设备并发起注册,避免瞬时注册风暴打死平台或本机。例:5000 台 @ 100/s → 50s 内均匀拉起。
+按 `ramp_per_second` 分批创建设备并发起注册,避免瞬时注册风暴打死平台或本机。例:5000 台 @ 100/s → 50s 内均匀拉起。
 
 ### 4.2 并发承载(FR-22)
 - 每台设备是**轻量异步任务**(Tokio task),非独立线程。
@@ -53,7 +53,7 @@ YAML 定义,字段与 `30-crates/scenario.md` 的 `Scenario` 结构一一对应�
 
 ## 5. 指标采集(FR-26、FR-27)
 
-引擎每秒聚合并经 WebSocket 推 UI(见 `20-architecture/api-contract.md`),同时落 SQLite(见 `20-architecture/data-model.md`)供报告。
+引擎每秒聚合无锁原子指标,经 **Tauri 事件 `metrics_tick`** 推 UI(见 `20-architecture/api-contract.md`)。时序落 SQLite 为规划中;当前报告导出为最终快照 JSON(见 `20-architecture/data-model.md`)。
 
 | 指标 | 说明 |
 |---|---|

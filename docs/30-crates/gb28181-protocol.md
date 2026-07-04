@@ -16,9 +16,10 @@ pub mod id_codec;  // 20 位 ID 编解码
 ```
 
 ### manscdp(用 quick-xml + serde)
-- 查询:`CatalogQuery`、`DeviceInfoQuery`、`DeviceStatusQuery`、`RecordInfoQuery`。
-- 应答:`CatalogResponse`(含通道列表,GB-2022 全字段)、`DeviceInfoResponse`、`DeviceStatusResponse`、`RecordInfoResponse`。
-- 通知:`Keepalive`、`Alarm`、`MediaStatus`。
+- 查询:`CatalogQuery`、`DeviceInfoQuery`、`DeviceStatusQuery`、`RecordInfoQuery`、`PresetQuery`、`ConfigDownload`(设备配置查询)。
+- 应答:`CatalogResponse`(含通道列表,GB-2022 全字段)、`DeviceInfoResponse`、`DeviceStatusResponse`、`RecordInfoResponse`、`PresetQueryResponse`(有状态预置位表)、`ConfigDownloadResponse`(BasicParam)。
+- 通知:`Keepalive`、`Alarm`、`MediaStatus`、`CatalogNotify`(目录订阅对话内 NOTIFY)。
+- 设备控制(平台 → 设备 `Control`):PTZ 解析 —— `ptz_motion()` 解出方向/速度(`PtzMotion`),`preset_op()` 解出预置位操作 `PresetAction{Set,Call,Delete}`(8 字节指令码 0x81/0x82/0x83)+ 预置位号;`HomePosition`(看守位)、`DragZoom`(拉框放大/缩小)。`Control::kind()` 返回中文命令名。
 - `from_xml(&str)` / `to_xml(&self)`,GB-2016/2022 字段差异用版本参数或字段可选处理。
 
 ### id_codec

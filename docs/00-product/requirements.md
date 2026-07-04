@@ -18,11 +18,16 @@
 | FR-4 | 支持 SIP over UDP 与 TCP | P0 | M1 |
 | FR-5 | 响应目录查询(Catalog),支持 GB-2022 字段 | P0 | M2 |
 | FR-6 | 响应设备信息(DeviceInfo)/ 设备状态(DeviceStatus)查询 | P0 | M2 |
-| FR-7 | 响应实时点播:INVITE 建流 / ACK / BYE 停流 | P0 | M2 |
-| FR-8 | 推送 H.264/H.265 码流,PS 封装,RTP over UDP/TCP | P0 | M2 |
-| FR-9 | 上报报警(Alarm Notify) | P1 | M3+ |
-| FR-10 | 响应录像查询(RecordInfo)与历史回放 | P2 | M3+ |
-| FR-11 | GB-2016 / GB-2022 版本切换 | P1 | M2 |
+| FR-7 | 响应实时点播:INVITE 建流 / ACK / BYE 停流 / CANCEL 取消 | P0 | M2 ✅ |
+| FR-8 | 推送 H.264/H.265 码流,PS 封装,RTP over UDP/TCP;音视频复合流(G.711A);MP4/FLV/MKV 容器源 | P0 | M2 ✅ |
+| FR-9 | 上报报警(Alarm Notify) | P1 | M3+ ✅ |
+| FR-10 | 响应录像查询(RecordInfo)、历史回放、倍速播放、录像下载 | P2 | M3+ ✅ |
+| FR-11 | GB-2016 / GB-2022 版本切换 | P1 | M2 ✅ |
+| FR-12 | 网络校时(解析平台 REGISTER 200 OK 的 Date 头对齐时钟) | P1 | M3+ ✅ |
+| FR-13 | 设备控制:PTZ 云台方向/变倍、预置位设置·调用·删除、看守位、拉框 | P1 | M3+ ✅ |
+| FR-14 | 设备配置查询(ConfigDownload)、预置位查询(PresetQuery) | P2 | M3+ ✅ |
+| FR-15 | 订阅通知:目录/报警(对话内 NOTIFY)、移动位置周期上报 | P1 | M3+ ✅ |
+| FR-16 | 回放控制:会话内 INFO/MANSRTSP 倍速、暂停/恢复 | P2 | M3+ ✅ |
 
 ### 压力测试(核心)
 

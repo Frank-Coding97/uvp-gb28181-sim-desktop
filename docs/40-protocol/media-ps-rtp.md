@@ -1,6 +1,6 @@
 # 协议规格:PS 封装与 RTP 推流
 
-**状态:草案** · 实时点播的媒体承载。实现见 `30-crates/media-rtp.md`。参考 GB/T 28181-2022 + ISO/IEC 13818-1(PS)+ RFC 3550(RTP)。
+**状态:已实现** · 实时点播的媒体承载。实现见 `30-crates/media-rtp.md`。参考 GB/T 28181-2022 + ISO/IEC 13818-1(PS)+ RFC 3550(RTP)。
 
 ## 总链路
 
