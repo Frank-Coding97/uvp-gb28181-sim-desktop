@@ -1,12 +1,27 @@
 <script setup lang="ts">
 // 单设备联调控制台(UC-1),高保真对齐参考原型 frost-blue:
 // 顶部 4 指标卡 + 双栏配置卡(SIP 服务器 / 设备身份)。
-import { ref, onMounted, onUnmounted, computed } from "vue";
+import { ref, onMounted, onUnmounted, onActivated, computed, inject, type Ref } from "vue";
 import { NButton, NSpace, useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 const message = useMessage();
+
+// 选择本地 H.264 文件作视频源(FR-8:C 档真实码流)。
+async function pickVideoSource() {
+  try {
+    const picked = await openDialog({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "H.264 裸流", extensions: ["h264", "264", "h265", "hevc"] }],
+    });
+    if (typeof picked === "string") form.value.video_source = picked;
+  } catch (e) {
+    message.error("选择文件失败:" + String(e));
+  }
+}
 
 const form = ref({
   server_host: "192.168.10.222",
@@ -20,12 +35,16 @@ const form = ref({
   video_source: "",
 });
 
-// 设备状态(device_state 事件驱动)。
+// 设备状态由常驻的 App.vue 统一维护并 provide,这里 inject 共享同一份,
+// 避免路由切换导致本页状态与顶栏胶囊分叉(注册后离开再回来两处状态不一致)。
 type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
-const deviceState = ref<DState>("Disconnected");
-const startedAt = ref<number | null>(null);
+const deviceState = inject<Ref<DState>>("deviceState", ref<DState>("Disconnected"));
+const startedAt = inject<Ref<number | null>>("deviceStartedAt", ref<number | null>(null));
 const uptime = ref("--:--:--");
 let timer: number | null = null;
+
+// 认证密码显示/隐藏切换。
+const showPassword = ref(false);
 
 const stateMeta = computed(() => {
   switch (deviceState.value) {
@@ -94,15 +113,9 @@ async function toggleTrace() {
 }
 function clearTraces() { traces.value = []; }
 
-let unlisten: UnlistenFn | null = null;
+// device_state 由 App.vue 统一订阅并写入共享状态,本页只订阅 sip_trace。
 let unlistenTrace: UnlistenFn | null = null;
 onMounted(async () => {
-  unlisten = await listen<string>("device_state", (e) => {
-    const s = e.payload as DState;
-    deviceState.value = s;
-    if (s === "Registered" && !startedAt.value) startedAt.value = Date.now();
-    if (s === "Disconnected" || s === "Failed") startedAt.value = null;
-  });
   unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
     if (!traceOn.value) return;
     traces.value.push(e.payload);
@@ -110,7 +123,18 @@ onMounted(async () => {
   });
   timer = window.setInterval(fmtUptime, 1000);
 });
-onUnmounted(() => { unlisten?.(); unlistenTrace?.(); if (timer) clearInterval(timer); });
+onUnmounted(() => { unlistenTrace?.(); if (timer) clearInterval(timer); });
+
+// keep-alive 激活时与引擎对账:设备状态由 App 共享,这里主要兜底 running 判断。
+onActivated(async () => {
+  try {
+    const st = await invoke<{ running: boolean }>("get_device_status");
+    if (!st.running && (deviceState.value !== "Disconnected")) {
+      deviceState.value = "Disconnected";
+      startedAt.value = null;
+    }
+  } catch { /* 忽略 */ }
+});
 
 const metrics = computed(() => [
   { label: "注册状态", value: stateMeta.value.text, color: stateMeta.value.color, dot: true },
@@ -182,7 +206,29 @@ const metrics = computed(() => [
         </div>
         <div class="fg">
           <label>认证密码</label>
-          <input v-model="form.password" class="inp" type="password" />
+          <div class="pwd-wrap">
+            <input
+              v-model="form.password"
+              class="inp"
+              :type="showPassword ? 'text' : 'password'"
+            />
+            <button
+              class="pwd-eye"
+              type="button"
+              :title="showPassword ? '隐藏密码' : '显示密码'"
+              @click="showPassword = !showPassword"
+            >
+              <!-- 睁眼 / 闭眼(带斜杠)图标,交互与平台配置页一致 -->
+              <svg v-if="showPassword" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+              <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-10-7-10-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+                <line x1="2" y1="2" x2="22" y2="22" />
+              </svg>
+            </button>
+          </div>
         </div>
         <div class="fg-row">
           <div class="fg">
@@ -191,7 +237,10 @@ const metrics = computed(() => [
           </div>
           <div class="fg">
             <label>视频源(可选)</label>
-            <input v-model="form.video_source" class="inp" placeholder="H.264 文件路径" />
+            <div class="file-row">
+              <input v-model="form.video_source" class="inp" placeholder="H.264 文件路径(点右侧选择)" />
+              <button class="file-btn" @click="pickVideoSource">选择文件</button>
+            </div>
           </div>
         </div>
 
@@ -270,6 +319,27 @@ const metrics = computed(() => [
   font-size: 13px; color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
 }
 .seg button.on { background: var(--accent); color: #fff; box-shadow: 0 2px 6px var(--accent-glow); }
+
+/* 密码显示/隐藏:框内右侧眼睛图标(与平台配置页交互一致) */
+.pwd-wrap { position: relative; }
+.pwd-wrap .inp { width: 100%; padding-right: 40px; }
+.pwd-eye {
+  position: absolute; top: 50%; right: 10px; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: transparent; padding: 2px; cursor: pointer;
+  color: var(--text-tertiary);
+}
+.pwd-eye:hover { color: var(--accent); }
+
+/* 视频源文件选择 */
+.file-row { display: flex; gap: 8px; align-items: stretch; }
+.file-row .inp { flex: 1 1 auto; }
+.file-btn {
+  flex: 0 0 auto; border: 1px solid var(--border-default); background: rgba(255,255,255,0.6);
+  border-radius: var(--radius-sm); padding: 0 14px; font-size: 13px; color: var(--text-secondary);
+  cursor: pointer; white-space: nowrap;
+}
+.file-btn:hover { border-color: var(--accent); color: var(--accent); }
 
 /* SIP 信令追踪面板 */
 .trace-panel { margin-top: 18px; }

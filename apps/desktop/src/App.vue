@@ -2,7 +2,7 @@
 // 主应用壳(frost-blue 磨砂风,对齐参考原型):
 // 顶栏右侧状态胶囊 + 磨砂侧边栏 + 内容区路由视图。
 // 必须保留 message/dialog/notification provider,否则子页 useMessage() 抛错致空白。
-import { computed, h, onMounted, onUnmounted, ref } from "vue";
+import { computed, h, onMounted, onUnmounted, provide, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
@@ -11,7 +11,7 @@ import {
 import type { MenuOption } from "naive-ui";
 import {
   SpeedometerOutline, HardwareChipOutline, ServerOutline,
-  LayersOutline, PulseOutline,
+  PulseOutline,
 } from "@vicons/ionicons5";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -26,8 +26,7 @@ const menuOptions: MenuOption[] = [
   { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
   { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
   { label: "平台配置",   key: "/config",    icon: icon(ServerOutline) },
-  { label: "压测场景",   key: "/scenario",  icon: icon(LayersOutline) },
-  { label: "运行监控",   key: "/monitor",   icon: icon(PulseOutline) },
+  { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
 ];
 
 const activeKey = computed(() => route.path);
@@ -47,10 +46,20 @@ const statusMeta = computed(() => {
     default:            return { text: "未连接", color: "var(--text-tertiary)" };
   }
 });
+// 注册起始时刻(在线时长基准)。放在常驻的 App 里,切换路由不丢失。
+const startedAt = ref<number | null>(null);
+
+// 作为唯一状态源下发给子页(Device 页 inject,避免各存一份导致状态分叉)。
+provide("deviceState", deviceState);
+provide("deviceStartedAt", startedAt);
+
 let unlisten: UnlistenFn | null = null;
 onMounted(async () => {
   unlisten = await listen<string>("device_state", (e) => {
-    deviceState.value = e.payload as DState;
+    const s = e.payload as DState;
+    deviceState.value = s;
+    if (s === "Registered" && !startedAt.value) startedAt.value = Date.now();
+    if (s === "Disconnected" || s === "Failed") startedAt.value = null;
   });
 });
 onUnmounted(() => unlisten?.());
@@ -104,7 +113,12 @@ const themeOverrides = {
                 </div>
               </header>
               <section class="content">
-                <router-view />
+                <!-- keep-alive:切换标签页不销毁组件,保留各页表单/运行/曲线状态。 -->
+                <router-view v-slot="{ Component }">
+                  <keep-alive>
+                    <component :is="Component" />
+                  </keep-alive>
+                </router-view>
               </section>
             </main>
           </div>
