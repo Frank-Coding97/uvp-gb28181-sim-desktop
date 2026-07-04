@@ -58,6 +58,32 @@ impl SendStats {
     }
 }
 
+/// 构造一个 RTCP Sender Report(SR)包(RFC 3550 §6.4.1,无接收报告块 RC=0)。
+///
+/// 字段:V=2,P=0,RC=0,PT=200,length=6(以 32 位字计 −1);SSRC;
+/// NTP 时间戳(64 位,自 1900 纪元)、RTP 时间戳、发送包数、发送字节数。
+/// 供设备侧向平台反馈发送统计(FR-32);当前作为独立可测组件,周期发送待接入 RTCP 端口。
+pub fn build_rtcp_sr(
+    ssrc: u32,
+    ntp_secs: u32,
+    ntp_frac: u32,
+    rtp_ts: u32,
+    packet_count: u32,
+    octet_count: u32,
+) -> [u8; 28] {
+    let mut b = [0u8; 28];
+    b[0] = 0x80; // V=2, P=0, RC=0
+    b[1] = 200; // PT=SR
+    b[2..4].copy_from_slice(&6u16.to_be_bytes()); // length = 28/4 - 1 = 6
+    b[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    b[8..12].copy_from_slice(&ntp_secs.to_be_bytes());
+    b[12..16].copy_from_slice(&ntp_frac.to_be_bytes());
+    b[16..20].copy_from_slice(&rtp_ts.to_be_bytes());
+    b[20..24].copy_from_slice(&packet_count.to_be_bytes());
+    b[24..28].copy_from_slice(&octet_count.to_be_bytes());
+    b
+}
+
 /// 发送通道:UDP 数据报,或 TCP(RFC 4571,每包前置 2 字节大端长度)。
 enum Channel {
     Udp { socket: UdpSocket, dst: SocketAddr },
@@ -160,6 +186,17 @@ mod tests {
         assert_eq!(&pkt[4..8], &[0xde, 0xad, 0xbe, 0xef]); // timestamp
         assert_eq!(&pkt[8..12], &[0xca, 0xfe, 0xba, 0xbe]); // ssrc
         assert_eq!(&pkt[12..], &[1, 2, 3]); // payload
+    }
+
+    #[test]
+    fn rtcp_sr_字段正确() {
+        let sr = build_rtcp_sr(0xcafebabe, 0x11111111, 0x22222222, 0x33333333, 100, 5000);
+        assert_eq!(sr[0], 0x80); // V=2 RC=0
+        assert_eq!(sr[1], 200); // PT=SR
+        assert_eq!(&sr[2..4], &6u16.to_be_bytes()); // length=6
+        assert_eq!(&sr[4..8], &0xcafebabeu32.to_be_bytes()); // SSRC
+        assert_eq!(&sr[20..24], &100u32.to_be_bytes()); // packet count
+        assert_eq!(&sr[24..28], &5000u32.to_be_bytes()); // octet count
     }
 
     #[tokio::test]

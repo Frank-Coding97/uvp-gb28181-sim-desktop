@@ -15,7 +15,7 @@ pub mod source;
 
 pub use ps::PsMuxer;
 pub use pusher::{push_stream, push_stream_controlled, PlaybackControl};
-pub use rtp::{RtpSender, SendStats, CLOCK_HZ, PT_PS};
+pub use rtp::{build_rtcp_sr, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{prepare_video_source, FileSource, Frame, LightSource, NoneSource, VideoSource};
 
 /// RTP 发送模式。
