@@ -15,6 +15,14 @@ use sip_core::{authorization, Challenge, UdpTransport};
 
 use crate::builder::{self, DialogIds};
 
+/// 设备初始内置的两个预置位(可被平台的预置位设置/删除命令修改)。
+fn default_presets() -> std::collections::BTreeMap<u8, String> {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(1, "预置位1".to_string());
+    m.insert(2, "预置位2".to_string());
+    m
+}
+
 /// 单个虚拟设备的静态配置。压测时由 `scenario` 按序号批量生成。
 #[derive(Debug, Clone)]
 pub struct DeviceConfig {
@@ -102,6 +110,8 @@ pub struct DeviceSimulator {
     /// 报警订阅对话(平台 `SUBSCRIBE + Alarm` 时记录:对话标识 + 平台地址)。
     /// 存在时,report_alarm 走对话内 NOTIFY;否则退化为独立 MESSAGE(如手动触发)。
     alarm_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
+    /// 预置位表(编号 → 名称)。PTZ 预置位设置/删除命令更新,PresetQuery 返回。
+    presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
 }
 
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
@@ -136,6 +146,7 @@ impl DeviceSimulator {
             position: std::sync::Mutex::new((116.397_428, 39.909_230)),
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
+            presets: std::sync::Mutex::new(default_presets()),
         }
     }
 
@@ -151,6 +162,7 @@ impl DeviceSimulator {
             position: std::sync::Mutex::new((116.397_428, 39.909_230)),
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
+            presets: std::sync::Mutex::new(default_presets()),
         }
     }
 
@@ -767,17 +779,19 @@ impl DeviceSimulator {
                 resp.to_xml()
             }
             "PresetQuery" => {
-                // 预置位查询:模拟设备返回两个内置预置位(真实设备由云台维护)。
-                let items = vec![
-                    PresetItem {
-                        preset_id: 1,
-                        preset_name: "预置位1".into(),
-                    },
-                    PresetItem {
-                        preset_id: 2,
-                        preset_name: "预置位2".into(),
-                    },
-                ];
+                // 预置位查询:返回当前预置位表(可被 PTZ 预置位设置/删除命令动态修改)。
+                let items: Vec<PresetItem> = self
+                    .presets
+                    .lock()
+                    .map(|p| {
+                        p.iter()
+                            .map(|(id, name)| PresetItem {
+                                preset_id: *id as u32,
+                                preset_name: name.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let resp = PresetQueryResponse::new(&query.device_id, query.sn, items);
                 resp.to_xml()
             }
@@ -794,8 +808,31 @@ impl DeviceSimulator {
     async fn handle_control(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<String> {
         tracing::info!(kind = %ctrl.kind(), sn = ctrl.sn, "收到设备控制");
         if let Some(ptz) = &ctrl.ptz_cmd {
-            // PTZ 8 字节码:解析方向/速度用于日志(真实设备驱动云台)。
-            tracing::info!(ptz = %ptz, "PTZ 云台控制(模拟接受)");
+            // PTZ 8 字节码:识别预置位设置/调用/删除并更新预置位表;其余为方向/变倍。
+            use gb28181_protocol::manscdp::PresetAction;
+            match ctrl.preset_op() {
+                Some((PresetAction::Set, idx)) => {
+                    if let Ok(mut p) = self.presets.lock() {
+                        p.insert(idx, format!("预置位{idx}"));
+                    }
+                    tracing::info!(preset = idx, "预置位设置");
+                }
+                Some((PresetAction::Delete, idx)) => {
+                    if let Ok(mut p) = self.presets.lock() {
+                        p.remove(&idx);
+                    }
+                    tracing::info!(preset = idx, "预置位删除");
+                }
+                Some((PresetAction::Call, idx)) => {
+                    tracing::info!(preset = idx, "预置位调用(转到)");
+                }
+                None => {
+                    tracing::info!(ptz = %ptz, "PTZ 云台控制(方向/变倍,模拟接受)");
+                }
+            }
+        }
+        if let Some(hp) = &ctrl.home_position {
+            tracing::info!(enabled = hp.enabled, preset = hp.preset_index, "看守位设置");
         }
         if ctrl.iframe_cmd.is_some() {
             tracing::info!("强制关键帧(下一帧起带 IDR)");

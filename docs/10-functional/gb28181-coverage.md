@@ -2,7 +2,7 @@
 
 **状态:核心已实现并真机验证** · 本项目实现 GB/T 28181-2022 **下级设备(IPC)侧**协议。协议流程参考开源项目 uvp-gb28181-sim(Android 版),桌面端用 Rust 独立重写。
 
-> **对标 uvp-gb28181-sim 结论(2026-07-03)**:上游 Android 版的核心能力(注册/心跳/目录/点播/PTZ 等设备控制/GPS 上报/报警)本项目均已覆盖并真机验证,且**额外**具备上游没有的**万级压测引擎**(差异化核心)、**GB-2016/2022 双版本**、**订阅通知全套**(目录/报警对话内 NOTIFY + 位置周期)、**回放倍速/下载**、**网络校时**、**SIP 信令实时追踪**。仅**语音广播**未做(本 WVP 环境无法触发验证,见下);双向对讲/GB35114/上级侧为明确不做。
+> **对标 uvp-gb28181-sim 结论(2026-07-04 更新)**:上游 Android 版的核心能力(注册/心跳/目录/点播/PTZ 及设备控制/**预置位 CRUD**/**看守位**/GPS 上报/报警)本项目均已覆盖并真机验证,且**额外**具备上游没有的**万级压测引擎**(差异化核心)、**GB-2016/2022 双版本**、**订阅通知全套**(目录/报警对话内 NOTIFY + 位置周期)、**回放倍速/下载**、**音视频复合流(H.264+G.711A)**、**MP4/FLV/MKV 容器源**、**网络校时**、**SIP 信令实时追踪**。仍缺:**语音广播/对讲**(需反向 INVITE + 音频上行,本 WVP 环境无法触发验证)、巡航轨迹控制、摄像头实时采集;GB35114/上级侧为明确不做。
 
 图例:✅ 已实现并对真实 WVP 验证 · 🟢 已实现(单测,未逐一真机) · 🚧 部分 · ⬜ 规划 · 🚫 明确不做
 
@@ -53,6 +53,8 @@
 | 功能 | CmdType/字段 | 优先级 | 状态 |
 |---|---|---|---|
 | PTZ 云台控制 | DeviceControl / PTZCmd | P0 | ✅ WVP 下发验证(解析+应答) |
+| 预置位设置/调用/删除 | DeviceControl / PTZCmd 指令码 81/82/83 | P1 | ✅ 解析 8 字节码预置位操作,有状态增删,实 SIP 注入验证(设置/删除后 PresetQuery 反映) |
+| 看守位设置 | DeviceControl / HomePosition | P1 | 🟢 解析 Enabled/ResetTime/PresetIndex + 应答 |
 | 强制关键帧 | DeviceControl / IFameCmd | P0 | ✅ 命令解析+应答;文件回放源自带周期 IDR,无法"强制"再生成一帧(硬标关键帧会产出坏流),故仅应答,符合回放模拟器语义 |
 | 录像控制(录制/停止) | DeviceControl / RecordCmd | P1 | ✅ 同一 Control 链路 |
 | 布防/撤防 | DeviceControl / GuardCmd | P1 | ✅ 同一 Control 链路 |
@@ -77,7 +79,7 @@
 | 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
 | 语音广播 | Broadcast | P2 | ⬜ 未做:需设备侧反向 INVITE(UAC)+ 音频接收。WVP broadcast API 返回成功但未观察到向设备发 SIP Broadcast Notify(疑需设备声明音频输出能力),本环境无法验证,故不盲写 |
 | 设备配置查询 | ConfigDownload / BasicParam | P2 | 🟢 回 200 + ConfigDownload Response(Name/Expiration/HeartBeat*),实 SIP UDP 注入验证 |
-| 预置位查询 | PresetQuery | P2 | 🟢 回 200 + PresetQuery Response(PresetList),实 SIP UDP 注入验证 |
+| 预置位查询 | PresetQuery | P2 | ✅ 返回有状态预置位表(随预置位设置/删除动态变),实 SIP 注入验证 |
 | 设备软件升级 | — | P2(边缘) | 🚫 暂不 |
 
 ## 主动上报(设备 → 平台)
