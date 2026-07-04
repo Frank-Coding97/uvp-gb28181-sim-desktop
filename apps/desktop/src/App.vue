@@ -90,7 +90,7 @@ const themeOverrides = {
             <!-- 侧边栏 -->
             <aside class="sidebar">
               <div class="brand">
-                <div class="brand-logo">GB</div>
+                <div class="brand-logo">UVP</div>
                 <div>
                   <div class="brand-title">GB28181 Sim</div>
                   <div class="brand-sub">国标设备模拟 · 压测</div>
@@ -142,7 +142,7 @@ const themeOverrides = {
 .brand-logo {
   width: 38px; height: 38px; border-radius: 10px;
   background: linear-gradient(135deg, #3884ff, #1e63dc);
-  color: #fff; font-weight: 700; font-size: 15px;
+  color: #fff; font-weight: 700; font-size: 13px; letter-spacing: 0.5px;
   display: flex; align-items: center; justify-content: center;
   box-shadow: 0 4px 12px var(--accent-glow);
 }
