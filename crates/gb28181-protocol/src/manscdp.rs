@@ -34,6 +34,16 @@ pub struct Query {
     /// 指示设备按此间隔周期上报位置 NOTIFY;普通查询不含此字段(None)。
     #[serde(rename = "Interval", default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<u64>,
+    /// 巡航轨迹号。仅巡航轨迹详情查询(CruiseTrackQuery)携带;缺省视为 1。
+    #[serde(rename = "GroupID", default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<u32>,
+    /// 配置类型(斜杠分隔可组合)。仅 ConfigDownload 查询携带,如 BasicParam / VideoParamOpt。
+    #[serde(
+        rename = "ConfigType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub config_type: Option<String>,
 }
 
 impl Query {
@@ -704,6 +714,21 @@ pub struct ConfigDownloadResponse {
     /// 基本参数(ConfigType=BasicParam 时携带)。
     #[serde(rename = "BasicParam", skip_serializing_if = "Option::is_none")]
     pub basic_param: Option<BasicParam>,
+    /// 视频参数(ConfigType=VideoParamOpt 时携带,GB-2022)。
+    #[serde(rename = "VideoParamOpt", skip_serializing_if = "Option::is_none")]
+    pub video_param_opt: Option<VideoParamOpt>,
+}
+
+/// 视频参数(ConfigDownload/VideoParamOpt 的内容,GB-2022)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "VideoParamOpt")]
+pub struct VideoParamOpt {
+    /// 支持的下载倍速,斜杠分隔(固定 "1/2/4",与上游一致)。
+    #[serde(rename = "DownloadSpeed")]
+    pub download_speed: String,
+    /// 分辨率标签(如 "1920*1080")。
+    #[serde(rename = "Resolution")]
+    pub resolution: String,
 }
 
 impl ConfigDownloadResponse {
@@ -726,6 +751,43 @@ impl ConfigDownloadResponse {
                 expiration,
                 heartbeat_interval,
                 heartbeat_count,
+            }),
+            video_param_opt: None,
+        }
+    }
+
+    /// 按 ConfigType(斜杠分隔可组合)构造应答,只输出被请求的块。
+    /// `config_type` 大小写不敏感,含 "BasicParam" / "VideoParamOpt"。
+    #[allow(clippy::too_many_arguments)]
+    pub fn by_type(
+        device_id: impl Into<String>,
+        sn: u32,
+        config_type: &str,
+        name: impl Into<String>,
+        expiration: u32,
+        heartbeat_interval: u32,
+        heartbeat_count: u32,
+        resolution: impl Into<String>,
+    ) -> Self {
+        let lower = config_type.to_ascii_lowercase();
+        // 缺省(空 ConfigType)按 BasicParam 处理,兼容旧行为。
+        let want_basic = lower.is_empty() || lower.contains("basicparam");
+        let want_video = lower.contains("videoparamopt");
+        let device_id = device_id.into();
+        ConfigDownloadResponse {
+            cmd_type: "ConfigDownload".into(),
+            sn,
+            device_id,
+            result: "OK".into(),
+            basic_param: want_basic.then(|| BasicParam {
+                name: name.into(),
+                expiration,
+                heartbeat_interval,
+                heartbeat_count,
+            }),
+            video_param_opt: want_video.then(|| VideoParamOpt {
+                download_speed: "1/2/4".into(),
+                resolution: resolution.into(),
             }),
         }
     }
@@ -856,6 +918,385 @@ impl CatalogNotify {
     pub fn to_xml(&self) -> Result<String> {
         let body = quick_xml::se::to_string(self)
             .map_err(|e| Error::Gb28181(format!("CatalogNotify 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FR-17 扩展查询应答(M6·P1)。骨架据上游 uvp-gb28181-sim 真实实现核对,
+// 均以独立 MESSAGE 发回 `<Response>`(与 Catalog/ConfigDownload 同路径)。
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 报警状态查询应答项(AlarmStatus,GB-2022 Item)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct AlarmStatusItem {
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 值守状态:ALARM(报警中)/ OFFDUTY(未布防)。
+    #[serde(rename = "DutyStatus")]
+    pub duty_status: String,
+}
+
+/// 报警状态查询应答(AlarmStatus,设备 → 平台)。
+///
+/// GB-2022 用 `Num`+`Item`(每报警通道一项 DutyStatus);
+/// GB-2016 用单个 `NotNumber`(0/1)。用 [`AlarmStatusResponse::new`] 按版本构造。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct AlarmStatusResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "Result")]
+    pub result: String,
+    /// GB-2016:未处理报警数(0/1)。2022 版为 None。
+    #[serde(rename = "NotNumber", skip_serializing_if = "Option::is_none")]
+    pub not_number: Option<u32>,
+    /// GB-2022:报警项数。2016 版为 None。
+    #[serde(rename = "Num", skip_serializing_if = "Option::is_none")]
+    pub num: Option<u32>,
+    /// GB-2022:各报警通道值守状态。2016 版为空。
+    #[serde(rename = "Item", default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<AlarmStatusItem>,
+}
+
+impl AlarmStatusResponse {
+    /// 按版本构造。`alarming` 为当前是否处于报警/布防态。
+    /// 2022 版每报警通道一项 DutyStatus;2016 版用 NotNumber。
+    pub fn new(
+        device_id: impl Into<String>,
+        sn: u32,
+        alarm_channels: &[String],
+        alarming: bool,
+        is_2022: bool,
+    ) -> Self {
+        let duty = if alarming { "ALARM" } else { "OFFDUTY" };
+        if is_2022 {
+            let items: Vec<AlarmStatusItem> = alarm_channels
+                .iter()
+                .map(|id| AlarmStatusItem {
+                    device_id: id.clone(),
+                    duty_status: duty.into(),
+                })
+                .collect();
+            AlarmStatusResponse {
+                cmd_type: "AlarmStatus".into(),
+                sn,
+                device_id: device_id.into(),
+                result: "OK".into(),
+                not_number: None,
+                num: Some(items.len() as u32),
+                items,
+            }
+        } else {
+            AlarmStatusResponse {
+                cmd_type: "AlarmStatus".into(),
+                sn,
+                device_id: device_id.into(),
+                result: "OK".into(),
+                not_number: Some(alarming as u32),
+                num: None,
+                items: Vec::new(),
+            }
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("AlarmStatusResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 看守位查询应答(HomePositionQuery,设备 → 平台)。
+///
+/// ResetTime 固定 30(平台下发不落存);PresetIndex 表"有无看守位"(1/0),非真实编号
+///(与上游 uvp-gb28181-sim 一致)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct HomePositionQueryResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 是否启用看守位(1/0)。
+    #[serde(rename = "Enabled")]
+    pub enabled: u8,
+    /// 自动归位时间(秒),固定 30。
+    #[serde(rename = "ResetTime")]
+    pub reset_time: u32,
+    /// 归位预置位标志(有看守位=1,否则 0)。
+    #[serde(rename = "PresetIndex")]
+    pub preset_index: u32,
+}
+
+impl HomePositionQueryResponse {
+    /// 用是否启用/是否已设看守位构造。
+    pub fn new(device_id: impl Into<String>, sn: u32, enabled: bool, has_home: bool) -> Self {
+        HomePositionQueryResponse {
+            cmd_type: "HomePositionQuery".into(),
+            sn,
+            device_id: device_id.into(),
+            enabled: enabled as u8,
+            reset_time: 30,
+            preset_index: has_home as u32,
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("HomePositionQueryResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 存储卡状态项(StorageCardStatusQuery Item)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct StorageCardItem {
+    #[serde(rename = "CardNum")]
+    pub card_num: u32,
+    /// 状态:Normal / Abnormal / NoDisk 等。
+    #[serde(rename = "Status")]
+    pub status: String,
+    /// 总容量(MB)。
+    #[serde(rename = "TotalCapacity")]
+    pub total_capacity: u64,
+    /// 剩余容量(MB)。
+    #[serde(rename = "RemainingSpace")]
+    pub remaining_space: u64,
+}
+
+/// 存储卡列表(带 Num 属性)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageList {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<StorageCardItem>,
+}
+
+/// 存储卡状态查询应答(StorageCardStatusQuery,设备 → 平台)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct StorageCardStatusResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SumNum")]
+    pub sum_num: u32,
+    #[serde(rename = "StorageList")]
+    pub storage_list: StorageList,
+}
+
+impl StorageCardStatusResponse {
+    /// 构造(模拟单张 32G 卡,余 24G,与上游一致)。
+    pub fn mock(device_id: impl Into<String>, sn: u32) -> Self {
+        let items = vec![StorageCardItem {
+            card_num: 0,
+            status: "Normal".into(),
+            total_capacity: 32768,
+            remaining_space: 24576,
+        }];
+        let num = items.len() as u32;
+        StorageCardStatusResponse {
+            cmd_type: "StorageCardStatusQuery".into(),
+            sn,
+            device_id: device_id.into(),
+            sum_num: num,
+            storage_list: StorageList { num, items },
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("StorageCardStatusResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 巡航轨迹列表项(CruiseTrackListQuery Item)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct CruiseTrackListItem {
+    #[serde(rename = "GroupID")]
+    pub group_id: u32,
+    #[serde(rename = "Name")]
+    pub name: String,
+}
+
+/// 巡航轨迹列表(带 Num 属性)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackList {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<CruiseTrackListItem>,
+}
+
+/// 巡航轨迹列表查询应答(CruiseTrackListQuery,设备 → 平台)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct CruiseTrackListResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SumNum")]
+    pub sum_num: u32,
+    #[serde(rename = "TrackList")]
+    pub track_list: TrackList,
+}
+
+impl CruiseTrackListResponse {
+    /// 用轨迹号列表构造(名称固定 "巡航 {号}")。
+    pub fn new(device_id: impl Into<String>, sn: u32, track_ids: &[u32]) -> Self {
+        let items: Vec<CruiseTrackListItem> = track_ids
+            .iter()
+            .map(|&t| CruiseTrackListItem {
+                group_id: t,
+                name: format!("巡航 {t}"),
+            })
+            .collect();
+        let num = items.len() as u32;
+        CruiseTrackListResponse {
+            cmd_type: "CruiseTrackListQuery".into(),
+            sn,
+            device_id: device_id.into(),
+            sum_num: num,
+            track_list: TrackList { num, items },
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("CruiseTrackListResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 巡航轨迹详情预置点(CruiseTrackQuery Item;Speed/DwellTime 固定 5/3)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct CruisePresetItem {
+    #[serde(rename = "PresetID")]
+    pub preset_id: u32,
+    #[serde(rename = "Speed")]
+    pub speed: u32,
+    #[serde(rename = "DwellTime")]
+    pub dwell_time: u32,
+}
+
+/// 巡航详情预置点列表(带 Num 属性)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CruisePresetList {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<CruisePresetItem>,
+}
+
+/// 巡航轨迹详情查询应答(CruiseTrackQuery,设备 → 平台)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct CruiseTrackQueryResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "GroupID")]
+    pub group_id: u32,
+    #[serde(rename = "SumNum")]
+    pub sum_num: u32,
+    #[serde(rename = "PresetList")]
+    pub preset_list: CruisePresetList,
+}
+
+impl CruiseTrackQueryResponse {
+    /// 用轨迹号与该轨迹的预置点列表构造(Speed/DwellTime 固定 5/3)。
+    pub fn new(device_id: impl Into<String>, sn: u32, group_id: u32, preset_ids: &[u32]) -> Self {
+        let items: Vec<CruisePresetItem> = preset_ids
+            .iter()
+            .map(|&p| CruisePresetItem {
+                preset_id: p,
+                speed: 5,
+                dwell_time: 3,
+            })
+            .collect();
+        let num = items.len() as u32;
+        CruiseTrackQueryResponse {
+            cmd_type: "CruiseTrackQuery".into(),
+            sn,
+            device_id: device_id.into(),
+            group_id,
+            sum_num: num,
+            preset_list: CruisePresetList { num, items },
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("CruiseTrackQueryResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// PTZ 精准状态查询应答(PTZPreciseStatusQuery,GB-2022,设备 → 平台)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct PtzPreciseStatusResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 水平角(度,%.2f)。
+    #[serde(rename = "Pan")]
+    pub pan: String,
+    /// 俯仰角(度,%.2f)。
+    #[serde(rename = "Tilt")]
+    pub tilt: String,
+    /// 变倍(≥1.00,%.2f)。
+    #[serde(rename = "Zoom")]
+    pub zoom: String,
+}
+
+impl PtzPreciseStatusResponse {
+    /// 用当前姿态构造(格式化为 %.2f)。
+    pub fn new(device_id: impl Into<String>, sn: u32, pan: f32, tilt: f32, zoom: f32) -> Self {
+        PtzPreciseStatusResponse {
+            cmd_type: "PTZPreciseStatusQuery".into(),
+            sn,
+            device_id: device_id.into(),
+            pan: format!("{pan:.2}"),
+            tilt: format!("{tilt:.2}"),
+            zoom: format!("{zoom:.2}"),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("PtzPreciseStatusResponse 序列化失败: {e}")))?;
         Ok(format!("{XML_DECL}{body}"))
     }
 }
@@ -1143,5 +1584,112 @@ mod tests {
         assert!(xml.contains("<CmdType>MobilePosition</CmdType>"));
         assert!(xml.contains("<Longitude>116.397</Longitude>"));
         assert!(xml.contains("<Latitude>39.908</Latitude>"));
+    }
+
+    #[test]
+    fn 报警状态应答_2022用item_2016用notnumber() {
+        let ch = vec!["35020000001340000001".to_string()];
+        let x22 = AlarmStatusResponse::new("dev", 1, &ch, true, true)
+            .to_xml()
+            .unwrap();
+        assert!(x22.contains("<CmdType>AlarmStatus</CmdType>"));
+        assert!(x22.contains("<Num>1</Num>"));
+        assert!(x22.contains("<DutyStatus>ALARM</DutyStatus>"));
+        assert!(!x22.contains("NotNumber"));
+
+        let x16 = AlarmStatusResponse::new("dev", 1, &ch, false, false)
+            .to_xml()
+            .unwrap();
+        assert!(x16.contains("<NotNumber>0</NotNumber>"));
+        assert!(!x16.contains("<Item>"));
+    }
+
+    #[test]
+    fn 看守位查询应答_resettime固定30() {
+        let xml = HomePositionQueryResponse::new("dev", 2, true, true)
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<CmdType>HomePositionQuery</CmdType>"));
+        assert!(xml.contains("<Enabled>1</Enabled>"));
+        assert!(xml.contains("<ResetTime>30</ResetTime>"));
+        assert!(xml.contains("<PresetIndex>1</PresetIndex>"));
+    }
+
+    #[test]
+    fn 存储卡状态应答_单张32g() {
+        let xml = StorageCardStatusResponse::mock("dev", 3).to_xml().unwrap();
+        assert!(xml.contains("<CmdType>StorageCardStatusQuery</CmdType>"));
+        assert!(xml.contains("<StorageList Num=\"1\">"));
+        assert!(xml.contains("<TotalCapacity>32768</TotalCapacity>"));
+        assert!(xml.contains("<RemainingSpace>24576</RemainingSpace>"));
+    }
+
+    #[test]
+    fn 巡航列表应答_名称与空表() {
+        let xml = CruiseTrackListResponse::new("dev", 4, &[1, 2])
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<TrackList Num=\"2\">"));
+        assert!(xml.contains("<Name>巡航 1</Name>"));
+        let empty = CruiseTrackListResponse::new("dev", 4, &[])
+            .to_xml()
+            .unwrap();
+        assert!(empty.contains("<TrackList Num=\"0\"/>"));
+    }
+
+    #[test]
+    fn 巡航详情应答_speed与dwell固定() {
+        let xml = CruiseTrackQueryResponse::new("dev", 5, 1, &[7, 8])
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<GroupID>1</GroupID>"));
+        assert!(xml.contains("<PresetID>7</PresetID>"));
+        assert!(xml.contains("<Speed>5</Speed>"));
+        assert!(xml.contains("<DwellTime>3</DwellTime>"));
+    }
+
+    #[test]
+    fn 配置查询_videoparamopt与组合() {
+        // 仅 VideoParamOpt。
+        let v = ConfigDownloadResponse::by_type(
+            "dev",
+            1,
+            "VideoParamOpt",
+            "cam",
+            3600,
+            60,
+            3,
+            "1920*1080",
+        )
+        .to_xml()
+        .unwrap();
+        assert!(v.contains("<VideoParamOpt>"));
+        assert!(v.contains("<DownloadSpeed>1/2/4</DownloadSpeed>"));
+        assert!(v.contains("<Resolution>1920*1080</Resolution>"));
+        assert!(!v.contains("<BasicParam>"));
+        // 组合 BasicParam/VideoParamOpt。
+        let both = ConfigDownloadResponse::by_type(
+            "dev",
+            1,
+            "BasicParam/VideoParamOpt",
+            "cam",
+            3600,
+            60,
+            3,
+            "1920*1080",
+        )
+        .to_xml()
+        .unwrap();
+        assert!(both.contains("<BasicParam>") && both.contains("<VideoParamOpt>"));
+    }
+
+    #[test]
+    fn ptz精准状态应答_两位小数() {
+        let xml = PtzPreciseStatusResponse::new("dev", 6, 123.456, -15.0, 3.5)
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<Pan>123.46</Pan>"));
+        assert!(xml.contains("<Tilt>-15.00</Tilt>"));
+        assert!(xml.contains("<Zoom>3.50</Zoom>"));
     }
 }

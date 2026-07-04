@@ -79,9 +79,16 @@
 |---|---|---|---|
 | 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
 | 语音广播 | Broadcast | P2 | ⬜ 未做:需设备侧反向 INVITE(UAC)+ 音频接收。WVP broadcast API 返回成功但未观察到向设备发 SIP Broadcast Notify(疑需设备声明音频输出能力),本环境无法验证,故不盲写 |
-| 设备配置查询 | ConfigDownload / BasicParam | P2 | 🟢 回 200 + ConfigDownload Response(Name/Expiration/HeartBeat*),实 SIP UDP 注入验证 |
+| 设备配置查询 | ConfigDownload / BasicParam + VideoParamOpt | P2 | 🟢 回 200 + ConfigDownload Response,支持 BasicParam(Name/Expiration/HeartBeat*)与 VideoParamOpt(DownloadSpeed/Resolution)按 ConfigType 组合输出(FR-17) |
 | 预置位查询 | PresetQuery | P2 | ✅ 返回有状态预置位表(随预置位设置/删除动态变),实 SIP 注入验证 |
-| 设备软件升级 | — | P2(边缘) | 🚫 暂不 |
+| 报警状态查询 | AlarmStatus | P1 | 🟢 GB-2022 每报警通道 DutyStatus(ALARM/OFFDUTY)/ GB-2016 NotNumber,随布防态动态(FR-17,单测) |
+| 看守位查询 | HomePositionQuery | P1 | 🟢 Enabled/ResetTime(固定30)/PresetIndex(有无看守位标志)(FR-17,单测) |
+| 存储卡状态查询 | StorageCardStatusQuery | P1 | 🟢 单张 32G 卡余 24G(模拟固定值)(FR-17,单测) |
+| 巡航轨迹列表查询 | CruiseTrackListQuery | P1 | 🟢 返回有状态巡航轨迹号列表(随巡航增删动态)(FR-17,单测) |
+| 巡航轨迹详情查询 | CruiseTrackQuery | P1 | 🟢 按 GroupID 返回该轨迹预置点(Speed/DwellTime 固定 5/3)(FR-17,单测) |
+| PTZ 精准状态查询 | PTZPreciseStatusQuery | P1 | 🟢 返回最近精准云台姿态 Pan/Tilt/Zoom(%.2f)(FR-17,单测) |
+| 移动位置单次查询 | MobilePosition | P1 | 🟢 复用位置 NOTIFY 骨架单发(FR-17) |
+| 设备软件升级 | DeviceUpgrade | P2 | 🚧 M6·P3 计划(4 步进度 NOTIFY) |
 
 ## 主动上报(设备 → 平台)
 

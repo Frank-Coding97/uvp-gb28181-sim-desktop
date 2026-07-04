@@ -72,6 +72,47 @@
 
 > **教训**:PTZ 8 字节码的位映射与字节位不要凭标准文档"推断",不同平台/文档表述有出入 —— 本项目的方向位、预置位号字节都是**在真实 WVP 上逐命令抓包核对**后才定的(修过两个方向/字节位 bug)。
 
+### 扩展查询应答(FR-17,M6·P1)
+
+以下查询均**先回 200 OK,再以独立 MESSAGE 发回 `<Response>`**(与 Catalog/ConfigDownload 同路径)。骨架据上游 uvp-gb28181-sim 真实实现核对。
+
+- **报警状态 AlarmStatus**(查询与应答同 CmdType 字符串):
+  - GB-2022:`<Response><CmdType>AlarmStatus</CmdType><SN/><DeviceID/><Result>OK</Result><Num>1</Num><Item><DeviceID>{报警通道ID}</DeviceID><DutyStatus>ALARM|OFFDUTY</DutyStatus></Item></Response>`。
+  - GB-2016:用 `<NotNumber>0|1</NotNumber>` 替换 `Num/Item` 块。
+  - `DutyStatus=ALARM` 当设备处布防/报警态,否则 `OFFDUTY`。
+- **看守位查询 HomePositionQuery**:`<Response><CmdType>HomePositionQuery</CmdType><SN/><DeviceID/><Enabled>0|1</Enabled><ResetTime>30</ResetTime><PresetIndex>0|1</PresetIndex></Response>`。ResetTime 固定 30(平台下发的 ResetTime 不落存);PresetIndex 表"有无看守位"(1/0),非真实预置位号。
+- **存储卡状态 StorageCardStatusQuery**:`<Response><CmdType>StorageCardStatusQuery</CmdType><SN/><DeviceID/><SumNum>1</SumNum><StorageList Num="1"><Item><CardNum>0</CardNum><Status>Normal</Status><TotalCapacity>32768</TotalCapacity><RemainingSpace>24576</RemainingSpace></Item></StorageList></Response>`。容量单位 MB(32G 总 / 24G 余),模拟固定值。
+- **巡航轨迹列表 CruiseTrackListQuery**:`<Response>...<SumNum>{n}</SumNum><TrackList Num="{n}"><Item><GroupID>{轨迹号}</GroupID><Name>巡航 {轨迹号}</Name></Item>...</TrackList></Response>`。无轨迹时 `<TrackList Num="0"/>`。
+- **巡航轨迹详情 CruiseTrackQuery**:读请求 `<GroupID>`(退回 `<TrackNum>`,默认 1)。`<Response>...<GroupID>{t}</GroupID><SumNum>{n}</SumNum><PresetList Num="{n}"><Item><PresetID>{p}</PresetID><Speed>5</Speed><DwellTime>3</DwellTime></Item>...</PresetList></Response>`。Speed/DwellTime 固定 5/3。无点时 `<PresetList Num="0"/>`。
+- **PTZ 精准状态 PTZPreciseStatusQuery**(GB-2022):`<Response>...<Pan>123.45</Pan><Tilt>-15.00</Tilt><Zoom>3.50</Zoom></Response>`。取最近一次 PTZPreciseCtrl 值,格式 %.2f。
+- **移动位置单次查询 MobilePosition**:与订阅周期上报的 `MobilePosition` Notify 体一致,但单发一条(不建周期任务)。
+
+### ConfigDownload 扩展 VideoParamOpt(FR-17)
+`<ConfigType>` 支持斜杠分隔组合;新增 `VideoParamOpt` 块:`<VideoParamOpt><DownloadSpeed>1/2/4</DownloadSpeed><Resolution>{分辨率标签}</Resolution></VideoParamOpt>`。只输出被请求的块(BasicParam/VideoParamOpt),Result 恒 OK。
+
+### 扩展设备控制(FR-18,M6·P2)
+
+`<Control>` 内新增子命令(响应均为 SIP 200 OK,无 MANSCDP 响应体,除 PTZPreciseCtrl 状态供 PTZPreciseStatusQuery 读回):
+
+- **精确云台 PTZPreciseCtrl**(GB-2022):子元素 `<Pan>`(0-360.00) `<Tilt>`(-30~90) `<Zoom>`(≥1.00),Float。设备存为最近姿态。
+- **巡航控制(PTZCmd 8 字节,byte3 指令码)**:`0x84` 增点(byte4=轨迹# byte5=预置#)、`0x85` 删点、`0x86` 速度(byte5=speed)、`0x87` 停留(byte5=秒)、`0x88` 启动(byte4=轨迹#,0=停止巡航)。
+- **辅助控制(PTZCmd)**:byte3 `0x89`(开)/`0x8A`(关),byte4=辅助号:`1=雨刷 2=红外灯 3=加热 4=除雾 5=制冷`(海康/大华事实标准)。
+- **Focus 聚焦/光圈**:PTZCmd byte3 的 bit6/bit7(现仅实现变倍 bit4/bit5)。
+- **目标跟踪 TargetTrack**:`<TargetTrack><Mode>Auto|Manual|Stop</Mode><ObjectID/><Speed/></TargetTrack>`(Mode 白名单,其它忽略仍 200;Speed 1-255);旧式 `<TargetTrack>Auto</TargetTrack>` 亦作 Mode。纯 XML 无字节码。
+- **格式化 SD 卡 FormatSDCard**:`<FormatSDCard>1</FormatSDCard><DiskNum>N</DiskNum>`(或旧式值即卡号)。模拟设备无实际存储,仅应答记录。
+
+### 平台下发抓拍(FR-19,M6·P3)
+- **SnapShotCmd**(7.4 旧路径):`<Control>...<SnapShotCmd>..</SnapShotCmd>`。触发后经 **Alarm Notify** 上报(priority=4/method=5/type=5,DeviceID=报警通道),无图片上传。
+- **SnapShotConfig**(GB-2022 §9.5 真上传):`<Control>...<SnapShotConfig><SessionID/><UploadURL/><SnapNum>1-10</SnapNum><Interval>秒</Interval></SnapShotConfig>`。SessionID+UploadURL 必填。串行拍 SnapNum 张,每张:采 JPEG → **HTTP PUT**(Content-Type image/jpeg,body 裸 JPEG;UploadURL 末尾为 `/` 则拼 `{SnapShotID}.jpg`;2xx 成功,失败退避 [1000,2000,4000]ms)→ 发完成 NOTIFY;张间隔 Interval。**SSRF 白名单**:仅 http/https,host 须在上传白名单(空名单=全拒),拒环回/链路本地/组播/元数据地址。
+  - 完成 NOTIFY:`<Notify><CmdType>Notify</CmdType><SubCmd>SnapShot</SubCmd><SN/><DeviceID/><SessionID/><SnapShotID>{YYYYMMDDThhmmss_序号}</SnapShotID><Time/><StoragePath/></Notify>`(旧式 buildLegacy 用 `<CmdType>SnapShot</CmdType>` 且无 SubCmd)。
+
+### 在线升级 DeviceUpgrade(FR-30,M6·P3)
+- 平台:`<Control>...<DeviceUpgrade><Firmware/><SessionID/><FileURL/></DeviceUpgrade>`。
+- 设备回 200 后启动 **4 步进度**:percent [0,30,60,100],步间 1500ms,100% 后 5000ms 清理。每步发 `DeviceUpgradeResult` NOTIFY:`<Notify><CmdType>DeviceUpgradeResult</CmdType><SN/><DeviceID/><SessionID/><Firmware/><Result>0|1</Result><Percent>0-100</Percent></Notify>`。percent<100→Result=0(进行中),==100→Result=1(成功);2=失败(定义但模拟不发)。SN=cseq&0xFFFF。
+
+### 主动通知 MediaStatus(FR-31,M6·P4)
+- `<Notify><CmdType>MediaStatus</CmdType><SN/><DeviceID/><NotifyType>{code}</NotifyType></Notify>`。code:`121`=历史媒体文件发送结束(回放/下载完成)、`122`=录像异常、`123`=存储满。121 在回放/下载会话结尾发;122/123 主动触发且 fan-out 给 Alarm 订阅者。
+
 ### 报警订阅 Alarm(✅ WVP 验证)
 - 平台 `SUBSCRIBE + Alarm` → 设备回带 tag 的 200 并**记录订阅对话**(Call-ID/tags/Event/Expires + 平台地址)。
 - 此后 `report_alarm` 上报的报警(Alarm Notify XML)走**对话内 SIP NOTIFY**(复用 `notify_in_dialog`),WVP code=200;若无订阅(如手动触发、平台未订阅)则退化为独立 MESSAGE(WVP 同样接受)。设备下线时清理对话。

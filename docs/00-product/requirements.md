@@ -28,6 +28,16 @@
 | FR-14 | 设备配置查询(ConfigDownload)、预置位查询(PresetQuery) | P2 | M3+ ✅ |
 | FR-15 | 订阅通知:目录/报警(对话内 NOTIFY)、移动位置周期上报 | P1 | M3+ ✅ |
 | FR-16 | 回放控制:会话内 INFO/MANSRTSP 倍速、暂停/恢复 | P2 | M3+ ✅ |
+| FR-17 | 扩展查询应答:报警状态(AlarmStatus)、看守位(HomePositionQuery)、存储卡状态(StorageCardStatusQuery)、巡航轨迹列表/详情(CruiseTrackListQuery/CruiseTrackQuery)、PTZ 精准状态(PTZPreciseStatusQuery)、移动位置单次查询;ConfigDownload 增 VideoParamOpt | P1 | M6 |
+| FR-18 | 扩展设备控制:精确云台(PTZPreciseCtrl)、巡航轨迹控制(PTZCmd 0x84-0x88)、辅助控制雨刷/红外/加热/除雾/制冷(PTZCmd 0x89/0x8A)、Focus 聚焦/光圈、目标跟踪(TargetTrack)、格式化 SD 卡(FormatSDCard) | P1 | M6 |
+| FR-19 | 平台下发抓拍:SnapShotCmd(经 Alarm Notify 上报)+ SnapShotConfig(GB-2022,JPEG 经 HTTP PUT 上传 + 完成 NOTIFY,含 SSRF 上传白名单校验) | P2 | M6 |
+| FR-30 | 在线升级 DeviceUpgrade:4 步进度(0/30/60/100%)DeviceUpgradeResult NOTIFY 闭环 | P2 | M6 |
+| FR-31 | 主动通知:录像完成/异常/存储满 MediaStatusNotify(NotifyType 121/122/123) | P1 | M6 |
+| FR-32 | 信令健壮性:Expires 到期 80% 主动续约、RTCP SR 周期反馈(5s)、Catalog 增量 NOTIFY(状态 diff) | P1 | M6 |
+| FR-33 | 媒体编码扩展:H.265(PSM stream_type 0x24)、AAC 音频复合流 | P2 | M6 |
+| FR-34 | 多视频通道 + 虚拟通道 CRUD + 模板(单设备/8ch NVR/3×2 跨区划/16ch 双业务分组);报警通道作独立 Catalog 节点(typeCode 134) | P1 | M6 |
+| FR-35 | OSD 叠加:时间戳(左上)、通道名(右上)、自定义水印(斜向平铺)烧入推流画面(行业惯例) | P2 | M6 |
+| FR-36 | 语音广播(平台→设备,G.711A 下行):Broadcast MESSAGE 应答 + 设备侧反向 INVITE(UAC)+ 音频接收播放 | P2 | M6 |
 
 ### 压力测试(核心)
 

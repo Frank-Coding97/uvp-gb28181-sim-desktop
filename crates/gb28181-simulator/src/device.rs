@@ -112,6 +112,36 @@ pub struct DeviceSimulator {
     alarm_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
     /// 预置位表(编号 → 名称)。PTZ 预置位设置/删除命令更新,PresetQuery 返回。
     presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
+    /// 设备控制态(布防/看守位/巡航/精准姿态)。扩展查询与控制命令共同维护(FR-17/18)。
+    control_state: std::sync::Mutex<ControlState>,
+}
+
+/// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
+/// 供扩展查询(AlarmStatus/HomePositionQuery/CruiseTrack*/PTZPreciseStatusQuery)读回。
+#[derive(Debug, Clone)]
+pub struct ControlState {
+    /// 是否处于布防/报警态(AlarmStatus 的 DutyStatus)。
+    pub alarming: bool,
+    /// 看守位是否启用。
+    pub home_enabled: bool,
+    /// 是否已设看守位(HomePositionQuery 的 PresetIndex 标志)。
+    pub home_set: bool,
+    /// 巡航轨迹:轨迹号 → 该轨迹的预置位号列表(增点/删点维护)。
+    pub cruise_tracks: std::collections::BTreeMap<u32, Vec<u32>>,
+    /// 最近一次精准云台姿态(pan 度, tilt 度, zoom 倍)。
+    pub precise_pose: (f32, f32, f32),
+}
+
+impl Default for ControlState {
+    fn default() -> Self {
+        ControlState {
+            alarming: false,
+            home_enabled: true,
+            home_set: false,
+            cruise_tracks: std::collections::BTreeMap::new(),
+            precise_pose: (0.0, 0.0, 1.0),
+        }
+    }
 }
 
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
@@ -147,6 +177,7 @@ impl DeviceSimulator {
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
             presets: std::sync::Mutex::new(default_presets()),
+            control_state: std::sync::Mutex::new(ControlState::default()),
         }
     }
 
@@ -163,6 +194,7 @@ impl DeviceSimulator {
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
             presets: std::sync::Mutex::new(default_presets()),
+            control_state: std::sync::Mutex::new(ControlState::default()),
         }
     }
 
@@ -766,15 +798,17 @@ impl DeviceSimulator {
                 resp.to_xml()
             }
             "ConfigDownload" => {
-                // 设备配置查询:返回基本参数(注册有效期/心跳间隔/超时次数)。
+                // 设备配置查询:按 ConfigType 返回基本参数(BasicParam)和/或视频参数(VideoParamOpt)。
                 // 心跳超时次数固定 3(与 device-simulation.md §3.2 重注册阈值一致)。
-                let resp = ConfigDownloadResponse::basic(
+                let resp = ConfigDownloadResponse::by_type(
                     &query.device_id,
                     query.sn,
+                    query.config_type.as_deref().unwrap_or("BasicParam"),
                     self.config.device_info.device_name.clone(),
                     3600,
                     self.config.heartbeat_interval_secs as u32,
                     3,
+                    "1920*1080",
                 );
                 resp.to_xml()
             }
@@ -794,6 +828,74 @@ impl DeviceSimulator {
                     .unwrap_or_default();
                 let resp = PresetQueryResponse::new(&query.device_id, query.sn, items);
                 resp.to_xml()
+            }
+            "AlarmStatus" => {
+                // 报警状态查询(FR-17):GB-2022 每报警通道一项 DutyStatus,GB-2016 用 NotNumber。
+                let alarming = self
+                    .control_state
+                    .lock()
+                    .map(|s| s.alarming)
+                    .unwrap_or(false);
+                // 报警通道:取设备各通道 ID(模拟器无独立报警通道时用查询目标 ID 兜底)。
+                let channels: Vec<String> = if self.config.channels.is_empty() {
+                    vec![query.device_id.clone()]
+                } else {
+                    self.config
+                        .channels
+                        .iter()
+                        .map(|c| c.channel_id.to_string())
+                        .collect()
+                };
+                let resp = AlarmStatusResponse::new(
+                    &query.device_id,
+                    query.sn,
+                    &channels,
+                    alarming,
+                    self.config.gb_version.is_2022(),
+                );
+                resp.to_xml()
+            }
+            "HomePositionQuery" => {
+                // 看守位查询(FR-17):ResetTime 固定 30,PresetIndex 为"有无看守位"标志。
+                let (enabled, has_home) = self
+                    .control_state
+                    .lock()
+                    .map(|s| (s.home_enabled, s.home_set))
+                    .unwrap_or((true, false));
+                HomePositionQueryResponse::new(&query.device_id, query.sn, enabled, has_home)
+                    .to_xml()
+            }
+            "StorageCardStatusQuery" => {
+                // 存储卡状态查询(FR-17):模拟单张 32G 卡余 24G。
+                StorageCardStatusResponse::mock(&query.device_id, query.sn).to_xml()
+            }
+            "CruiseTrackListQuery" => {
+                // 巡航轨迹列表查询(FR-17):返回已配置的轨迹号。
+                let tracks: Vec<u32> = self
+                    .control_state
+                    .lock()
+                    .map(|s| s.cruise_tracks.keys().copied().collect())
+                    .unwrap_or_default();
+                CruiseTrackListResponse::new(&query.device_id, query.sn, &tracks).to_xml()
+            }
+            "CruiseTrackQuery" => {
+                // 巡航轨迹详情查询(FR-17):读 GroupID(缺省 1),返回该轨迹预置点(Speed/DwellTime 固定 5/3)。
+                let group = query.group_id.unwrap_or(1);
+                let presets: Vec<u32> = self
+                    .control_state
+                    .lock()
+                    .map(|s| s.cruise_tracks.get(&group).cloned().unwrap_or_default())
+                    .unwrap_or_default();
+                CruiseTrackQueryResponse::new(&query.device_id, query.sn, group, &presets).to_xml()
+            }
+            "PTZPreciseStatusQuery" => {
+                // PTZ 精准状态查询(FR-17,GB-2022):返回最近精准云台姿态。
+                let (pan, tilt, zoom) = self
+                    .control_state
+                    .lock()
+                    .map(|s| s.precise_pose)
+                    .unwrap_or((0.0, 0.0, 1.0));
+                PtzPreciseStatusResponse::new(&query.device_id, query.sn, pan, tilt, zoom).to_xml()
             }
             _ => Err(Error::Gb28181(format!(
                 "未实现的查询类型: {}",
@@ -1335,6 +1437,8 @@ mod tests {
             sn: 1,
             device_id: "35020000001310000001".into(),
             interval: None,
+            group_id: None,
+            config_type: None,
         };
         let ch = ChannelConfig {
             channel_id: DeviceId::new("35020000001310000132").unwrap(),
@@ -1361,6 +1465,60 @@ mod tests {
             !xml16.contains("SecurityLevelCode"),
             "2016 不应含 2022 新增字段"
         );
+    }
+
+    /// 扩展查询(FR-17):AlarmStatus/HomePositionQuery/StorageCard/CruiseTrack*/PTZPreciseStatus。
+    #[test]
+    fn 扩展查询应答_各cmdtype() {
+        let mk = |cmd: &str, group: Option<u32>| gb28181_protocol::manscdp::Query {
+            cmd_type: cmd.into(),
+            sn: 1,
+            device_id: "34020000001320000001".into(),
+            interval: None,
+            group_id: group,
+            config_type: None,
+        };
+        let mut cfg = test_cfg("127.0.0.1", 5060);
+        cfg.channels.push(ChannelConfig {
+            channel_id: DeviceId::new("34020000001320000001").unwrap(),
+            name: "Ch".into(),
+            status: "ON".into(),
+        });
+        let sim = DeviceSimulator::new(cfg);
+
+        // 预置一条巡航轨迹 1 = [1,3],并置布防态,便于验证读回。
+        {
+            let mut s = sim.control_state.lock().unwrap();
+            s.alarming = true;
+            s.home_set = true;
+            s.cruise_tracks.insert(1, vec![1, 3]);
+        }
+
+        let alarm = sim.handle_query(&mk("AlarmStatus", None)).unwrap();
+        assert!(alarm.contains("<CmdType>AlarmStatus</CmdType>"));
+        assert!(alarm.contains("<DutyStatus>ALARM</DutyStatus>"));
+
+        let home = sim.handle_query(&mk("HomePositionQuery", None)).unwrap();
+        assert!(home.contains("<ResetTime>30</ResetTime>"));
+        assert!(home.contains("<PresetIndex>1</PresetIndex>"));
+
+        let sd = sim
+            .handle_query(&mk("StorageCardStatusQuery", None))
+            .unwrap();
+        assert!(sd.contains("<TotalCapacity>32768</TotalCapacity>"));
+
+        let list = sim.handle_query(&mk("CruiseTrackListQuery", None)).unwrap();
+        assert!(list.contains("<TrackList Num=\"1\">"));
+        assert!(list.contains("<Name>巡航 1</Name>"));
+
+        let detail = sim.handle_query(&mk("CruiseTrackQuery", Some(1))).unwrap();
+        assert!(detail.contains("<GroupID>1</GroupID>"));
+        assert!(detail.contains("<PresetID>3</PresetID>"));
+
+        let precise = sim
+            .handle_query(&mk("PTZPreciseStatusQuery", None))
+            .unwrap();
+        assert!(precise.contains("<Zoom>1.00</Zoom>"));
     }
 
     #[tokio::test]
