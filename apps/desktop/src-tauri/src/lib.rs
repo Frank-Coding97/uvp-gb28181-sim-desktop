@@ -82,6 +82,10 @@ impl DeviceObserver for StateEmitter {
                 );
                 return;
             }
+            DeviceEvent::PtzPresetCall { preset } => {
+                let _ = self.app.emit("ptz_preset", preset);
+                return;
+            }
         };
         let _ = self.app.emit("device_state", state);
     }

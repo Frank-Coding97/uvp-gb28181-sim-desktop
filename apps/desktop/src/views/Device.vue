@@ -139,39 +139,107 @@ const ptz = ref<PtzAction>({
 const ptzActive = computed(() =>
   ptz.value.up || ptz.value.down || ptz.value.left || ptz.value.right ||
   ptz.value.zoom_in || ptz.value.zoom_out);
+
+// 云台连续姿态:pan/tilt 角度(度)+ zoom 倍数。手动 PTZ 实时改,预置位调用平滑转到目标。
+const pan = ref(0);    // 水平 -180~180
+const tilt = ref(0);   // 俯仰 -60~60
+const zoom = ref(1);   // 变倍 1~4
+// 预置位目标位(演示用固定映射:每个预置位一个 pan/tilt/zoom)。
+const PRESET_POS: Record<number, { pan: number; tilt: number; zoom: number }> = {
+  1: { pan: -120, tilt: 20, zoom: 1 },
+  2: { pan: 90, tilt: -15, zoom: 2 },
+  3: { pan: 0, tilt: 30, zoom: 1.5 },
+  4: { pan: 160, tilt: 0, zoom: 3 },
+  5: { pan: -60, tilt: -30, zoom: 2.5 },
+};
+// 预置位巡航(转到目标)状态:目标 + 是否在补间。
+const target = ref<{ pan: number; tilt: number; zoom: number } | null>(null);
+const seeking = ref(false);
+const activePreset = ref<number | null>(null);
+
 const dirText = computed(() => {
+  if (seeking.value && activePreset.value) return `转向预置位 ${activePreset.value}`;
   const m = ptz.value;
   const v = m.up ? "上" : m.down ? "下" : "";
   const h = m.left ? "左" : m.right ? "右" : "";
   return (v + h) || "—";
 });
-// 摇杆向当前方向偏移(px);3D 立体感靠 CSS 阴影。像真摇杆一样推向命令方向。
-const OFFSET = 20;
+// 摇杆偏移:反映当前 pan/tilt(相对目标视角),像真摇杆推向运动方向。
 const knobStyle = computed(() => {
   const m = ptz.value;
-  const x = (m.left ? -OFFSET : 0) + (m.right ? OFFSET : 0);
-  const y = (m.up ? -OFFSET : 0) + (m.down ? OFFSET : 0);
-  // 变倍时摇杆轻微下压/上提示意。
-  const z = m.zoom_in ? 1.06 : m.zoom_out ? 0.94 : 1;
-  return { transform: `translate(${x}px, ${y}px) scale(${z})` };
+  let dx = 0, dy = 0;
+  if (seeking.value) {
+    // 巡航中:摇杆指向目标方向。
+    const t = target.value!;
+    dx = Math.max(-1, Math.min(1, (t.pan - pan.value) / 30)) * 22;
+    dy = Math.max(-1, Math.min(1, (t.tilt - tilt.value) / 20)) * -22;
+  } else {
+    dx = (m.left ? -22 : 0) + (m.right ? 22 : 0);
+    dy = (m.up ? -22 : 0) + (m.down ? 22 : 0);
+  }
+  const z = 0.9 + (zoom.value - 1) * 0.06 + (m.zoom_in ? 0.04 : m.zoom_out ? -0.04 : 0);
+  return { transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) scale(${z.toFixed(2)})` };
 });
 
-// device_state 由 App.vue 统一订阅并写入共享状态,本页订阅 sip_trace + ptz_action。
+// 视野方位角文本(演示"摄像头当前朝向")。
+const poseText = computed(() =>
+  `方位 ${pan.value.toFixed(0)}° · 俯仰 ${tilt.value.toFixed(0)}° · ${zoom.value.toFixed(1)}×`);
+
+// 60ms 动画帧:手动 PTZ 按速度连续改 pan/tilt/zoom;预置位巡航平滑补间到目标。
+let poseTimer: number | null = null;
+function poseTick() {
+  if (seeking.value && target.value) {
+    const t = target.value;
+    const ease = 0.08;
+    pan.value += (t.pan - pan.value) * ease;
+    tilt.value += (t.tilt - tilt.value) * ease;
+    zoom.value += (t.zoom - zoom.value) * ease;
+    if (Math.abs(t.pan - pan.value) < 0.5 && Math.abs(t.tilt - tilt.value) < 0.5 && Math.abs(t.zoom - zoom.value) < 0.02) {
+      pan.value = t.pan; tilt.value = t.tilt; zoom.value = t.zoom;
+      seeking.value = false; target.value = null;
+    }
+    return;
+  }
+  const m = ptz.value;
+  const ps = (m.pan_speed / 255) * 4 + 1.5;
+  const ts = (m.tilt_speed / 255) * 4 + 1.5;
+  if (m.left)  pan.value = Math.max(-180, pan.value - ps);
+  if (m.right) pan.value = Math.min(180, pan.value + ps);
+  if (m.up)    tilt.value = Math.min(60, tilt.value + ts);
+  if (m.down)  tilt.value = Math.max(-60, tilt.value - ts);
+  if (m.zoom_in)  zoom.value = Math.min(4, zoom.value + 0.03);
+  if (m.zoom_out) zoom.value = Math.max(1, zoom.value - 0.03);
+}
+
+// device_state 由 App.vue 统一订阅并写入共享状态,本页订阅 sip_trace + ptz_action + ptz_preset。
 let unlistenTrace: UnlistenFn | null = null;
 let unlistenPtz: UnlistenFn | null = null;
+let unlistenPreset: UnlistenFn | null = null;
 onMounted(async () => {
   unlistenPtz = await listen<PtzAction>("ptz_action", (e) => { ptz.value = e.payload; });
+  // 预置位调用:平滑巡航到目标位(未登记的预置位随机造一个目标演示)。
+  unlistenPreset = await listen<number>("ptz_preset", (e) => {
+    const id = e.payload;
+    activePreset.value = id;
+    target.value = PRESET_POS[id] ?? {
+      pan: ((id * 53) % 360) - 180, tilt: ((id * 37) % 100) - 50, zoom: 1 + (id % 3),
+    };
+    seeking.value = true;
+  });
   unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
     if (!traceOn.value) return;
     traces.value.push(e.payload);
     if (traces.value.length > MAX_TRACE) traces.value.splice(0, traces.value.length - MAX_TRACE);
   });
   timer = window.setInterval(fmtUptime, 1000);
+  poseTimer = window.setInterval(poseTick, 60);
 });
 onUnmounted(() => {
   unlistenTrace?.();
   unlistenPtz?.();
+  unlistenPreset?.();
   if (timer) clearInterval(timer);
+  if (poseTimer) clearInterval(poseTimer);
 });
 
 // keep-alive 激活时与引擎对账:以引擎真实状态为准同步 deviceLive(避免切页后按钮态错乱)。
@@ -319,7 +387,7 @@ const metrics = computed(() => [
       <div class="ptz-sub">平台下发 PTZ 命令时,下方球机实时演示转动方向与变倍(本设备为被控端)</div>
       <div class="ptz-body">
         <!-- 拟态摇杆:凹陷底盘 + 悬浮摇杆,随命令向对应方向偏移 -->
-        <div class="stick-wrap" :class="{ active: ptzActive }">
+        <div class="stick-wrap" :class="{ active: ptzActive, seeking }">
           <div class="stick-base">
             <span class="arr arr-u" :class="{ on: ptz.up }">▲</span>
             <span class="arr arr-d" :class="{ on: ptz.down }">▼</span>
@@ -335,11 +403,16 @@ const metrics = computed(() => [
         <!-- 状态 -->
         <div class="ptz-info">
           <div class="ptz-stats">
-            <div class="ptz-stat"><span>方向</span><b>{{ dirText }}</b></div>
+            <div class="ptz-stat"><span>当前朝向</span><b class="pose">{{ poseText }}</b></div>
+            <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking }">{{ dirText }}</b></div>
             <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ ptz.zoom_in ? "放大 +" : ptz.zoom_out ? "缩小 −" : "—" }}</b></div>
-            <div class="ptz-stat"><span>水平速度</span><b>{{ ptz.pan_speed }}</b></div>
-            <div class="ptz-stat"><span>垂直速度</span><b>{{ ptz.tilt_speed }}</b></div>
-            <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive }">{{ ptzActive ? "转动中" : "静止" }}</b></div>
+            <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive || seeking }">{{ seeking ? "巡航中" : ptzActive ? "转动中" : "静止" }}</b></div>
+            <div class="ptz-stat presets">
+              <span>预置位</span>
+              <span class="preset-chips">
+                <b v-for="id in [1,2,3,4,5]" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">{{ id }}</b>
+              </span>
+            </div>
           </div>
         </div>
       </div>
@@ -507,6 +580,21 @@ const metrics = computed(() => [
 .ptz-stat span { font-size: 12px; color: var(--text-tertiary); width: 56px; }
 .ptz-stat b { font-size: 14px; color: var(--text-primary); }
 .ptz-stat b.hot { color: var(--accent); }
+.ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 13px; }
+.ptz-stat.presets { align-items: center; }
+.preset-chips { display: inline-flex; gap: 6px; }
+.pchip {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  color: var(--text-tertiary); background: rgba(255,255,255,0.5);
+  border: 1px solid var(--border-default); transition: all 0.15s;
+}
+.pchip.on { color: #fff; background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: scale(1.12); }
+/* 巡航中底盘泛蓝光 */
+.stick-wrap.seeking .stick-base { box-shadow:
+  8px 8px 20px rgba(163,177,198,0.65), -8px -8px 20px rgba(255,255,255,0.9),
+  inset 3px 3px 8px rgba(163,177,198,0.5), inset -3px -3px 8px rgba(255,255,255,0.7),
+  0 0 0 3px rgba(37,99,235,0.25); }
 
 /* SIP 信令追踪面板 */
 .trace-panel { margin-top: 18px; }
