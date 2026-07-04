@@ -1318,6 +1318,81 @@ impl CatalogNotify {
     }
 }
 
+/// 目录通道快照(用于增量 NOTIFY diff)。仅保留 diff 所需字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSnapshot {
+    /// 通道 ID → (名称, 状态)。
+    pub channels: std::collections::BTreeMap<String, (String, String)>,
+}
+
+impl CatalogSnapshot {
+    /// 从 (id, name, status) 三元组构造快照。
+    pub fn from_items<I, S>(items: I) -> Self
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: Into<String>,
+    {
+        let channels = items
+            .into_iter()
+            .map(|(id, name, status)| (id.into(), (name.into(), status.into())))
+            .collect();
+        CatalogSnapshot { channels }
+    }
+
+    /// 计算从 `self`(旧)到 `next`(新)的目录变更项。
+    ///
+    /// - 新增通道 → Event=ADD
+    /// - 删除通道 → Event=DEL
+    /// - 名称变化 → Event=UPDATE
+    /// - 仅状态变化 → Event=ON(变 ON)/ OFF(变非 ON)
+    ///
+    /// 无变化返回空 Vec(调用方据此决定不发 NOTIFY)。
+    pub fn diff(&self, next: &CatalogSnapshot) -> Vec<CatalogNotifyItem> {
+        let mut items = Vec::new();
+        // 新增 / 变更。
+        for (id, (name, status)) in &next.channels {
+            match self.channels.get(id) {
+                None => items.push(CatalogNotifyItem {
+                    device_id: id.clone(),
+                    name: name.clone(),
+                    event: "ADD".into(),
+                    status: status.clone(),
+                }),
+                Some((old_name, old_status)) => {
+                    if old_name != name {
+                        items.push(CatalogNotifyItem {
+                            device_id: id.clone(),
+                            name: name.clone(),
+                            event: "UPDATE".into(),
+                            status: status.clone(),
+                        });
+                    } else if old_status != status {
+                        let on = status.eq_ignore_ascii_case("ON");
+                        items.push(CatalogNotifyItem {
+                            device_id: id.clone(),
+                            name: name.clone(),
+                            event: if on { "ON" } else { "OFF" }.into(),
+                            status: status.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // 删除。
+        for (id, (name, _)) in &self.channels {
+            if !next.channels.contains_key(id) {
+                items.push(CatalogNotifyItem {
+                    device_id: id.clone(),
+                    name: name.clone(),
+                    event: "DEL".into(),
+                    status: "OFF".into(),
+                });
+            }
+        }
+        items
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // FR-17 扩展查询应答(M6·P1)。骨架据上游 uvp-gb28181-sim 真实实现核对,
 // 均以独立 MESSAGE 发回 `<Response>`(与 Catalog/ConfigDownload 同路径)。
@@ -2075,6 +2150,39 @@ mod tests {
         // 方向命令不应误判为巡航/辅助/聚焦。
         assert!(mk("A50F0108320000").cruise_op().is_none());
         assert!(mk("A50F0108320000").focus_op().is_none());
+    }
+
+    #[test]
+    fn 目录快照diff_增删改与状态() {
+        let old = CatalogSnapshot::from_items([
+            ("ch1", "相机1", "ON"),
+            ("ch2", "相机2", "ON"),
+            ("ch3", "相机3", "ON"),
+        ]);
+        let next = CatalogSnapshot::from_items([
+            ("ch1", "相机1", "ON"),   // 不变
+            ("ch2", "相机2改", "ON"), // 改名 → UPDATE
+            ("ch3", "相机3", "OFF"),  // 状态变 → OFF
+            ("ch4", "相机4", "ON"),   // 新增 → ADD
+        ]);
+        let d = old.diff(&next);
+        // ch2 UPDATE, ch3 OFF, ch4 ADD, ch1 无。删除:无。共 3 项。
+        assert_eq!(d.len(), 3);
+        let by_id = |id: &str| {
+            d.iter()
+                .find(|i| i.device_id == id)
+                .map(|i| i.event.as_str())
+        };
+        assert_eq!(by_id("ch2"), Some("UPDATE"));
+        assert_eq!(by_id("ch3"), Some("OFF"));
+        assert_eq!(by_id("ch4"), Some("ADD"));
+        assert_eq!(by_id("ch1"), None);
+
+        // 删除通道 → DEL。
+        let d2 = old.diff(&CatalogSnapshot::from_items([("ch1", "相机1", "ON")]));
+        assert!(d2.iter().any(|i| i.device_id == "ch2" && i.event == "DEL"));
+        // 无变化 → 空。
+        assert!(old.diff(&old).is_empty());
     }
 
     #[test]
