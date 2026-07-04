@@ -109,7 +109,9 @@
 | 录像完成/异常通知(MediaStatus) | FR-31 | 🟢 回放/下载会话 BYE 后发 MediaStatus NotifyType=121(历史媒体发送结束);122/123(异常/存储满)类型已备(FR-31) |
 | 注册续约 | FR-32 | 🟢 注册有效期 3600s,到期前 80%(2880s)主动重注册,不等心跳失败被动重注册(FR-32) |
 | RTCP SR 反馈 | FR-32 | 🟢 build_rtcp_sr 按 RFC3550 §6.4.1 构造 SR 包(SSRC/NTP/RTP-TS/包数/字节数),单测;周期发送待接入 RTCP 端口(需真机反馈校准,暂不盲发) |
-| Catalog 增量 NOTIFY | FR-32 | 🚧 现为全量 Event=ON;增量 diff(ADD/DEL/UPDATE)随 P6 多通道 CRUD 落地(通道静态时全量即可) |
+| Catalog 增量 NOTIFY | FR-32 | 🟢 diff 引擎(CatalogSnapshot::diff,ADD/DEL/UPDATE/ON/OFF)+ 设备侧 catalog_dialog 记录订阅,CRUD 后 notify_catalog_changed 发对话内增量 NOTIFY;全量 NOTIFY 刷新快照基线(FR-32/34,单测) |
+| 多通道虚拟通道 CRUD + 模板 | FR-34 | 🟢 引擎 CatalogNode 树 + 4 模板(single/nvr-8ch/civil-3x2/large-16ch,据上游核对)+ 载入/增删改;报警通道独立节点 typeCode 134;多通道 Catalog 应答按层级出 ParentID/Parental/CivilCode。前端「多通道目录」页:模板选择器 + 目录树表格 + 通道增删改弹窗(headless Chrome 渲染核对)(FR-34,单测) |
+| OSD 叠加 | FR-35 | 🟡 配置面对齐上游(时间戳/通道名/水印开关+位置+字号,本地持久化)。**与上游一致 OSD 为本地渲染,不进 GB28181 协议、不影响平台收流**;我方文件推流模型不逐帧烧入(逐帧重编码破坏轻量循环模型,压测不可用),故仅配置面(FR-35) |
 
 ## 压力测试(差异化能力)
 

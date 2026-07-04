@@ -11,7 +11,7 @@ import {
 import type { MenuOption } from "naive-ui";
 import {
   SpeedometerOutline, HardwareChipOutline, ServerOutline,
-  PulseOutline,
+  PulseOutline, GitNetworkOutline,
 } from "@vicons/ionicons5";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -25,6 +25,7 @@ function icon(comp: any) {
 const menuOptions: MenuOption[] = [
   { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
   { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
+  { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
   { label: "平台配置",   key: "/config",    icon: icon(ServerOutline) },
   { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
 ];

@@ -7,6 +7,7 @@ import "./theme.css";
 import App from "./App.vue";
 import Dashboard from "./views/Dashboard.vue";
 import Device from "./views/Device.vue";
+import Channels from "./views/Channels.vue";
 import Config from "./views/Config.vue";
 import Scenario from "./views/Scenario.vue";
 
@@ -16,6 +17,7 @@ const router = createRouter({
     { path: "/", redirect: "/dashboard" },
     { path: "/dashboard", component: Dashboard },
     { path: "/device",    component: Device },
+    { path: "/channels",  component: Channels },
     { path: "/config",    component: Config },
     // 压力测试(场景编排 + 实时监控已合并到一页)。
     { path: "/scenario",  component: Scenario },
