@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 stress-engine     = { path = "../../../crates/stress-engine" }
 scenario          = { path = "../../../crates/scenario" }
 gb28181-simulator = { path = "../../../crates/gb28181-simulator" }
+gb28181-protocol  = { path = "../../../crates/gb28181-protocol" }
 sip-core          = { path = "../../../crates/sip-core" }
 common            = { path = "../../../crates/common" }
 tauri = { version = "2", features = [] }

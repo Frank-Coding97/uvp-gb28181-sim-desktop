@@ -512,6 +512,126 @@ async fn set_sip_trace(
 
 // ── 数据传输对象 ──────────────────────────────────────────
 
+/// 目录节点 DTO(前端多通道管理 ⇄ 引擎 CatalogNode)。
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ChannelNodeDto {
+    id: String,
+    /// 类型:Device/BusinessGroup/VirtualOrg/VideoChannel/AlarmChannel。
+    node_type: String,
+    name: String,
+    parent_id: String,
+    #[serde(default)]
+    civil_code: Option<String>,
+    #[serde(default = "default_on")]
+    status: String,
+}
+
+fn default_on() -> String {
+    "ON".into()
+}
+
+fn node_type_from_str(s: &str) -> gb28181_protocol::id_codec::CatalogNodeType {
+    use gb28181_protocol::id_codec::CatalogNodeType::*;
+    match s {
+        "BusinessGroup" => BusinessGroup,
+        "VirtualOrg" => VirtualOrg,
+        "AlarmChannel" => AlarmChannel,
+        "Device" => Device,
+        _ => VideoChannel,
+    }
+}
+
+fn node_type_to_str(t: gb28181_protocol::id_codec::CatalogNodeType) -> &'static str {
+    use gb28181_protocol::id_codec::CatalogNodeType::*;
+    match t {
+        Device => "Device",
+        BusinessGroup => "BusinessGroup",
+        VirtualOrg => "VirtualOrg",
+        VideoChannel => "VideoChannel",
+        AlarmChannel => "AlarmChannel",
+    }
+}
+
+impl From<&gb28181_protocol::id_codec::CatalogNode> for ChannelNodeDto {
+    fn from(n: &gb28181_protocol::id_codec::CatalogNode) -> Self {
+        ChannelNodeDto {
+            id: n.id.clone(),
+            node_type: node_type_to_str(n.node_type).into(),
+            name: n.name.clone(),
+            parent_id: n.parent_id.clone(),
+            civil_code: n.civil_code.clone(),
+            status: n.status.clone(),
+        }
+    }
+}
+
+impl From<ChannelNodeDto> for gb28181_protocol::id_codec::CatalogNode {
+    fn from(d: ChannelNodeDto) -> Self {
+        let mut node = gb28181_protocol::id_codec::CatalogNode::new(
+            d.id,
+            node_type_from_str(&d.node_type),
+            d.name,
+            d.parent_id,
+        );
+        node.civil_code = d.civil_code;
+        node.status = d.status;
+        node
+    }
+}
+
+/// 载入内置目录模板(single/nvr-8ch/civil-3x2/large-16ch),返回加载后的节点列表(FR-34)。
+#[tauri::command]
+async fn load_catalog_template(
+    template: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ChannelNodeDto>, String> {
+    let guard = state.device.lock().await;
+    let h = guard.as_ref().ok_or("设备未启动,请先在单设备页启动设备")?;
+    h.sim.load_catalog_template(&template);
+    h.sim.notify_catalog_changed(&h.transport).await.ok();
+    Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
+}
+
+/// 获取当前目录树节点(FR-34)。
+#[tauri::command]
+async fn get_catalog_tree(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ChannelNodeDto>, String> {
+    let guard = state.device.lock().await;
+    let h = guard.as_ref().ok_or("设备未启动")?;
+    Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
+}
+
+/// 新增/更新一个目录通道节点,触发增量 NOTIFY(FR-34)。
+#[tauri::command]
+async fn upsert_channel(
+    node: ChannelNodeDto,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let guard = state.device.lock().await;
+    let h = guard.as_ref().ok_or("设备未启动")?;
+    let added = h.sim.upsert_channel(node.into());
+    h.sim.notify_catalog_changed(&h.transport).await.ok();
+    Ok(if added {
+        "已新增通道".into()
+    } else {
+        "已更新通道".into()
+    })
+}
+
+/// 删除一个目录通道节点,触发增量 NOTIFY(FR-34)。
+#[tauri::command]
+async fn remove_channel(id: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let guard = state.device.lock().await;
+    let h = guard.as_ref().ok_or("设备未启动")?;
+    if h.sim.remove_channel(&id) {
+        h.sim.notify_catalog_changed(&h.transport).await.ok();
+        Ok("已删除通道".into())
+    } else {
+        Err("通道不存在".into())
+    }
+}
+
 #[derive(serde::Serialize)]
 struct ScenarioSummary {
     name: String,
@@ -542,6 +662,10 @@ pub fn run() {
             set_sip_trace,
             get_stress_status,
             get_device_status,
+            load_catalog_template,
+            get_catalog_tree,
+            upsert_channel,
+            remove_channel,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
