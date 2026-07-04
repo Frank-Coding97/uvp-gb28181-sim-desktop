@@ -24,14 +24,14 @@
 
 ## 3. 场景模型(FR-25)
 
-YAML 定义,字段与 `30-crates/scenario.md` 的 `Scenario` 结构一一对应。示例见 `examples/scenarios/5000-register.yaml`。关键块:
+TOML 定义(字段平铺在顶层,无 `scenario:` 包裹),对应 `30-crates/scenario.md` 的 `LinearScenario` 结构。示例见 `examples/scenarios/linear.toml`。关键字段:
 
-- `platform` — 上级平台 host/port/domain
-- `devices` — 数量、ID 前缀、起始序号、密码(批量生成规则,FR-20)
-- `register` — 是否注册 + 爬坡速率(每秒台数,FR-21)
-- `heartbeat` — 是否心跳 + 间隔
-- `media` — 档位 mode + active_ratio + 码率 + 文件
-- `duration_seconds` — 压测时长
+- `base_device_id` — 起始 20 位 ID(后续 u128 递增),`password`(批量生成规则,FR-20)
+- `server_host`/`server_port`/`server_domain` — 上级平台
+- `ramp_per_second` — 爬坡速率(每秒拉起台数,0=一次全拉起,FR-21)
+- `heartbeat_interval_secs` — 心跳间隔;`channels_per_device` — 每设备通道数
+- `media_profile`(A/B/C)+ `active_ratio` + `bitrate_kbps` + `video_source` + `video_fps`(FR-23/24)
+- `gb_version`(2016/2022)、`transport`(UDP/TCP)
 
 ## 4. 调度策略
 
