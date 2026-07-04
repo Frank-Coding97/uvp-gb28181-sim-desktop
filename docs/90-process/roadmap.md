@@ -12,6 +12,19 @@
 | **M3 压测引擎** | scenario 场景 + 编排器 + CLI;批量并发注册 + 原子指标 | FR-20~27 | 多设备批量注册(UC-2) | ✅ 核心完成 |
 | **M4 UI 完善** | 平台配置、场景编排、监控大盘(ECharts)+ 报告导出 | FR-40~44, FR-28 | 非技术用户独立跑一次压测 | ✅ 核心完成 |
 | **M5 打包分发** | 三平台安装包 + 签名/公证 | NFR-1/2 | Win/macOS/Linux 下载即用 | 🚧 macOS dmg 已验证,Win/Linux 靠 CI |
+| **M6 协议全覆盖对齐上游** | 扩展查询/控制/抓拍/升级/主动通知/信令健壮性 + H.265/AAC + 多通道·OSD·语音广播 | FR-17~19, FR-30~36 | 对标 uvp-gb28181-sim GB-2022 覆盖矩阵 100%(去除明确不做项);SIP 注入/真机 WVP 验证 | 🚧 进行中 |
+
+### M6 分档推进(每档:文档→代码→单测/注入验证→更新覆盖矩阵→commit)
+
+| 档 | 内容 | 需求 | 验证 |
+|---|---|---|---|
+| P1 查询 | AlarmStatus / HomePositionQuery / StorageCardStatusQuery / CruiseTrackListQuery / CruiseTrackQuery / PTZPreciseStatusQuery / MobilePosition 单次 / ConfigDownload+VideoParamOpt | FR-17 | SIP 注入 |
+| P2 控制 | PTZPreciseCtrl / 巡航控制 / 辅助控制 / Focus / TargetTrack / FormatSDCard | FR-18 | SIP 注入 + WVP |
+| P3 抓拍升级 | SnapShotCmd / SnapShotConfig(HTTP PUT) / DeviceUpgrade 4 步 | FR-19, FR-30 | SIP 注入 + 本地 HTTP 收图 |
+| P4 通知健壮 | MediaStatus / Expires 续约 / RTCP SR / Catalog 增量 NOTIFY | FR-31, FR-32 | 单测 + WVP |
+| P5 媒体 | H.265 / AAC | FR-33 | ffmpeg 转封装实测 |
+| P6 多通道+OSD | 虚拟通道 CRUD+模板 / 报警通道节点 / OSD 叠加 | FR-34, FR-35 | headless Chrome + WVP 目录树 |
+| P7 语音广播 | Broadcast 应答 + 反向 INVITE UAC + 音频接收 | FR-36 | (本环境无法触发,尽力实现 + 单测) |
 
 ---
 
