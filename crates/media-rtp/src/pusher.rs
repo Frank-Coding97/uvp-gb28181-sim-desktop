@@ -114,7 +114,8 @@ pub async fn push_stream_controlled(
     } else {
         RtpSender::new(dst, ssrc).await?
     };
-    let mux = PsMuxer::new();
+    // PSM 视频 stream_type 跟随源编码(H.264=0x1B / H.265=0x24)。
+    let mux = PsMuxer::with_video(source.codec());
     let fps = fps.max(1);
     let ts_step = CLOCK_HZ / fps;
     let base_interval_us = 1_000_000f32 / fps as f32;

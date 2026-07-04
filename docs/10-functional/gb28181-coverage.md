@@ -40,6 +40,9 @@
 | RTP over UDP 推流 | FR-8 | ✅ |
 | RTP over TCP(RFC 4571) | FR-8 | ✅ WVP TCP-PASSIVE 收流 |
 | PS 封装 H.264(Pack/System/PSM/PES) | FR-8 | ✅ WVP 转 FLV 出画面 |
+| PS 封装 H.265(PSM stream_type 0x24) | FR-33 | 🟢 从 NAL(VPS type32)自动探测 H.265,PSM 声明 0x24,帧切分按 H.265 VCL/关键帧类型;单测(真机推流待验) |
+| 音频复合流 G.711A(PSM 0x90) | FR-8 | ✅ 与视频同步复用 |
+| 音频复合流 AAC(PSM stream_type 0x0F) | FR-33 | 🟢 PSM 支持 AAC ES 映射;单测(AAC 音频轨抽取/ADTS 封装待接 ffmpeg) |
 | H.264 文件循环推流(C 档) | FR-8 | ✅ |
 | 历史回放流推送 | FR-10 | 🟢 复用点播 INVITE 推流路径 |
 | 回放控制(会话内 INFO/MANSRTSP:PLAY/PAUSE/Scale 倍速) | FR-10 | 🟢 INFO 回 200 + 运行时调速/暂停/恢复(单测+真机 INFO 注入回 200);全链路倍速需活跃回放会话 |
