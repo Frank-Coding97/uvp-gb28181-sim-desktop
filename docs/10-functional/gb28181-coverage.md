@@ -94,7 +94,9 @@
 | 巡航轨迹详情查询 | CruiseTrackQuery | P1 | 🟢 按 GroupID 返回该轨迹预置点(Speed/DwellTime 固定 5/3)(FR-17,单测) |
 | PTZ 精准状态查询 | PTZPreciseStatusQuery | P1 | 🟢 返回最近精准云台姿态 Pan/Tilt/Zoom(%.2f)(FR-17,单测) |
 | 移动位置单次查询 | MobilePosition | P1 | 🟢 复用位置 NOTIFY 骨架单发(FR-17) |
-| 设备软件升级 | DeviceUpgrade | P2 | 🚧 M6·P3 计划(4 步进度 NOTIFY) |
+| 设备软件升级 | DeviceUpgrade | P2 | 🟢 回 200 后异步发 4 步进度(0/30/60/100%)DeviceUpgradeResult NOTIFY(percent<100→Result=0,=100→Result=1)(FR-30,单测) |
+| 平台下发抓拍(旧) | SnapShotCmd | P2 | 🟢 触发经 Alarm Notify 上报(FR-19) |
+| 平台下发抓拍(GB-2022) | SnapShotConfig | P2 | 🟢 SessionID/UploadURL/SnapNum(钳1-10)/Interval;串行拍 N 张,裸 TCP HTTP PUT 上传占位 JPEG(2xx 判定 + SSRF 白名单拒环回/私网/组播)+ 完成 NOTIFY(CmdType=Notify/SubCmd=SnapShot);仅 http(FR-19,单测) |
 
 ## 主动上报(设备 → 平台)
 

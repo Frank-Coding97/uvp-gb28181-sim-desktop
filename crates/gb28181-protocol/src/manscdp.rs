@@ -103,6 +103,58 @@ pub struct Control {
     /// 格式化卡号(与 FormatSDCard 配套,GB-2022)。
     #[serde(rename = "DiskNum", skip_serializing_if = "Option::is_none")]
     pub disk_num: Option<u32>,
+    /// 平台下发抓拍(7.4 旧路径),值为任意占位串;触发后经 Alarm Notify 上报。
+    #[serde(rename = "SnapShotCmd", skip_serializing_if = "Option::is_none")]
+    pub snap_shot_cmd: Option<String>,
+    /// 抓拍配置(GB-2022 §9.5):JPEG 经 HTTP 上传 + 完成 NOTIFY。
+    #[serde(rename = "SnapShotConfig", skip_serializing_if = "Option::is_none")]
+    pub snap_shot_config: Option<SnapShotConfig>,
+    /// 在线升级(DeviceUpgrade):4 步进度 NOTIFY。
+    #[serde(rename = "DeviceUpgrade", skip_serializing_if = "Option::is_none")]
+    pub device_upgrade: Option<DeviceUpgrade>,
+}
+
+/// 抓拍配置参数(SnapShotConfig 子元素,GB-2022 §9.5)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapShotConfig {
+    /// 会话标识(必填)。
+    #[serde(rename = "SessionID", default)]
+    pub session_id: String,
+    /// 图片上传地址(必填,http/https)。
+    #[serde(rename = "UploadURL", default)]
+    pub upload_url: String,
+    /// 抓拍张数(1-10,越界钳制)。
+    #[serde(rename = "SnapNum", default)]
+    pub snap_num: u32,
+    /// 抓拍间隔(秒)。
+    #[serde(rename = "Interval", default)]
+    pub interval: u32,
+}
+
+impl SnapShotConfig {
+    /// 会话标识与上传地址非空视为有效。
+    pub fn is_valid(&self) -> bool {
+        !self.session_id.is_empty() && !self.upload_url.is_empty()
+    }
+
+    /// 钳制后的抓拍张数(1-10)。
+    pub fn clamped_num(&self) -> u32 {
+        self.snap_num.clamp(1, 10)
+    }
+}
+
+/// 在线升级参数(DeviceUpgrade 子元素)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceUpgrade {
+    /// 固件版本。
+    #[serde(rename = "Firmware", default)]
+    pub firmware: String,
+    /// 会话标识。
+    #[serde(rename = "SessionID", default)]
+    pub session_id: String,
+    /// 固件文件地址。
+    #[serde(rename = "FileURL", default)]
+    pub file_url: String,
 }
 
 /// 精确云台控制参数(PTZPreciseCtrl 子元素,GB-2022)。
@@ -202,6 +254,12 @@ impl Control {
             "目标跟踪"
         } else if self.format_sd_card.is_some() {
             "格式化SD卡"
+        } else if self.device_upgrade.is_some() {
+            "在线升级"
+        } else if self.snap_shot_config.is_some() {
+            "抓拍配置"
+        } else if self.snap_shot_cmd.is_some() {
+            "抓拍"
         } else {
             "未知控制"
         }
@@ -522,6 +580,153 @@ impl MobilePositionNotify {
     pub fn to_xml(&self) -> Result<String> {
         let body = quick_xml::se::to_string(self)
             .map_err(|e| Error::Gb28181(format!("MobilePosition 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 在线升级进度通知(DeviceUpgradeResult,设备 → 平台)。
+///
+/// 4 步进度 percent [0,30,60,100]。percent<100 → Result=0(进行中),
+/// percent==100 → Result=1(成功);2=失败(定义但模拟不发)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct DeviceUpgradeResultNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SessionID")]
+    pub session_id: String,
+    #[serde(rename = "Firmware")]
+    pub firmware: String,
+    /// 0=进行中 1=成功 2=失败。
+    #[serde(rename = "Result")]
+    pub result: u8,
+    /// 进度百分比(0-100)。
+    #[serde(rename = "Percent")]
+    pub percent: u8,
+}
+
+impl DeviceUpgradeResultNotify {
+    /// 用会话/固件/进度构造(Result 由 percent 推导)。
+    pub fn new(
+        device_id: impl Into<String>,
+        sn: u32,
+        session_id: impl Into<String>,
+        firmware: impl Into<String>,
+        percent: u8,
+    ) -> Self {
+        DeviceUpgradeResultNotify {
+            cmd_type: "DeviceUpgradeResult".into(),
+            sn,
+            device_id: device_id.into(),
+            session_id: session_id.into(),
+            firmware: firmware.into(),
+            result: if percent >= 100 { 1 } else { 0 },
+            percent,
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("DeviceUpgradeResultNotify 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 抓拍完成通知(设备 → 平台,GB-2022 §9.5)。
+///
+/// 主格式:CmdType=Notify + SubCmd=SnapShot。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct SnapShotNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SubCmd")]
+    pub sub_cmd: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SessionID")]
+    pub session_id: String,
+    #[serde(rename = "SnapShotID")]
+    pub snap_shot_id: String,
+    #[serde(rename = "Time")]
+    pub time: String,
+    #[serde(rename = "StoragePath")]
+    pub storage_path: String,
+}
+
+impl SnapShotNotify {
+    /// 构造抓拍完成通知。
+    pub fn new(
+        device_id: impl Into<String>,
+        sn: u32,
+        session_id: impl Into<String>,
+        snap_shot_id: impl Into<String>,
+        time: impl Into<String>,
+        storage_path: impl Into<String>,
+    ) -> Self {
+        SnapShotNotify {
+            cmd_type: "Notify".into(),
+            sub_cmd: "SnapShot".into(),
+            sn,
+            device_id: device_id.into(),
+            session_id: session_id.into(),
+            snap_shot_id: snap_shot_id.into(),
+            time: time.into(),
+            storage_path: storage_path.into(),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("SnapShotNotify 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
+/// 媒体状态通知(MediaStatus,设备 → 平台)。
+///
+/// NotifyType:121=历史媒体发送结束、122=录像异常、123=存储满。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct MediaStatusNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "NotifyType")]
+    pub notify_type: u32,
+}
+
+impl MediaStatusNotify {
+    /// 历史媒体文件发送结束(121)。
+    pub fn finished(device_id: impl Into<String>, sn: u32) -> Self {
+        Self::new(device_id, sn, 121)
+    }
+
+    /// 用 NotifyType 构造(121/122/123)。
+    pub fn new(device_id: impl Into<String>, sn: u32, notify_type: u32) -> Self {
+        MediaStatusNotify {
+            cmd_type: "MediaStatus".into(),
+            sn,
+            device_id: device_id.into(),
+            notify_type,
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("MediaStatusNotify 序列化失败: {e}")))?;
         Ok(format!("{XML_DECL}{body}"))
     }
 }
@@ -1870,6 +2075,48 @@ mod tests {
         // 方向命令不应误判为巡航/辅助/聚焦。
         assert!(mk("A50F0108320000").cruise_op().is_none());
         assert!(mk("A50F0108320000").focus_op().is_none());
+    }
+
+    #[test]
+    fn 升级进度与抓拍完成通知() {
+        let n0 = DeviceUpgradeResultNotify::new("d", 1, "s1", "v2.0", 0)
+            .to_xml()
+            .unwrap();
+        assert!(n0.contains("<CmdType>DeviceUpgradeResult</CmdType>"));
+        assert!(n0.contains("<Result>0</Result>") && n0.contains("<Percent>0</Percent>"));
+        let n100 = DeviceUpgradeResultNotify::new("d", 2, "s1", "v2.0", 100)
+            .to_xml()
+            .unwrap();
+        assert!(n100.contains("<Result>1</Result>"));
+
+        let snap = SnapShotNotify::new("d", 3, "sess", "20260704T120000_1", "t", "http://x/a.jpg")
+            .to_xml()
+            .unwrap();
+        assert!(snap.contains("<SubCmd>SnapShot</SubCmd>"));
+        assert!(snap.contains("<SnapShotID>20260704T120000_1</SnapShotID>"));
+
+        let media = MediaStatusNotify::finished("d", 4).to_xml().unwrap();
+        assert!(media.contains("<CmdType>MediaStatus</CmdType>"));
+        assert!(media.contains("<NotifyType>121</NotifyType>"));
+    }
+
+    #[test]
+    fn 解析抓拍配置与升级() {
+        let xml = r#"<?xml version="1.0"?>
+<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID>
+<SnapShotConfig><SessionID>s1</SessionID><UploadURL>http://h/</UploadURL><SnapNum>20</SnapNum><Interval>2</Interval></SnapShotConfig></Control>"#;
+        let c = Control::parse(xml).unwrap();
+        assert_eq!(c.kind(), "抓拍配置");
+        let cfg = c.snap_shot_config.unwrap();
+        assert!(cfg.is_valid());
+        assert_eq!(cfg.clamped_num(), 10); // 20 钳制到 10
+
+        let xml2 = r#"<?xml version="1.0"?>
+<Control><CmdType>DeviceControl</CmdType><SN>2</SN><DeviceID>d</DeviceID>
+<DeviceUpgrade><Firmware>v2</Firmware><SessionID>u1</SessionID><FileURL>http://f/x.bin</FileURL></DeviceUpgrade></Control>"#;
+        let c2 = Control::parse(xml2).unwrap();
+        assert_eq!(c2.kind(), "在线升级");
+        assert_eq!(c2.device_upgrade.unwrap().firmware, "v2");
     }
 
     #[test]
