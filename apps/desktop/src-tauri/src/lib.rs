@@ -60,6 +60,28 @@ impl DeviceObserver for StateEmitter {
             DeviceEvent::StreamStop => "Registered",
             // 心跳事件不改变状态灯。
             DeviceEvent::HeartbeatOk | DeviceEvent::HeartbeatFail => return,
+            // 云台控制:单独推 ptz_action 事件给前端做云台动画。
+            DeviceEvent::Ptz {
+                up,
+                down,
+                left,
+                right,
+                zoom_in,
+                zoom_out,
+                pan_speed,
+                tilt_speed,
+                zoom_speed,
+            } => {
+                let _ = self.app.emit(
+                    "ptz_action",
+                    serde_json::json!({
+                        "up": up, "down": down, "left": left, "right": right,
+                        "zoom_in": zoom_in, "zoom_out": zoom_out,
+                        "pan_speed": pan_speed, "tilt_speed": tilt_speed, "zoom_speed": zoom_speed,
+                    }),
+                );
+                return;
+            }
         };
         let _ = self.app.emit("device_state", state);
     }

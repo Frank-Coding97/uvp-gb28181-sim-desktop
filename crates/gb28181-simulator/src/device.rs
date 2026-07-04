@@ -827,7 +827,24 @@ impl DeviceSimulator {
                     tracing::info!(preset = idx, "预置位调用(转到)");
                 }
                 None => {
-                    tracing::info!(ptz = %ptz, "PTZ 云台控制(方向/变倍,模拟接受)");
+                    // 方向/变倍运动:解析后上报观察者(供 UI 云台动画)。
+                    if let Some(m) = ctrl.ptz_motion() {
+                        tracing::info!(ptz = %ptz, up=m.up, down=m.down, left=m.left, right=m.right,
+                            zoom_in=m.zoom_in, zoom_out=m.zoom_out, "PTZ 云台运动");
+                        self.observer.on_event(common::DeviceEvent::Ptz {
+                            up: m.up,
+                            down: m.down,
+                            left: m.left,
+                            right: m.right,
+                            zoom_in: m.zoom_in,
+                            zoom_out: m.zoom_out,
+                            pan_speed: m.pan_speed,
+                            tilt_speed: m.tilt_speed,
+                            zoom_speed: m.zoom_speed,
+                        });
+                    } else {
+                        tracing::info!(ptz = %ptz, "PTZ 云台控制(模拟接受)");
+                    }
                 }
             }
         }
