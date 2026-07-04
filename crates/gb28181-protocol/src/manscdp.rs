@@ -156,7 +156,7 @@ impl Control {
         let bytes = (0..hex.len() / 2)
             .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
             .collect::<Option<Vec<u8>>>()?;
-        if bytes.len() < 6 {
+        if bytes.len() < 7 {
             return None;
         }
         let action = match bytes[3] {
@@ -165,7 +165,9 @@ impl Control {
             0x83 => PresetAction::Delete,
             _ => return None,
         };
-        Some((action, bytes[4]))
+        // 预置位编号在字节5(数据2);字节4(数据1)恒为 0x01。
+        // 实测 WVP:A50F0182 01 <presetId> 00 校验 —— presetId=1→..0101、=7→..0107。
+        Some((action, bytes[5]))
     }
 
     /// 解析 PTZ 8 字节码的方向/变倍运动(GB/T 28181 附录 A.3.1)。
@@ -1068,9 +1070,15 @@ mod tests {
             .unwrap()
         };
         use PresetAction::*;
-        assert_eq!(mk("A50F01810300EA").preset_op(), Some((Set, 3)));
-        assert_eq!(mk("A50F01820300EB").preset_op(), Some((Call, 3)));
-        assert_eq!(mk("A50F01830300EC").preset_op(), Some((Delete, 3)));
+        // 实测 WVP 布局:字节4=0x01,字节5=预置位号。
+        assert_eq!(mk("A50F01810103003B").preset_op(), Some((Set, 3)));
+        assert_eq!(mk("A50F01820103003C").preset_op(), Some((Call, 3)));
+        assert_eq!(mk("A50F01830103003D").preset_op(), Some((Delete, 3)));
+        // WVP 真实调用码 presetId=7。
+        assert_eq!(
+            mk("A50F018201070 3F".replace(' ', "").as_str()).preset_op(),
+            Some((Call, 7))
+        );
     }
 
     #[test]

@@ -825,6 +825,8 @@ impl DeviceSimulator {
                 }
                 Some((PresetAction::Call, idx)) => {
                     tracing::info!(preset = idx, "预置位调用(转到)");
+                    self.observer
+                        .on_event(common::DeviceEvent::PtzPresetCall { preset: idx });
                 }
                 None => {
                     // 方向/变倍运动:解析后上报观察者(供 UI 云台动画)。

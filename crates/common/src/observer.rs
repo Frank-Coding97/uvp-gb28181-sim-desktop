@@ -34,6 +34,8 @@ pub enum DeviceEvent {
         tilt_speed: u8,
         zoom_speed: u8,
     },
+    /// 平台调用预置位(转到某预置位),供 UI 演示摄像头转到目标角度。
+    PtzPresetCall { preset: u8 },
 }
 
 /// 失败归因(与 docs/20-architecture/data-model.md#4 对齐)。
