@@ -2,7 +2,14 @@
 
 **状态:M2 完成** · RTP/PS 封装与推流引擎。
 
-> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · 单测 14 全绿。待补:TCP(RFC 4571)推流。
+> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · 单测 14 全绿。待补:TCP(RFC 4571)推流、音频复合流(G.711A)。
+
+## 容器格式支持(FileSource)
+
+引擎推流只吃 **H.264/H.265 Annex B 裸流**(按起始码切帧)。为支持常见容器(MP4/FLV/MKV/MOV):
+`FileSource::from_path` 检测文件非 Annex B 时,调用系统 **ffmpeg** 转封装为 Annex B 裸流
+(`-c:v copy -bsf:v h264_mp4toannexb`,失败回退重编码),结果按"源路径+修改时间"缓存到临时目录复用。
+ffmpeg 为**可选**外部依赖:仅容器格式需要;裸流(.h264/.h265)不依赖它。ffmpeg 缺失时对容器文件报明确错误。
 
 ## 职责
 

@@ -7,6 +7,100 @@
 
 use common::{Error, Result};
 
+/// 判断字节流是否以 Annex B 起始码开头(`00 00 01` 或 `00 00 00 01`)。
+fn starts_with_annexb(b: &[u8]) -> bool {
+    b.starts_with(&[0, 0, 1]) || b.starts_with(&[0, 0, 0, 1])
+}
+
+/// 把容器视频文件(MP4/FLV/MKV/MOV 等)转封装为 H.264 Annex B 裸流,返回裸流文件路径。
+///
+/// 用系统 `ffmpeg`:优先 `-c:v copy -bsf:v h264_mp4toannexb`(无损转封装,快);
+/// 失败则回退重编码(`libx264 -preset ultrafast`,兼容任意输入)。结果按"源路径 + 修改时间"
+/// 缓存到临时目录,同一文件只转一次(压测多设备共用同一文件时只转一次)。
+///
+/// ffmpeg 为可选外部依赖:仅容器格式需要;缺失时返回明确错误。
+fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
+    use std::process::Command;
+
+    // 缓存键:源路径 + 修改时间(mtime),避免源文件更新后用旧缓存。
+    let meta = std::fs::metadata(src).map_err(Error::Io)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(src, mtime), &mut hasher);
+    let key = std::hash::Hasher::finish(&hasher);
+    let out = std::env::temp_dir().join(format!("uvp-annexb-{key:016x}.h264"));
+    if out.exists() {
+        return Ok(out);
+    }
+
+    // 检查 ffmpeg 是否可用。
+    let has_ffmpeg = Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_ffmpeg {
+        return Err(Error::Media(format!(
+            "视频源是容器格式({src}),需要 ffmpeg 转封装,但未找到 ffmpeg;\
+             请安装 ffmpeg,或直接提供 .h264/.h265 Annex B 裸流"
+        )));
+    }
+
+    // ① 无损转封装(copy + h264_mp4toannexb)。
+    let copy_ok = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            src,
+            "-c:v",
+            "copy",
+            "-bsf:v",
+            "h264_mp4toannexb",
+        ])
+        .arg(&out)
+        .output()
+        .map(|o| o.status.success() && out.exists())
+        .unwrap_or(false);
+    if copy_ok {
+        return Ok(out);
+    }
+
+    // ② 回退:重编码为 H.264 Annex B(兼容任意编码/容器)。
+    let _ = std::fs::remove_file(&out);
+    let enc = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            src,
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-f",
+            "h264",
+        ])
+        .arg(&out)
+        .output()
+        .map_err(|e| Error::Media(format!("ffmpeg 执行失败: {e}")))?;
+    if enc.status.success() && out.exists() {
+        Ok(out)
+    } else {
+        Err(Error::Media(format!(
+            "ffmpeg 转封装/重编码失败({src}):{}",
+            String::from_utf8_lossy(&enc.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+        )))
+    }
+}
+
 /// 一帧编码数据(H.264 Annex B 访问单元,含起始码)。
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -74,10 +168,21 @@ pub struct FileSource {
 }
 
 impl FileSource {
-    /// 从 H.264 Annex B 裸流文件加载并切帧。
+    /// 从视频文件加载并切帧。
+    ///
+    /// 直接支持 H.264/H.265 **Annex B 裸流**(按起始码切帧)。若文件是容器
+    /// (MP4/FLV/MKV/MOV,即开头不是 Annex B 起始码),自动经系统 ffmpeg 转封装为
+    /// Annex B 裸流再加载(见 [`ensure_annexb`])。
     pub fn from_path(path: &str) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(Error::Io)?;
-        Self::from_bytes(&bytes)
+        // 已是 Annex B 裸流:直接切帧。
+        if starts_with_annexb(&bytes) {
+            return Self::from_bytes(&bytes);
+        }
+        // 容器格式:转封装为 Annex B 后加载。
+        let converted = ensure_annexb(path)?;
+        let out = std::fs::read(&converted).map_err(Error::Io)?;
+        Self::from_bytes(&out)
     }
 
     /// 从内存中的 Annex B 字节切帧。
@@ -229,6 +334,35 @@ mod tests {
     #[test]
     fn 空流报错() {
         assert!(FileSource::from_bytes(&[0xFF, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn annexb_起始码识别() {
+        assert!(starts_with_annexb(&[0, 0, 1, 0x67]));
+        assert!(starts_with_annexb(&[0, 0, 0, 1, 0x67]));
+        assert!(!starts_with_annexb(&[
+            0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p'
+        ])); // MP4 ftyp box
+        assert!(!starts_with_annexb(&[]));
+    }
+
+    // 容器转封装依赖系统 ffmpeg,默认忽略;需要时:
+    //   ffmpeg -y -f lavfi -i testsrc=duration=2:size=320x240:rate=25 \
+    //     -c:v libx264 -preset ultrafast /tmp/uvp_test.mp4
+    //   cargo test -p media-rtp -- --ignored mp4_转封装
+    #[test]
+    #[ignore = "需系统 ffmpeg + /tmp/uvp_test.mp4"]
+    fn mp4_转封装并切帧() {
+        let mut s = FileSource::from_path("/tmp/uvp_test.mp4").expect("MP4 应能转封装加载");
+        let mut n = 0;
+        while let Some(f) = s.next_frame() {
+            assert!(!f.data.is_empty());
+            n += 1;
+            if n > 5 {
+                break;
+            }
+        }
+        assert!(n > 0, "应从 MP4 切出帧");
     }
 
     #[test]

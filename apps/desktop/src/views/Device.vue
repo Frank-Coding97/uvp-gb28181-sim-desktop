@@ -15,7 +15,9 @@ async function pickVideoSource() {
     const picked = await openDialog({
       multiple: false,
       directory: false,
-      filters: [{ name: "H.264 裸流", extensions: ["h264", "264", "h265", "hevc"] }],
+      filters: [
+        { name: "视频", extensions: ["h264", "264", "h265", "hevc", "mp4", "flv", "mkv", "mov"] },
+      ],
     });
     if (typeof picked === "string") form.value.video_source = picked;
   } catch (e) {
