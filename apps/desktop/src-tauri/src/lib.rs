@@ -130,6 +130,8 @@ async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
 async fn start_stress(
     toml: String,
     count: usize,
+    position_interval: u64,
+    alarm_interval: u64,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -149,10 +151,10 @@ async fn start_stress(
     *state.last_scenario.lock().await = Some((toml.clone(), count));
     drop(stop_guard);
 
-    // 压测任务。
+    // 压测任务(含批量主动上报:0=关闭)。
     let tx2 = tx.clone();
     tokio::spawn(async move {
-        let _ = orch.run(tx2).await;
+        let _ = orch.run(tx2, position_interval, alarm_interval).await;
     });
 
     // 每秒推送指标快照给前端。
@@ -198,6 +200,28 @@ async fn get_metrics(state: tauri::State<'_, AppState>) -> Result<String, String
         Some(m) => serde_json::to_string(&m.snapshot()).map_err(|e| e.to_string()),
         None => Err("无正在运行的压测".into()),
     }
+}
+
+/// 查询压测运行状态(供 UI 页面切换后与引擎真实状态对账,消除组件重建导致的状态丢失)。
+/// running=是否有压测在跑;device_count=当前场景设备数(无则 0)。
+#[tauri::command]
+async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let running = state.stop_tx.lock().await.is_some();
+    let device_count = state
+        .last_scenario
+        .lock()
+        .await
+        .as_ref()
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    Ok(serde_json::json!({ "running": running, "device_count": device_count }))
+}
+
+/// 查询单设备运行状态(UI 切页后对账用)。running=设备实例是否存在。
+#[tauri::command]
+async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let running = state.device.lock().await.is_some();
+    Ok(serde_json::json!({ "running": running }))
 }
 
 /// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
@@ -460,6 +484,7 @@ struct ScenarioSummary {
 pub fn run() {
     common::logging::init();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             engine_version,
@@ -473,6 +498,8 @@ pub fn run() {
             fire_alarm,
             fire_position,
             set_sip_trace,
+            get_stress_status,
+            get_device_status,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
