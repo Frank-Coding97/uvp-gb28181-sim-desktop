@@ -103,7 +103,10 @@
 | 功能 | 需求 | 状态 |
 |---|---|---|
 | 报警上报(Alarm Notify) | FR-9 | ✅ WVP 接受(code 200) |
-| 录像完成/异常通知 | FR-10 | ⬜ |
+| 录像完成/异常通知(MediaStatus) | FR-31 | 🟢 回放/下载会话 BYE 后发 MediaStatus NotifyType=121(历史媒体发送结束);122/123(异常/存储满)类型已备(FR-31) |
+| 注册续约 | FR-32 | 🟢 注册有效期 3600s,到期前 80%(2880s)主动重注册,不等心跳失败被动重注册(FR-32) |
+| RTCP SR 反馈 | FR-32 | 🟢 build_rtcp_sr 按 RFC3550 §6.4.1 构造 SR 包(SSRC/NTP/RTP-TS/包数/字节数),单测;周期发送待接入 RTCP 端口(需真机反馈校准,暂不盲发) |
+| Catalog 增量 NOTIFY | FR-32 | 🚧 现为全量 Event=ON;增量 diff(ADD/DEL/UPDATE)随 P6 多通道 CRUD 落地(通道静态时全量即可) |
 
 ## 压力测试(差异化能力)
 

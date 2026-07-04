@@ -245,6 +245,8 @@ struct PushSession {
     stop_tx: tokio::sync::oneshot::Sender<()>,
     /// 回放控制(倍速/暂停),供会话内 INFO 调整推流。
     control: Arc<media_rtp::PlaybackControl>,
+    /// 是否为回放/下载会话(s=Playback/Download):结束时发 MediaStatus 121。
+    is_history: bool,
 }
 
 /// 一条活跃订阅(周期 NOTIFY 任务句柄 + 停止信号)。
@@ -1384,20 +1386,22 @@ impl DeviceSimulator {
                 _task: task,
                 stop_tx,
                 control,
+                is_history: platform_sdp.is_playback() || platform_sdp.is_download(),
             });
         }
         drop(sess_guard);
         Ok(true)
     }
 
-    /// 处理 BYE:停止推流,回 200 OK。
+    /// 处理 BYE:停止推流,回 200 OK。回放/下载会话结束后补发 MediaStatus 121。
     async fn handle_bye(
-        &self,
+        self: &Arc<Self>,
         transport: &Arc<UdpTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
     ) -> Result<bool> {
         let mut sess_guard = self.session.lock().await;
+        let was_history = sess_guard.as_ref().map(|s| s.is_history).unwrap_or(false);
         if let Some(session) = sess_guard.take() {
             let _ = session.stop_tx.send(()); // 触发停流
         }
@@ -1405,6 +1409,21 @@ impl DeviceSimulator {
 
         let resp = sip_core::SipMessage::Response(builder::response_ok(req));
         transport.send_to(&resp, from).await?;
+
+        // 回放/下载会话结束:补发 MediaStatus 121(历史媒体文件发送结束)。
+        if was_history {
+            let (h, p) = (self.local_host(), self.local_port());
+            let sn = self.next_cseq();
+            if let Ok(xml) = gb28181_protocol::manscdp::MediaStatusNotify::finished(
+                self.config.device_id.as_str(),
+                sn,
+            )
+            .to_xml()
+            {
+                let _ = self.send_message_xml(transport, &h, p, &xml).await;
+            }
+            tracing::info!("回放/下载结束,发 MediaStatus 121");
+        }
         Ok(true)
     }
 
@@ -1462,13 +1481,22 @@ impl DeviceSimulator {
         }
         tracing::info!(device=%self.config.device_id, "注册成功");
 
-        // 心跳主循环。
+        // 心跳主循环 + 注册续约(FR-32)。
+        // 注册有效期 3600s(与 builder::register 一致),到期前 80%(2880s)主动重注册续约。
         let interval = Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
+        let renew_after = Duration::from_secs(3600 * 80 / 100);
+        let mut renew_ticker = tokio::time::interval(renew_after);
+        renew_ticker.reset(); // 跳过启动即触发
         let max_hb_fail = 3u32;
         let mut hb_fail = 0u32;
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
+                _ = renew_ticker.tick() => {
+                    // 到期前主动续约,避免掉线后被动重注册。
+                    tracing::info!(device=%self.config.device_id, "注册续约(到期前 80%)");
+                    let _ = self.register(&transport, &local_host, local_port).await;
+                }
                 _ = tokio::time::sleep(interval) => {
                     match self.send_keepalive(&transport, &local_host, local_port).await {
                         Ok(200) => hb_fail = 0,
@@ -2067,6 +2095,7 @@ mod tests {
             _task: task,
             stop_tx,
             control: control.clone(),
+            is_history: false,
         });
 
         // 构造 INFO 请求的辅助闭包。
