@@ -73,6 +73,45 @@ pub struct Control {
     /// 远程启动,值 "Boot"。
     #[serde(rename = "TeleBoot", skip_serializing_if = "Option::is_none")]
     pub tele_boot: Option<String>,
+    /// 看守位控制(HomePosition):Enabled/ResetTime/PresetIndex 等,GB-2016 A.2.4.4。
+    #[serde(rename = "HomePosition", skip_serializing_if = "Option::is_none")]
+    pub home_position: Option<HomePosition>,
+    /// 拉框放大/缩小(DragZoomIn/DragZoomOut),GB-2022 精确控制。
+    #[serde(rename = "DragZoomIn", skip_serializing_if = "Option::is_none")]
+    pub drag_zoom_in: Option<DragZoom>,
+    #[serde(rename = "DragZoomOut", skip_serializing_if = "Option::is_none")]
+    pub drag_zoom_out: Option<DragZoom>,
+}
+
+/// 看守位设置(HomePosition 子元素)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomePosition {
+    /// 是否启用看守位(1 启用 / 0 关闭)。
+    #[serde(rename = "Enabled")]
+    pub enabled: u8,
+    /// 自动归位时间(秒)。
+    #[serde(rename = "ResetTime", default)]
+    pub reset_time: u32,
+    /// 归位到的预置位编号。
+    #[serde(rename = "PresetIndex", default)]
+    pub preset_index: u32,
+}
+
+/// 拉框放大/缩小参数(DragZoom 子元素)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragZoom {
+    #[serde(rename = "Length", default)]
+    pub length: u32,
+    #[serde(rename = "Width", default)]
+    pub width: u32,
+    #[serde(rename = "MidPointX", default)]
+    pub midpoint_x: u32,
+    #[serde(rename = "MidPointY", default)]
+    pub midpoint_y: u32,
+    #[serde(rename = "LengthX", default)]
+    pub length_x: u32,
+    #[serde(rename = "LengthY", default)]
+    pub length_y: u32,
 }
 
 impl Control {
@@ -96,10 +135,49 @@ impl Control {
             "报警复位"
         } else if self.tele_boot.is_some() {
             "远程启动"
+        } else if self.home_position.is_some() {
+            "看守位设置"
+        } else if self.drag_zoom_in.is_some() {
+            "拉框放大"
+        } else if self.drag_zoom_out.is_some() {
+            "拉框缩小"
         } else {
             "未知控制"
         }
     }
+
+    /// 解析 PTZ 8 字节码(`ptz_cmd`,16 位十六进制)的预置位操作。
+    ///
+    /// GB/T 28181 附录 A.3.1:字节3(指令码)高 4 位为预置位操作类型
+    /// (0x81 设置 / 0x82 调用 / 0x83 删除),字节5(数据2)为预置位编号。
+    /// 非预置位指令或格式不符返回 None。
+    pub fn preset_op(&self) -> Option<(PresetAction, u8)> {
+        let hex = self.ptz_cmd.as_ref()?;
+        let bytes = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        if bytes.len() < 6 {
+            return None;
+        }
+        let action = match bytes[3] {
+            0x81 => PresetAction::Set,
+            0x82 => PresetAction::Call,
+            0x83 => PresetAction::Delete,
+            _ => return None,
+        };
+        Some((action, bytes[4]))
+    }
+}
+
+/// 预置位操作类型(PTZ 指令码解析结果)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetAction {
+    /// 设置预置位。
+    Set,
+    /// 调用(转到)预置位。
+    Call,
+    /// 删除预置位。
+    Delete,
 }
 
 /// 设备控制应答(设备 → 平台,DeviceControl 结果)。
@@ -918,6 +996,36 @@ mod tests {
         assert_eq!(c.sn, 5);
         assert_eq!(c.ptz_cmd.as_deref(), Some("A50F01000000FF"));
         assert_eq!(c.kind(), "PTZ 云台控制");
+        assert_eq!(c.preset_op(), None); // 非预置位指令
+    }
+
+    #[test]
+    fn 解析预置位设置调用删除() {
+        // 字节3=指令码(81 设置/82 调用/83 删除),字节5=预置位号(0x03)。
+        let mk = |cmd: &str| {
+            Control::parse(&format!(
+                "<?xml version=\"1.0\"?><Control><CmdType>DeviceControl</CmdType>\
+                 <SN>1</SN><DeviceID>d</DeviceID><PTZCmd>{cmd}</PTZCmd></Control>"
+            ))
+            .unwrap()
+        };
+        use PresetAction::*;
+        assert_eq!(mk("A50F01810300EA").preset_op(), Some((Set, 3)));
+        assert_eq!(mk("A50F01820300EB").preset_op(), Some((Call, 3)));
+        assert_eq!(mk("A50F01830300EC").preset_op(), Some((Delete, 3)));
+    }
+
+    #[test]
+    fn 解析看守位设置() {
+        let xml = "<?xml version=\"1.0\"?><Control><CmdType>DeviceControl</CmdType>\
+            <SN>7</SN><DeviceID>d</DeviceID>\
+            <HomePosition><Enabled>1</Enabled><ResetTime>60</ResetTime><PresetIndex>2</PresetIndex></HomePosition></Control>";
+        let c = Control::parse(xml).unwrap();
+        assert_eq!(c.kind(), "看守位设置");
+        let hp = c.home_position.unwrap();
+        assert_eq!(hp.enabled, 1);
+        assert_eq!(hp.reset_time, 60);
+        assert_eq!(hp.preset_index, 2);
     }
 
     #[test]
