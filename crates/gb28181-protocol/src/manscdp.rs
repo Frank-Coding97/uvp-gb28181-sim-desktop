@@ -54,6 +54,81 @@ impl Query {
     }
 }
 
+/// 语音广播通知(平台 → 设备,CmdType=Broadcast)。
+///
+/// 平台请求把某音源(SourceID)广播到设备(TargetID)。设备回 Broadcast Response,
+/// 若接受则**由设备向平台发起 INVITE**(设备为主叫 UAC),SDP `a=recvonly` 收 G.711A。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct BroadcastNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    /// 音源 ID(平台侧广播源)。
+    #[serde(rename = "SourceID")]
+    pub source_id: String,
+    /// 目标 ID(应为本设备/通道 ID)。
+    #[serde(rename = "TargetID")]
+    pub target_id: String,
+}
+
+impl BroadcastNotify {
+    /// 从 XML 解析广播通知。
+    pub fn parse(xml: &str) -> Result<Self> {
+        quick_xml::de::from_str(strip_xml_decl(xml))
+            .map_err(|e| Error::Gb28181(format!("Broadcast 解析失败: {e}")))
+    }
+}
+
+/// 语音广播应答(设备 → 平台)。Result=OK 接受、ERROR 拒绝(带 Reason)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct BroadcastResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "Result")]
+    pub result: String,
+    /// 拒绝原因(仅 ERROR 时);如 busy / target mismatch。
+    #[serde(rename = "Reason", skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl BroadcastResponse {
+    /// 接受广播(Result=OK)。
+    pub fn ok(device_id: impl Into<String>, sn: u32) -> Self {
+        BroadcastResponse {
+            cmd_type: "Broadcast".into(),
+            sn,
+            device_id: device_id.into(),
+            result: "OK".into(),
+            reason: None,
+        }
+    }
+
+    /// 拒绝广播(Result=ERROR + Reason)。
+    pub fn error(device_id: impl Into<String>, sn: u32, reason: impl Into<String>) -> Self {
+        BroadcastResponse {
+            cmd_type: "Broadcast".into(),
+            sn,
+            device_id: device_id.into(),
+            result: "ERROR".into(),
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("BroadcastResponse 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
 /// 平台 → 设备的控制命令(Control)。GB28181 §A.2.4:PTZ/录像/布防/校时/重启/关键帧等。
 /// 各命令是可选子元素,按出现的字段判断具体控制类型。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2150,6 +2225,26 @@ mod tests {
         // 方向命令不应误判为巡航/辅助/聚焦。
         assert!(mk("A50F0108320000").cruise_op().is_none());
         assert!(mk("A50F0108320000").focus_op().is_none());
+    }
+
+    #[test]
+    fn 语音广播_解析与应答() {
+        let xml = r#"<?xml version="1.0"?>
+<Notify><CmdType>Broadcast</CmdType><SN>7</SN><SourceID>34020000002000000001</SourceID><TargetID>34020000001320000001</TargetID></Notify>"#;
+        let b = BroadcastNotify::parse(xml).unwrap();
+        assert_eq!(b.source_id, "34020000002000000001");
+        assert_eq!(b.target_id, "34020000001320000001");
+
+        let ok = BroadcastResponse::ok("34020000001320000001", 7)
+            .to_xml()
+            .unwrap();
+        assert!(ok.contains("<CmdType>Broadcast</CmdType>"));
+        assert!(ok.contains("<Result>OK</Result>"));
+        assert!(!ok.contains("<Reason>"));
+
+        let err = BroadcastResponse::error("d", 7, "busy").to_xml().unwrap();
+        assert!(err.contains("<Result>ERROR</Result>"));
+        assert!(err.contains("<Reason>busy</Reason>"));
     }
 
     #[test]

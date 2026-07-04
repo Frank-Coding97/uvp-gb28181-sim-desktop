@@ -12,6 +12,6 @@ pub mod transport;
 // 常用类型再导出,方便上层 `use sip_core::{...}`。
 pub use auth::{authorization, Challenge};
 pub use message::{Headers, Method, Request, Response, SipMessage};
-pub use sdp::SessionDescription;
+pub use sdp::{build_broadcast_offer, SessionDescription};
 pub use transaction::{client_transact, Timing};
 pub use transport::{Incoming, SipTrace, TraceDir, TraceObserver, UdpTransport};

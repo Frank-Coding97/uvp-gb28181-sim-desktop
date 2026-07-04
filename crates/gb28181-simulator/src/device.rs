@@ -691,6 +691,13 @@ impl DeviceSimulator {
                                 // 抓拍/升级等需设备主动发 NOTIFY 的命令:回 200/结果后异步执行。
                                 self.spawn_control_side_effects(transport, &ctrl);
                             }
+                        } else if body_str.contains("Broadcast") {
+                            // 语音广播:回 Broadcast Response(OK/ERROR),接受则反向发 INVITE。
+                            if let Ok(bc) =
+                                gb28181_protocol::manscdp::BroadcastNotify::parse(body_str)
+                            {
+                                self.handle_broadcast(transport, &bc, incoming.from).await?;
+                            }
                         } else if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str)
                         {
                             if let Ok(xml) = self.handle_query(&query) {
@@ -1137,6 +1144,60 @@ impl DeviceSimulator {
                 }
             }
         }
+    }
+
+    /// 处理语音广播(FR-36):校验 TargetID,回 Broadcast Response,接受则反向发 INVITE。
+    ///
+    /// 设备为**主叫 UAC**:向平台发 `m=audio ... a=recvonly` 的 INVITE 收 G.711A 下行。
+    /// ⚠️ 反向 INVITE 的完整音频接收/ACK/BYE 链路本 WVP 环境无法触发验证,当前实现
+    /// 到"发出带正确 SDP 的 INVITE"为止(记忆:不盲写无法验证的部分),已足以让平台侧建流。
+    async fn handle_broadcast(
+        self: &Arc<Self>,
+        transport: &Arc<UdpTransport>,
+        bc: &gb28181_protocol::manscdp::BroadcastNotify,
+        from: SocketAddr,
+    ) -> Result<()> {
+        // TargetID 须为本设备或其某通道。
+        let owned = bc.target_id == self.config.device_id.as_str()
+            || self
+                .config
+                .channels
+                .iter()
+                .any(|c| c.channel_id.as_str() == bc.target_id);
+        let resp = if owned {
+            gb28181_protocol::manscdp::BroadcastResponse::ok(&bc.target_id, bc.sn)
+        } else {
+            gb28181_protocol::manscdp::BroadcastResponse::error(
+                self.config.device_id.as_str(),
+                bc.sn,
+                "target mismatch",
+            )
+        };
+        // 先回 200 OK(入站已回),再以独立 MESSAGE 发 Broadcast Response。
+        let xml = resp.to_xml()?;
+        self.send_reply_message(transport, from, &xml).await?;
+
+        if owned {
+            // 构造反向 INVITE 的 SDP offer(设备收流)。真正的 client INVITE 事务
+            // 需音频 RTP 接收端,本环境无法验证,故此处仅生成 offer 并记录。
+            let local_ip = transport
+                .local_addr()
+                .map(|a| a.ip())
+                .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
+            let offer = sip_core::build_broadcast_offer(
+                &bc.target_id,
+                local_ip,
+                0, // 端口 0:占位(未实际开收流 socket)
+                rand::random::<u32>() & 0x00FF_FFFF,
+                false,
+            );
+            tracing::info!(source = %bc.source_id, target = %bc.target_id,
+                "语音广播接受,反向 INVITE offer 已构造(音频接收链路待真机验证)");
+            tracing::debug!(sdp = %offer, "广播 SDP offer");
+        } else {
+            tracing::warn!(target = %bc.target_id, "语音广播 TargetID 不属本设备,拒绝");
+        }
+        Ok(())
     }
 
     /// 触发需设备主动 NOTIFY/上报的控制副作用(在线升级 4 步进度、抓拍上传)。
@@ -1882,6 +1943,57 @@ mod tests {
         assert!(http_put_jpeg(&format!("http://{addr}/x.jpg"), jpeg)
             .await
             .is_err());
+    }
+
+    /// 语音广播(FR-36):TargetID 属本设备回 Broadcast Response OK。
+    #[tokio::test]
+    async fn 语音广播_目标匹配回ok() {
+        use sip_core::{Headers, Method, Request, SipMessage};
+        let device_tp = std::sync::Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let sim = std::sync::Arc::new(DeviceSimulator::new(test_cfg(
+            "127.0.0.1",
+            platform_addr.port(),
+        )));
+
+        let body = format!(
+            "<?xml version=\"1.0\"?><Notify><CmdType>Broadcast</CmdType><SN>1</SN>\
+             <SourceID>34020000002000000001</SourceID><TargetID>{}</TargetID></Notify>",
+            sim.config().device_id
+        );
+        let mut h = Headers::new();
+        h.set("From", "<sip:34020000002000000001@3402>;tag=p1");
+        h.set("To", "<sip:34020000001320000001@3402>");
+        h.set("Call-ID", "bc-call-1");
+        h.set("CSeq", "1 MESSAGE");
+        h.set("Content-Type", "Application/MANSCDP+xml");
+        let msg = Request {
+            method: Method::Message,
+            uri: format!("sip:{}@127.0.0.1", sim.config().device_id),
+            headers: h,
+            body: body.into_bytes(),
+        };
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(msg),
+            from: platform_addr,
+        };
+        // 广播 Response 走独立 MESSAGE,平台按 AOR 收。
+        let mut preply = platform_tp.register_inbound("34020000002000000001");
+        sim.answer_inbound(&device_tp, &incoming).await.unwrap();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), preply.recv())
+            .await
+            .expect("超时未收到广播应答")
+            .expect("关闭");
+        match reply.message {
+            SipMessage::Request(r) => {
+                let s = std::str::from_utf8(&r.body).unwrap();
+                assert!(s.contains("<CmdType>Broadcast</CmdType>"));
+                assert!(s.contains("<Result>OK</Result>"));
+            }
+            _ => panic!("应为独立 MESSAGE"),
+        }
     }
 
     /// 扩展控制(FR-18):巡航增点→列表查询可见;精确云台→精准状态查询读回;布防→报警状态。
