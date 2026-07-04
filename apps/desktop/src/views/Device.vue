@@ -136,35 +136,31 @@ const ptz = ref<PtzAction>({
   up: false, down: false, left: false, right: false,
   zoom_in: false, zoom_out: false, pan_speed: 0, tilt_speed: 0, zoom_speed: 0,
 });
-const panAngle = ref(0);   // 累积水平角(rotateY)
-const tiltAngle = ref(0);  // 累积垂直角(rotateX)
-const zoomScale = ref(1);  // 变倍(镜头缩放)
 const ptzActive = computed(() =>
   ptz.value.up || ptz.value.down || ptz.value.left || ptz.value.right ||
   ptz.value.zoom_in || ptz.value.zoom_out);
-const domeStyle = computed(() => ({
-  transform: `rotateX(${(-15 + tiltAngle.value).toFixed(1)}deg) rotateY(${panAngle.value.toFixed(1)}deg)`,
-}));
-let ptzTimer: number | null = null;
-// 60ms 定时:命令持续期间按速度累积角度,像真云台一样连续转。
-function ptzTick() {
+const dirText = computed(() => {
   const m = ptz.value;
-  const panStep = (m.pan_speed / 255) * 4 + 1;
-  const tiltStep = (m.tilt_speed / 255) * 4 + 1;
-  if (m.left)  panAngle.value -= panStep;
-  if (m.right) panAngle.value += panStep;
-  if (m.up)    tiltAngle.value = Math.min(tiltAngle.value + tiltStep, 40);
-  if (m.down)  tiltAngle.value = Math.max(tiltAngle.value - tiltStep, -40);
-  if (m.zoom_in)  zoomScale.value = Math.min(zoomScale.value + 0.03, 2.2);
-  if (m.zoom_out) zoomScale.value = Math.max(zoomScale.value - 0.03, 0.6);
-}
+  const v = m.up ? "上" : m.down ? "下" : "";
+  const h = m.left ? "左" : m.right ? "右" : "";
+  return (v + h) || "—";
+});
+// 摇杆向当前方向偏移(px);3D 立体感靠 CSS 阴影。像真摇杆一样推向命令方向。
+const OFFSET = 20;
+const knobStyle = computed(() => {
+  const m = ptz.value;
+  const x = (m.left ? -OFFSET : 0) + (m.right ? OFFSET : 0);
+  const y = (m.up ? -OFFSET : 0) + (m.down ? OFFSET : 0);
+  // 变倍时摇杆轻微下压/上提示意。
+  const z = m.zoom_in ? 1.06 : m.zoom_out ? 0.94 : 1;
+  return { transform: `translate(${x}px, ${y}px) scale(${z})` };
+});
 
 // device_state 由 App.vue 统一订阅并写入共享状态,本页订阅 sip_trace + ptz_action。
 let unlistenTrace: UnlistenFn | null = null;
 let unlistenPtz: UnlistenFn | null = null;
 onMounted(async () => {
   unlistenPtz = await listen<PtzAction>("ptz_action", (e) => { ptz.value = e.payload; });
-  ptzTimer = window.setInterval(ptzTick, 60);
   unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
     if (!traceOn.value) return;
     traces.value.push(e.payload);
@@ -176,7 +172,6 @@ onUnmounted(() => {
   unlistenTrace?.();
   unlistenPtz?.();
   if (timer) clearInterval(timer);
-  if (ptzTimer) clearInterval(ptzTimer);
 });
 
 // keep-alive 激活时与引擎对账:以引擎真实状态为准同步 deviceLive(避免切页后按钮态错乱)。
@@ -323,36 +318,28 @@ const metrics = computed(() => [
       <div class="panel-title" style="margin: 0 0 4px">云台控制</div>
       <div class="ptz-sub">平台下发 PTZ 命令时,下方球机实时演示转动方向与变倍(本设备为被控端)</div>
       <div class="ptz-body">
-        <!-- 3D 球机 -->
-        <div class="dome-stage">
-          <div class="dome" :style="domeStyle">
-            <div class="dome-base"></div>
-            <div class="dome-arm">
-              <div class="dome-head" :style="{ transform: `scale(${zoomScale})` }">
-                <div class="lens"></div>
+        <!-- 拟态摇杆:凹陷底盘 + 悬浮摇杆,随命令向对应方向偏移 -->
+        <div class="stick-wrap" :class="{ active: ptzActive }">
+          <div class="stick-base">
+            <span class="arr arr-u" :class="{ on: ptz.up }">▲</span>
+            <span class="arr arr-d" :class="{ on: ptz.down }">▼</span>
+            <span class="arr arr-l" :class="{ on: ptz.left }">◀</span>
+            <span class="arr arr-r" :class="{ on: ptz.right }">▶</span>
+            <div class="stick-knob" :style="knobStyle">
+              <div class="knob-face">
+                <div class="knob-dot" :class="{ zoom: ptz.zoom_in || ptz.zoom_out }"></div>
               </div>
             </div>
           </div>
-          <div class="dome-shadow"></div>
         </div>
-        <!-- 方向盘 + 状态 -->
+        <!-- 状态 -->
         <div class="ptz-info">
-          <div class="dpad">
-            <span class="d d-ul" :class="{ on: ptz.up && ptz.left }">↖</span>
-            <span class="d d-u"  :class="{ on: ptz.up }">↑</span>
-            <span class="d d-ur" :class="{ on: ptz.up && ptz.right }">↗</span>
-            <span class="d d-l"  :class="{ on: ptz.left }">←</span>
-            <span class="d d-c"  :class="{ on: ptzActive }">⊙</span>
-            <span class="d d-r"  :class="{ on: ptz.right }">→</span>
-            <span class="d d-dl" :class="{ on: ptz.down && ptz.left }">↙</span>
-            <span class="d d-d"  :class="{ on: ptz.down }">↓</span>
-            <span class="d d-dr" :class="{ on: ptz.down && ptz.right }">↘</span>
-          </div>
           <div class="ptz-stats">
+            <div class="ptz-stat"><span>方向</span><b>{{ dirText }}</b></div>
             <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ ptz.zoom_in ? "放大 +" : ptz.zoom_out ? "缩小 −" : "—" }}</b></div>
             <div class="ptz-stat"><span>水平速度</span><b>{{ ptz.pan_speed }}</b></div>
             <div class="ptz-stat"><span>垂直速度</span><b>{{ ptz.tilt_speed }}</b></div>
-            <div class="ptz-stat"><span>状态</span><b>{{ ptzActive ? "转动中" : "静止" }}</b></div>
+            <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive }">{{ ptzActive ? "转动中" : "静止" }}</b></div>
           </div>
         </div>
       </div>
@@ -450,60 +437,72 @@ const metrics = computed(() => [
 /* 云台控制可视化 */
 .ptz-panel { margin-top: 18px; }
 .ptz-sub { font-size: 12px; color: var(--text-tertiary); margin-bottom: 16px; }
-.ptz-body { display: flex; gap: 32px; align-items: center; }
-.dome-stage {
-  flex: 0 0 200px; height: 190px; perspective: 620px;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-}
-.dome {
-  width: 120px; height: 120px; position: relative;
-  transform-style: preserve-3d;
-  transition: transform 0.12s linear;
-}
-.dome-base {
-  position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%);
-  width: 96px; height: 26px; border-radius: 50%;
-  background: linear-gradient(180deg, #cbd5e1, #94a3b8);
-  box-shadow: 0 6px 14px rgba(15,23,42,0.18);
-}
-.dome-arm {
-  position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
-  width: 70px; height: 70px;
-}
-.dome-head {
-  width: 78px; height: 62px; border-radius: 42% 42% 46% 46% / 54% 54% 40% 40%;
-  background: radial-gradient(circle at 38% 30%, #f8fafc 0%, #cbd5e1 55%, #64748b 100%);
-  box-shadow: inset -6px -8px 14px rgba(15,23,42,0.25), 0 4px 10px rgba(15,23,42,0.15);
-  position: relative; transition: transform 0.12s linear;
-}
-.lens {
-  position: absolute; left: 50%; bottom: -8px; transform: translateX(-50%);
-  width: 34px; height: 34px; border-radius: 50%;
-  background: radial-gradient(circle at 40% 35%, #334155 0%, #0f172a 60%, #020617 100%);
-  border: 3px solid #475569;
-  box-shadow: 0 0 0 2px rgba(56,189,248,0.35), inset 0 0 6px rgba(56,189,248,0.5);
-}
-.dome-shadow {
-  width: 90px; height: 12px; border-radius: 50%; margin-top: 10px;
-  background: rgba(15,23,42,0.12); filter: blur(3px);
-}
-.ptz-info { flex: 1 1 auto; display: flex; gap: 28px; align-items: center; }
-.dpad {
-  display: grid; grid-template-columns: repeat(3, 34px); grid-template-rows: repeat(3, 34px);
-  gap: 6px; flex: 0 0 auto;
-}
-.d {
+.ptz-body { display: flex; gap: 40px; align-items: center; }
+
+/* 拟态摇杆(neumorphism):凹陷底盘 + 悬浮圆钮 */
+.stick-wrap { flex: 0 0 auto; padding: 6px; }
+.stick-base {
+  position: relative;
+  width: 176px; height: 176px; border-radius: 50%;
+  background: linear-gradient(145deg, #e4e9ef, #c8cfd8);
+  /* 外凸底座 + 内凹碗:双向阴影营造立体 */
+  box-shadow:
+    8px 8px 20px rgba(163, 177, 198, 0.65),
+    -8px -8px 20px rgba(255, 255, 255, 0.9),
+    inset 3px 3px 8px rgba(163, 177, 198, 0.5),
+    inset -3px -3px 8px rgba(255, 255, 255, 0.7);
   display: flex; align-items: center; justify-content: center;
-  border-radius: 8px; font-size: 16px; color: var(--text-tertiary);
-  background: rgba(255,255,255,0.5); border: 1px solid var(--border-default);
-  transition: all 0.12s;
 }
-.d.on {
-  color: #fff; background: var(--accent);
-  box-shadow: 0 0 10px var(--accent-glow); transform: scale(1.08);
+/* 碗内深凹槽 */
+.stick-base::before {
+  content: ""; position: absolute; width: 128px; height: 128px; border-radius: 50%;
+  background: linear-gradient(145deg, #cfd6de, #eef2f6);
+  box-shadow:
+    inset 6px 6px 14px rgba(163, 177, 198, 0.7),
+    inset -6px -6px 14px rgba(255, 255, 255, 0.85);
 }
-.d-c { font-size: 13px; }
-.ptz-stats { display: flex; flex-direction: column; gap: 8px; }
+/* 方向箭头(碗沿) */
+.arr {
+  position: absolute; font-size: 12px; color: #9aa5b1; z-index: 3;
+  transition: color 0.15s, text-shadow 0.15s, transform 0.15s;
+}
+.arr-u { top: 12px; left: 50%; transform: translateX(-50%); }
+.arr-d { bottom: 12px; left: 50%; transform: translateX(-50%); }
+.arr-l { left: 12px; top: 50%; transform: translateY(-50%); }
+.arr-r { right: 12px; top: 50%; transform: translateY(-50%); }
+.arr.on { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); transform: scale(1.35) translate(0,0); }
+.arr-u.on { transform: translateX(-50%) scale(1.35); }
+.arr-d.on { transform: translateX(-50%) scale(1.35); }
+.arr-l.on { transform: translateY(-50%) scale(1.35); }
+.arr-r.on { transform: translateY(-50%) scale(1.35); }
+/* 悬浮摇杆钮 */
+.stick-knob {
+  position: relative; z-index: 2;
+  width: 92px; height: 92px; border-radius: 50%;
+  background: linear-gradient(145deg, #f4f7fa, #d2d9e1);
+  box-shadow:
+    5px 5px 14px rgba(163, 177, 198, 0.75),
+    -4px -4px 12px rgba(255, 255, 255, 0.95);
+  transition: transform 0.18s cubic-bezier(.34,1.56,.64,1);
+  display: flex; align-items: center; justify-content: center;
+}
+.knob-face {
+  width: 66px; height: 66px; border-radius: 50%;
+  background: linear-gradient(145deg, #eaeef3, #ffffff);
+  box-shadow: inset 2px 2px 6px rgba(163,177,198,0.5), inset -2px -2px 6px rgba(255,255,255,0.9);
+  display: flex; align-items: center; justify-content: center;
+}
+.knob-dot {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #9aa5b1, #64748b);
+  box-shadow: inset 0 1px 2px rgba(255,255,255,0.4);
+  transition: all 0.15s;
+}
+.knob-dot.zoom { background: radial-gradient(circle at 35% 30%, #7dd3fc, var(--accent)); box-shadow: 0 0 10px var(--accent-glow); }
+.stick-wrap.active .stick-knob { box-shadow: 6px 6px 16px rgba(163,177,198,0.85), -4px -4px 12px rgba(255,255,255,0.95), 0 0 0 2px rgba(37,99,235,0.15); }
+
+.ptz-info { flex: 1 1 auto; display: flex; gap: 28px; align-items: center; }
+.ptz-stats { display: flex; flex-direction: column; gap: 10px; }
 .ptz-stat { display: flex; gap: 10px; align-items: baseline; }
 .ptz-stat span { font-size: 12px; color: var(--text-tertiary); width: 56px; }
 .ptz-stat b { font-size: 14px; color: var(--text-primary); }

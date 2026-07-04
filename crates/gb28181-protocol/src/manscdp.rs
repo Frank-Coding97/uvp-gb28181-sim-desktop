@@ -188,10 +188,12 @@ impl Control {
             return None; // 预置位等扩展指令,不是运动
         }
         Some(PtzMotion {
-            up: cmd & 0x01 != 0,
-            down: cmd & 0x02 != 0,
-            left: cmd & 0x04 != 0,
-            right: cmd & 0x08 != 0,
+            // 指令码位定义(GB/T 28181-2016 附录 A.3.1,实测 WVP 一致):
+            // 右=0x01 左=0x02 下=0x04 上=0x08 放大=0x10 缩小=0x20。
+            right: cmd & 0x01 != 0,
+            left: cmd & 0x02 != 0,
+            down: cmd & 0x04 != 0,
+            up: cmd & 0x08 != 0,
             zoom_in: cmd & 0x10 != 0,
             zoom_out: cmd & 0x20 != 0,
             pan_speed: bytes[4],
@@ -1081,15 +1083,16 @@ mod tests {
             ))
             .unwrap()
         };
+        // 实测 WVP:right=0x01 left=0x02 down=0x04 up=0x08(带标签抓包核对)。
         assert!(mk("A50F0100000000B5").ptz_motion().unwrap().is_stop()); // 停止
-        let up = mk("A50F0101969610F2").ptz_motion().unwrap();
-        assert!(up.up && !up.down && up.pan_speed == 0x96);
-        let down = mk("A50F0102969610F3").ptz_motion().unwrap();
-        assert!(down.down && !down.up);
-        let left = mk("A50F0104969610F5").ptz_motion().unwrap();
+        let right = mk("A50F0101969610F2").ptz_motion().unwrap();
+        assert!(right.right && !right.left && right.pan_speed == 0x96);
+        let left = mk("A50F0102969610F3").ptz_motion().unwrap();
         assert!(left.left && !left.right);
-        let right = mk("A50F0108969610F9").ptz_motion().unwrap();
-        assert!(right.right && !right.left);
+        let down = mk("A50F0104969610F5").ptz_motion().unwrap();
+        assert!(down.down && !down.up);
+        let up = mk("A50F0108969610F9").ptz_motion().unwrap();
+        assert!(up.up && !up.down);
         assert!(mk("A50F011096961001").ptz_motion().unwrap().zoom_in);
         assert!(mk("A50F012096961011").ptz_motion().unwrap().zoom_out);
         // 预置位码不算运动。
