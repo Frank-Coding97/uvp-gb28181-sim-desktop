@@ -9,7 +9,6 @@ import Dashboard from "./views/Dashboard.vue";
 import Device from "./views/Device.vue";
 import Config from "./views/Config.vue";
 import Scenario from "./views/Scenario.vue";
-import Monitor from "./views/Monitor.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -18,8 +17,9 @@ const router = createRouter({
     { path: "/dashboard", component: Dashboard },
     { path: "/device",    component: Device },
     { path: "/config",    component: Config },
+    // 压力测试(场景编排 + 实时监控已合并到一页)。
     { path: "/scenario",  component: Scenario },
-    { path: "/monitor",   component: Monitor },
+    { path: "/monitor",   redirect: "/scenario" }, // 旧路由兼容,重定向到合并页
   ],
 });
 
