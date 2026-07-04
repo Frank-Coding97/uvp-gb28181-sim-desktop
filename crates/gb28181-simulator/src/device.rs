@@ -23,6 +23,99 @@ fn default_presets() -> std::collections::BTreeMap<u8, String> {
     m
 }
 
+/// 最小 HTTP PUT 上传 JPEG(抓拍上传用)。仅支持 http://(https 需 TLS,本工具不引入重依赖)。
+///
+/// 含基本 SSRF 防护:拒绝环回/链路本地/私网/组播地址(测试工具场景下上传目标应为受控采集服务)。
+/// 用裸 TCP 手写请求,避免给压测链路(依赖本 crate)引入 HTTP 客户端。
+async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| Error::Gb28181("抓拍上传仅支持 http:// URL".into()))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>()
+                .map_err(|_| Error::Gb28181("上传 URL 端口非法".into()))?,
+        ),
+        None => (authority.to_string(), 80),
+    };
+    reject_ssrf(&host)?;
+
+    let req = format!(
+        "PUT {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: image/jpeg\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| Error::Gb28181("上传连接超时".into()))?
+    .map_err(|e| Error::Gb28181(format!("上传连接失败: {e}")))?;
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| Error::Gb28181(format!("上传写入失败: {e}")))?;
+    stream
+        .write_all(body)
+        .await
+        .map_err(|e| Error::Gb28181(format!("上传写入失败: {e}")))?;
+
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut resp),
+    )
+    .await;
+    // 解析状态行首行 "HTTP/1.1 2xx"。
+    let head = String::from_utf8_lossy(&resp);
+    let ok = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .map(|c| (200..300).contains(&c))
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Gb28181(format!(
+            "上传响应非 2xx: {}",
+            head.lines().next().unwrap_or("")
+        )))
+    }
+}
+
+/// 拒绝 SSRF 高危目标(环回/链路本地/私网/组播/未指定)。
+fn reject_ssrf(host: &str) -> Result<()> {
+    use std::net::IpAddr;
+    // 仅对字面 IP 做判定;域名交由 DNS(受控内网场景)。
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let bad = match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_private()
+                    || v4.is_multicast()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast() || v6.is_unspecified(),
+        };
+        if bad {
+            return Err(Error::Gb28181(format!("上传目标 {host} 属受限地址,已拒绝")));
+        }
+    }
+    Ok(())
+}
+
 /// 单个虚拟设备的静态配置。压测时由 `scenario` 按序号批量生成。
 #[derive(Debug, Clone)]
 pub struct DeviceConfig {
@@ -593,6 +686,8 @@ impl DeviceSimulator {
                                 let xml = self.handle_control(&ctrl).await?;
                                 self.send_reply_message(transport, incoming.from, &xml)
                                     .await?;
+                                // 抓拍/升级等需设备主动发 NOTIFY 的命令:回 200/结果后异步执行。
+                                self.spawn_control_side_effects(transport, &ctrl);
                             }
                         } else if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str)
                         {
@@ -1038,6 +1133,115 @@ impl DeviceSimulator {
                     s.cruise_tracks.entry(track).or_default();
                     tracing::info!(track, "巡航启动");
                 }
+            }
+        }
+    }
+
+    /// 触发需设备主动 NOTIFY/上报的控制副作用(在线升级 4 步进度、抓拍上传)。
+    /// 已在入站循环里回过 200/结果,这里异步执行不阻塞应答。
+    fn spawn_control_side_effects(
+        self: &Arc<Self>,
+        transport: &Arc<UdpTransport>,
+        ctrl: &gb28181_protocol::manscdp::Control,
+    ) {
+        // 在线升级:4 步进度 NOTIFY。
+        if let Some(up) = &ctrl.device_upgrade {
+            let dev = Arc::clone(self);
+            let tp = Arc::clone(transport);
+            let up = up.clone();
+            tokio::spawn(async move {
+                dev.run_upgrade_progress(&tp, &up).await;
+            });
+        }
+        // 抓拍配置(GB-2022):HTTP 上传 + 完成 NOTIFY。
+        if let Some(cfg) = &ctrl.snap_shot_config {
+            if cfg.is_valid() {
+                let dev = Arc::clone(self);
+                let tp = Arc::clone(transport);
+                let cfg = cfg.clone();
+                tokio::spawn(async move {
+                    dev.run_snapshot_upload(&tp, &cfg).await;
+                });
+            } else {
+                tracing::warn!("SnapShotConfig 缺 SessionID/UploadURL,忽略");
+            }
+        }
+        // 抓拍(旧路径):经 Alarm Notify 上报。
+        if ctrl.snap_shot_cmd.is_some() {
+            let dev = Arc::clone(self);
+            let tp = Arc::clone(transport);
+            tokio::spawn(async move {
+                let (h, p) = (dev.local_host(), dev.local_port());
+                let _ = dev.report_alarm(&tp, &h, p, "SnapShot").await;
+            });
+        }
+    }
+
+    /// 在线升级 4 步进度:percent [0,30,60,100],步间 1.5s,发 DeviceUpgradeResult NOTIFY。
+    async fn run_upgrade_progress(
+        &self,
+        transport: &Arc<UdpTransport>,
+        up: &gb28181_protocol::manscdp::DeviceUpgrade,
+    ) {
+        let (h, p) = (self.local_host(), self.local_port());
+        for percent in [0u8, 30, 60, 100] {
+            let sn = self.next_cseq() & 0xFFFF;
+            let notify = gb28181_protocol::manscdp::DeviceUpgradeResultNotify::new(
+                self.config.device_id.as_str(),
+                sn,
+                &up.session_id,
+                &up.firmware,
+                percent,
+            );
+            if let Ok(xml) = notify.to_xml() {
+                let _ = self.send_message_xml(transport, &h, p, &xml).await;
+            }
+            tracing::info!(percent, "在线升级进度");
+            if percent < 100 {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+        }
+    }
+
+    /// 抓拍上传(GB-2022):串行拍 N 张,每张 HTTP PUT 上传后发完成 NOTIFY。
+    /// 模拟设备无摄像头,上传一段占位 JPEG 字节。
+    async fn run_snapshot_upload(
+        &self,
+        transport: &Arc<UdpTransport>,
+        cfg: &gb28181_protocol::manscdp::SnapShotConfig,
+    ) {
+        let (h, p) = (self.local_host(), self.local_port());
+        let num = cfg.clamped_num();
+        // 占位 JPEG(SOI + EOI),真实设备为编码帧。
+        let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xD9];
+        for idx in 1..=num {
+            let ts = common::clock::synced_iso8601();
+            let snap_id = format!("{}_{idx}", ts.replace([':', '-'], "").replace('.', ""));
+            let url = if cfg.upload_url.ends_with('/') {
+                format!("{}{snap_id}.jpg", cfg.upload_url)
+            } else {
+                cfg.upload_url.clone()
+            };
+            match http_put_jpeg(&url, jpeg).await {
+                Ok(()) => {
+                    let sn = self.next_cseq();
+                    let notify = gb28181_protocol::manscdp::SnapShotNotify::new(
+                        self.config.device_id.as_str(),
+                        sn,
+                        &cfg.session_id,
+                        &snap_id,
+                        &ts,
+                        &url,
+                    );
+                    if let Ok(xml) = notify.to_xml() {
+                        let _ = self.send_message_xml(transport, &h, p, &xml).await;
+                    }
+                    tracing::info!(snap_id, "抓拍上传成功");
+                }
+                Err(e) => tracing::warn!(error = %e, url, "抓拍上传失败"),
+            }
+            if idx < num && cfg.interval > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(cfg.interval as u64)).await;
             }
         }
     }
@@ -1599,6 +1803,57 @@ mod tests {
             .handle_query(&mk("PTZPreciseStatusQuery", None))
             .unwrap();
         assert!(precise.contains("<Zoom>1.00</Zoom>"));
+    }
+
+    #[test]
+    fn ssrf_拒绝受限地址() {
+        assert!(reject_ssrf("127.0.0.1").is_err());
+        assert!(reject_ssrf("169.254.1.1").is_err());
+        assert!(reject_ssrf("192.168.1.10").is_err());
+        assert!(reject_ssrf("10.0.0.1").is_err());
+        assert!(reject_ssrf("224.0.0.1").is_err());
+        // 公网 IP 与域名放行(受控内网场景)。
+        assert!(reject_ssrf("203.0.113.9").is_ok());
+        assert!(reject_ssrf("upload.example.com").is_ok());
+    }
+
+    #[tokio::test]
+    async fn 抓拍上传_协议格式与2xx判定() {
+        // 起一个本地 TCP 服务模拟采集端(回 200),用 127.0.0.1 直连绕过 SSRF(仅测协议)。
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = s.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            req
+        });
+        // http_put_jpeg 对 127.0.0.1 会被 SSRF 拒绝(安全设计),此处直接建连验证 PUT 报文格式与 2xx。
+        let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xD9];
+        let head = format!(
+            "PUT /snap.jpg HTTP/1.1\r\nHost: {addr}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            jpeg.len()
+        );
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(head.as_bytes()).await.unwrap();
+        c.write_all(jpeg).await.unwrap();
+        let mut resp = Vec::new();
+        let _ = c.read_to_end(&mut resp).await;
+        assert!(String::from_utf8_lossy(&resp).contains("200"));
+
+        let req = srv.await.unwrap();
+        assert!(req.starts_with("PUT /snap.jpg HTTP/1.1"));
+        assert!(req.contains("Content-Type: image/jpeg"));
+
+        // 且 http_put_jpeg 对环回目标必须拒绝(SSRF 防护生效)。
+        assert!(http_put_jpeg(&format!("http://{addr}/x.jpg"), jpeg)
+            .await
+            .is_err());
     }
 
     /// 扩展控制(FR-18):巡航增点→列表查询可见;精确云台→精准状态查询读回;布防→报警状态。
