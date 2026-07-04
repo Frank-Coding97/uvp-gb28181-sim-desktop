@@ -21,9 +21,10 @@
 |---|---|---|---|---|
 | `engine_version` | — | `string` | 引擎版本自检 | M0 ✅ |
 | `validate_scenario` | `{ yaml: string }` | `ScenarioSummary` | 校验并预览场景 | M3 |
-| `start_stress` | `{ scenario: Scenario }` | `{ run_id: string }` | 启动压测,返回运行 ID | M3 |
+| `start_stress` | `{ toml, count, positionInterval, alarmInterval }` | `string` | 启动压测;position/alarmInterval>0 时批量周期主动上报定位/报警(0=关) | M3/M4 |
 | `stop_stress` | `{ run_id: string }` | `{ ok: bool }` | 停止压测 | M3 |
 | `get_run_status` | `{ run_id: string }` | `RunStatus` | 查询某次运行状态 | M3 |
+| `get_stress_status` | — | `{ running: bool, device_count: number }` | 查压测运行态(页面切换后与引擎对账,防组件重建丢状态) | M4 |
 | `list_runs` | — | `RunSummary[]` | 历史运行列表 | M4 |
 | `export_report` | `{ run_id: string, format: string }` | `{ path: string }` | 导出报告 | M4 |
 | `save_scenario` | `{ name: string, yaml: string }` | `{ id: string }` | 保存场景 | M3 |
@@ -35,6 +36,7 @@
 |---|---|---|---|---|
 | `start_device` | `{ config: DeviceCfg }` | `string` | 启动一台设备(注册+心跳+应答+入站),后台常驻 | M4 |
 | `stop_device` | — | `string` | 停止当前设备 | M4 |
+| `get_device_status` | — | `{ running: bool }` | 查设备运行态(页面切换后与引擎对账) | M4 |
 | `device_state` | — | `string`(状态枚举) | 查询当前设备状态 | M4 |
 | `fire_alarm` | `{ description: string }` | `string` | 主动上报一条报警 | M4 |
 
@@ -64,17 +66,20 @@
 
 ```ts
 // 压测实时指标快照(对应 stress_engine::Metrics 的可序列化投影)
+// 实际实现(crates/stress-engine/src/metrics.rs::MetricsSnapshot)。
 interface MetricsSnapshot {
-  ts_ms: number;
   register_attempted: number;
   register_succeeded: number;
+  register_failed: number;
   register_success_rate: number;   // 0.0~1.0
-  register_latency_p95_ms: number;
-  heartbeat_success_rate: number;
-  invite_succeeded: number;
+  heartbeat_succeeded: number;
+  heartbeat_failed: number;
   active_streams: number;
-  send_bitrate_kbps: number;
-  failures: Record<string, number>; // 失败归因 → 计数
+  fail_timeout: number;            // 失败归因:超时
+  fail_rejected: number;           // 失败归因:被拒
+  fail_other: number;              // 失败归因:其它
+  position_reported: number;       // 批量定位上报成功数(主动上报施压)
+  alarm_reported: number;          // 批量报警上报成功数
 }
 
 interface ScenarioSummary {
