@@ -299,6 +299,9 @@ struct DeviceCfg {
     channel_name: String,
     #[serde(default)]
     video_source: Option<String>,
+    /// 目录模板(single/nvr-8ch/civil-3x2/large-16ch);空则用默认单通道。
+    #[serde(default)]
+    catalog_template: String,
 }
 
 /// 通过"向平台发起 UDP connect"发现本机对外 IP(不真正发包)。
@@ -398,6 +401,11 @@ async fn start_device(
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
     let sim = Arc::new(DeviceSimulator::with_observer(cfg, observer));
+
+    // 若指定了目录模板,在注册前载入(平台注册后会立即同步目录,需在这之前准备好)。
+    if !config.catalog_template.is_empty() {
+        sim.load_catalog_template(&config.catalog_template);
+    }
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let sim_run = sim.clone();
