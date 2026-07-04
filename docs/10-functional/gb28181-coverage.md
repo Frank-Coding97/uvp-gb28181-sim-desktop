@@ -35,7 +35,7 @@
 
 | 功能 | 需求 | 状态 |
 |---|---|---|
-| INVITE 点播 / ACK / BYE 停流 | FR-7 | ✅ WVP 点播成功出流 |
+| INVITE 点播 / ACK / BYE 停流 / CANCEL 取消 | FR-7 | ✅ WVP 点播成功出流;CANCEL 停未决点播 |
 | SDP 协商(PS/90000,y=ssrc,TCP/UDP proto) | FR-7 | ✅ |
 | RTP over UDP 推流 | FR-8 | ✅ |
 | RTP over TCP(RFC 4571) | FR-8 | ✅ WVP TCP-PASSIVE 收流 |
