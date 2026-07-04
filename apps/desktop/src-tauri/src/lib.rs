@@ -588,7 +588,8 @@ async fn load_catalog_template(
     let guard = state.device.lock().await;
     let h = guard.as_ref().ok_or("设备未启动,请先在单设备页启动设备")?;
     h.sim.load_catalog_template(&template);
-    h.sim.notify_catalog_changed(&h.transport).await.ok();
+    // 增量 NOTIFY 推送是副作用,后台发送不阻塞 UI 返回(平台不及时回 200 时事务会退避重传数秒)。
+    spawn_catalog_notify(h);
     Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
 }
 
@@ -611,7 +612,7 @@ async fn upsert_channel(
     let guard = state.device.lock().await;
     let h = guard.as_ref().ok_or("设备未启动")?;
     let added = h.sim.upsert_channel(node.into());
-    h.sim.notify_catalog_changed(&h.transport).await.ok();
+    spawn_catalog_notify(h);
     Ok(if added {
         "已新增通道".into()
     } else {
@@ -625,11 +626,25 @@ async fn remove_channel(id: String, state: tauri::State<'_, AppState>) -> Result
     let guard = state.device.lock().await;
     let h = guard.as_ref().ok_or("设备未启动")?;
     if h.sim.remove_channel(&id) {
-        h.sim.notify_catalog_changed(&h.transport).await.ok();
+        spawn_catalog_notify(h);
         Ok("已删除通道".into())
     } else {
         Err("通道不存在".into())
     }
+}
+
+/// 后台推送目录增量 NOTIFY(fire-and-forget)。
+///
+/// NOTIFY 是通知平台的副作用,不该阻塞 IPC 返回:目录订阅存在但平台不及时回 200 时,
+/// SIP 客户端事务会按 T1 退避重传,最坏阻塞约 4 秒。放后台 spawn 让 UI 立即拿到目录树。
+fn spawn_catalog_notify(h: &DeviceHandle) {
+    let sim = Arc::clone(&h.sim);
+    let transport = Arc::clone(&h.transport);
+    tokio::spawn(async move {
+        if let Err(e) = sim.notify_catalog_changed(&transport).await {
+            tracing::warn!(error = %e, "目录增量 NOTIFY 推送失败");
+        }
+    });
 }
 
 #[derive(serde::Serialize)]
