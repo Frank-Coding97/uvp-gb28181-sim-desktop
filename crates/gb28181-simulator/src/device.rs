@@ -2059,9 +2059,7 @@ mod tests {
         assert!(home.contains("<ResetTime>30</ResetTime>"));
         assert!(home.contains("<PresetIndex>1</PresetIndex>"));
 
-        let sd = sim
-            .handle_query(&mk("SDCardStatus", None))
-            .unwrap();
+        let sd = sim.handle_query(&mk("SDCardStatus", None)).unwrap();
         assert!(sd.contains("<TotalCapacity>32768</TotalCapacity>"));
 
         let list = sim.handle_query(&mk("CruiseTrackListQuery", None)).unwrap();
@@ -2072,9 +2070,7 @@ mod tests {
         assert!(detail.contains("<GroupID>1</GroupID>"));
         assert!(detail.contains("<PresetID>3</PresetID>"));
 
-        let precise = sim
-            .handle_query(&mk("PTZPosition", None))
-            .unwrap();
+        let precise = sim.handle_query(&mk("PTZPosition", None)).unwrap();
         assert!(precise.contains("<Zoom>1.00</Zoom>"));
     }
 
