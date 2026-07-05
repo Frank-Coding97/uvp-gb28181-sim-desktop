@@ -1986,6 +1986,11 @@ mod tests {
             interval: None,
             group_id: None,
             config_type: None,
+            start_time: None,
+            end_time: None,
+            record_type: None,
+            indistinct_query: None,
+            stream_number: None,
         };
         let ch = ChannelConfig {
             channel_id: DeviceId::new("35020000001310000132").unwrap(),
@@ -2024,6 +2029,11 @@ mod tests {
             interval: None,
             group_id: group,
             config_type: None,
+            start_time: None,
+            end_time: None,
+            record_type: None,
+            indistinct_query: None,
+            stream_number: None,
         };
         let mut cfg = test_cfg("127.0.0.1", 5060);
         cfg.channels.push(ChannelConfig {
@@ -2131,6 +2141,11 @@ mod tests {
             interval: None,
             group_id: None,
             config_type: None,
+            start_time: None,
+            end_time: None,
+            record_type: None,
+            indistinct_query: None,
+            stream_number: None,
         };
         let xml = sim.handle_query(&q).unwrap();
         // 8 视频通道 + 1 业务分组 = 9 项(根设备自引用被过滤)。
