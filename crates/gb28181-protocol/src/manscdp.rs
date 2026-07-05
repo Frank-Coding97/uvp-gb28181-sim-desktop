@@ -56,10 +56,18 @@ pub struct Query {
     #[serde(rename = "Type", default, skip_serializing_if = "Option::is_none")]
     pub record_type: Option<String>,
     /// 模糊查询:0=不模糊,1=模糊查询(同时中心+前端检索)。
-    #[serde(rename = "IndistinctQuery", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "IndistinctQuery",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub indistinct_query: Option<String>,
     /// 码流编号:0=主码流,1=子码流1,2=子码流2 等。
-    #[serde(rename = "StreamNumber", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "StreamNumber",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stream_number: Option<u32>,
 }
 
@@ -276,7 +284,11 @@ pub struct DeviceUpgrade {
     #[serde(rename = "FileURL", default)]
     pub file_url: String,
     /// 设备厂商(GB28181-2022 必选)。
-    #[serde(rename = "Manufacturer", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Manufacturer",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub manufacturer: Option<String>,
 }
 
@@ -315,7 +327,11 @@ pub struct TargetTrack {
     #[serde(rename = "DeviceID2", default, skip_serializing_if = "Option::is_none")]
     pub device_id2: Option<String>,
     /// 全景图片大小、框选的区域坐标信息(手动跟踪时需要)。
-    #[serde(rename = "TargetArea", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "TargetArea",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target_area: Option<TargetArea>,
 }
 
@@ -347,7 +363,11 @@ pub struct TargetArea {
 pub struct AlarmInfo {
     /// 报警方式:0=全部,1=电话,2=设备,3=短信,4=GPS,5=视频,6=设备故障,7=其他。
     /// 可组合如 "1/2" 表示电话或设备报警。
-    #[serde(rename = "AlarmMethod", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "AlarmMethod",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub alarm_method: Option<String>,
     /// 报警类型(含义取决于 AlarmMethod)。
     #[serde(rename = "AlarmType", default, skip_serializing_if = "Option::is_none")]
@@ -358,10 +378,18 @@ pub struct AlarmInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PTZCmdParams {
     /// 预置位名称(设置预置位时可选)。
-    #[serde(rename = "PresetName", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "PresetName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub preset_name: Option<String>,
     /// 巡航轨迹名称(最长32字节,巡航指令时可选)。
-    #[serde(rename = "CruiseTrackName", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "CruiseTrackName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cruise_track_name: Option<String>,
 }
 
@@ -1473,18 +1501,18 @@ impl ConfigDownloadResponse {
                 download_speed: "1/2/4".into(),
                 resolution: resolution.into(),
             }),
-            video_record_plan: want_record_plan.then(|| VideoRecordPlan {
+            video_record_plan: want_record_plan.then_some(VideoRecordPlan {
                 record_plan_type: 0,
             }),
-            video_alarm_record: want_alarm_record.then(|| VideoAlarmRecord { duration: 30 }),
-            picture_mask: want_picture_mask.then(|| PictureMask { enabled: 0 }),
-            frame_mirror: want_frame_mirror.then(|| FrameMirror { mode: 0 }),
-            alarm_report: want_alarm_report.then(|| AlarmReport { enabled: 1 }),
-            osd_config: want_osd.then(|| OSDConfig {
+            video_alarm_record: want_alarm_record.then_some(VideoAlarmRecord { duration: 30 }),
+            picture_mask: want_picture_mask.then_some(PictureMask { enabled: 0 }),
+            frame_mirror: want_frame_mirror.then_some(FrameMirror { mode: 0 }),
+            alarm_report: want_alarm_report.then_some(AlarmReport { enabled: 1 }),
+            osd_config: want_osd.then_some(OSDConfig {
                 time_show_flag: 1,
                 osd_show_flag: 1,
             }),
-            snap_shot_config: want_snapshot.then(|| SnapShotCfg {
+            snap_shot_config: want_snapshot.then_some(SnapShotCfg {
                 snap_num: 1,
                 interval: 1,
             }),
