@@ -35,7 +35,8 @@ pub struct Query {
     #[serde(rename = "Interval", default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<u64>,
     /// 巡航轨迹号。仅巡航轨迹详情查询(CruiseTrackQuery)携带;缺省视为 1。
-    #[serde(rename = "GroupID", default, skip_serializing_if = "Option::is_none")]
+    /// GB28181-2022 附录 A.2.4.12 字段名为 Number。
+    #[serde(rename = "Number", default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<u32>,
     /// 配置类型(斜杠分隔可组合)。仅 ConfigDownload 查询携带,如 BasicParam / VideoParamOpt。
     #[serde(
@@ -1188,6 +1189,27 @@ pub struct ConfigDownloadResponse {
     /// 视频参数(ConfigType=VideoParamOpt 时携带,GB-2022)。
     #[serde(rename = "VideoParamOpt", skip_serializing_if = "Option::is_none")]
     pub video_param_opt: Option<VideoParamOpt>,
+    /// 录像计划(ConfigType=VideoRecordPlan 时携带,GB-2022)。
+    #[serde(rename = "VideoRecordPlan", skip_serializing_if = "Option::is_none")]
+    pub video_record_plan: Option<VideoRecordPlan>,
+    /// 报警录像(ConfigType=VideoAlarmRecord 时携带,GB-2022)。
+    #[serde(rename = "VideoAlarmRecord", skip_serializing_if = "Option::is_none")]
+    pub video_alarm_record: Option<VideoAlarmRecord>,
+    /// 视频画面遮挡(ConfigType=PictureMask 时携带,GB-2022)。
+    #[serde(rename = "PictureMask", skip_serializing_if = "Option::is_none")]
+    pub picture_mask: Option<PictureMask>,
+    /// 画面翻转(ConfigType=FrameMirror 时携带,GB-2022)。
+    #[serde(rename = "FrameMirror", skip_serializing_if = "Option::is_none")]
+    pub frame_mirror: Option<FrameMirror>,
+    /// 报警上报开关(ConfigType=AlarmReport 时携带,GB-2022)。
+    #[serde(rename = "AlarmReport", skip_serializing_if = "Option::is_none")]
+    pub alarm_report: Option<AlarmReport>,
+    /// 前端OSD配置(ConfigType=OSDConfig 时携带,GB-2022)。
+    #[serde(rename = "OSDConfig", skip_serializing_if = "Option::is_none")]
+    pub osd_config: Option<OSDConfig>,
+    /// 图像抓拍配置(ConfigType=SnapShotConfig 时携带,GB-2022)。
+    #[serde(rename = "SnapShotConfig", skip_serializing_if = "Option::is_none")]
+    pub snap_shot_config: Option<SnapShotCfg>,
 }
 
 /// 视频参数(ConfigDownload/VideoParamOpt 的内容,GB-2022)。
@@ -1200,6 +1222,75 @@ pub struct VideoParamOpt {
     /// 分辨率标签(如 "1920*1080")。
     #[serde(rename = "Resolution")]
     pub resolution: String,
+}
+
+/// 录像计划(ConfigDownload/VideoRecordPlan,GB-2022 A.2.3.2.6)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "VideoRecordPlan")]
+pub struct VideoRecordPlan {
+    /// 录像计划类型:0=定时录像,1=事件触发录像,2=手动录像。
+    #[serde(rename = "RecordPlanType")]
+    pub record_plan_type: u32,
+}
+
+/// 报警录像(ConfigDownload/VideoAlarmRecord,GB-2022 A.2.3.2.7)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "VideoAlarmRecord")]
+pub struct VideoAlarmRecord {
+    /// 报警录像时长(秒)。
+    #[serde(rename = "Duration")]
+    pub duration: u32,
+}
+
+/// 视频画面遮挡(ConfigDownload/PictureMask,GB-2022 A.2.3.2.8)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "PictureMask")]
+pub struct PictureMask {
+    /// 是否启用画面遮挡:0=关闭,1=开启。
+    #[serde(rename = "Enabled")]
+    pub enabled: u32,
+}
+
+/// 画面翻转(ConfigDownload/FrameMirror,GB-2022 A.2.1.23)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "FrameMirror")]
+pub struct FrameMirror {
+    /// 翻转模式:0=不启用,1=水平镜像,2=上下镜像,3=中心镜像。
+    #[serde(rename = "Mode")]
+    pub mode: u32,
+}
+
+/// 报警上报开关(ConfigDownload/AlarmReport,GB-2022 A.2.3.2.10)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "AlarmReport")]
+pub struct AlarmReport {
+    /// 是否启用报警上报:0=关闭,1=开启。
+    #[serde(rename = "Enabled")]
+    pub enabled: u32,
+}
+
+/// 前端OSD配置(ConfigDownload/OSDConfig,GB-2022 A.2.3.2.11)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "OSDConfig")]
+pub struct OSDConfig {
+    /// 绝对时间信息显示开关:0=关闭,1=开启。
+    #[serde(rename = "TimeShowFlag")]
+    pub time_show_flag: u32,
+    /// OSD信息显示开关:0=关闭,1=开启。
+    #[serde(rename = "OSDShowFlag")]
+    pub osd_show_flag: u32,
+}
+
+/// 图像抓拍配置(ConfigDownload/SnapShotConfig,GB-2022 A.2.1.24)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "SnapShotConfig")]
+pub struct SnapShotCfg {
+    /// 连拍张数(1-10)。
+    #[serde(rename = "SnapNum")]
+    pub snap_num: u32,
+    /// 单张抓拍间隔时间(秒)。
+    #[serde(rename = "Interval")]
+    pub interval: u32,
 }
 
 impl ConfigDownloadResponse {
@@ -1224,11 +1315,18 @@ impl ConfigDownloadResponse {
                 heartbeat_count,
             }),
             video_param_opt: None,
+            video_record_plan: None,
+            video_alarm_record: None,
+            picture_mask: None,
+            frame_mirror: None,
+            alarm_report: None,
+            osd_config: None,
+            snap_shot_config: None,
         }
     }
 
     /// 按 ConfigType(斜杠分隔可组合)构造应答,只输出被请求的块。
-    /// `config_type` 大小写不敏感,含 "BasicParam" / "VideoParamOpt"。
+    /// 支持 GB28181-2022 附录 A.2.4.7 定义的全部 ConfigType。
     #[allow(clippy::too_many_arguments)]
     pub fn by_type(
         device_id: impl Into<String>,
@@ -1244,6 +1342,13 @@ impl ConfigDownloadResponse {
         // 缺省(空 ConfigType)按 BasicParam 处理,兼容旧行为。
         let want_basic = lower.is_empty() || lower.contains("basicparam");
         let want_video = lower.contains("videoparamopt");
+        let want_record_plan = lower.contains("videorecordplan");
+        let want_alarm_record = lower.contains("videoalarmrecord");
+        let want_picture_mask = lower.contains("picturemask");
+        let want_frame_mirror = lower.contains("framemirror");
+        let want_alarm_report = lower.contains("alarmreport");
+        let want_osd = lower.contains("osdconfig");
+        let want_snapshot = lower.contains("snapshotconfig");
         let device_id = device_id.into();
         ConfigDownloadResponse {
             cmd_type: "ConfigDownload".into(),
@@ -1259,6 +1364,21 @@ impl ConfigDownloadResponse {
             video_param_opt: want_video.then(|| VideoParamOpt {
                 download_speed: "1/2/4".into(),
                 resolution: resolution.into(),
+            }),
+            video_record_plan: want_record_plan.then(|| VideoRecordPlan {
+                record_plan_type: 0,
+            }),
+            video_alarm_record: want_alarm_record.then(|| VideoAlarmRecord { duration: 30 }),
+            picture_mask: want_picture_mask.then(|| PictureMask { enabled: 0 }),
+            frame_mirror: want_frame_mirror.then(|| FrameMirror { mode: 0 }),
+            alarm_report: want_alarm_report.then(|| AlarmReport { enabled: 1 }),
+            osd_config: want_osd.then(|| OSDConfig {
+                time_show_flag: 1,
+                osd_show_flag: 1,
+            }),
+            snap_shot_config: want_snapshot.then(|| SnapShotCfg {
+                snap_num: 1,
+                interval: 1,
             }),
         }
     }
@@ -1604,7 +1724,7 @@ impl HomePositionQueryResponse {
     }
 }
 
-/// 存储卡状态项(StorageCardStatusQuery Item)。
+/// 存储卡状态项(SDCardStatus Item)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "Item")]
 pub struct StorageCardItem {
@@ -1630,7 +1750,7 @@ pub struct StorageList {
     pub items: Vec<StorageCardItem>,
 }
 
-/// 存储卡状态查询应答(StorageCardStatusQuery,设备 → 平台)。
+/// 存储卡状态查询应答(SDCardStatus,设备 → 平台)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "Response")]
 pub struct StorageCardStatusResponse {
@@ -1657,7 +1777,7 @@ impl StorageCardStatusResponse {
         }];
         let num = items.len() as u32;
         StorageCardStatusResponse {
-            cmd_type: "StorageCardStatusQuery".into(),
+            cmd_type: "SDCardStatus".into(),
             sn,
             device_id: device_id.into(),
             sum_num: num,
@@ -1805,7 +1925,7 @@ impl CruiseTrackQueryResponse {
     }
 }
 
-/// PTZ 精准状态查询应答(PTZPreciseStatusQuery,GB-2022,设备 → 平台)。
+/// PTZ 精准状态查询应答(PTZPosition,GB-2022,设备 → 平台)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "Response")]
 pub struct PtzPreciseStatusResponse {
@@ -1830,7 +1950,7 @@ impl PtzPreciseStatusResponse {
     /// 用当前姿态构造(格式化为 %.2f)。
     pub fn new(device_id: impl Into<String>, sn: u32, pan: f32, tilt: f32, zoom: f32) -> Self {
         PtzPreciseStatusResponse {
-            cmd_type: "PTZPreciseStatusQuery".into(),
+            cmd_type: "PTZPosition".into(),
             sn,
             device_id: device_id.into(),
             pan: format!("{pan:.2}"),
@@ -2164,7 +2284,7 @@ mod tests {
     #[test]
     fn 存储卡状态应答_单张32g() {
         let xml = StorageCardStatusResponse::mock("dev", 3).to_xml().unwrap();
-        assert!(xml.contains("<CmdType>StorageCardStatusQuery</CmdType>"));
+        assert!(xml.contains("<CmdType>SDCardStatus</CmdType>"));
         assert!(xml.contains("<StorageList Num=\"1\">"));
         assert!(xml.contains("<TotalCapacity>32768</TotalCapacity>"));
         assert!(xml.contains("<RemainingSpace>24576</RemainingSpace>"));

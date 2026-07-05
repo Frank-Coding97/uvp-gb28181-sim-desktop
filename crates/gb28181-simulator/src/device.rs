@@ -217,7 +217,7 @@ pub struct DeviceSimulator {
 }
 
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
-/// 供扩展查询(AlarmStatus/HomePositionQuery/CruiseTrack*/PTZPreciseStatusQuery)读回。
+/// 供扩展查询(AlarmStatus/HomePositionQuery/CruiseTrack*/PTZPosition)读回。
 #[derive(Debug, Clone)]
 pub struct ControlState {
     /// 是否处于布防/报警态(AlarmStatus 的 DutyStatus)。
@@ -1120,7 +1120,7 @@ impl DeviceSimulator {
                 HomePositionQueryResponse::new(&query.device_id, query.sn, enabled, has_home)
                     .to_xml()
             }
-            "StorageCardStatusQuery" => {
+            "SDCardStatus" => {
                 // 存储卡状态查询(FR-17):模拟单张 32G 卡余 24G。
                 StorageCardStatusResponse::mock(&query.device_id, query.sn).to_xml()
             }
@@ -1143,7 +1143,7 @@ impl DeviceSimulator {
                     .unwrap_or_default();
                 CruiseTrackQueryResponse::new(&query.device_id, query.sn, group, &presets).to_xml()
             }
-            "PTZPreciseStatusQuery" => {
+            "PTZPosition" => {
                 // PTZ 精准状态查询(FR-17,GB-2022):返回最近精准云台姿态。
                 let (pan, tilt, zoom) = self
                     .control_state
@@ -1214,7 +1214,7 @@ impl DeviceSimulator {
                 }
             }
         }
-        // 精确云台控制(GB-2022):记录姿态供 PTZPreciseStatusQuery 读回。
+        // 精确云台控制(GB-2022):记录姿态供 PTZPosition 读回。
         if let Some(p) = &ctrl.ptz_precise_ctrl {
             tracing::info!(pan = p.pan, tilt = p.tilt, zoom = p.zoom, "精确云台控制");
             if let Ok(mut s) = self.control_state.lock() {
@@ -2027,7 +2027,7 @@ mod tests {
         assert!(home.contains("<PresetIndex>1</PresetIndex>"));
 
         let sd = sim
-            .handle_query(&mk("StorageCardStatusQuery", None))
+            .handle_query(&mk("SDCardStatus", None))
             .unwrap();
         assert!(sd.contains("<TotalCapacity>32768</TotalCapacity>"));
 
@@ -2040,7 +2040,7 @@ mod tests {
         assert!(detail.contains("<PresetID>3</PresetID>"));
 
         let precise = sim
-            .handle_query(&mk("PTZPreciseStatusQuery", None))
+            .handle_query(&mk("PTZPosition", None))
             .unwrap();
         assert!(precise.contains("<Zoom>1.00</Zoom>"));
     }
