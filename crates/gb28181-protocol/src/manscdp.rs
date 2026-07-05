@@ -45,6 +45,22 @@ pub struct Query {
         skip_serializing_if = "Option::is_none"
     )]
     pub config_type: Option<String>,
+    // ── RecordInfo 查询扩展字段(GB28181-2022 A.2.4.5) ──
+    /// 录像检索起始时间。
+    #[serde(rename = "StartTime", default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    /// 录像检索终止时间。
+    #[serde(rename = "EndTime", default, skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<String>,
+    /// 录像产生类型:time/alarm/manual/all。
+    #[serde(rename = "Type", default, skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+    /// 模糊查询:0=不模糊,1=模糊查询(同时中心+前端检索)。
+    #[serde(rename = "IndistinctQuery", default, skip_serializing_if = "Option::is_none")]
+    pub indistinct_query: Option<String>,
+    /// 码流编号:0=主码流,1=子码流1,2=子码流2 等。
+    #[serde(rename = "StreamNumber", default, skip_serializing_if = "Option::is_none")]
+    pub stream_number: Option<u32>,
 }
 
 impl Query {
@@ -144,6 +160,9 @@ pub struct Control {
     /// PTZ 云台控制码(8 字节十六进制串)。
     #[serde(rename = "PTZCmd", skip_serializing_if = "Option::is_none")]
     pub ptz_cmd: Option<String>,
+    /// PTZ 云台控制附加参数(GB28181-2022 A.2.3.1.2)。
+    #[serde(rename = "PTZCmdParams", skip_serializing_if = "Option::is_none")]
+    pub ptz_cmd_params: Option<PTZCmdParams>,
     /// 强制关键帧,值 "Send"。
     #[serde(rename = "IFameCmd", skip_serializing_if = "Option::is_none")]
     pub iframe_cmd: Option<String>,
@@ -156,6 +175,9 @@ pub struct Control {
     /// 报警复位。
     #[serde(rename = "AlarmCmd", skip_serializing_if = "Option::is_none")]
     pub alarm_cmd: Option<String>,
+    /// 报警复位扩展信息(GB28181-2022 A.2.3.1.6):报警方式、报警类型。
+    #[serde(rename = "Info", skip_serializing_if = "Option::is_none")]
+    pub alarm_info: Option<AlarmInfo>,
     /// 远程启动,值 "Boot"。
     #[serde(rename = "TeleBoot", skip_serializing_if = "Option::is_none")]
     pub tele_boot: Option<String>,
@@ -241,7 +263,7 @@ impl SnapShotConfig {
     }
 }
 
-/// 在线升级参数(DeviceUpgrade 子元素)。
+/// 在线升级参数(DeviceUpgrade 子元素,GB28181-2022 A.2.3.1.12)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceUpgrade {
     /// 固件版本。
@@ -253,6 +275,9 @@ pub struct DeviceUpgrade {
     /// 固件文件地址。
     #[serde(rename = "FileURL", default)]
     pub file_url: String,
+    /// 设备厂商(GB28181-2022 必选)。
+    #[serde(rename = "Manufacturer", default, skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
 }
 
 /// 精确云台控制参数(PTZPreciseCtrl 子元素,GB-2022)。
@@ -273,9 +298,9 @@ fn one_f32() -> f32 {
     1.0
 }
 
-/// 目标跟踪参数(TargetTrack 子元素,GB-2022)。
+/// 目标跟踪参数(TargetTrack 子元素,GB-2022 A.2.3.1.14)。
 /// 平台可发结构体(Mode/ObjectID/Speed)或旧式纯文本 `<TargetTrack>Auto</TargetTrack>`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TargetTrack {
     /// 跟踪模式:Auto / Manual / Stop(白名单外忽略)。
     #[serde(rename = "Mode", default)]
@@ -286,6 +311,58 @@ pub struct TargetTrack {
     /// 跟踪速度(1-255,可选)。
     #[serde(rename = "Speed", default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<u32>,
+    /// 全景相机的全景通道 ID(可选)。
+    #[serde(rename = "DeviceID2", default, skip_serializing_if = "Option::is_none")]
+    pub device_id2: Option<String>,
+    /// 全景图片大小、框选的区域坐标信息(手动跟踪时需要)。
+    #[serde(rename = "TargetArea", default, skip_serializing_if = "Option::is_none")]
+    pub target_area: Option<TargetArea>,
+}
+
+/// 目标跟踪区域坐标(TargetArea 子元素,GB28181-2022 A.2.3.1.14)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetArea {
+    /// 全景播放窗口长度像素值。
+    #[serde(rename = "Length", default)]
+    pub length: u32,
+    /// 全景播放窗口宽度像素值。
+    #[serde(rename = "Width", default)]
+    pub width: u32,
+    /// 跟踪框中心的横轴坐标像素值。
+    #[serde(rename = "MidPointX", default)]
+    pub midpoint_x: u32,
+    /// 跟踪框中心的纵轴坐标像素值。
+    #[serde(rename = "MidPointY", default)]
+    pub midpoint_y: u32,
+    /// 跟踪框长度像素值。
+    #[serde(rename = "LengthX", default)]
+    pub length_x: u32,
+    /// 跟踪框宽度像素值。
+    #[serde(rename = "LengthY", default)]
+    pub length_y: u32,
+}
+
+/// 报警复位扩展信息(AlarmCmd Info 子元素,GB28181-2022 A.2.3.1.6)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlarmInfo {
+    /// 报警方式:0=全部,1=电话,2=设备,3=短信,4=GPS,5=视频,6=设备故障,7=其他。
+    /// 可组合如 "1/2" 表示电话或设备报警。
+    #[serde(rename = "AlarmMethod", default, skip_serializing_if = "Option::is_none")]
+    pub alarm_method: Option<String>,
+    /// 报警类型(含义取决于 AlarmMethod)。
+    #[serde(rename = "AlarmType", default, skip_serializing_if = "Option::is_none")]
+    pub alarm_type: Option<String>,
+}
+
+/// PTZ 云台控制附加参数(PTZCmdParams,GB28181-2022 A.2.3.1.2)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PTZCmdParams {
+    /// 预置位名称(设置预置位时可选)。
+    #[serde(rename = "PresetName", default, skip_serializing_if = "Option::is_none")]
+    pub preset_name: Option<String>,
+    /// 巡航轨迹名称(最长32字节,巡航指令时可选)。
+    #[serde(rename = "CruiseTrackName", default, skip_serializing_if = "Option::is_none")]
+    pub cruise_track_name: Option<String>,
 }
 
 /// 看守位设置(HomePosition 子元素)。
