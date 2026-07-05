@@ -1254,6 +1254,29 @@ impl DeviceSimulator {
         if ctrl.iframe_cmd.is_some() {
             tracing::info!("强制关键帧(下一帧起带 IDR)");
         }
+        // DeviceConfig 控制命令(GB28181-2022 A.2.3.2):设备配置修改。
+        // 模拟器接受所有配置修改并回 OK,实际不改变设备行为(仅记录日志)。
+        if ctrl.cfg_basic_param.is_some() {
+            tracing::info!("设备配置:基本参数(模拟接受)");
+        }
+        if ctrl.cfg_video_record_plan.is_some() {
+            tracing::info!("设备配置:录像计划(模拟接受)");
+        }
+        if ctrl.cfg_video_alarm_record.is_some() {
+            tracing::info!("设备配置:报警录像(模拟接受)");
+        }
+        if ctrl.cfg_picture_mask.is_some() {
+            tracing::info!("设备配置:画面遮挡(模拟接受)");
+        }
+        if ctrl.cfg_frame_mirror.is_some() {
+            tracing::info!("设备配置:画面翻转(模拟接受)");
+        }
+        if ctrl.cfg_alarm_report.is_some() {
+            tracing::info!("设备配置:报警上报开关(模拟接受)");
+        }
+        if ctrl.cfg_osd_config.is_some() {
+            tracing::info!("设备配置:前端OSD(模拟接受)");
+        }
         let resp = gb28181_protocol::manscdp::ControlResponse::ok(&ctrl.device_id, ctrl.sn);
         resp.to_xml()
     }

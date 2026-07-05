@@ -188,6 +188,28 @@ pub struct Control {
     /// 在线升级(DeviceUpgrade):4 步进度 NOTIFY。
     #[serde(rename = "DeviceUpgrade", skip_serializing_if = "Option::is_none")]
     pub device_upgrade: Option<DeviceUpgrade>,
+    // ── DeviceConfig 控制命令字段(GB28181-2022 A.2.3.2) ──
+    /// 基本参数配置。
+    #[serde(rename = "BasicParam", skip_serializing_if = "Option::is_none")]
+    pub cfg_basic_param: Option<BasicParam>,
+    /// 录像计划配置。
+    #[serde(rename = "VideoRecordPlan", skip_serializing_if = "Option::is_none")]
+    pub cfg_video_record_plan: Option<VideoRecordPlan>,
+    /// 报警录像配置。
+    #[serde(rename = "VideoAlarmRecord", skip_serializing_if = "Option::is_none")]
+    pub cfg_video_alarm_record: Option<VideoAlarmRecord>,
+    /// 视频画面遮挡配置。
+    #[serde(rename = "PictureMask", skip_serializing_if = "Option::is_none")]
+    pub cfg_picture_mask: Option<PictureMask>,
+    /// 画面翻转配置。
+    #[serde(rename = "FrameMirror", skip_serializing_if = "Option::is_none")]
+    pub cfg_frame_mirror: Option<FrameMirror>,
+    /// 报警上报开关配置。
+    #[serde(rename = "AlarmReport", skip_serializing_if = "Option::is_none")]
+    pub cfg_alarm_report: Option<AlarmReport>,
+    /// 前端OSD配置。
+    #[serde(rename = "OSDConfig", skip_serializing_if = "Option::is_none")]
+    pub cfg_osd_config: Option<OSDConfig>,
 }
 
 /// 抓拍配置参数(SnapShotConfig 子元素,GB-2022 §9.5)。
@@ -336,6 +358,15 @@ impl Control {
             "抓拍配置"
         } else if self.snap_shot_cmd.is_some() {
             "抓拍"
+        } else if self.cfg_basic_param.is_some()
+            || self.cfg_video_record_plan.is_some()
+            || self.cfg_video_alarm_record.is_some()
+            || self.cfg_picture_mask.is_some()
+            || self.cfg_frame_mirror.is_some()
+            || self.cfg_alarm_report.is_some()
+            || self.cfg_osd_config.is_some()
+        {
+            "设备配置"
         } else {
             "未知控制"
         }
