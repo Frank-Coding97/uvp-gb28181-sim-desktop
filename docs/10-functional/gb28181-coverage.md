@@ -89,13 +89,14 @@
 | 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
 | 语音广播 | Broadcast | P2 | 🟡 握手已实现:解析 Broadcast Notify(SourceID/TargetID)→ 回 Broadcast Response(TargetID 属本设备 OK,否则 ERROR+Reason);接受后构造反向 INVITE 的 SDP offer(a=recvonly / PCMA+PCMU / y=ssrc)。**反向 INVITE 事务与音频 RTP 接收/ACK/BYE 链路本 WVP 环境无法触发验证,未实装收流**(FR-36,握手+SDP 单测) |
 | 设备配置查询 | ConfigDownload / BasicParam + VideoParamOpt | P2 | 🟢 回 200 + ConfigDownload Response,支持 BasicParam(Name/Expiration/HeartBeat*)与 VideoParamOpt(DownloadSpeed/Resolution)按 ConfigType 组合输出(FR-17) |
+| 设备配置查询扩展 | ConfigDownload / SVACEncodeConfig + SVACDecodeConfig + VideoParamAttribute + VideoRecordPlan + VideoAlarmRecord + PictureMask + FrameMirror + AlarmReport + OSDConfig + SnapShotConfig | P2 | ⬜ GB28181-2022 附录 A.2.4.7 定义的完整 ConfigType 列表,当前仅实现 BasicParam + VideoParamOpt |
 | 预置位查询 | PresetQuery | P2 | ✅ 返回有状态预置位表(随预置位设置/删除动态变),实 SIP 注入验证 |
 | 报警状态查询 | AlarmStatus | P1 | 🟢 GB-2022 每报警通道 DutyStatus(ALARM/OFFDUTY)/ GB-2016 NotNumber,随布防态动态(FR-17,单测) |
 | 看守位查询 | HomePositionQuery | P1 | 🟢 Enabled/ResetTime(固定30)/PresetIndex(有无看守位标志)(FR-17,单测) |
-| 存储卡状态查询 | StorageCardStatusQuery | P1 | 🟢 单张 32G 卡余 24G(模拟固定值)(FR-17,单测) |
+| 存储卡状态查询 | SDCardStatus | P1 | 🟢 单张 32G 卡余 24G(模拟固定值)(FR-17,单测) |
 | 巡航轨迹列表查询 | CruiseTrackListQuery | P1 | 🟢 返回有状态巡航轨迹号列表(随巡航增删动态)(FR-17,单测) |
-| 巡航轨迹详情查询 | CruiseTrackQuery | P1 | 🟢 按 GroupID 返回该轨迹预置点(Speed/DwellTime 固定 5/3)(FR-17,单测) |
-| PTZ 精准状态查询 | PTZPreciseStatusQuery | P1 | 🟢 返回最近精准云台姿态 Pan/Tilt/Zoom(%.2f)(FR-17,单测) |
+| 巡航轨迹详情查询 | CruiseTrackQuery | P1 | 🟢 按 Number 返回该轨迹预置点(Speed/DwellTime 固定 5/3)(FR-17,单测) |
+| PTZ 精准状态查询 | PTZPosition | P1 | 🟢 返回最近精准云台姿态 Pan/Tilt/Zoom(%.2f)(FR-17,单测) |
 | 移动位置单次查询 | MobilePosition | P1 | 🟢 复用位置 NOTIFY 骨架单发(FR-17) |
 | 设备软件升级 | DeviceUpgrade | P2 | 🟢 回 200 后异步发 4 步进度(0/30/60/100%)DeviceUpgradeResult NOTIFY(percent<100→Result=0,=100→Result=1)(FR-30,单测) |
 | 平台下发抓拍(旧) | SnapShotCmd | P2 | 🟢 触发经 Alarm Notify 上报(FR-19) |
