@@ -38,6 +38,7 @@
 | FR-34 | 多视频通道 + 虚拟通道 CRUD + 模板(单设备/8ch NVR/3×2 跨区划/16ch 双业务分组);报警通道作独立 Catalog 节点(typeCode 134) | P1 | M6 |
 | FR-35 | OSD 叠加:时间戳(左上)、通道名(右上)、自定义水印(斜向平铺)烧入推流画面(行业惯例) | P2 | M6 |
 | FR-36 | 语音广播(平台→设备,G.711A 下行):Broadcast MESSAGE 应答 + 设备侧反向 INVITE(UAC)+ 音频接收播放 | P2 | M6 |
+| FR-37 | GB28181-2022 合规补全:实时视音频回传通知(VideoUploadNotify A.2.5.8)、强制关键帧拼写兼容(IFrameCmd/IFameCmd)、RecordInfo 应答必选 Name(A.2.6.7)、SVAC 编解码/视频参数属性配置(A.2.3.2.3~5) | P1 | M7 |
 
 ### 压力测试(核心)
 

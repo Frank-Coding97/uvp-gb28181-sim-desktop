@@ -117,6 +117,26 @@
 - 平台 `SUBSCRIBE + Alarm` → 设备回带 tag 的 200 并**记录订阅对话**(Call-ID/tags/Event/Expires + 平台地址)。
 - 此后 `report_alarm` 上报的报警(Alarm Notify XML)走**对话内 SIP NOTIFY**(复用 `notify_in_dialog`),WVP code=200;若无订阅(如手动触发、平台未订阅)则退化为独立 MESSAGE(WVP 同样接受)。设备下线时清理对话。
 
+### 实时视音频回传通知 VideoUploadNotify(FR-37,GB28181-2022 A.2.5.8)
+- 设备主动上报"实时视音频已开始回传"通知,供平台感知回传状态。
+- 结构:`<Notify><CmdType>VideoUploadNotify</CmdType><SN/><DeviceID/><Time/><Longitude/><Latitude/></Notify>`。CmdType/SN/DeviceID/Time 必选,经纬度可选。
+- 设备实现:`VideoUploadNotify` 类型 + `report_video_upload` 主动发独立 MESSAGE(与 report_alarm 同路径)。
+
+### 强制关键帧拼写兼容(GB28181-2022 A.2.3.1.7)
+- 2022 标准元素名为 `IFrameCmd`,2016 版/多数设备沿用 `IFameCmd`(少个 r)。设备侧 Control **同时接受两种拼写**(serde alias),避免严格 2022 平台的关键帧命令解析不到。
+
+### RecordInfo 应答补必选 Name(GB28181-2022 A.2.6.7)
+- A.2.6.7 规定录像检索应答含必选 `<Name>`(设备/区域名称),位于 SumNum 前。`RecordInfoResponse` 补该字段(取设备名)。
+
+### 标准合规说明(结构偏差取舍)
+以下应答的元素名/结构与 2022 XSD 字面存在差异,但均**据 WVP/上游 uvp-gb28181-sim 真实实现核对并真机验证**,为保证互通**保持现状**(不盲目改标准字面):
+- SDCardStatus 应答(StorageList/CardNum vs 标准 SDCardStatusInfo/ID)
+- CruiseTrackList/CruiseTrackQuery 应答(TrackList/Item/GroupID vs 标准 CruiseTrackList/CruiseTrack/Number)
+- HomePositionQuery 应答(顶层平铺 vs 标准 HomePosition 子元素)
+- MobilePosition 通知(2016 平铺式 vs 2022 DeviceList 列表式)
+- 抓拍完成通知(Notify+SubCmd=SnapShot vs 标准 UploadSnapShotFinished)
+- DeviceUpgradeResult(Result/Percent 进度语义 vs 标准 UpgradeResult 成败语义)
+
 ## 版本差异
 GB-2016 与 GB-2022 在 Catalog 字段集、部分命令上有差异;实现用可选字段 + 版本开关处理(FR-11)。
 

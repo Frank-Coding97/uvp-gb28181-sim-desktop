@@ -607,6 +607,28 @@ impl DeviceSimulator {
             .await
     }
 
+    /// 主动上报实时视音频回传通知(VideoUploadNotify,GB28181-2022 A.2.5.8)。
+    /// 设备 → 平台独立 MESSAGE,携带当前位置。返回平台响应状态码。
+    pub async fn report_video_upload(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+    ) -> Result<u16> {
+        let sn = self.next_cseq();
+        let time = common::clock::synced_iso8601();
+        let pos = self.position.lock().map(|p| *p).ok();
+        let notify = gb28181_protocol::manscdp::VideoUploadNotify::new(
+            self.config.device_id.as_str(),
+            sn,
+            time,
+            pos,
+        );
+        let xml = notify.to_xml()?;
+        self.send_message_xml(transport, local_host, local_port, &xml)
+            .await
+    }
+
     /// 主动上报一条移动位置(GPS,MobilePosition NOTIFY)。设备 → 平台。
     /// 位置订阅场景下由周期任务调用;也可手动触发。返回平台响应状态码。
     pub async fn report_position(
@@ -1049,7 +1071,12 @@ impl DeviceSimulator {
                     end_time: "2026-07-03T10:05:00".into(),
                     kind: "time".into(),
                 }];
-                let resp = RecordInfoResponse::new(&query.device_id, query.sn, items);
+                let resp = RecordInfoResponse::with_name(
+                    &query.device_id,
+                    self.config.device_info.device_name.clone(),
+                    query.sn,
+                    items,
+                );
                 resp.to_xml()
             }
             "ConfigDownload" => {

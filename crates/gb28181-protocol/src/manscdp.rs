@@ -172,7 +172,13 @@ pub struct Control {
     #[serde(rename = "PTZCmdParams", skip_serializing_if = "Option::is_none")]
     pub ptz_cmd_params: Option<PTZCmdParams>,
     /// 强制关键帧,值 "Send"。
-    #[serde(rename = "IFameCmd", skip_serializing_if = "Option::is_none")]
+    /// 2016 版拼写 `IFameCmd`(少个 r,多数设备沿用);GB28181-2022 A.2.3.1.7 为 `IFrameCmd`。
+    /// 用 alias 同时接受两种拼写,序列化用 2016 拼写(WVP 已验证)。
+    #[serde(
+        rename = "IFameCmd",
+        alias = "IFrameCmd",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub iframe_cmd: Option<String>,
     /// 录像控制:Record / StopRecord。
     #[serde(rename = "RecordCmd", skip_serializing_if = "Option::is_none")]
@@ -953,6 +959,55 @@ impl MediaStatusNotify {
     }
 }
 
+/// 实时视音频回传通知(VideoUploadNotify,GB28181-2022 A.2.5.8)。
+///
+/// 设备主动上报"实时视音频已开始回传",供平台感知回传状态。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct VideoUploadNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 上报通知时间(ISO8601)。
+    #[serde(rename = "Time")]
+    pub time: String,
+    /// 经度(可选)。
+    #[serde(rename = "Longitude", skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// 纬度(可选)。
+    #[serde(rename = "Latitude", skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+}
+
+impl VideoUploadNotify {
+    /// 构造通知(带可选经纬度)。
+    pub fn new(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        position: Option<(f64, f64)>,
+    ) -> Self {
+        VideoUploadNotify {
+            cmd_type: "VideoUploadNotify".into(),
+            sn,
+            device_id: device_id.into(),
+            time: time.into(),
+            longitude: position.map(|(lng, _)| lng),
+            latitude: position.map(|(_, lat)| lat),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        let body = quick_xml::se::to_string(self)
+            .map_err(|e| Error::Gb28181(format!("VideoUploadNotify 序列化失败: {e}")))?;
+        Ok(format!("{XML_DECL}{body}"))
+    }
+}
+
 /// 心跳通知(设备 → 平台,周期发送)。
 ///
 /// 对应 XML:
@@ -1257,6 +1312,9 @@ pub struct RecordInfoResponse {
     pub sn: u32,
     #[serde(rename = "DeviceID")]
     pub device_id: String,
+    /// 设备/区域名称(GB28181-2022 A.2.6.7 必选),位于 SumNum 前。
+    #[serde(rename = "Name")]
+    pub name: String,
     /// 录像总数。
     #[serde(rename = "SumNum")]
     pub sum_num: u32,
@@ -1274,13 +1332,26 @@ pub struct RecordList {
 }
 
 impl RecordInfoResponse {
-    /// 用设备 ID、SN、录像段构造应答。
+    /// 用设备 ID、SN、录像段构造应答(名称默认取 DeviceID)。
     pub fn new(device_id: impl Into<String>, sn: u32, items: Vec<RecordItem>) -> Self {
+        let device_id = device_id.into();
+        let name = device_id.clone();
+        Self::with_name(device_id, name, sn, items)
+    }
+
+    /// 用设备 ID、名称、SN、录像段构造应答(A.2.6.7 Name 必选)。
+    pub fn with_name(
+        device_id: impl Into<String>,
+        name: impl Into<String>,
+        sn: u32,
+        items: Vec<RecordItem>,
+    ) -> Self {
         let num = items.len() as u32;
         RecordInfoResponse {
             cmd_type: "RecordInfo".into(),
             sn,
             device_id: device_id.into(),
+            name: name.into(),
             sum_num: num,
             record_list: RecordList { num, items },
         }
@@ -2665,5 +2736,48 @@ mod tests {
         assert!(xml.contains("<Result>OK</Result>"));
         let ctrl = ControlResponse::ok("dev", 7).to_xml().unwrap();
         assert!(ctrl.contains("<CmdType>DeviceControl</CmdType>"));
+    }
+
+    #[test]
+    fn 实时视音频回传通知() {
+        // A.2.5.8 VideoUploadNotify:带经纬度。
+        let xml = VideoUploadNotify::new("dev", 1, "2026-07-05T14:00:00", Some((116.4, 39.9)))
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<CmdType>VideoUploadNotify</CmdType>"));
+        assert!(xml.contains("<Time>2026-07-05T14:00:00</Time>"));
+        assert!(xml.contains("<Longitude>116.4</Longitude>"));
+        // 无位置时不含经纬度。
+        let x2 = VideoUploadNotify::new("dev", 2, "t", None)
+            .to_xml()
+            .unwrap();
+        assert!(!x2.contains("Longitude"));
+    }
+
+    #[test]
+    fn 强制关键帧兼容两种拼写() {
+        // 2016 拼写 IFameCmd 与 2022 拼写 IFrameCmd 都应解析到 iframe_cmd。
+        let x2016 = r#"<?xml version="1.0"?><Control><CmdType>DeviceControl</CmdType>
+<SN>1</SN><DeviceID>d</DeviceID><IFameCmd>Send</IFameCmd></Control>"#;
+        let x2022 = r#"<?xml version="1.0"?><Control><CmdType>DeviceControl</CmdType>
+<SN>1</SN><DeviceID>d</DeviceID><IFrameCmd>Send</IFrameCmd></Control>"#;
+        assert_eq!(
+            Control::parse(x2016).unwrap().iframe_cmd.as_deref(),
+            Some("Send")
+        );
+        assert_eq!(
+            Control::parse(x2022).unwrap().iframe_cmd.as_deref(),
+            Some("Send")
+        );
+    }
+
+    #[test]
+    fn 录像检索应答含必选name() {
+        // A.2.6.7:RecordInfo 应答含必选 Name。
+        let xml = RecordInfoResponse::with_name("dev", "前门相机", 1, vec![])
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<Name>前门相机</Name>"));
+        assert!(xml.contains("<CmdType>RecordInfo</CmdType>"));
     }
 }
