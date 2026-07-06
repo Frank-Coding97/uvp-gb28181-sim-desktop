@@ -1,10 +1,11 @@
 <script setup lang="ts">
-// 多通道目录管理页(FR-34):模板选择 + 目录树 CRUD + OSD 配置(配置面对齐上游,不烧入画面)。
-// 通道操作需设备已在「单设备联调」页启动;OSD 配置仅本地持久化(与上游一致,不进协议)。
+// 多通道目录管理页(FR-34):模板选择 + 目录树 CRUD。
+// 通道操作需设备已在「单设备联调」页启动。
+// (OSD 是平台→设备的配置命令,展示在单设备页"OSD 设置(平台下发)",不在此页。)
 import { ref, onMounted, onActivated } from "vue";
 import {
   NButton, NSpace, NSelect, NDataTable, NModal, NForm, NFormItem, NInput,
-  NTag, NSwitch, NInputNumber, useMessage, type DataTableColumns,
+  NTag, useMessage, type DataTableColumns,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -129,30 +130,8 @@ const columns: DataTableColumns<ChannelNode> = [
   },
 ];
 
-// ── OSD 配置(FR-35,配置面对齐上游:本地持久化,不烧入画面/不进协议)──
-const OSD_KEY = "uvp_osd_config";
-const osd = ref({
-  timestamp: true, timestampPos: "TOP_LEFT",
-  channelName: true, channelNamePos: "TOP_RIGHT",
-  watermark: false, watermarkText: "UVP-Sim", watermarkAlpha: 0.28,
-  size: "MEDIUM",
-});
-const posOptions = [
-  { label: "左上", value: "TOP_LEFT" }, { label: "右上", value: "TOP_RIGHT" },
-  { label: "左下", value: "BOTTOM_LEFT" }, { label: "右下", value: "BOTTOM_RIGHT" },
-];
-const sizeOptions = [
-  { label: "小(3.5%)", value: "SMALL" }, { label: "中(5%)", value: "MEDIUM" }, { label: "大(7%)", value: "LARGE" },
-];
-function saveOsd() {
-  localStorage.setItem(OSD_KEY, JSON.stringify(osd.value));
-  message.success("OSD 配置已保存(本地渲染叠加,不影响平台收流)");
-}
-
 import { h } from "vue";
 onMounted(() => {
-  const saved = localStorage.getItem(OSD_KEY);
-  if (saved) { try { Object.assign(osd.value, JSON.parse(saved)); } catch {} }
   refresh();
 });
 onActivated(refresh);
@@ -184,33 +163,6 @@ onActivated(refresh);
       <div v-if="nodes.length === 0" class="empty">设备未启动或目录为空。请到「单设备联调」启动设备,或载入模板。</div>
     </div>
 
-    <div class="glass-card panel" style="margin-top: 20px">
-      <div class="section-title">OSD 叠加配置</div>
-      <div class="section-hint">
-        与上游一致:OSD 为本地渲染叠加(时间/通道名/水印),不进 GB28181 协议、不影响平台收流。
-      </div>
-      <n-form label-placement="left" label-width="96" style="max-width: 520px; margin-top: 12px">
-        <n-form-item label="时间戳">
-          <n-switch v-model:value="osd.timestamp" />
-          <n-select v-model:value="osd.timestampPos" :options="posOptions" size="small" style="width: 110px; margin-left: 12px" :disabled="!osd.timestamp" />
-        </n-form-item>
-        <n-form-item label="通道名">
-          <n-switch v-model:value="osd.channelName" />
-          <n-select v-model:value="osd.channelNamePos" :options="posOptions" size="small" style="width: 110px; margin-left: 12px" :disabled="!osd.channelName" />
-        </n-form-item>
-        <n-form-item label="水印">
-          <n-switch v-model:value="osd.watermark" />
-          <n-input v-model:value="osd.watermarkText" size="small" placeholder="水印文字" style="width: 160px; margin-left: 12px" :disabled="!osd.watermark" />
-        </n-form-item>
-        <n-form-item label="水印透明度" v-if="osd.watermark">
-          <n-input-number v-model:value="osd.watermarkAlpha" :min="0" :max="1" :step="0.02" style="width: 140px" />
-        </n-form-item>
-        <n-form-item label="字号">
-          <n-select v-model:value="osd.size" :options="sizeOptions" style="width: 160px" />
-        </n-form-item>
-      </n-form>
-      <n-button type="primary" @click="saveOsd">保存 OSD 配置</n-button>
-    </div>
 
     <n-modal v-model:show="showEdit" preset="card" :title="isNew ? '新增通道' : '编辑通道'" style="max-width: 480px">
       <n-form label-placement="top">
