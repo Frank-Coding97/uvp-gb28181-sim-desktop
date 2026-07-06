@@ -14,7 +14,7 @@
 
 | 功能 | 需求 | 状态 |
 |---|---|---|
-| REGISTER / Digest MD5 / 注销 | FR-1 | ✅ WVP 显示设备在线 |
+| REGISTER / Digest MD5 / 注销 | FR-1 | ✅ WVP 显示设备在线;下线发 REGISTER Expires=0 主动注销(§9.1.2.2),WVP 立即置离线(真机验证) |
 | 心跳保活 + 超时重注册(指数退避) | FR-2 | ✅ |
 | OPTIONS 探活响应 | FR-3 | ✅ |
 | SUBSCRIBE 订阅应答(回 200) | FR-3 | ✅ 注册后 SUBSCRIBE 正常应答 |
