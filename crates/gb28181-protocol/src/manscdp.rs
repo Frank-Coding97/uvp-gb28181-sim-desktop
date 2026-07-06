@@ -9,6 +9,14 @@ use serde::{Deserialize, Serialize};
 /// XML 声明前缀(GB28181 惯例用 GB2312 编码声明,内容为 ASCII 安全)。
 const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"GB2312\"?>\n";
 
+/// 把一个 MANSCDP 结构序列化为带 XML 声明的完整报文。
+/// 各 Response/Notify 的 `to_xml()` 统一委托此函数,消除重复模板。
+fn manscdp_to_xml<T: Serialize>(value: &T) -> Result<String> {
+    let body = quick_xml::se::to_string(value)
+        .map_err(|e| Error::Gb28181(format!("MANSCDP 序列化失败: {e}")))?;
+    Ok(format!("{XML_DECL}{body}"))
+}
+
 /// 去掉 `<?xml ...?>` 声明,返回其后的元素部分。
 fn strip_xml_decl(xml: &str) -> &str {
     match xml.find("?>") {
@@ -148,9 +156,7 @@ impl BroadcastResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("BroadcastResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -766,9 +772,7 @@ impl ControlResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("ControlResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -818,9 +822,7 @@ impl MobilePositionNotify {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("MobilePosition 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -871,9 +873,7 @@ impl DeviceUpgradeResultNotify {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("DeviceUpgradeResultNotify 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -925,9 +925,7 @@ impl SnapShotNotify {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("SnapShotNotify 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -965,9 +963,7 @@ impl MediaStatusNotify {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("MediaStatusNotify 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1014,9 +1010,7 @@ impl VideoUploadNotify {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("VideoUploadNotify 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1062,9 +1056,7 @@ impl Keepalive {
 
     /// 序列化为完整 XML(含 XML 声明)。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("Keepalive 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1160,9 +1152,7 @@ impl CatalogResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("CatalogResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1194,9 +1184,7 @@ pub struct DeviceInfoResponse {
 impl DeviceInfoResponse {
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("DeviceInfoResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1223,9 +1211,7 @@ pub struct DeviceStatusResponse {
 impl DeviceStatusResponse {
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("DeviceStatusResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1287,9 +1273,7 @@ impl AlarmNotify {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("AlarmNotify 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1371,9 +1355,7 @@ impl RecordInfoResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("RecordInfoResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1693,9 +1675,7 @@ impl ConfigDownloadResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("ConfigDownloadResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1751,9 +1731,7 @@ impl PresetQueryResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("PresetQueryResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1815,9 +1793,7 @@ impl CatalogNotify {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("CatalogNotify 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -1981,9 +1957,7 @@ impl AlarmStatusResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("AlarmStatusResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -2026,9 +2000,7 @@ impl HomePositionQueryResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("HomePositionQueryResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -2095,9 +2067,7 @@ impl StorageCardStatusResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("StorageCardStatusResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -2158,9 +2128,7 @@ impl CruiseTrackListResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("CruiseTrackListResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -2227,9 +2195,7 @@ impl CruiseTrackQueryResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("CruiseTrackQueryResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
@@ -2269,9 +2235,7 @@ impl PtzPreciseStatusResponse {
 
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
-        let body = quick_xml::se::to_string(self)
-            .map_err(|e| Error::Gb28181(format!("PtzPreciseStatusResponse 序列化失败: {e}")))?;
-        Ok(format!("{XML_DECL}{body}"))
+        manscdp_to_xml(self)
     }
 }
 
