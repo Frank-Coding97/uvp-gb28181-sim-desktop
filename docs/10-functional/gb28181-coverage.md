@@ -45,7 +45,7 @@
 | 音频复合流 AAC(PSM stream_type 0x0F) | FR-33 | 🟢 PSM 支持 AAC ES 映射;单测(AAC 音频轨抽取/ADTS 封装待接 ffmpeg) |
 | H.264 文件循环推流(C 档) | FR-8 | ✅ |
 | 历史回放流推送 | FR-10 | 🟢 复用点播 INVITE 推流路径 |
-| 回放控制(会话内 INFO/MANSRTSP:PLAY/PAUSE/Scale 倍速) | FR-10 | 🟢 INFO 回 200 + 运行时调速/暂停/恢复(单测+真机 INFO 注入回 200);全链路倍速需活跃回放会话 |
+| 回放控制(会话内 INFO/MANSRTSP:PLAY/PAUSE/Scale 倍速/Range 拖动) | FR-10 | 🟢 INFO 回 200 + 运行时调速/暂停/恢复;§9.8 Range 拖动:解析 npt 起点折算千分比,PlaybackControl.seek + FileSource 跳最近关键帧(单测+真机 INFO 注入回 200) |
 | 下载(INVITE s=Download + a=downloadspeed:N) | FR-10 | ✅ 按 N 倍速推流(实测:4× → 100 包/s = 4×25fps,1× → ~29/s) |
 | 强制关键帧(IFrameCmd) | FR-8 | 🚧 见设备控制 |
 
@@ -98,6 +98,7 @@
 | 巡航轨迹列表查询 | CruiseTrackListQuery | P1 | 🟢 返回有状态巡航轨迹号列表(随巡航增删动态)(FR-17,单测) |
 | 巡航轨迹详情查询 | CruiseTrackQuery | P1 | 🟢 按 Number 返回该轨迹预置点(Speed/DwellTime 固定 5/3)(FR-17,单测) |
 | PTZ 精准状态查询 | PTZPosition | P1 | 🟢 返回最近精准云台姿态 Pan/Tilt/Zoom(%.2f)(FR-17,单测) |
+| PTZ 精准位置事件订阅+通知 | PTZPosition(SUBSCRIBE) | P1 | 🟢 §9.11.1/9.11.2:平台 SUBSCRIBE+PTZPosition(携 Interval)→ 设备周期发 PTZ 精准状态 NOTIFY(复用 PTZPosition 应答体,独立 MESSAGE);2022 新增(FR-37) |
 | 移动位置单次查询 | MobilePosition | P1 | 🟢 复用位置 NOTIFY 骨架单发(FR-17) |
 | 设备软件升级 | DeviceUpgrade | P2 | 🟢 回 200 后异步发 4 步进度(0/30/60/100%)DeviceUpgradeResult NOTIFY(percent<100→Result=0,=100→Result=1)(FR-30,单测) |
 | 平台下发抓拍(旧) | SnapShotCmd | P2 | 🟢 触发经 Alarm Notify 上报(FR-19) |

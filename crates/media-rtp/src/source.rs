@@ -199,6 +199,10 @@ pub trait VideoSource: Send {
     fn codec(&self) -> crate::ps::VideoCodec {
         crate::ps::VideoCodec::H264
     }
+
+    /// 拖动(seek)到流的千分比位置(0..=1000)。回放 Range 定位用(§9.8)。
+    /// 默认忽略(不支持定位的源如空媒体/循环灯);FileSource 覆盖为跳转帧游标。
+    fn seek(&mut self, _permille: u32) {}
 }
 
 /// 空媒体源:永不产帧(A 档,只维持信令)。
@@ -334,6 +338,27 @@ impl VideoSource for FileSource {
 
     fn has_audio(&self) -> bool {
         !self.audio.is_empty()
+    }
+
+    fn seek(&mut self, permille: u32) {
+        if self.frames.is_empty() {
+            return;
+        }
+        // 千分比 → 帧游标;从最近的关键帧起播,避免解码花屏。
+        let target = (self.frames.len() as u64 * permille.min(1000) as u64 / 1000) as usize;
+        let target = target.min(self.frames.len() - 1);
+        // 向前找最近关键帧(找不到就用 target)。
+        let start = (0..=target)
+            .rev()
+            .find(|&i| self.frames[i].key_frame)
+            .unwrap_or(target);
+        self.cursor = start;
+        // 音频游标按比例同步。
+        if !self.audio.is_empty() {
+            self.audio_cursor = (self.audio.len() as u64 * permille.min(1000) as u64 / 1000)
+                as usize
+                % self.audio.len();
+        }
     }
 
     fn next_audio(&mut self) -> Vec<Vec<u8>> {

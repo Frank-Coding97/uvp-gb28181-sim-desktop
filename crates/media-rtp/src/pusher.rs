@@ -24,6 +24,9 @@ pub struct PlaybackControl {
     speed_milli: AtomicU32,
     /// 是否暂停(暂停时保持会话但不取帧/发送)。
     paused: AtomicBool,
+    /// 待处理的拖动(seek)请求:千分比位置+1(0=无请求,1=0‰,1001=1000‰=末尾)。
+    /// 平台经 INFO PLAY Range 下发,推流循环消费后清零。回放拖动(§9.8)用。
+    seek_permille_plus1: AtomicU32,
 }
 
 impl Default for PlaybackControl {
@@ -31,6 +34,7 @@ impl Default for PlaybackControl {
         Self {
             speed_milli: AtomicU32::new(1000),
             paused: AtomicBool::new(false),
+            seek_permille_plus1: AtomicU32::new(0),
         }
     }
 }
@@ -67,6 +71,18 @@ impl PlaybackControl {
     /// 是否暂停中。
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// 请求拖动(seek)到流的千分比位置(0..=1000)。回放 Range 定位用(§9.8)。
+    pub fn seek_permille(&self, permille: u32) {
+        let p = permille.min(1000);
+        self.seek_permille_plus1.store(p + 1, Ordering::Relaxed);
+    }
+
+    /// 取出并清除待处理的 seek 请求(千分比 0..=1000);无请求返回 None。
+    pub fn take_seek(&self) -> Option<u32> {
+        let v = self.seek_permille_plus1.swap(0, Ordering::Relaxed);
+        (v > 0).then(|| v - 1)
     }
 }
 
@@ -133,6 +149,10 @@ pub async fn push_stream_controlled(
         tokio::select! {
             _ = &mut stop => break,
             _ = sleep => {
+                // 处理待定拖动请求(§9.8 回放 Range 定位):跳转源游标到目标位置。
+                if let Some(permille) = control.take_seek() {
+                    source.seek(permille);
+                }
                 if control.is_paused() {
                     continue; // 暂停中,不取帧。
                 }
@@ -212,6 +232,17 @@ mod tests {
         assert!(c.is_paused());
         c.resume();
         assert!(!c.is_paused());
+    }
+
+    #[test]
+    fn 回放拖动_seek请求消费一次() {
+        let c = PlaybackControl::new();
+        assert_eq!(c.take_seek(), None); // 无请求
+        c.seek_permille(500);
+        assert_eq!(c.take_seek(), Some(500)); // 取一次
+        assert_eq!(c.take_seek(), None); // 已清除
+        c.seek_permille(2000); // 越界钳到 1000
+        assert_eq!(c.take_seek(), Some(1000));
     }
 
     #[tokio::test]
