@@ -514,6 +514,70 @@ impl DeviceSimulator {
         }
     }
 
+    /// 向平台注销(GB28181-2022 §9.1.2.2):发 REGISTER Expires=0。
+    ///
+    /// 设备下线时主动注销,平台立即置离线,无需等心跳超时。与注册同样处理 401 鉴权挑战。
+    /// 尽力而为:失败仅记录警告(下线流程不因注销失败而阻塞)。
+    pub async fn unregister(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+    ) -> Result<()> {
+        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
+            .parse()
+            .map_err(|_| Error::Config("平台地址非法".into()))?;
+        // 用独立 Call-ID,避免与运行中的注册路由冲突。
+        let ids = DialogIds::new();
+        let mut rx = transport.register(ids.call_id.clone());
+        let timing = sip_core::Timing::default();
+
+        // 首发 REGISTER Expires=0(无鉴权)。
+        let cseq1 = self.next_cseq();
+        let req1 = builder::register(&self.config, &ids, cseq1, local_host, local_port, None, 0);
+        let result = async {
+            let resp = sip_core::client_transact(transport, dst, &req1, &mut rx, timing).await?;
+            match resp.status {
+                200 => Ok(()),
+                401 => {
+                    let wa = resp
+                        .headers
+                        .get("WWW-Authenticate")
+                        .ok_or_else(|| Error::Sip("注销 401 缺少 WWW-Authenticate".into()))?;
+                    let challenge = Challenge::parse(wa)?;
+                    let auth = authorization(
+                        &challenge,
+                        &self.config.username,
+                        &self.config.password,
+                        "REGISTER",
+                        &req1.uri,
+                    );
+                    let cseq2 = self.next_cseq();
+                    let req2 = builder::register(
+                        &self.config,
+                        &ids,
+                        cseq2,
+                        local_host,
+                        local_port,
+                        Some(&auth),
+                        0,
+                    );
+                    let resp2 =
+                        sip_core::client_transact(transport, dst, &req2, &mut rx, timing).await?;
+                    if resp2.status == 200 {
+                        Ok(())
+                    } else {
+                        Err(Error::Sip(format!("注销被拒: {}", resp2.status)))
+                    }
+                }
+                other => Err(Error::Sip(format!("注销被拒: {other}"))),
+            }
+        }
+        .await;
+        transport.unregister(&ids.call_id);
+        result
+    }
+
     /// 发送一条无对话的 MANSCDP MESSAGE(心跳/报警/位置等)并等平台响应。
     ///
     /// 每次事务用**全新** [`DialogIds`](独立 Call-ID):同一设备的心跳、报警、
@@ -1829,6 +1893,12 @@ impl DeviceSimulator {
         }
         inbound_task.abort();
         self.stop_subscriptions().await;
+        // 主动向平台注销(REGISTER Expires=0,§9.1.2.2):平台立即置离线,不等心跳超时。
+        if let Err(e) = self.unregister(&transport, &local_host, local_port).await {
+            tracing::warn!(device=%self.config.device_id, error=%e, "注销失败(下线仍继续)");
+        } else {
+            tracing::info!(device=%self.config.device_id, "已向平台注销");
+        }
         transport.unregister_inbound(self.config.device_id.as_str());
     }
 }
