@@ -1514,8 +1514,15 @@ impl DeviceSimulator {
         if ctrl.cfg_alarm_report.is_some() {
             tracing::info!("设备配置:报警上报开关(模拟接受)");
         }
-        if ctrl.cfg_osd_config.is_some() {
-            tracing::info!("设备配置:前端OSD(模拟接受)");
+        if let Some(osd) = &ctrl.cfg_osd_config {
+            let time_show = osd.time_show_flag != 0;
+            let osd_show = osd.osd_show_flag != 0;
+            tracing::info!(time_show, osd_show, "设备配置:前端OSD(已应用)");
+            // 上报观察者:供 UI 展示"平台下发 OSD 配置、设备已应用"(国标 A.2.3.2.11)。
+            self.observer.on_event(common::DeviceEvent::OsdConfig {
+                time_show,
+                osd_show,
+            });
         }
         let resp = if is_device_config {
             gb28181_protocol::manscdp::ControlResponse::config_ok(&ctrl.device_id, ctrl.sn)
@@ -1932,6 +1939,19 @@ impl DeviceSimulator {
                 .iter()
                 .map(|c| c.channel_id.as_str().to_string()),
         );
+        // 多通道目录树的视频通道 ID 也要注册,否则平台点播子通道的 INVITE 收不到(问题1)。
+        {
+            let tree = self.catalog_tree.lock().unwrap();
+            aors.extend(
+                tree.iter()
+                    .filter(|n| {
+                        n.node_type == gb28181_protocol::id_codec::CatalogNodeType::VideoChannel
+                    })
+                    .map(|n| n.id.clone()),
+            );
+        }
+        aors.sort();
+        aors.dedup();
         let mut inbound = transport.register_inbound_many(aors);
         let inbound_sim = self.clone();
         let inbound_tp = transport.clone();
@@ -2284,6 +2304,44 @@ mod tests {
             DeviceSimulator::parse_range_permille("PLAY MANSRTSP/1.0\r\nScale: 2.0\r\n"),
             None
         );
+    }
+
+    /// OSD 配置命令(国标 A.2.3.2.11):平台下发 DeviceConfig+OSDConfig,
+    /// 设备回 DeviceConfig 应答 + 上报 OsdConfig 事件(供 UI 展示已应用)。
+    #[tokio::test]
+    async fn osd配置命令_应答并上报事件() {
+        use common::{DeviceEvent, DeviceObserver};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // 捕获 OsdConfig 事件的观察者。
+        struct Cap {
+            got: Arc<AtomicBool>,
+        }
+        impl DeviceObserver for Cap {
+            fn on_event(&self, e: DeviceEvent) {
+                if let DeviceEvent::OsdConfig {
+                    time_show,
+                    osd_show,
+                } = e
+                {
+                    assert!(time_show && osd_show);
+                    self.got.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let got = Arc::new(AtomicBool::new(false));
+        let sim = DeviceSimulator::with_observer(
+            test_cfg("127.0.0.1", 5060),
+            Arc::new(Cap { got: got.clone() }),
+        );
+        let ctrl = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>1</SN><DeviceID>d</DeviceID>\
+             <OSDConfig><TimeShowFlag>1</TimeShowFlag><OSDShowFlag>1</OSDShowFlag></OSDConfig></Control>",
+        )
+        .unwrap();
+        let xml = sim.handle_control(&ctrl).await.unwrap();
+        // 应答 CmdType=DeviceConfig(A.2.6.8),且事件已上报。
+        assert!(xml.contains("<CmdType>DeviceConfig</CmdType>"));
+        assert!(got.load(Ordering::SeqCst), "应上报 OsdConfig 事件");
     }
 
     /// 扩展查询(FR-17):AlarmStatus/HomePositionQuery/StorageCard/CruiseTrack*/PTZPreciseStatus。

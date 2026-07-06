@@ -86,6 +86,17 @@ impl DeviceObserver for StateEmitter {
                 let _ = self.app.emit("ptz_preset", preset);
                 return;
             }
+            // 平台下发 OSD 配置命令,设备已应用:推给前端展示。
+            DeviceEvent::OsdConfig {
+                time_show,
+                osd_show,
+            } => {
+                let _ = self.app.emit(
+                    "osd_config",
+                    serde_json::json!({ "time_show": time_show, "osd_show": osd_show }),
+                );
+                return;
+            }
         };
         let _ = self.app.emit("device_state", state);
     }

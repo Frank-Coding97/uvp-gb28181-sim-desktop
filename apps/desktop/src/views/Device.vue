@@ -49,14 +49,14 @@ let timer: number | null = null;
 // 认证密码显示/隐藏切换。
 const showPassword = ref(false);
 
-// OSD 配置(从 Channels 页 localStorage 读取,实时更新)。
-const osd = ref({ timestamp: true, timestampPos: "TOP_LEFT", channelName: true, channelNamePos: "TOP_RIGHT", watermark: false, watermarkText: "UVP-Sim", watermarkAlpha: 0.28, size: "MEDIUM" });
+// OSD 配置状态:反映**平台下发的 OSD 配置命令**(国标 A.2.3.2.11),设备已按其设置。
+// 非本地随意填写——osd_config 事件由后端在收到平台 DeviceConfig+OSDConfig 时推来。
+const osd = ref<{ received: boolean; time_show: boolean; osd_show: boolean; at: string }>({
+  received: false, time_show: false, osd_show: false, at: "",
+});
 const now = ref(new Date().toLocaleString("zh-CN", { hour12: false }));
 let osdTimer: number | null = null;
-
-function loadOsd() {
-  try { Object.assign(osd.value, JSON.parse(localStorage.getItem("uvp_osd_config") || "{}")); } catch {}
-}
+let unlistenOsd: (() => void) | null = null;
 
 const stateMeta = computed(() => {
   switch (deviceState.value) {
@@ -223,6 +223,7 @@ const poseText = computed(() =>
 
 // 60ms 动画帧:手动 PTZ 按速度连续改 pan/tilt/zoom;预置位巡航平滑补间到目标。
 let poseTimer: number | null = null;
+let ptzStopTimer: number | null = null;
 function poseTick() {
   if (seeking.value && target.value) {
     const t = target.value;
@@ -252,7 +253,20 @@ let unlistenTrace: UnlistenFn | null = null;
 let unlistenPtz: UnlistenFn | null = null;
 let unlistenPreset: UnlistenFn | null = null;
 onMounted(async () => {
-  unlistenPtz = await listen<PtzAction>("ptz_action", (e) => { ptz.value = e.payload; });
+  unlistenPtz = await listen<PtzAction>("ptz_action", (e) => {
+    ptz.value = e.payload;
+    // 自动停止兜底:部分平台(如 WVP)松手时不发显式停止命令,持续运动命令后
+    // 若 1.2s 内无新命令,自动归零,避免 UI 一直显示"转动中"。收到显式停止(全 false)则不再计时。
+    if (ptzStopTimer) { clearTimeout(ptzStopTimer); ptzStopTimer = null; }
+    const m = e.payload;
+    const active = m.up || m.down || m.left || m.right || m.zoom_in || m.zoom_out;
+    if (active) {
+      ptzStopTimer = window.setTimeout(() => {
+        ptz.value = { up: false, down: false, left: false, right: false,
+          zoom_in: false, zoom_out: false, pan_speed: 0, tilt_speed: 0, zoom_speed: 0 };
+      }, 1200);
+    }
+  });
   // 预置位调用:平滑巡航到目标位(未登记的预置位随机造一个目标演示)。
   unlistenPreset = await listen<number>("ptz_preset", (e) => {
     const id = e.payload;
@@ -269,16 +283,26 @@ onMounted(async () => {
   });
   timer = window.setInterval(fmtUptime, 1000);
   poseTimer = window.setInterval(poseTick, 60);
-  loadOsd();
-  osdTimer = window.setInterval(() => { now.value = new Date().toLocaleString("zh-CN", { hour12: false }); loadOsd(); }, 1000);
+  osdTimer = window.setInterval(() => { now.value = new Date().toLocaleString("zh-CN", { hour12: false }); }, 1000);
+  // 订阅平台下发的 OSD 配置命令(国标 A.2.3.2.11)。
+  unlistenOsd = await listen<{ time_show: boolean; osd_show: boolean }>("osd_config", (e) => {
+    osd.value = {
+      received: true,
+      time_show: e.payload.time_show,
+      osd_show: e.payload.osd_show,
+      at: new Date().toLocaleString("zh-CN", { hour12: false }),
+    };
+  });
 });
 onUnmounted(() => {
   unlistenTrace?.();
   unlistenPtz?.();
   unlistenPreset?.();
+  unlistenOsd?.();
   if (timer) clearInterval(timer);
   if (poseTimer) clearInterval(poseTimer);
   if (osdTimer) clearInterval(osdTimer);
+  if (ptzStopTimer) clearTimeout(ptzStopTimer);
 });
 
 // keep-alive 激活时与引擎对账:以引擎真实状态为准同步 deviceLive(避免切页后按钮态错乱)。
@@ -470,18 +494,28 @@ const metrics = computed(() => [
       </div>
     </div>
 
-    <!-- OSD 叠加预览(FR-35):读 Channels 页保存的 OSD 配置,实时展示叠加效果 -->
-    <div class="glass-card panel osd-panel" v-if="osd.timestamp || osd.channelName || osd.watermark">
-      <div class="panel-title">OSD 叠加预览</div>
-      <div class="osd-preview" :class="'osd-' + osd.size.toLowerCase()">
-        <div class="osd-video">
-          <div class="osd-placeholder">推流画面区域(模拟)</div>
-          <div v-if="osd.timestamp" class="osd-text" :class="'osd-' + osd.timestampPos.toLowerCase()">{{ now }}</div>
-          <div v-if="osd.channelName" class="osd-text" :class="'osd-' + osd.channelNamePos.toLowerCase()">{{ form.channel_name || 'Camera-1' }}</div>
-          <div v-if="osd.watermark" class="osd-watermark" :style="{ opacity: osd.watermarkAlpha }">{{ osd.watermarkText }}</div>
+    <!-- OSD 配置(国标 A.2.3.2.11):展示平台下发的 OSD 设置命令,设备已按其应用 -->
+    <div class="glass-card panel osd-panel">
+      <div class="panel-title">OSD 设置(平台下发)</div>
+      <div v-if="!osd.received" class="osd-empty">
+        等待平台下发 OSD 配置命令(DeviceConfig + OSDConfig)…
+        <div class="fg-hint" style="margin-top:6px">
+          国标中 OSD 是平台→设备的配置命令(时间/信息显示开关)。平台下发后此处显示设备已应用的设置。
         </div>
       </div>
-      <div class="fg-hint">OSD 配置在「多通道目录」页修改,此处为实时预览。推流时 OSD 叠加需 ffmpeg 烧入(当前为预览模式)。</div>
+      <div v-else class="osd-applied">
+        <div class="osd-row">
+          <span class="osd-label">时间叠加显示</span>
+          <span class="osd-badge" :class="osd.time_show ? 'on' : 'off'">{{ osd.time_show ? '开启' : '关闭' }}</span>
+          <span v-if="osd.time_show" class="osd-sample">{{ now }}</span>
+        </div>
+        <div class="osd-row">
+          <span class="osd-label">OSD 信息显示</span>
+          <span class="osd-badge" :class="osd.osd_show ? 'on' : 'off'">{{ osd.osd_show ? '开启' : '关闭' }}</span>
+          <span v-if="osd.osd_show" class="osd-sample">{{ form.channel_name || 'Camera-1' }}</span>
+        </div>
+        <div class="fg-hint">✓ 已应用平台 OSD 配置 · {{ osd.at }} · 设备已回 DeviceConfig 应答</div>
+      </div>
     </div>
 
     <!-- SIP 信令实时追踪(FR-43) -->
@@ -688,34 +722,19 @@ const metrics = computed(() => [
 .trace-sum { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; color: var(--text-primary); }
 .trace-cseq { flex: 0 0 auto; color: var(--text-secondary); }
 
-/* OSD 叠加预览 */
+/* OSD 设置(平台下发) */
 .osd-panel { margin-top: 18px; }
-.osd-preview { margin: 8px 0; }
-.osd-video {
-  position: relative; width: 100%; aspect-ratio: 16/9;
-  background: #0f172a; border-radius: 8px; overflow: hidden;
-  display: flex; align-items: center; justify-content: center;
+.osd-empty { color: var(--text-tertiary); font-size: 13px; padding: 8px 0; }
+.osd-applied { padding: 6px 0; }
+.osd-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; }
+.osd-label { width: 110px; color: var(--text-secondary); font-size: 13px; }
+.osd-badge {
+  font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 10px;
 }
-.osd-placeholder { color: rgba(255,255,255,0.15); font-size: 14px; }
-.osd-text {
-  position: absolute; color: #fff; font-weight: 600;
-  text-shadow: 0 1px 3px rgba(0,0,0,0.7);
-  padding: 4px 8px;
+.osd-badge.on { color: #059669; background: rgba(5,150,105,0.12); }
+.osd-badge.off { color: var(--text-tertiary); background: rgba(120,120,120,0.12); }
+.osd-sample {
+  font-family: monospace; font-size: 13px; color: var(--text-primary);
+  background: #0f172a; color: #fff; padding: 2px 10px; border-radius: 4px;
 }
-.osd-text.osd-top_left { top: 8px; left: 8px; }
-.osd-text.osd-top_right { top: 8px; right: 8px; }
-.osd-text.osd-bottom_left { bottom: 8px; left: 8px; }
-.osd-text.osd-bottom_right { bottom: 8px; right: 8px; }
-.osd-watermark {
-  position: absolute; top: 50%; left: 50%;
-  transform: translate(-50%, -50%) rotate(-30deg);
-  color: rgba(255,255,255,0.25); font-size: 28px; font-weight: 700;
-  white-space: nowrap; pointer-events: none;
-}
-.osd-small .osd-text { font-size: 11px; }
-.osd-small .osd-watermark { font-size: 20px; }
-.osd-medium .osd-text { font-size: 14px; }
-.osd-medium .osd-watermark { font-size: 28px; }
-.osd-large .osd-text { font-size: 18px; }
-.osd-large .osd-watermark { font-size: 36px; }
 </style>

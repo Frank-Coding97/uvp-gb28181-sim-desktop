@@ -36,6 +36,14 @@ pub enum DeviceEvent {
     },
     /// 平台调用预置位(转到某预置位),供 UI 演示摄像头转到目标角度。
     PtzPresetCall { preset: u8 },
+    /// 平台下发 OSD 配置命令(DeviceConfig + OSDConfig),设备已应用。
+    /// 供 UI 展示"平台设置了 OSD、设备已按其设置"(国标 A.2.3.2.11)。
+    OsdConfig {
+        /// 时间显示开关。
+        time_show: bool,
+        /// OSD 信息(通道名等)显示开关。
+        osd_show: bool,
+    },
 }
 
 /// 失败归因(与 docs/20-architecture/data-model.md#4 对齐)。
