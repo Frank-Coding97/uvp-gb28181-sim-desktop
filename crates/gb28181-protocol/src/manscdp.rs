@@ -246,6 +246,18 @@ pub struct Control {
     /// 前端OSD配置。
     #[serde(rename = "OSDConfig", skip_serializing_if = "Option::is_none")]
     pub cfg_osd_config: Option<OSDConfig>,
+    /// 视频参数属性配置(A.2.3.2.5)。
+    #[serde(
+        rename = "VideoParamAttribute",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cfg_video_param_attribute: Option<VideoParamAttribute>,
+    /// SVAC 编码配置(A.2.3.2.3)。
+    #[serde(rename = "SVACEncodeConfig", skip_serializing_if = "Option::is_none")]
+    pub cfg_svac_encode: Option<SvacConfig>,
+    /// SVAC 解码配置(A.2.3.2.4)。
+    #[serde(rename = "SVACDecodeConfig", skip_serializing_if = "Option::is_none")]
+    pub cfg_svac_decode: Option<SvacConfig>,
 }
 
 /// 抓拍配置参数(SnapShotConfig 子元素,GB-2022 §9.5)。
@@ -1427,6 +1439,18 @@ pub struct ConfigDownloadResponse {
     /// 图像抓拍配置(ConfigType=SnapShotConfig 时携带,GB-2022)。
     #[serde(rename = "SnapShotConfig", skip_serializing_if = "Option::is_none")]
     pub snap_shot_config: Option<SnapShotCfg>,
+    /// 视频参数属性(ConfigType=VideoParamAttribute 时携带,GB-2022)。
+    #[serde(
+        rename = "VideoParamAttribute",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub video_param_attribute: Option<VideoParamAttribute>,
+    /// SVAC 编码配置(ConfigType=SVACEncodeConfig 时携带,占位)。
+    #[serde(rename = "SVACEncodeConfig", skip_serializing_if = "Option::is_none")]
+    pub svac_encode_config: Option<SvacConfig>,
+    /// SVAC 解码配置(ConfigType=SVACDecodeConfig 时携带,占位)。
+    #[serde(rename = "SVACDecodeConfig", skip_serializing_if = "Option::is_none")]
+    pub svac_decode_config: Option<SvacConfig>,
 }
 
 /// 视频参数(ConfigDownload/VideoParamOpt 的内容,GB-2022)。
@@ -1439,6 +1463,50 @@ pub struct VideoParamOpt {
     /// 分辨率标签(如 "1920*1080")。
     #[serde(rename = "Resolution")]
     pub resolution: String,
+}
+
+/// 视频参数属性配置(VideoParamAttribute,GB-2022 A.2.1.13/A.2.3.2.5)。
+/// 描述各码流的编码格式/分辨率/帧率/码率。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "VideoParamAttribute")]
+pub struct VideoParamAttribute {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<VideoParamAttributeItem>,
+}
+
+/// 视频参数属性项(某一码流的参数,GB-2022 A.2.1.13)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Item")]
+pub struct VideoParamAttributeItem {
+    /// 视频流编号:0=主码流,1=子码流1,2=子码流2。
+    #[serde(rename = "StreamNumber")]
+    pub stream_number: u32,
+    /// 视频编码格式(SDP f 字段规定)。
+    #[serde(rename = "VideoFormat")]
+    pub video_format: String,
+    /// 分辨率当前配置值。
+    #[serde(rename = "Resolution")]
+    pub resolution: String,
+    /// 帧率当前配置值。
+    #[serde(rename = "FrameRate")]
+    pub frame_rate: String,
+    /// 码率类型配置值。
+    #[serde(rename = "BitRateType")]
+    pub bit_rate_type: String,
+    /// 视频码率(固定码率时携带)。
+    #[serde(rename = "VideoBitRate", skip_serializing_if = "Option::is_none")]
+    pub video_bit_rate: Option<String>,
+}
+
+/// SVAC 编码/解码配置占位(GB-2022 A.2.1.21/22)。
+/// SVAC 结构复杂(ROI 等),平台极少用;此处最小合规占位(仅 Result 语义)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SvacConfig {
+    /// 配置标识占位(1=已配置)。
+    #[serde(rename = "Configured", skip_serializing_if = "Option::is_none")]
+    pub configured: Option<u32>,
 }
 
 /// 录像计划(ConfigDownload/VideoRecordPlan,GB-2022 A.2.3.2.6)。
@@ -1539,6 +1607,9 @@ impl ConfigDownloadResponse {
             alarm_report: None,
             osd_config: None,
             snap_shot_config: None,
+            video_param_attribute: None,
+            svac_encode_config: None,
+            svac_decode_config: None,
         }
     }
 
@@ -1566,6 +1637,9 @@ impl ConfigDownloadResponse {
         let want_alarm_report = lower.contains("alarmreport");
         let want_osd = lower.contains("osdconfig");
         let want_snapshot = lower.contains("snapshotconfig");
+        let want_vpa = lower.contains("videoparamattribute");
+        let want_svac_enc = lower.contains("svacencodeconfig");
+        let want_svac_dec = lower.contains("svacdecodeconfig");
         let device_id = device_id.into();
         ConfigDownloadResponse {
             cmd_type: "ConfigDownload".into(),
@@ -1596,6 +1670,23 @@ impl ConfigDownloadResponse {
             snap_shot_config: want_snapshot.then_some(SnapShotCfg {
                 snap_num: 1,
                 interval: 1,
+            }),
+            video_param_attribute: want_vpa.then(|| VideoParamAttribute {
+                num: 1,
+                items: vec![VideoParamAttributeItem {
+                    stream_number: 0,
+                    video_format: "H.264".into(),
+                    resolution: "1920*1080".into(),
+                    frame_rate: "25".into(),
+                    bit_rate_type: "CBR".into(),
+                    video_bit_rate: Some("4096".into()),
+                }],
+            }),
+            svac_encode_config: want_svac_enc.then_some(SvacConfig {
+                configured: Some(0),
+            }),
+            svac_decode_config: want_svac_dec.then_some(SvacConfig {
+                configured: Some(0),
             }),
         }
     }
@@ -2779,5 +2870,39 @@ mod tests {
             .unwrap();
         assert!(xml.contains("<Name>前门相机</Name>"));
         assert!(xml.contains("<CmdType>RecordInfo</CmdType>"));
+    }
+
+    #[test]
+    fn 配置查询_视频参数属性与svac() {
+        // A.2.3.2.5 VideoParamAttribute 查询返回码流参数。
+        let xml = ConfigDownloadResponse::by_type(
+            "dev",
+            1,
+            "VideoParamAttribute",
+            "cam",
+            3600,
+            60,
+            3,
+            "1920*1080",
+        )
+        .to_xml()
+        .unwrap();
+        assert!(xml.contains("<VideoParamAttribute"));
+        assert!(xml.contains("<StreamNumber>0</StreamNumber>"));
+        // SVAC 编码查询返回占位块。
+        let svac = ConfigDownloadResponse::by_type(
+            "dev",
+            1,
+            "SVACEncodeConfig",
+            "cam",
+            3600,
+            60,
+            3,
+            "1920*1080",
+        )
+        .to_xml()
+        .unwrap();
+        assert!(svac.contains("<SVACEncodeConfig>"));
+        assert!(svac.contains("<Result>OK</Result>"));
     }
 }

@@ -128,6 +128,10 @@
 ### RecordInfo 应答补必选 Name(GB28181-2022 A.2.6.7)
 - A.2.6.7 规定录像检索应答含必选 `<Name>`(设备/区域名称),位于 SumNum 前。`RecordInfoResponse` 补该字段(取设备名)。
 
+### SVAC 编解码/视频参数属性配置(FR-37,GB28181-2022 A.2.3.2.3~5)
+- **VideoParamAttribute**(视频参数属性,A.2.1.13):`Item`(StreamNumber/VideoFormat/Resolution/FrameRate/BitRateType/VideoBitRate)列表。ConfigDownload 查询返回主码流一项;DeviceConfig 修改接受回 OK。
+- **SVACEncodeConfig / SVACDecodeConfig**(SVAC 编解码配置,A.2.1.21/22):SVAC 为国标特有编码,结构复杂(ROI 感兴趣区域等)。设备侧实现为**最小合规**:DeviceConfig 修改接受回 OK;ConfigDownload 查询返回带 Result=OK 的占位块。普通平台(WVP/LiveGBS)极少用,不展开完整 ROI 结构。
+
 ### 标准合规说明(结构偏差取舍)
 以下应答的元素名/结构与 2022 XSD 字面存在差异,但均**据 WVP/上游 uvp-gb28181-sim 真实实现核对并真机验证**,为保证互通**保持现状**(不盲目改标准字面):
 - SDCardStatus 应答(StorageList/CardNum vs 标准 SDCardStatusInfo/ID)
