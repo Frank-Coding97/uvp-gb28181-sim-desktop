@@ -890,6 +890,77 @@ impl DeviceSimulator {
         tracing::info!(interval = secs, "移动位置订阅已建立,开始周期上报");
     }
 
+    /// 启动(或重建)PTZ 精准位置事件订阅的周期上报任务(GB28181-2022 §9.11.2)。
+    ///
+    /// 平台 `SUBSCRIBE + PTZPosition`(携 Interval)后调用:按 interval 秒周期发
+    /// PTZ 精准状态 NOTIFY(独立 MESSAGE,复用 PTZPosition 应答体)。真实设备应在姿态
+    /// 变化时触发;模拟器按周期上报当前 precise_pose。
+    async fn start_ptz_position_subscription(
+        self: &Arc<Self>,
+        transport: &Arc<UdpTransport>,
+        interval: Option<u64>,
+    ) {
+        let secs = interval.filter(|s| *s > 0).unwrap_or(5);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let sim = Arc::clone(self);
+        let tp = Arc::clone(transport);
+        let local_host = self.local_host();
+        let local_port = self.local_port();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs));
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = ticker.tick() => {
+                        if let Err(e) = sim
+                            .report_ptz_position(&tp, &local_host, local_port)
+                            .await
+                        {
+                            tracing::warn!(error=%e, "PTZ 精准位置订阅周期上报失败");
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut subs = self.subscriptions.lock().await;
+        subs.insert(
+            "PTZPosition".to_string(),
+            Subscription {
+                _task: task,
+                stop_tx,
+            },
+        );
+        tracing::info!(interval = secs, "PTZ 精准位置订阅已建立,开始周期上报");
+    }
+
+    /// 主动上报一条 PTZ 精准状态 NOTIFY(GB28181-2022 §9.11.2)。
+    /// 复用 PTZPosition 应答体(Pan/Tilt/Zoom),独立 MESSAGE fire-and-forget。
+    pub async fn report_ptz_position(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+    ) -> Result<()> {
+        let sn = self.next_cseq();
+        let (pan, tilt, zoom) = self
+            .control_state
+            .lock()
+            .map(|s| s.precise_pose)
+            .unwrap_or((0.0, 0.0, 1.0));
+        let notify = gb28181_protocol::manscdp::PtzPreciseStatusResponse::new(
+            self.config.device_id.as_str(),
+            sn,
+            pan,
+            tilt,
+            zoom,
+        );
+        let xml = notify.to_xml()?;
+        self.send_message_xml_oneshot(transport, local_host, local_port, &xml)
+            .await
+    }
+
     /// 停止全部活跃订阅(设备下线/重注册时调,避免残留周期任务)。
     async fn stop_subscriptions(&self) {
         let mut subs = self.subscriptions.lock().await;
@@ -1027,6 +1098,12 @@ impl DeviceSimulator {
                                 "Alarm" => {
                                     *self.alarm_dialog.lock().await = Some((dialog, incoming.from));
                                 }
+                                // PTZ 精准位置事件订阅(GB28181-2022 §9.11.1/9.11.2):
+                                // 启动周期 PTZ 精准状态 NOTIFY(独立 MESSAGE 路径,与位置订阅一致)。
+                                "PTZPosition" => {
+                                    self.start_ptz_position_subscription(transport, query.interval)
+                                        .await;
+                                }
                                 _ => {}
                             }
                         }
@@ -1072,6 +1149,12 @@ impl DeviceSimulator {
                                 .and_then(|(_, v)| v.trim().parse::<f32>().ok())
                         })
                         .unwrap_or(1.0);
+                    // 取 Range 行(拖动定位,§9.8):`Range: npt=<start>-<end>`。
+                    // start 为回放起点秒偏移;按 INVITE t= 时间段折算千分比位置。
+                    if let Some(permille) = Self::parse_range_permille(body) {
+                        session.control.seek_permille(permille);
+                        tracing::info!(permille, "回放控制:拖动定位");
+                    }
                     session.control.set_speed(scale);
                     session.control.resume();
                     tracing::info!(scale, "回放控制:播放/倍速");
@@ -1081,6 +1164,29 @@ impl DeviceSimulator {
         let resp = sip_core::SipMessage::Response(builder::response_ok(req));
         transport.send_to(&resp, from).await?;
         Ok(true)
+    }
+
+    /// 解析 MANSRTSP PLAY 的 `Range: npt=<start>-<end>` 头,折算为流内千分比位置(0..=1000)。
+    ///
+    /// GB28181 回放拖动:npt 为回放起点秒偏移。模拟器循环推短文件,无真实录像时间轴,
+    /// 故把 start 对一个名义 3600s 时间窗取模折算千分比(保证拖动可见地改变起播位置)。
+    /// 返回 None 表示无 Range 或无法解析。
+    fn parse_range_permille(body: &str) -> Option<u32> {
+        let range = body.lines().find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("Range"))
+                .map(|(_, v)| v.trim().to_string())
+        })?;
+        // 形如 "npt=10-" / "npt=10-20" / "npt=now-"。取 start。
+        let npt = range.split_once('=').map(|(_, v)| v).unwrap_or(&range);
+        let start = npt.split('-').next()?.trim();
+        if start.eq_ignore_ascii_case("now") {
+            return None; // now 表示从当前继续,不定位。
+        }
+        let secs: f64 = start.parse().ok()?;
+        // 名义 3600s 窗口取模 → 千分比。
+        let permille = ((secs.rem_euclid(3600.0) / 3600.0) * 1000.0) as u32;
+        Some(permille.min(1000))
     }
 
     /// 处理 Query,返回应答 XML。
@@ -2160,6 +2266,23 @@ mod tests {
         assert!(
             !xml16.contains("SecurityLevelCode"),
             "2016 不应含 2022 新增字段"
+        );
+    }
+
+    #[test]
+    fn 回放range解析折算千分比() {
+        // npt=1800- → 1800/3600 = 500‰。
+        let p = DeviceSimulator::parse_range_permille("PLAY MANSRTSP/1.0\r\nRange: npt=1800-\r\n");
+        assert_eq!(p, Some(500));
+        // npt=now- → 不定位。
+        assert_eq!(
+            DeviceSimulator::parse_range_permille("PLAY MANSRTSP/1.0\r\nRange: npt=now-\r\n"),
+            None
+        );
+        // 无 Range → None。
+        assert_eq!(
+            DeviceSimulator::parse_range_permille("PLAY MANSRTSP/1.0\r\nScale: 2.0\r\n"),
+            None
         );
     }
 
