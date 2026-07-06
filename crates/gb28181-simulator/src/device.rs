@@ -1291,7 +1291,10 @@ impl DeviceSimulator {
             || ctrl.cfg_picture_mask.is_some()
             || ctrl.cfg_frame_mirror.is_some()
             || ctrl.cfg_alarm_report.is_some()
-            || ctrl.cfg_osd_config.is_some();
+            || ctrl.cfg_osd_config.is_some()
+            || ctrl.cfg_video_param_attribute.is_some()
+            || ctrl.cfg_svac_encode.is_some()
+            || ctrl.cfg_svac_decode.is_some();
         if ctrl.cfg_basic_param.is_some() {
             tracing::info!("设备配置:基本参数(模拟接受)");
         }

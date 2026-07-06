@@ -89,7 +89,8 @@
 | 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
 | 语音广播 | Broadcast | P2 | 🟡 握手已实现:解析 Broadcast Notify(SourceID/TargetID)→ 回 Broadcast Response(TargetID 属本设备 OK,否则 ERROR+Reason);接受后构造反向 INVITE 的 SDP offer(a=recvonly / PCMA+PCMU / y=ssrc)。**反向 INVITE 事务与音频 RTP 接收/ACK/BYE 链路本 WVP 环境无法触发验证,未实装收流**(FR-36,握手+SDP 单测) |
 | 设备配置查询 | ConfigDownload / BasicParam + VideoParamOpt | P2 | 🟢 回 200 + ConfigDownload Response,支持 BasicParam(Name/Expiration/HeartBeat*)与 VideoParamOpt(DownloadSpeed/Resolution)按 ConfigType 组合输出(FR-17) |
-| 设备配置查询扩展 | ConfigDownload / SVACEncodeConfig + SVACDecodeConfig + VideoParamAttribute + VideoRecordPlan + VideoAlarmRecord + PictureMask + FrameMirror + AlarmReport + OSDConfig + SnapShotConfig | P2 | ⬜ GB28181-2022 附录 A.2.4.7 定义的完整 ConfigType 列表,当前仅实现 BasicParam + VideoParamOpt |
+| 设备配置查询扩展 | ConfigDownload / 全 ConfigType | P2 | 🟢 GB28181-2022 A.2.4.7 全部 ConfigType:BasicParam/VideoParamOpt/VideoParamAttribute/VideoRecordPlan/VideoAlarmRecord/PictureMask/FrameMirror/AlarmReport/OSDConfig/SnapShotConfig 完整;SVACEncodeConfig/SVACDecodeConfig 最小合规占位(FR-37,单测) |
+| 设备配置修改 | DeviceConfig / 全配置项 | P2 | 🟢 A.2.3.2 全部配置命令接受回 DeviceConfig 应答(A.2.6.8);含 SVAC/VideoParamAttribute(FR-37) |
 | 预置位查询 | PresetQuery | P2 | ✅ 返回有状态预置位表(随预置位设置/删除动态变),实 SIP 注入验证 |
 | 报警状态查询 | AlarmStatus | P1 | 🟢 GB-2022 每报警通道 DutyStatus(ALARM/OFFDUTY)/ GB-2016 NotNumber,随布防态动态(FR-17,单测) |
 | 看守位查询 | HomePositionQuery | P1 | 🟢 Enabled/ResetTime(固定30)/PresetIndex(有无看守位标志)(FR-17,单测) |
