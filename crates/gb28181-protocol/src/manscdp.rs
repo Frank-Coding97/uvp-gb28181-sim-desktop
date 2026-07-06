@@ -1365,16 +1365,16 @@ impl RecordInfoResponse {
 #[serde(rename = "BasicParam")]
 pub struct BasicParam {
     /// 设备名称。
-    #[serde(rename = "Name")]
+    #[serde(rename = "Name", default)]
     pub name: String,
-    /// 注册有效期(秒)。
-    #[serde(rename = "Expiration")]
+    /// 注册有效期(秒)。配置修改命令可只带部分字段,故默认 0。
+    #[serde(rename = "Expiration", default)]
     pub expiration: u32,
     /// 心跳间隔(秒)。
-    #[serde(rename = "HeartBeatInterval")]
+    #[serde(rename = "HeartBeatInterval", default)]
     pub heartbeat_interval: u32,
     /// 心跳超时次数(连续未应答判定掉线的阈值)。
-    #[serde(rename = "HeartBeatCount")]
+    #[serde(rename = "HeartBeatCount", default)]
     pub heartbeat_count: u32,
 }
 

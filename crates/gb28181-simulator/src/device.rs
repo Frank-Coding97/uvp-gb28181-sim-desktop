@@ -328,6 +328,12 @@ impl DeviceSimulator {
         &self.config
     }
 
+    /// 设置本端信令地址(仅供测试/非 run 场景手动注入应答用;run() 会自动设置)。
+    #[doc(hidden)]
+    pub fn set_local_addr_for_test(&self, host: &str, port: u16) {
+        let _ = self.local_addr.set((host.to_string(), port));
+    }
+
     /// 载入一个内置目录模板(single/nvr-8ch/civil-3x2/large-16ch),替换现有目录树(FR-34)。
     pub fn load_catalog_template(&self, template: &str) {
         let tree = gb28181_protocol::id_codec::catalog_template(
@@ -535,6 +541,28 @@ impl DeviceSimulator {
         Ok(result?.status)
     }
 
+    /// 发送一条通知 MESSAGE 但**不等待响应**(fire-and-forget)。
+    ///
+    /// 用于纯告知性、平台可能不 ACK 的通知(如 VideoUploadNotify —— 部分平台
+    /// 不支持该 CmdType 直接丢弃)。发出即返回,不因平台不响应而阻塞重传。
+    async fn send_message_xml_oneshot(
+        &self,
+        transport: &Arc<UdpTransport>,
+        local_host: &str,
+        local_port: u16,
+        xml: &str,
+    ) -> Result<()> {
+        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
+            .parse()
+            .map_err(|_| Error::Config("平台地址非法".into()))?;
+        let ids = DialogIds::new();
+        let cseq = self.next_cseq();
+        let req = builder::message_xml(&self.config, &ids, cseq, local_host, local_port, xml);
+        transport
+            .send_to(&sip_core::SipMessage::Request(req), dst)
+            .await
+    }
+
     /// 发送一次心跳(MESSAGE + Keepalive XML)。返回平台响应状态码。
     pub async fn send_keepalive(
         &self,
@@ -608,13 +636,16 @@ impl DeviceSimulator {
     }
 
     /// 主动上报实时视音频回传通知(VideoUploadNotify,GB28181-2022 A.2.5.8)。
-    /// 设备 → 平台独立 MESSAGE,携带当前位置。返回平台响应状态码。
+    /// 设备 → 平台独立 MESSAGE,携带当前位置。
+    ///
+    /// **fire-and-forget**:该通知为告知性,部分平台(如 WVP)不支持此 CmdType 会
+    /// 直接丢弃不回 200,故不等待响应,发出即返回,避免无谓的事务重传阻塞。
     pub async fn report_video_upload(
         &self,
         transport: &Arc<UdpTransport>,
         local_host: &str,
         local_port: u16,
-    ) -> Result<u16> {
+    ) -> Result<()> {
         let sn = self.next_cseq();
         let time = common::clock::synced_iso8601();
         let pos = self.position.lock().map(|p| *p).ok();
@@ -625,7 +656,7 @@ impl DeviceSimulator {
             pos,
         );
         let xml = notify.to_xml()?;
-        self.send_message_xml(transport, local_host, local_port, &xml)
+        self.send_message_xml_oneshot(transport, local_host, local_port, &xml)
             .await
     }
 
