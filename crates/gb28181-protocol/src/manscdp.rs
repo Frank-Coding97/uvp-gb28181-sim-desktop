@@ -726,10 +726,20 @@ pub struct ControlResponse {
 }
 
 impl ControlResponse {
-    /// 构造 OK 应答。
+    /// 构造 DeviceControl OK 应答。
     pub fn ok(device_id: impl Into<String>, sn: u32) -> Self {
         ControlResponse {
             cmd_type: "DeviceControl".into(),
+            sn,
+            device_id: device_id.into(),
+            result: "OK".into(),
+        }
+    }
+
+    /// 构造 DeviceConfig OK 应答(GB28181-2022 A.2.6.8:CmdType=DeviceConfig)。
+    pub fn config_ok(device_id: impl Into<String>, sn: u32) -> Self {
+        ControlResponse {
+            cmd_type: "DeviceConfig".into(),
             sn,
             device_id: device_id.into(),
             result: "OK".into(),
@@ -2645,5 +2655,15 @@ mod tests {
         assert!(xml.contains("<Pan>123.46</Pan>"));
         assert!(xml.contains("<Tilt>-15.00</Tilt>"));
         assert!(xml.contains("<Zoom>3.50</Zoom>"));
+    }
+
+    #[test]
+    fn 设备配置应答cmdtype为deviceconfig() {
+        // A.2.6.8:DeviceConfig 应答 CmdType 须为 DeviceConfig,区别于 DeviceControl。
+        let xml = ControlResponse::config_ok("dev", 7).to_xml().unwrap();
+        assert!(xml.contains("<CmdType>DeviceConfig</CmdType>"));
+        assert!(xml.contains("<Result>OK</Result>"));
+        let ctrl = ControlResponse::ok("dev", 7).to_xml().unwrap();
+        assert!(ctrl.contains("<CmdType>DeviceControl</CmdType>"));
     }
 }

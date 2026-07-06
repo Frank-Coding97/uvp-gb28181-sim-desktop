@@ -1256,6 +1256,15 @@ impl DeviceSimulator {
         }
         // DeviceConfig 控制命令(GB28181-2022 A.2.3.2):设备配置修改。
         // 模拟器接受所有配置修改并回 OK,实际不改变设备行为(仅记录日志)。
+        // CmdType=DeviceConfig 时应答须为 DeviceConfig(A.2.6.8),而非 DeviceControl。
+        let is_device_config = ctrl.cmd_type == "DeviceConfig"
+            || ctrl.cfg_basic_param.is_some()
+            || ctrl.cfg_video_record_plan.is_some()
+            || ctrl.cfg_video_alarm_record.is_some()
+            || ctrl.cfg_picture_mask.is_some()
+            || ctrl.cfg_frame_mirror.is_some()
+            || ctrl.cfg_alarm_report.is_some()
+            || ctrl.cfg_osd_config.is_some();
         if ctrl.cfg_basic_param.is_some() {
             tracing::info!("设备配置:基本参数(模拟接受)");
         }
@@ -1277,7 +1286,11 @@ impl DeviceSimulator {
         if ctrl.cfg_osd_config.is_some() {
             tracing::info!("设备配置:前端OSD(模拟接受)");
         }
-        let resp = gb28181_protocol::manscdp::ControlResponse::ok(&ctrl.device_id, ctrl.sn);
+        let resp = if is_device_config {
+            gb28181_protocol::manscdp::ControlResponse::config_ok(&ctrl.device_id, ctrl.sn)
+        } else {
+            gb28181_protocol::manscdp::ControlResponse::ok(&ctrl.device_id, ctrl.sn)
+        };
         resp.to_xml()
     }
 
