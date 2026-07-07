@@ -907,6 +907,8 @@ impl DeviceSimulator {
         let tp = Arc::clone(transport);
         let local_host = self.local_host();
         let local_port = self.local_port();
+        let notify_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = notify_count.clone();
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs));
             loop {
@@ -918,6 +920,13 @@ impl DeviceSimulator {
                             .await
                         {
                             tracing::warn!(error=%e, "PTZ 精准位置订阅周期上报失败");
+                        } else {
+                            let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            sim.observer.on_event(common::DeviceEvent::SubscriptionChanged {
+                                kind: "PTZPosition".into(),
+                                active: true,
+                                notify_count: n,
+                            });
                         }
                     }
                 }
@@ -932,6 +941,12 @@ impl DeviceSimulator {
                 stop_tx,
             },
         );
+        self.observer
+            .on_event(common::DeviceEvent::SubscriptionChanged {
+                kind: "PTZPosition".into(),
+                active: true,
+                notify_count: 0,
+            });
         tracing::info!(interval = secs, "PTZ 精准位置订阅已建立,开始周期上报");
     }
 
@@ -1004,6 +1019,12 @@ impl DeviceSimulator {
                                 let xml = self.handle_control(&ctrl).await?;
                                 self.send_reply_message(transport, incoming.from, &xml)
                                     .await?;
+                                // 平台命令时间线:上报语义摘要(控制类)。
+                                self.observer
+                                    .on_event(common::DeviceEvent::PlatformCommand {
+                                        kind: "control".into(),
+                                        summary: format!("平台控制:{} → 已应答 OK", ctrl.kind()),
+                                    });
                                 // 抓拍/升级等需设备主动发 NOTIFY 的命令:回 200/结果后异步执行。
                                 self.spawn_control_side_effects(transport, &ctrl);
                             }
@@ -1013,12 +1034,23 @@ impl DeviceSimulator {
                                 gb28181_protocol::manscdp::BroadcastNotify::parse(body_str)
                             {
                                 self.handle_broadcast(transport, &bc, incoming.from).await?;
+                                self.observer
+                                    .on_event(common::DeviceEvent::PlatformCommand {
+                                        kind: "broadcast".into(),
+                                        summary: "平台语音广播请求 → 已应答".into(),
+                                    });
                             }
                         } else if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str)
                         {
                             if let Ok(xml) = self.handle_query(&query) {
                                 self.send_reply_message(transport, incoming.from, &xml)
                                     .await?;
+                                // 平台命令时间线:上报语义摘要(查询类)。
+                                self.observer
+                                    .on_event(common::DeviceEvent::PlatformCommand {
+                                        kind: "query".into(),
+                                        summary: self.query_summary(&query.cmd_type),
+                                    });
                             }
                         }
                     }
@@ -1187,6 +1219,36 @@ impl DeviceSimulator {
         // 名义 3600s 窗口取模 → 千分比。
         let permille = ((secs.rem_euclid(3600.0) / 3600.0) * 1000.0) as u32;
         Some(permille.min(1000))
+    }
+
+    /// 查询命令的人类可读摘要(供 UI 命令时间线)。
+    fn query_summary(&self, cmd_type: &str) -> String {
+        let ch_count = {
+            let tree = self.catalog_tree.lock().unwrap();
+            if tree.is_empty() {
+                self.config.channels.len()
+            } else {
+                tree.iter()
+                    .filter(|n| {
+                        n.node_type == gb28181_protocol::id_codec::CatalogNodeType::VideoChannel
+                    })
+                    .count()
+            }
+        };
+        match cmd_type {
+            "Catalog" => format!("查询目录 → 回 {ch_count} 通道"),
+            "DeviceInfo" => "查询设备信息 → 已应答".into(),
+            "DeviceStatus" => "查询设备状态 → 在线".into(),
+            "RecordInfo" => "检索录像 → 回录像列表".into(),
+            "ConfigDownload" => "查询设备配置 → 已应答".into(),
+            "PresetQuery" => "查询预置位 → 回预置位列表".into(),
+            "HomePositionQuery" => "查询看守位 → 已应答".into(),
+            "SDCardStatus" => "查询存储卡状态 → 已应答".into(),
+            "CruiseTrackListQuery" => "查询巡航轨迹列表 → 已应答".into(),
+            "CruiseTrackQuery" => "查询巡航轨迹 → 已应答".into(),
+            "PTZPosition" => "查询 PTZ 精准状态 → 已应答".into(),
+            other => format!("查询 {other} → 已应答"),
+        }
     }
 
     /// 处理 Query,返回应答 XML。
@@ -1685,6 +1747,18 @@ impl DeviceSimulator {
                 let _ = self.send_message_xml(transport, &h, p, &xml).await;
             }
             tracing::info!(percent, "在线升级进度");
+            let step = match percent {
+                0 => 1,
+                30 => 2,
+                60 => 3,
+                _ => 4,
+            };
+            self.observer.on_event(common::DeviceEvent::Progress {
+                kind: "upgrade".into(),
+                current: step,
+                total: 4,
+                percent: percent as u32,
+            });
             if percent < 100 {
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             }
@@ -1728,6 +1802,12 @@ impl DeviceSimulator {
                 }
                 Err(e) => tracing::warn!(error = %e, url, "抓拍上传失败"),
             }
+            self.observer.on_event(common::DeviceEvent::Progress {
+                kind: "snapshot".into(),
+                current: idx,
+                total: num,
+                percent: idx * 100 / num,
+            });
             if idx < num && cfg.interval > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(cfg.interval as u64)).await;
             }
@@ -1876,6 +1956,18 @@ impl DeviceSimulator {
             });
         }
         drop(sess_guard);
+        let mode = if platform_sdp.is_download() {
+            "下载"
+        } else if platform_sdp.is_playback() {
+            "回放"
+        } else {
+            "点播"
+        };
+        self.observer
+            .on_event(common::DeviceEvent::PlatformCommand {
+                kind: "invite".into(),
+                summary: format!("平台{mode} INVITE → 200 OK,开始推流"),
+            });
         Ok(true)
     }
 
