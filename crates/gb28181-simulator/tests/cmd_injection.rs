@@ -17,6 +17,7 @@ fn cfg() -> DeviceConfig {
         server_domain: "3402000000".into(),
         transport: Transport::Udp,
         gb_version: GbVersion::V2022,
+        signaling_encoding: common::SignalingEncoding::Gb18030,
         heartbeat_interval_secs: 60,
         channels: vec![ChannelConfig {
             channel_id: DeviceId::new("34020000001320000001").unwrap(),

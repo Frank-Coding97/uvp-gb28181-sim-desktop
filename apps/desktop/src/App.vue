@@ -37,7 +37,7 @@ const profileOptions = computed(() =>
   profiles.value.map((p) => ({ label: `${p.name}  (${p.server_host}:${p.server_port})`, value: p.id }))
 );
 // 顶栏编辑弹层用的临时表单。
-const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP" });
+const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP", signaling_encoding: "GB18030" });
 function openEdit() {
   if (active.value) Object.assign(editForm.value, active.value);
 }
@@ -46,10 +46,14 @@ function saveEdit() {
 }
 function addNew() {
   addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
-    server_domain: "34020000002000000001", password: "12345678", transport: "UDP" });
+    server_domain: "34020000002000000001", password: "12345678", transport: "UDP", signaling_encoding: "GB18030" });
   openEdit();
 }
 const transportOptions = [{ label: "UDP", value: "UDP" }, { label: "TCP", value: "TCP" }];
+const encodingOptions = [
+  { label: "GB18030(国标默认)", value: "GB18030" },
+  { label: "UTF-8", value: "UTF-8" },
+];
 
 const activeKey = computed(() => route.path);
 function onMenuSelect(key: string) {
@@ -152,6 +156,7 @@ const themeOverrides = {
                       <n-input v-model:value="editForm.server_domain" size="small" placeholder="平台域 ID" />
                       <n-input v-model:value="editForm.password" size="small" type="password" show-password-on="click" placeholder="SIP 密码" />
                       <n-select v-model:value="editForm.transport" size="small" :options="transportOptions" />
+                      <n-select v-model:value="editForm.signaling_encoding" size="small" :options="encodingOptions" />
                       <div class="pe-actions">
                         <n-button size="small" type="primary" @click="saveEdit">保存</n-button>
                         <n-button size="small" @click="addNew">+ 新增</n-button>

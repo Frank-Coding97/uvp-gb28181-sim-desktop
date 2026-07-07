@@ -91,6 +91,7 @@ async function startDevice() {
     const config = {
       server_host: p.server_host, server_port: p.server_port,
       server_domain: p.server_domain, password: p.password, transport: p.transport,
+      signaling_encoding: p.signaling_encoding ?? "GB18030",
       ...form.value,
       video_source: form.value.video_source.trim() || null,
     };

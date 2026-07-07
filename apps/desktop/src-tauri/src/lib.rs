@@ -19,6 +19,8 @@ struct AppState {
     stop_tx: Mutex<Option<broadcast::Sender<()>>>,
     /// 当前压测的实时指标；None 表示空闲。
     metrics: Mutex<Option<Arc<Metrics>>>,
+    /// 最近一次压测的指标快照(停止后保留,供导出报告)。
+    last_metrics: Mutex<Option<stress_engine::MetricsSnapshot>>,
     /// 最近一次启动使用的场景 TOML 与设备数（报告导出用）。
     last_scenario: Mutex<Option<(String, usize)>>,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
@@ -39,6 +41,7 @@ impl AppState {
         AppState {
             stop_tx: Mutex::new(None),
             metrics: Mutex::new(None),
+            last_metrics: Mutex::new(None),
             last_scenario: Mutex::new(None),
             device: Mutex::new(None),
         }
@@ -260,7 +263,10 @@ async fn stop_stress(state: tauri::State<'_, AppState>) -> Result<String, String
     match stop_guard.take() {
         Some(tx) => {
             let _ = tx.send(());
-            *state.metrics.lock().await = None;
+            // 停止前保留最后指标快照(供停止后导出报告)。
+            if let Some(m) = state.metrics.lock().await.take() {
+                *state.last_metrics.lock().await = Some(m.snapshot());
+            }
             Ok("压测已停止".into())
         }
         None => Err("没有正在运行的压测".into()),
@@ -302,9 +308,13 @@ async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_js
 /// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
 #[tauri::command]
 async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    // 优先取运行中指标,否则取最近一次压测保留的快照。
     let snap = match &*state.metrics.lock().await {
         Some(m) => m.snapshot(),
-        None => return Err("无压测数据可导出".into()),
+        None => match &*state.last_metrics.lock().await {
+            Some(s) => s.clone(),
+            None => return Err("无压测数据可导出(尚未运行过压测)".into()),
+        },
     };
     let scenario = state.last_scenario.lock().await.clone();
 
@@ -350,6 +360,9 @@ struct DeviceCfg {
     /// 目录模板(single/nvr-8ch/civil-3x2/large-16ch);空则用默认单通道。
     #[serde(default)]
     catalog_template: String,
+    /// 信令字符集编码(GB18030/UTF-8);空则默认 GB18030。
+    #[serde(default)]
+    signaling_encoding: String,
 }
 
 /// 通过"向平台发起 UDP connect"发现本机对外 IP(不真正发包)。
@@ -418,6 +431,7 @@ async fn start_device(
         video_fps: 25,
         light_bitrate_kbps: None,
         gb_version,
+        signaling_encoding: common::SignalingEncoding::from_str_lenient(&config.signaling_encoding),
     };
 
     // 预热视频源:容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会阻塞

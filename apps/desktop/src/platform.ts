@@ -10,6 +10,7 @@ export interface PlatformProfile {
   server_domain: string;
   password: string;
   transport: string; // "UDP" | "TCP"
+  signaling_encoding?: string; // "GB18030"(默认) | "UTF-8"
 }
 
 const STORE_KEY = "uvp_platform_profiles";
@@ -25,6 +26,7 @@ function defaultProfiles(): PlatformProfile[] {
       server_domain: "3502000000",
       password: "wvp_sip_password",
       transport: "UDP",
+      signaling_encoding: "GB18030",
     },
     {
       id: "local",
@@ -34,6 +36,7 @@ function defaultProfiles(): PlatformProfile[] {
       server_domain: "34020000002000000001",
       password: "12345678",
       transport: "UDP",
+      signaling_encoding: "GB18030",
     },
   ];
 }

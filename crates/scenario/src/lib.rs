@@ -166,6 +166,8 @@ impl Scenario for LinearScenario {
                 video_fps: self.video_fps,
                 light_bitrate_kbps,
                 gb_version: self.gb_version,
+                // 压测默认 GB18030(国标 §6.10);中文通道名不乱码。
+                signaling_encoding: common::SignalingEncoding::default(),
             });
         }
         Ok(configs)

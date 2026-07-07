@@ -56,6 +56,36 @@ impl fmt::Display for GbVersion {
     }
 }
 
+/// 信令字符集编码(GB/T 28181-2022 §6.10 规定 GB18030;部分平台兼容 UTF-8)。
+/// 决定 MANSCDP XML 体的字节编码与 `<?xml encoding=...?>` 声明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SignalingEncoding {
+    /// GB18030(国标 §6.10 规定,默认)。中文用双/四字节。
+    #[default]
+    Gb18030,
+    /// UTF-8(部分平台兼容)。
+    Utf8,
+}
+
+impl SignalingEncoding {
+    /// XML 声明里的 encoding 值。
+    pub fn xml_name(&self) -> &'static str {
+        match self {
+            SignalingEncoding::Gb18030 => "GB18030",
+            SignalingEncoding::Utf8 => "UTF-8",
+        }
+    }
+
+    /// 从字符串解析(大小写/连字符不敏感);未知回退 GB18030。
+    pub fn from_str_lenient(s: &str) -> Self {
+        let k = s.to_ascii_uppercase().replace(['-', '_'], "");
+        match k.as_str() {
+            "UTF8" => SignalingEncoding::Utf8,
+            _ => SignalingEncoding::Gb18030,
+        }
+    }
+}
+
 /// GB28181 设备/通道国标 ID。
 ///
 /// 20 位数字:中心编码(8) + 行业(2) + 类型(3) + 序号(7)。
