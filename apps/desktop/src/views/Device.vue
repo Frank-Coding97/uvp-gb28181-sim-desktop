@@ -25,13 +25,13 @@ async function pickVideoSource() {
   }
 }
 
+// 平台连接参数(server_host/port/domain/password/transport)来自顶栏全局平台档案,
+// 本页只管设备自身参数(设备 ID/版本/通道/视频源/模板)。
+import { usePlatform } from "../platform";
+const { active: activePlatform } = usePlatform();
+
 const form = ref({
-  server_host: "192.168.10.222",
-  server_port: 8160,
-  server_domain: "3502000000",
   device_id: "35020000001310000001",
-  password: "wvp_sip_password",
-  transport: "UDP",
   gb_version: "2022",
   channel_name: "Camera-1",
   video_source: "",
@@ -46,8 +46,6 @@ const startedAt = inject<Ref<number | null>>("deviceStartedAt", ref<number | nul
 const uptime = ref("--:--:--");
 let timer: number | null = null;
 
-// 认证密码显示/隐藏切换。
-const showPassword = ref(false);
 
 // OSD 配置状态:反映**平台下发的 OSD 配置命令**(国标 A.2.3.2.11),设备已按其设置。
 // 非本地随意填写——osd_config 事件由后端在收到平台 DeviceConfig+OSDConfig 时推来。
@@ -87,7 +85,15 @@ function fmtUptime() {
 
 async function startDevice() {
   try {
-    const config = { ...form.value, video_source: form.value.video_source.trim() || null };
+    const p = activePlatform.value;
+    if (!p) { message.error("请先在顶栏配置目标平台"); return; }
+    // 合并全局平台参数 + 本页设备参数。
+    const config = {
+      server_host: p.server_host, server_port: p.server_port,
+      server_domain: p.server_domain, password: p.password, transport: p.transport,
+      ...form.value,
+      video_source: form.value.video_source.trim() || null,
+    };
     const msg = await invoke<string>("start_device", { config });
     // 设备实例已在后台运行(可能仍在注册/重试),允许注销。
     deviceLive.value = true;
@@ -115,6 +121,32 @@ async function fireAlarm() {
 async function firePosition() {
   try { message.success(await invoke<string>("fire_position", { longitude: 116.397, latitude: 39.908 })); }
   catch (e) { message.error(String(e)); }
+}
+
+// 平台命令时间线 / 活跃订阅 / 长任务进度(展示后端语义事件)。
+interface CmdEntry { kind: string; summary: string; ts_ms: number; }
+const commands = ref<CmdEntry[]>([]);
+const MAX_CMD = 100;
+let unlistenCmd: (() => void) | null = null;
+
+interface SubState { kind: string; active: boolean; notify_count: number; }
+const subs = ref<Record<string, SubState>>({});
+let unlistenSub: (() => void) | null = null;
+
+interface TaskProgress { kind: string; current: number; total: number; percent: number; }
+const progress = ref<TaskProgress | null>(null);
+let unlistenProg: (() => void) | null = null;
+let progHideTimer: number | null = null;
+
+const subList = computed(() => Object.values(subs.value).filter((s) => s.active));
+const kindLabel: Record<string, string> = {
+  query: "查询", control: "控制", invite: "点播", broadcast: "广播",
+  Catalog: "目录", Alarm: "报警", MobilePosition: "移动位置", PTZPosition: "PTZ精准位置",
+  snapshot: "抓拍上传", upgrade: "在线升级",
+};
+function fmtCmdTs(ms: number): string {
+  const d = new Date(ms);
+  return d.toLocaleTimeString("zh-CN", { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
 // SIP 信令追踪(FR-43):订阅 sip_trace 事件,滚动展示最近 N 条。
@@ -293,10 +325,31 @@ onMounted(async () => {
       at: new Date().toLocaleString("zh-CN", { hour12: false }),
     };
   });
+  // 平台命令时间线。
+  unlistenCmd = await listen<CmdEntry>("platform_command", (e) => {
+    commands.value.unshift(e.payload);
+    if (commands.value.length > MAX_CMD) commands.value.splice(MAX_CMD);
+  });
+  // 活跃订阅。
+  unlistenSub = await listen<SubState>("subscription_state", (e) => {
+    subs.value = { ...subs.value, [e.payload.kind]: e.payload };
+  });
+  // 长任务进度(抓拍/升级);完成后 3s 自动隐藏。
+  unlistenProg = await listen<TaskProgress>("task_progress", (e) => {
+    progress.value = e.payload;
+    if (progHideTimer) clearTimeout(progHideTimer);
+    if (e.payload.percent >= 100) {
+      progHideTimer = window.setTimeout(() => { progress.value = null; }, 3000);
+    }
+  });
 });
 onUnmounted(() => {
   unlistenTrace?.();
   unlistenPtz?.();
+  unlistenCmd?.();
+  unlistenSub?.();
+  unlistenProg?.();
+  if (progHideTimer) clearTimeout(progHideTimer);
   unlistenPreset?.();
   unlistenOsd?.();
   if (timer) clearInterval(timer);
@@ -328,7 +381,7 @@ const metrics = computed(() => [
   { label: "注册状态", value: stateMeta.value.text, color: stateMeta.value.color, dot: true },
   { label: "在线时长", value: uptime.value, mono: true },
   { label: "国标版本", value: "GB/T " + form.value.gb_version },
-  { label: "传输协议", value: form.value.transport },
+  { label: "传输协议", value: activePlatform.value?.transport ?? "—" },
 ]);
 </script>
 
@@ -352,31 +405,17 @@ const metrics = computed(() => [
 
     <!-- 双栏配置 -->
     <div class="cols">
-      <!-- SIP 服务器 -->
+      <!-- 目标平台(来自顶栏全局档案,只读回显;改在顶栏"编辑") -->
       <div class="glass-card panel">
-        <div class="panel-title">SIP 服务器</div>
-        <div class="fg">
-          <label>服务器地址</label>
-          <input v-model="form.server_host" class="inp" placeholder="WVP 主机 IP" />
+        <div class="panel-title">目标平台</div>
+        <div class="plat-readonly" v-if="activePlatform">
+          <div class="pr-name">{{ activePlatform.name }}</div>
+          <div class="pr-row"><span>地址</span><b>{{ activePlatform.server_host }}:{{ activePlatform.server_port }}</b></div>
+          <div class="pr-row"><span>平台域</span><b>{{ activePlatform.server_domain }}</b></div>
+          <div class="pr-row"><span>传输</span><b>{{ activePlatform.transport }}</b></div>
+          <div class="fg-hint">平台参数在顶栏"目标平台"处切换/编辑,单设备与压测共用。</div>
         </div>
-        <div class="fg-row">
-          <div class="fg">
-            <label>SIP 端口</label>
-            <input v-model.number="form.server_port" class="inp" type="number" />
-          </div>
-          <div class="fg">
-            <label>服务器域</label>
-            <input v-model="form.server_domain" class="inp" placeholder="如 3502000000" />
-          </div>
-        </div>
-        <div class="fg">
-          <label>传输协议</label>
-          <div class="seg">
-            <button :class="{ on: form.transport === 'UDP' }" @click="form.transport = 'UDP'">UDP</button>
-            <button :class="{ on: form.transport === 'TCP' }" @click="form.transport = 'TCP'">TCP</button>
-          </div>
-        </div>
-        <div class="fg">
+        <div class="fg" style="margin-top: 12px">
           <label>国标版本</label>
           <div class="seg">
             <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">2022</button>
@@ -391,32 +430,7 @@ const metrics = computed(() => [
         <div class="fg">
           <label>设备编号</label>
           <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
-        </div>
-        <div class="fg">
-          <label>认证密码</label>
-          <div class="pwd-wrap">
-            <input
-              v-model="form.password"
-              class="inp"
-              :type="showPassword ? 'text' : 'password'"
-            />
-            <button
-              class="pwd-eye"
-              type="button"
-              :title="showPassword ? '隐藏密码' : '显示密码'"
-              @click="showPassword = !showPassword"
-            >
-              <!-- 睁眼 / 闭眼(带斜杠)图标,交互与平台配置页一致 -->
-              <svg v-if="showPassword" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-              <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-10-7-10-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
-                <line x1="2" y1="2" x2="22" y2="22" />
-              </svg>
-            </button>
-          </div>
+          <div class="fg-hint">SIP 认证密码用顶栏目标平台的密码。</div>
         </div>
         <div class="fg-row">
           <div class="fg">
@@ -518,6 +532,42 @@ const metrics = computed(() => [
       </div>
     </div>
 
+    <!-- 长任务进度(抓拍上传 / 在线升级) -->
+    <div class="glass-card panel" v-if="progress">
+      <div class="panel-title">{{ kindLabel[progress.kind] ?? progress.kind }}进度</div>
+      <div class="prog-wrap">
+        <div class="prog-bar"><div class="prog-fill" :style="{ width: progress.percent + '%' }" /></div>
+        <div class="prog-txt">{{ progress.current }}/{{ progress.total }} · {{ progress.percent }}%</div>
+      </div>
+    </div>
+
+    <!-- 活跃订阅面板 -->
+    <div class="glass-card panel" v-if="subList.length">
+      <div class="panel-title">活跃订阅</div>
+      <div class="sub-list">
+        <div v-for="s in subList" :key="s.kind" class="sub-item">
+          <span class="sub-dot" />
+          <span class="sub-kind">{{ kindLabel[s.kind] ?? s.kind }}</span>
+          <span class="sub-count">已发 NOTIFY {{ s.notify_count }} 次</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 平台命令时间线:平台下发了什么、设备回了什么 -->
+    <div class="glass-card panel">
+      <div class="panel-title">平台命令时间线</div>
+      <div v-if="commands.length === 0" class="cmd-empty">
+        等待平台下发命令(注册后平台会查目录、下发控制等)…
+      </div>
+      <div v-else class="cmd-list">
+        <div v-for="(c, i) in commands" :key="i" class="cmd-item">
+          <span class="cmd-ts">{{ fmtCmdTs(c.ts_ms) }}</span>
+          <span class="cmd-tag" :class="'k-' + c.kind">{{ kindLabel[c.kind] ?? c.kind }}</span>
+          <span class="cmd-sum">{{ c.summary }}</span>
+        </div>
+      </div>
+    </div>
+
     <!-- SIP 信令实时追踪(FR-43) -->
     <div class="glass-card panel trace-panel">
       <div class="trace-head">
@@ -545,6 +595,11 @@ const metrics = computed(() => [
 <style scoped>
 .page { max-width: 1100px; }
 .page-header { margin-bottom: 20px; }
+.plat-readonly { font-size: 13px; }
+.pr-name { font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
+.pr-row { display: flex; gap: 10px; padding: 3px 0; color: var(--text-secondary); }
+.pr-row span { width: 56px; }
+.pr-row b { color: var(--text-primary); font-weight: 500; }
 .page-title { font-size: 24px; font-weight: 700; color: var(--text-primary); }
 .page-sub { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; }
 
@@ -695,6 +750,34 @@ const metrics = computed(() => [
   8px 8px 20px rgba(163,177,198,0.65), -8px -8px 20px rgba(255,255,255,0.9),
   inset 3px 3px 8px rgba(163,177,198,0.5), inset -3px -3px 8px rgba(255,255,255,0.7),
   0 0 0 3px rgba(37,99,235,0.25); }
+
+/* 长任务进度 */
+.prog-wrap { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+.prog-bar { flex: 1; height: 8px; background: rgba(120,120,120,0.15); border-radius: 4px; overflow: hidden; }
+.prog-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.4s; }
+.prog-txt { font-size: 12.5px; color: var(--text-secondary); font-family: monospace; }
+
+/* 活跃订阅面板 */
+.sub-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.sub-item { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
+  background: rgba(5,150,105,0.08); border-radius: 8px; font-size: 13px; }
+.sub-dot { width: 8px; height: 8px; border-radius: 50%; background: #059669;
+  box-shadow: 0 0 0 3px rgba(5,150,105,0.15); }
+.sub-kind { font-weight: 600; color: var(--text-primary); }
+.sub-count { color: var(--text-tertiary); font-size: 12px; }
+
+/* 平台命令时间线 */
+.cmd-empty { color: var(--text-tertiary); font-size: 13px; padding: 12px 0; }
+.cmd-list { margin-top: 8px; max-height: 260px; overflow-y: auto; }
+.cmd-item { display: flex; align-items: center; gap: 10px; padding: 5px 0;
+  border-bottom: 1px solid rgba(120,120,120,0.08); font-size: 12.5px; }
+.cmd-ts { color: var(--text-tertiary); font-family: monospace; font-size: 11.5px; flex-shrink: 0; }
+.cmd-tag { flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 8px;
+  background: rgba(56,132,255,0.12); color: var(--accent); }
+.cmd-tag.k-control { background: rgba(234,88,12,0.12); color: #ea580c; }
+.cmd-tag.k-invite { background: rgba(5,150,105,0.12); color: #059669; }
+.cmd-tag.k-broadcast { background: rgba(139,92,246,0.12); color: #8b5cf6; }
+.cmd-sum { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* SIP 信令追踪面板 */
 .trace-panel { margin-top: 18px; }

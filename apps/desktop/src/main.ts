@@ -8,7 +8,6 @@ import App from "./App.vue";
 import Dashboard from "./views/Dashboard.vue";
 import Device from "./views/Device.vue";
 import Channels from "./views/Channels.vue";
-import Config from "./views/Config.vue";
 import Scenario from "./views/Scenario.vue";
 
 const router = createRouter({
@@ -18,10 +17,10 @@ const router = createRouter({
     { path: "/dashboard", component: Dashboard },
     { path: "/device",    component: Device },
     { path: "/channels",  component: Channels },
-    { path: "/config",    component: Config },
     // 压力测试(场景编排 + 实时监控已合并到一页)。
     { path: "/scenario",  component: Scenario },
     { path: "/monitor",   redirect: "/scenario" }, // 旧路由兼容,重定向到合并页
+    { path: "/config",    redirect: "/device" },   // 平台配置已并入顶栏,旧路由重定向
   ],
 });
 

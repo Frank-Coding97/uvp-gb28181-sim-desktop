@@ -10,10 +10,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as echarts from "echarts";
+import { usePlatform } from "../platform";
+
+// 平台连接参数来自顶栏全局平台档案(与单设备页共用)。
+const { active: activePlatform } = usePlatform();
 
 const message = useMessage();
-
-const STORAGE_KEY = "uvp_platform_config";
 
 // 场景参数。
 const form = ref({
@@ -69,16 +71,11 @@ async function reconcile() {
   } catch { /* 忽略 */ }
 }
 
-function loadPlatformConfig() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  return raw ? JSON.parse(raw) : {
+function buildToml(): string {
+  const p = activePlatform.value ?? {
     server_host: "127.0.0.1", server_port: 5060,
     server_domain: "34020000002000000001", password: "12345678", transport: "UDP",
   };
-}
-
-function buildToml(): string {
-  const p = loadPlatformConfig();
   const lines = [
     `base_device_id = "${form.value.base_device_id}"`,
     `password = "${p.password}"`,
