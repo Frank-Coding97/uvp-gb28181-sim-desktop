@@ -1026,11 +1026,14 @@ impl DeviceSimulator {
                                 let xml = self.handle_control(&ctrl).await?;
                                 self.send_reply_message(transport, incoming.from, &xml)
                                     .await?;
-                                // 平台命令时间线:上报语义摘要(控制类)。
+                                // 平台命令时间线:上报语义摘要(控制类,含方向/变倍/预置位等细节)。
                                 self.observer
                                     .on_event(common::DeviceEvent::PlatformCommand {
                                         kind: "control".into(),
-                                        summary: format!("平台控制:{} → 已应答 OK", ctrl.kind()),
+                                        summary: format!(
+                                            "平台控制:{} → 已应答 OK",
+                                            Self::control_detail(&ctrl)
+                                        ),
                                     });
                                 // 抓拍/升级等需设备主动发 NOTIFY 的命令:回 200/结果后异步执行。
                                 self.spawn_control_side_effects(transport, &ctrl);
@@ -1228,6 +1231,89 @@ impl DeviceSimulator {
         // 名义 3600s 窗口取模 → 千分比。
         let permille = ((secs.rem_euclid(3600.0) / 3600.0) * 1000.0) as u32;
         Some(permille.min(1000))
+    }
+
+    /// 控制命令的详细人类可读摘要(供 UI 命令时间线):方向/变倍/预置位/巡航/辅助等。
+    fn control_detail(ctrl: &gb28181_protocol::manscdp::Control) -> String {
+        use gb28181_protocol::manscdp::{CruiseOp, PresetAction};
+        // PTZ 方向/变倍。
+        if let Some(m) = ctrl.ptz_motion() {
+            if !m.is_stop() {
+                let mut parts = Vec::new();
+                if m.up {
+                    parts.push("上");
+                }
+                if m.down {
+                    parts.push("下");
+                }
+                if m.left {
+                    parts.push("左");
+                }
+                if m.right {
+                    parts.push("右");
+                }
+                if m.zoom_in {
+                    parts.push("放大");
+                }
+                if m.zoom_out {
+                    parts.push("缩小");
+                }
+                let dir = if parts.is_empty() {
+                    "云台动作".to_string()
+                } else {
+                    parts.join("+")
+                };
+                return format!(
+                    "PTZ {dir}(水平{} 垂直{} 变倍{})",
+                    m.pan_speed, m.tilt_speed, m.zoom_speed
+                );
+            }
+            return "PTZ 停止".into();
+        }
+        // 预置位。
+        if let Some((action, idx)) = ctrl.preset_op() {
+            let a = match action {
+                PresetAction::Set => "设置",
+                PresetAction::Call => "调用",
+                PresetAction::Delete => "删除",
+            };
+            return format!("PTZ {a}预置位 {idx}");
+        }
+        // 巡航。
+        if let Some(op) = ctrl.cruise_op() {
+            return match op {
+                CruiseOp::SetPoint { track, preset } => format!("巡航{track}增点(预置{preset})"),
+                CruiseOp::DelPoint { track, preset } => format!("巡航{track}删点(预置{preset})"),
+                CruiseOp::SetSpeed { track, speed } => format!("巡航{track}设速{speed}"),
+                CruiseOp::SetDwell { track, dwell } => format!("巡航{track}停留{dwell}s"),
+                CruiseOp::Start { track } => {
+                    if track == 0 {
+                        "巡航停止".into()
+                    } else {
+                        format!("巡航{track}启动")
+                    }
+                }
+            };
+        }
+        // 辅助控制。
+        if let Some(aux) = ctrl.aux_op() {
+            return format!(
+                "辅助{}{}",
+                aux.function.label(),
+                if aux.on { "开" } else { "关" }
+            );
+        }
+        // 其它:录像/布防/复位/看守位/精准云台/升级/抓拍/配置等,用 kind()。
+        if let Some(v) = ctrl.record_cmd.as_deref() {
+            return format!("录像控制:{v}");
+        }
+        if let Some(g) = &ctrl.guard_cmd {
+            return format!("布防/撤防:{g}");
+        }
+        if let Some(p) = &ctrl.ptz_precise_ctrl {
+            return format!("精确云台 Pan{} Tilt{} Zoom{}", p.pan, p.tilt, p.zoom);
+        }
+        ctrl.kind().to_string()
     }
 
     /// 查询命令的人类可读摘要(供 UI 命令时间线)。
