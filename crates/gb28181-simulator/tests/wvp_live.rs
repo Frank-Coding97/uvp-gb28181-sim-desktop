@@ -17,6 +17,7 @@ fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
         server_domain: "3502000000".into(),
         transport: Transport::Udp,
         gb_version: GbVersion::V2022,
+        signaling_encoding: common::SignalingEncoding::Gb18030,
         heartbeat_interval_secs: 30,
         channels: template_channels,
         device_info: DeviceInfo {

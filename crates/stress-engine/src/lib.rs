@@ -12,6 +12,6 @@
 pub mod metrics;
 pub mod scheduler;
 
-pub use metrics::Metrics;
+pub use metrics::{Metrics, MetricsSnapshot};
 pub use scenario::{LinearScenario, MediaProfile, Scenario};
 pub use scheduler::Orchestrator;

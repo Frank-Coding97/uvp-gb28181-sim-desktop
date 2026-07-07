@@ -13,6 +13,51 @@ pub fn rand_token(prefix: &str) -> String {
     format!("{prefix}{n:016x}")
 }
 
+/// 把 MANSCDP XML(UTF-8 String)按信令编码转为报文体字节(§6.10,修复中文乱码)。
+///
+/// 同时把 `<?xml ... encoding="..."?>` 声明改写为实际编码,保证声明与字节一致
+/// (原代码声明固定 GB2312 但字节是 UTF-8,导致平台解码中文乱码)。
+pub fn encode_xml_body(xml: &str, encoding: common::SignalingEncoding) -> Vec<u8> {
+    // 1) 改写 XML 声明里的 encoding 值以匹配实际编码。
+    let fixed = rewrite_xml_encoding(xml, encoding.xml_name());
+    // 2) 按目标字符集编码字节。
+    match encoding {
+        common::SignalingEncoding::Utf8 => fixed.into_bytes(),
+        common::SignalingEncoding::Gb18030 => {
+            let (bytes, _, _) = encoding_rs::GB18030.encode(&fixed);
+            bytes.into_owned()
+        }
+    }
+}
+
+/// 把 XML 声明的 `encoding="XXX"` 改成给定值;无声明则原样返回。
+fn rewrite_xml_encoding(xml: &str, enc_name: &str) -> String {
+    if let Some(start) = xml.find("encoding=\"") {
+        let val_start = start + "encoding=\"".len();
+        if let Some(rel_end) = xml[val_start..].find('"') {
+            let val_end = val_start + rel_end;
+            let mut out = String::with_capacity(xml.len());
+            out.push_str(&xml[..val_start]);
+            out.push_str(enc_name);
+            out.push_str(&xml[val_end..]);
+            return out;
+        }
+    }
+    xml.to_string()
+}
+
+/// 把入站报文体字节按信令编码解码为 UTF-8 String(供解析)。
+/// 先按声明/配置编码尝试;GB18030 解码兼容 GB2312/ASCII。
+pub fn decode_xml_body(bytes: &[u8], encoding: common::SignalingEncoding) -> String {
+    match encoding {
+        common::SignalingEncoding::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+        common::SignalingEncoding::Gb18030 => {
+            let (text, _, _) = encoding_rs::GB18030.decode(bytes);
+            text.into_owned()
+        }
+    }
+}
+
 /// 构造一次注册所需的会话标识(同一注册事务内 branch/from-tag/call-id 保持一致)。
 #[derive(Debug, Clone)]
 pub struct DialogIds {
@@ -132,7 +177,7 @@ pub fn message_xml(
         method: Method::Message,
         uri: platform_uri(cfg),
         headers,
-        body: xml.as_bytes().to_vec(),
+        body: encode_xml_body(xml, cfg.signaling_encoding),
     }
 }
 
@@ -236,7 +281,7 @@ pub fn notify_in_dialog(
         method: Method::Notify,
         uri: platform_uri(cfg),
         headers,
-        body: xml.as_bytes().to_vec(),
+        body: encode_xml_body(xml, cfg.signaling_encoding),
     }
 }
 
@@ -267,6 +312,7 @@ mod tests {
             video_fps: 25,
             light_bitrate_kbps: None,
             gb_version: common::GbVersion::V2022,
+            signaling_encoding: common::SignalingEncoding::Gb18030,
         }
     }
 
@@ -299,6 +345,23 @@ mod tests {
         assert!(text.contains("Content-Type: Application/MANSCDP+xml"));
         assert!(text.contains("Content-Length: 9"));
         assert!(text.ends_with("<Notify/>"));
+    }
+
+    #[test]
+    fn 中文编码_gb18030与utf8往返() {
+        let xml =
+            "<?xml version=\"1.0\" encoding=\"GB2312\"?>\n<Notify><Name>前门相机</Name></Notify>";
+        // GB18030:声明改写为 GB18030,字节为 GB18030 编码,解码回原文。
+        let g = encode_xml_body(xml, common::SignalingEncoding::Gb18030);
+        assert!(g.windows(7).any(|w| w == b"GB18030"), "声明应含 GB18030");
+        let back = decode_xml_body(&g, common::SignalingEncoding::Gb18030);
+        assert!(back.contains("前门相机"), "GB18030 往返应还原中文");
+        // GB18030 字节与 UTF-8 不同(证明真编码了,非直接塞 UTF-8)。
+        assert_ne!(g, xml.replace("GB2312", "GB18030").into_bytes());
+        // UTF-8:声明改 UTF-8,字节即 UTF-8。
+        let u = encode_xml_body(xml, common::SignalingEncoding::Utf8);
+        assert!(u.windows(5).any(|w| w == b"UTF-8"));
+        assert!(decode_xml_body(&u, common::SignalingEncoding::Utf8).contains("前门相机"));
     }
 
     #[test]

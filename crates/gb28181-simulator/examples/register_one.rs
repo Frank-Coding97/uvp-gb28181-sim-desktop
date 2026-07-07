@@ -84,6 +84,7 @@ async fn main() {
         } else {
             common::GbVersion::V2022
         },
+        signaling_encoding: common::SignalingEncoding::Gb18030,
     };
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。

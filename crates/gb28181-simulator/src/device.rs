@@ -147,6 +147,9 @@ pub struct DeviceConfig {
     pub light_bitrate_kbps: Option<u32>,
     /// GB28181 协议版本(影响 MANSCDP 应答字段集,2022 默认)。
     pub gb_version: common::GbVersion,
+    /// 信令字符集编码(§6.10:GB18030 默认;部分平台用 UTF-8)。
+    /// 决定 MANSCDP XML 体的字节编码与声明,修复中文乱码。
+    pub signaling_encoding: common::SignalingEncoding,
 }
 
 /// 通道配置(对应目录查询中的一个 Item)。
@@ -1011,7 +1014,11 @@ impl DeviceSimulator {
 
                     // body 可能是查询(Query)或控制(Control)。按**根元素**区分,
                     // 不能靠 parse 成功与否(quick-xml 忽略根名,Query 会误吞 Control)。
-                    if let Ok(body_str) = std::str::from_utf8(&req.body) {
+                    // 按信令编码解码(GB18030/UTF-8),修复中文乱码。
+                    {
+                        let body_str =
+                            builder::decode_xml_body(&req.body, self.config.signaling_encoding);
+                        let body_str = body_str.as_str();
                         let is_control =
                             body_str.contains("<Control>") || body_str.contains("<Control ");
                         if is_control {
@@ -1081,8 +1088,10 @@ impl DeviceSimulator {
                     ));
                     transport.send_to(&resp, incoming.from).await?;
 
-                    if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                        if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str) {
+                    {
+                        let body_str =
+                            builder::decode_xml_body(&req.body, self.config.signaling_encoding);
+                        if let Ok(query) = gb28181_protocol::manscdp::Query::parse(&body_str) {
                             // 从 SUBSCRIBE + 本端 tag 构建订阅对话(供对话内 NOTIFY 用)。
                             let dialog = builder::NotifyDialog {
                                 call_id: req.headers.call_id().unwrap_or_default().to_string(),
@@ -2147,6 +2156,7 @@ mod tests {
             video_fps: 25,
             light_bitrate_kbps: None,
             gb_version: common::GbVersion::V2022,
+            signaling_encoding: common::SignalingEncoding::Gb18030,
         }
     }
 
