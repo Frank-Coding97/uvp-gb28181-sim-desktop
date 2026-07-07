@@ -6,7 +6,7 @@ import { computed, h, onMounted, onUnmounted, provide, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
-  NMenu, NIcon, zhCN, dateZhCN,
+  NMenu, NIcon, NPopover, NInput, NInputNumber, NButton, NSelect, zhCN, dateZhCN,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
 import {
@@ -14,6 +14,7 @@ import {
   PulseOutline, GitNetworkOutline,
 } from "@vicons/ionicons5";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { usePlatform } from "./platform";
 
 const route = useRoute();
 const router = useRouter();
@@ -26,9 +27,29 @@ const menuOptions: MenuOption[] = [
   { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
   { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
   { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
-  { label: "平台配置",   key: "/config",    icon: icon(ServerOutline) },
   { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
 ];
+
+// 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
+const { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile } = usePlatform();
+provide("platform", { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile });
+const profileOptions = computed(() =>
+  profiles.value.map((p) => ({ label: `${p.name}  (${p.server_host}:${p.server_port})`, value: p.id }))
+);
+// 顶栏编辑弹层用的临时表单。
+const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP" });
+function openEdit() {
+  if (active.value) Object.assign(editForm.value, active.value);
+}
+function saveEdit() {
+  updateProfile(activeId.value, { ...editForm.value });
+}
+function addNew() {
+  addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
+    server_domain: "34020000002000000001", password: "12345678", transport: "UDP" });
+  openEdit();
+}
+const transportOptions = [{ label: "UDP", value: "UDP" }, { label: "TCP", value: "TCP" }];
 
 const activeKey = computed(() => route.path);
 function onMenuSelect(key: string) {
@@ -108,6 +129,37 @@ const themeOverrides = {
             <!-- 主区 -->
             <main class="main">
               <header class="topbar">
+                <!-- 全局目标平台:单设备/压测共用,下拉切换 + 编辑 -->
+                <div class="platform-bar">
+                  <n-icon :component="ServerOutline" class="plat-icon" />
+                  <span class="plat-label">目标平台</span>
+                  <n-select
+                    size="small"
+                    :value="activeId"
+                    :options="profileOptions"
+                    style="width: 280px"
+                    @update:value="setActive"
+                  />
+                  <n-popover trigger="click" placement="bottom-start" @update:show="(s: boolean) => s && openEdit()">
+                    <template #trigger>
+                      <n-button size="small" tertiary>编辑</n-button>
+                    </template>
+                    <div class="plat-edit">
+                      <div class="pe-title">平台档案</div>
+                      <n-input v-model:value="editForm.name" size="small" placeholder="档案名称" />
+                      <n-input v-model:value="editForm.server_host" size="small" placeholder="平台 IP" />
+                      <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
+                      <n-input v-model:value="editForm.server_domain" size="small" placeholder="平台域 ID" />
+                      <n-input v-model:value="editForm.password" size="small" type="password" show-password-on="click" placeholder="SIP 密码" />
+                      <n-select v-model:value="editForm.transport" size="small" :options="transportOptions" />
+                      <div class="pe-actions">
+                        <n-button size="small" type="primary" @click="saveEdit">保存</n-button>
+                        <n-button size="small" @click="addNew">+ 新增</n-button>
+                        <n-button size="small" type="error" :disabled="profiles.length <= 1" @click="removeProfile(activeId)">删除</n-button>
+                      </div>
+                    </div>
+                  </n-popover>
+                </div>
                 <div class="status-pill">
                   <span class="pill-dot" :style="{ background: statusMeta.color }" />
                   <span class="pill-text">{{ statusMeta.text }}</span>
@@ -155,9 +207,15 @@ const themeOverrides = {
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar {
   height: 48px; flex-shrink: 0;
-  display: flex; align-items: center; justify-content: flex-end;
-  padding: 0 24px;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 24px; gap: 12px;
 }
+.platform-bar { display: inline-flex; align-items: center; gap: 8px; }
+.plat-icon { color: var(--accent); font-size: 16px; }
+.plat-label { font-size: 12.5px; color: var(--text-secondary); }
+.plat-edit { display: flex; flex-direction: column; gap: 8px; width: 240px; }
+.pe-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.pe-actions { display: flex; gap: 8px; margin-top: 4px; }
 .status-pill {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 5px 14px; border-radius: 999px;
