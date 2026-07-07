@@ -5,7 +5,7 @@
 //! 最底层,避免下层 crate 反向依赖上层。
 
 /// 设备运行过程中的关键事件。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum DeviceEvent {
     /// 发起一次注册。
     RegisterAttempt,
@@ -43,6 +43,34 @@ pub enum DeviceEvent {
         time_show: bool,
         /// OSD 信息(通道名等)显示开关。
         osd_show: bool,
+    },
+    /// 平台命令语义事件(供 UI"平台命令时间线"展示):
+    /// 平台下发了什么、设备回了什么,人类可读。
+    PlatformCommand {
+        /// 命令类别(如 Catalog/DeviceInfo/PTZ/Invite/OSD 等,用于图标/分类)。
+        kind: String,
+        /// 人类可读摘要(如"查询目录 → 回 8 通道"、"PTZ 左转")。
+        summary: String,
+    },
+    /// 订阅状态变化(供 UI"活跃订阅面板"):建立/清理/收到 NOTIFY 计数。
+    SubscriptionChanged {
+        /// 订阅类别(Catalog/Alarm/MobilePosition/PTZPosition)。
+        kind: String,
+        /// 是否活跃(false=已清理)。
+        active: bool,
+        /// 累计已发送 NOTIFY 次数。
+        notify_count: u32,
+    },
+    /// 长任务进度(供 UI 进度条):抓拍上传 / 在线升级。
+    Progress {
+        /// 任务类别(snapshot/upgrade)。
+        kind: String,
+        /// 当前步/张。
+        current: u32,
+        /// 总步/张数。
+        total: u32,
+        /// 百分比(0-100)。
+        percent: u32,
     },
 }
 

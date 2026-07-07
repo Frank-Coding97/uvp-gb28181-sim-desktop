@@ -97,6 +97,43 @@ impl DeviceObserver for StateEmitter {
                 );
                 return;
             }
+            // 平台命令语义事件 → 前端"平台命令时间线"。
+            DeviceEvent::PlatformCommand { kind, summary } => {
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = self.app.emit(
+                    "platform_command",
+                    serde_json::json!({ "kind": kind, "summary": summary, "ts_ms": ts_ms }),
+                );
+                return;
+            }
+            // 订阅状态变化 → 前端"活跃订阅面板"。
+            DeviceEvent::SubscriptionChanged {
+                kind,
+                active,
+                notify_count,
+            } => {
+                let _ = self.app.emit(
+                    "subscription_state",
+                    serde_json::json!({ "kind": kind, "active": active, "notify_count": notify_count }),
+                );
+                return;
+            }
+            // 长任务进度 → 前端进度条。
+            DeviceEvent::Progress {
+                kind,
+                current,
+                total,
+                percent,
+            } => {
+                let _ = self.app.emit(
+                    "task_progress",
+                    serde_json::json!({ "kind": kind, "current": current, "total": total, "percent": percent }),
+                );
+                return;
+            }
         };
         let _ = self.app.emit("device_state", state);
     }
