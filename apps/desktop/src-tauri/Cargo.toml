@@ -21,6 +21,7 @@ scenario          = { path = "../../../crates/scenario" }
 gb28181-simulator = { path = "../../../crates/gb28181-simulator" }
 gb28181-protocol  = { path = "../../../crates/gb28181-protocol" }
 sip-core          = { path = "../../../crates/sip-core" }
+encoding_rs       = { workspace = true }
 common            = { path = "../../../crates/common" }
 tauri = { version = "2", features = [] }
 serde.workspace = true

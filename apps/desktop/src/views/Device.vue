@@ -153,11 +153,15 @@ function fmtCmdTs(ms: number): string {
 // SIP 信令追踪(FR-43):订阅 sip_trace 事件,滚动展示最近 N 条。
 interface TraceEntry {
   ts_ms: number; direction: "in" | "out"; method: string;
-  status?: number; cseq?: string; call_id?: string; peer: string; summary: string;
+  status?: number; cseq?: string; call_id?: string; peer: string; summary: string; raw?: string;
 }
 const traces = ref<TraceEntry[]>([]);
 const traceOn = ref(true);
 const MAX_TRACE = 200;
+const expandedTrace = ref<number | null>(null);
+function toggleTraceRow(i: number) {
+  expandedTrace.value = expandedTrace.value === i ? null : i;
+}
 function fmtTs(ms: number) {
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")}`;
@@ -167,7 +171,7 @@ async function toggleTrace() {
     await invoke<string>("set_sip_trace", { enabled: traceOn.value });
   } catch (e) { message.error(String(e)); }
 }
-function clearTraces() { traces.value = []; }
+function clearTraces() { traces.value = []; expandedTrace.value = null; }
 
 // 云台控制可视化:订阅 ptz_action 事件,累积转动角度驱动 3D 球机。
 interface PtzAction {
@@ -311,8 +315,10 @@ onMounted(async () => {
   });
   unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
     if (!traceOn.value) return;
-    traces.value.push(e.payload);
-    if (traces.value.length > MAX_TRACE) traces.value.splice(0, traces.value.length - MAX_TRACE);
+    traces.value.unshift(e.payload); // 新的在最上(倒序)
+    if (traces.value.length > MAX_TRACE) traces.value.splice(MAX_TRACE);
+    // 展开态锚在原条目上:新条目插到头部后,展开索引下移一位。
+    if (expandedTrace.value !== null) expandedTrace.value += 1;
   });
   timer = window.setInterval(fmtUptime, 1000);
   poseTimer = window.setInterval(poseTick, 60);
@@ -581,13 +587,17 @@ const metrics = computed(() => [
         </div>
       </div>
       <div class="trace-log">
-        <div v-if="!traces.length" class="trace-empty">注册上线后,收发的 SIP 报文将实时显示在这里</div>
-        <div v-for="(t, i) in traces" :key="i" class="trace-row" :class="t.direction">
-          <span class="trace-ts">{{ fmtTs(t.ts_ms) }}</span>
-          <span class="trace-dir" :class="t.direction">{{ t.direction === "in" ? "◀ 收" : "▶ 发" }}</span>
-          <span class="trace-sum">{{ t.summary }}</span>
-          <span class="trace-cseq" v-if="t.cseq">{{ t.cseq }}</span>
-        </div>
+        <div v-if="!traces.length" class="trace-empty">注册上线后,收发的 SIP 报文将实时显示在这里(新的在最上,点击展开详情)</div>
+        <template v-for="(t, i) in traces" :key="i">
+          <div class="trace-row" :class="[t.direction, { open: expandedTrace === i }]" @click="toggleTraceRow(i)">
+            <span class="trace-caret">{{ expandedTrace === i ? "▾" : "▸" }}</span>
+            <span class="trace-ts">{{ fmtTs(t.ts_ms) }}</span>
+            <span class="trace-dir" :class="t.direction">{{ t.direction === "in" ? "◀ 收" : "▶ 发" }}</span>
+            <span class="trace-sum">{{ t.summary }}</span>
+            <span class="trace-cseq" v-if="t.cseq">{{ t.cseq }}</span>
+          </div>
+          <pre v-if="expandedTrace === i" class="trace-raw">{{ t.raw }}</pre>
+        </template>
       </div>
     </div>
   </div>
@@ -796,8 +806,17 @@ const metrics = computed(() => [
 }
 .trace-empty { color: var(--text-secondary); padding: 12px; text-align: center; }
 .trace-row {
-  display: flex; align-items: baseline; gap: 8px; padding: 2px 4px;
+  display: flex; align-items: baseline; gap: 8px; padding: 3px 4px;
   border-bottom: 1px solid rgba(15,23,42,0.04); white-space: nowrap;
+  cursor: pointer; transition: background 0.12s;
+}
+.trace-row:hover { background: rgba(56,132,255,0.05); }
+.trace-row.open { background: rgba(56,132,255,0.08); }
+.trace-caret { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; width: 10px; }
+.trace-raw {
+  margin: 0 0 6px 22px; padding: 10px 12px; background: #0f172a; color: #cbd5e1;
+  border-radius: 6px; font-size: 11.5px; line-height: 1.5; white-space: pre-wrap;
+  word-break: break-all; max-height: 300px; overflow-y: auto;
 }
 .trace-ts { color: var(--text-secondary); flex: 0 0 auto; }
 .trace-dir { flex: 0 0 auto; font-weight: 600; }

@@ -165,6 +165,16 @@ impl sip_core::TraceObserver for TraceEmitter {
                 format!("SIP/2.0 {} {}", r.status, r.reason),
             ),
         };
+        // 完整报文文本(供前端展开查看详情);body 可能是 GB18030,按 lossy 解码展示。
+        let raw = {
+            let bytes = match trace.message {
+                sip_core::SipMessage::Request(r) => r.to_bytes(),
+                sip_core::SipMessage::Response(r) => r.to_bytes(),
+            };
+            // GB18030 兼容 ASCII 头;中文 body 用 GB18030 解码更可读。
+            let (text, _, _) = encoding_rs::GB18030.decode(&bytes);
+            text.into_owned()
+        };
         let entry = serde_json::json!({
             "ts_ms": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -176,6 +186,7 @@ impl sip_core::TraceObserver for TraceEmitter {
             "call_id": call_id,
             "peer": trace.peer.to_string(),
             "summary": summary,
+            "raw": raw,
         });
         let _ = self.app.emit("sip_trace", entry);
     }
