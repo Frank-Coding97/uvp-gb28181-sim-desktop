@@ -55,6 +55,9 @@ async function refresh() {
     nodes.value = [];
   }
 }
+function countBy(type: string): number {
+  return nodes.value.filter((n) => n.node_type === type).length;
+}
 
 // ── 新增/编辑弹窗 ──
 const showEdit = ref(false);
@@ -105,18 +108,31 @@ async function removeNode(row: ChannelNode) {
   }
 }
 
+const typeTagType: Record<string, "warning" | "info" | "success" | "default"> = {
+  Device: "info", BusinessGroup: "default", VirtualOrg: "default",
+  VideoChannel: "success", AlarmChannel: "warning",
+};
 const columns: DataTableColumns<ChannelNode> = [
-  { title: "名称", key: "name", width: 160 },
   {
-    title: "类型", key: "node_type", width: 110,
-    render: (r) => h(NTag, { size: "small", type: r.node_type === "AlarmChannel" ? "warning" : "default" }, { default: () => typeLabel[r.node_type] ?? r.node_type }),
+    title: "名称", key: "name", width: 150, ellipsis: { tooltip: true },
+    render: (r) => h("span", { style: "font-weight:500" }, r.name),
   },
-  { title: "国标 ID", key: "id", width: 190 },
-  { title: "父节点", key: "parent_id", width: 190 },
-  { title: "区划码", key: "civil_code", width: 90, render: (r) => r.civil_code ?? "—" },
   {
-    title: "状态", key: "status", width: 70,
-    render: (r) => h(NTag, { size: "small", type: r.status === "ON" ? "success" : "error" }, { default: () => r.status }),
+    title: "类型", key: "node_type", width: 100,
+    render: (r) => h(NTag, { size: "small", type: typeTagType[r.node_type] ?? "default", bordered: false }, { default: () => typeLabel[r.node_type] ?? r.node_type }),
+  },
+  {
+    title: "国标 ID", key: "id", minWidth: 200,
+    render: (r) => h("span", { style: "font-family:monospace;font-size:12px;white-space:nowrap" }, r.id),
+  },
+  {
+    title: "父节点", key: "parent_id", minWidth: 200,
+    render: (r) => h("span", { style: "font-family:monospace;font-size:12px;color:var(--text-tertiary);white-space:nowrap" }, r.parent_id),
+  },
+  { title: "区划码", key: "civil_code", width: 84, render: (r) => r.civil_code ?? "—" },
+  {
+    title: "状态", key: "status", width: 72,
+    render: (r) => h(NTag, { size: "small", type: r.status === "ON" ? "success" : "error", bordered: false }, { default: () => (r.status === "ON" ? "在线" : "离线") }),
   },
   {
     title: "操作", key: "actions", width: 130,
@@ -151,6 +167,9 @@ onActivated(refresh);
         <n-button type="primary" @click="loadTemplate">载入模板</n-button>
         <n-button @click="refresh">刷新</n-button>
         <n-button type="info" @click="openAdd">+ 新增通道</n-button>
+        <span v-if="nodes.length" class="chan-summary">
+          共 {{ nodes.length }} 节点 · 视频 {{ countBy('VideoChannel') }} · 报警 {{ countBy('AlarmChannel') }} · 分组 {{ countBy('BusinessGroup') + countBy('VirtualOrg') }}
+        </span>
       </n-space>
       <n-data-table
         :columns="columns"
@@ -158,6 +177,7 @@ onActivated(refresh);
         :bordered="false"
         size="small"
         style="margin-top: 16px"
+        :scroll-x="900"
         :row-key="(r: ChannelNode) => r.id"
       />
       <div v-if="nodes.length === 0" class="empty">设备未启动或目录为空。请到「单设备联调」启动设备,或载入模板。</div>
@@ -200,6 +220,7 @@ onActivated(refresh);
 .panel { padding: 24px; }
 .label { color: var(--text-secondary); font-size: 13px; }
 .empty { color: var(--text-tertiary); font-size: 13px; margin-top: 12px; text-align: center; padding: 20px; }
+.chan-summary { font-size: 12.5px; color: var(--text-tertiary); margin-left: auto; }
 .section-title { font-size: 16px; font-weight: 600; color: var(--text-primary); }
 .section-hint { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
 </style>

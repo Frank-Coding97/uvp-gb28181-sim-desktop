@@ -494,6 +494,13 @@ const metrics = computed(() => [
                 <div class="knob-dot" :class="{ zoom: ptz.zoom_in || ptz.zoom_out }"></div>
               </div>
             </div>
+            <!-- 变倍指示:放大/缩小时中心浮出 +/− 徽标 + 脉冲动画 -->
+            <transition name="zoom-pop">
+              <div v-if="ptz.zoom_in || ptz.zoom_out" class="zoom-badge" :class="ptz.zoom_in ? 'zin' : 'zout'">
+                <span class="zoom-sign">{{ ptz.zoom_in ? '＋' : '－' }}</span>
+                <span class="zoom-ring"></span>
+              </div>
+            </transition>
           </div>
         </div>
         <!-- 状态 -->
@@ -700,20 +707,23 @@ const metrics = computed(() => [
     inset 6px 6px 14px rgba(163, 177, 198, 0.7),
     inset -6px -6px 14px rgba(255, 255, 255, 0.85);
 }
-/* 方向箭头(碗沿) */
+/* 方向箭头(碗沿):统一 14px 内边距,居中对齐,箭头等宽盒子避免字形宽度差导致压边 */
 .arr {
-  position: absolute; font-size: 12px; color: #9aa5b1; z-index: 3;
+  position: absolute; z-index: 3;
+  width: 16px; height: 16px; line-height: 16px; text-align: center;
+  font-size: 12px; color: #9aa5b1;
   transition: color 0.15s, text-shadow 0.15s, transform 0.15s;
 }
-.arr-u { top: 12px; left: 50%; transform: translateX(-50%); }
-.arr-d { bottom: 12px; left: 50%; transform: translateX(-50%); }
-.arr-l { left: 12px; top: 50%; transform: translateY(-50%); }
-.arr-r { right: 12px; top: 50%; transform: translateY(-50%); }
-.arr.on { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); transform: scale(1.35) translate(0,0); }
-.arr-u.on { transform: translateX(-50%) scale(1.35); }
-.arr-d.on { transform: translateX(-50%) scale(1.35); }
-.arr-l.on { transform: translateY(-50%) scale(1.35); }
-.arr-r.on { transform: translateY(-50%) scale(1.35); }
+.arr-u { top: 14px; left: 50%; transform: translateX(-50%); }
+.arr-d { bottom: 14px; left: 50%; transform: translateX(-50%); }
+.arr-l { left: 14px; top: 50%; transform: translateY(-50%); }
+.arr-r { right: 14px; top: 50%; transform: translateY(-50%); }
+.arr.on { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
+/* 点亮时放大,保留各自的居中位移(不被基类 transform 覆盖) */
+.arr-u.on { transform: translateX(-50%) scale(1.4); }
+.arr-d.on { transform: translateX(-50%) scale(1.4); }
+.arr-l.on { transform: translateY(-50%) scale(1.4); }
+.arr-r.on { transform: translateY(-50%) scale(1.4); }
 /* 悬浮摇杆钮 */
 .stick-knob {
   position: relative; z-index: 2;
@@ -738,6 +748,26 @@ const metrics = computed(() => [
   transition: all 0.15s;
 }
 .knob-dot.zoom { background: radial-gradient(circle at 35% 30%, #7dd3fc, var(--accent)); box-shadow: 0 0 10px var(--accent-glow); }
+
+/* 变倍中心徽标 + 脉冲环 */
+.zoom-badge {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 44px; height: 44px; border-radius: 50%; z-index: 5;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(37,99,235,0.92); box-shadow: 0 4px 14px var(--accent-glow);
+}
+.zoom-badge.zout { background: rgba(234,88,12,0.92); }
+.zoom-sign { color: #fff; font-size: 20px; font-weight: 700; line-height: 1; z-index: 2; }
+.zoom-ring {
+  position: absolute; inset: 0; border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.7); animation: zoomPulse 1s ease-out infinite;
+}
+@keyframes zoomPulse {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+.zoom-pop-enter-active, .zoom-pop-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.zoom-pop-enter-from, .zoom-pop-leave-to { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
 .stick-wrap.active .stick-knob { box-shadow: 6px 6px 16px rgba(163,177,198,0.85), -4px -4px 12px rgba(255,255,255,0.95), 0 0 0 2px rgba(37,99,235,0.15); }
 
 .ptz-info { flex: 1 1 auto; display: flex; gap: 28px; align-items: center; }
