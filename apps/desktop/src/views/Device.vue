@@ -395,8 +395,8 @@ const metrics = computed(() => [
 <template>
   <div class="page">
     <div class="page-header">
-      <div class="page-title">连接配置</div>
-      <div class="page-sub">配置 SIP 服务器连接参数和设备身份信息</div>
+      <div class="page-title">单设备联调</div>
+      <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
     </div>
 
     <!-- 顶部指标卡 -->
@@ -611,7 +611,7 @@ const metrics = computed(() => [
 </template>
 
 <style scoped>
-.page { max-width: 1100px; }
+.page { max-width: 1320px; }
 .page-header { margin-bottom: 20px; }
 .plat-readonly { font-size: 13px; }
 .pr-name { font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
@@ -631,7 +631,8 @@ const metrics = computed(() => [
 .metric-value.mono { font-family: "SF Mono", Menlo, monospace; letter-spacing: 1px; }
 .mdot { width: 8px; height: 8px; border-radius: 50%; }
 
-.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+/* 配置区自适应:宽屏 3 列、中屏 2 列、窄屏 1 列,避免面板挤成一坨 */
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; align-items: start; }
 .panel { padding: 22px 22px 24px; }
 .panel-title {
   font-size: 12px; font-weight: 600; color: var(--text-tertiary);
