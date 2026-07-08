@@ -33,6 +33,39 @@ pub fn prepare_video_source(path: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// 定位 ffmpeg 可执行文件。
+///
+/// **关键**:从 .app 双击启动的 GUI 进程 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`,
+/// 不含 Homebrew 的 `/opt/homebrew/bin`,故仅靠 PATH 找 `ffmpeg` 在打包后会失败
+/// (终端 `cargo run` 有完整 PATH 所以能找到——这是"终端能用、打包不能用"的根因)。
+/// 先试 PATH,再逐个探测常见绝对路径。返回可用的命令名/路径。
+pub fn ffmpeg_bin() -> Option<String> {
+    use std::process::Command;
+    let probe = |bin: &str| {
+        Command::new(bin)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    // 1) PATH(终端启动 / 已配置环境)。
+    if probe("ffmpeg") {
+        return Some("ffmpeg".into());
+    }
+    // 2) 常见绝对路径(GUI 启动无 Homebrew PATH 时兜底)。
+    for p in [
+        "/opt/homebrew/bin/ffmpeg", // Apple Silicon Homebrew
+        "/usr/local/bin/ffmpeg",    // Intel Homebrew
+        "/opt/local/bin/ffmpeg",    // MacPorts
+        "/usr/bin/ffmpeg",          // Linux 系统包
+    ] {
+        if std::path::Path::new(p).exists() && probe(p) {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
 /// 把容器视频文件(MP4/FLV/MKV/MOV 等)转封装为 H.264 Annex B 裸流,返回裸流文件路径。
 ///
 /// 用系统 `ffmpeg`:优先 `-c:v copy -bsf:v h264_mp4toannexb`(无损转封装,快);
@@ -59,21 +92,16 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
         return Ok(out);
     }
 
-    // 检查 ffmpeg 是否可用。
-    let has_ffmpeg = Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !has_ffmpeg {
-        return Err(Error::Media(format!(
+    // 检查 ffmpeg 是否可用(PATH + 常见绝对路径,兼容 GUI 启动无 Homebrew PATH)。
+    let ffmpeg = ffmpeg_bin().ok_or_else(|| {
+        Error::Media(format!(
             "视频源是容器格式({src}),需要 ffmpeg 转封装,但未找到 ffmpeg;\
-             请安装 ffmpeg,或直接提供 .h264/.h265 Annex B 裸流"
-        )));
-    }
+             请安装 ffmpeg(brew install ffmpeg),或直接提供 .h264/.h265 Annex B 裸流"
+        ))
+    })?;
 
     // ① 无损转封装(copy + h264_mp4toannexb)。
-    let copy_ok = Command::new("ffmpeg")
+    let copy_ok = Command::new(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -93,7 +121,7 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
 
     // ② 回退:重编码为 H.264 Annex B(兼容任意编码/容器)。
     let _ = std::fs::remove_file(&out);
-    let enc = Command::new("ffmpeg")
+    let enc = Command::new(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -144,16 +172,11 @@ fn extract_g711a(src: &str) -> Result<Vec<u8>> {
         return std::fs::read(&out).map_err(Error::Io);
     }
 
-    let has_ffmpeg = Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !has_ffmpeg {
+    let Some(ffmpeg) = ffmpeg_bin() else {
         return Ok(Vec::new()); // 无 ffmpeg:静默退化为纯视频。
-    }
+    };
 
-    let res = Command::new("ffmpeg")
+    let res = Command::new(&ffmpeg)
         .args([
             "-y", "-i", src, "-vn", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1", "-f", "alaw",
         ])
@@ -480,6 +503,20 @@ fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Fr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffmpeg查找_返回可执行或none不panic() {
+        // 不强求装了 ffmpeg;只验证查找逻辑健壮(PATH + 绝对路径探测)不 panic,
+        // 且返回值要么 None 要么是真能跑 -version 的路径。
+        if let Some(bin) = ffmpeg_bin() {
+            let ok = std::process::Command::new(&bin)
+                .arg("-version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "ffmpeg_bin 返回的 {bin} 应可执行");
+        }
+    }
 
     /// 造一个含 SPS/PPS/IDR + 非关键帧的 Annex B 流。
     fn sample_h264() -> Vec<u8> {
