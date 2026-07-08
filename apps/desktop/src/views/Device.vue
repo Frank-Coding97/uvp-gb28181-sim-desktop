@@ -2,7 +2,7 @@
 // 单设备联调控制台(UC-1),高保真对齐参考原型 frost-blue:
 // 顶部 4 指标卡 + 双栏配置卡(SIP 服务器 / 设备身份)。
 import { ref, onMounted, onUnmounted, onActivated, computed, inject, type Ref } from "vue";
-import { NButton, NSpace, useMessage } from "naive-ui";
+import { NButton, useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -399,63 +399,41 @@ const metrics = computed(() => [
       <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
     </div>
 
-    <!-- 顶部指标卡 -->
-    <div class="metrics">
-      <div v-for="m in metrics" :key="m.label" class="glass-card metric">
-        <div class="metric-label">{{ m.label }}</div>
-        <div class="metric-value" :class="{ mono: m.mono }" :style="{ color: m.color }">
-          <span v-if="m.dot" class="mdot" :style="{ background: m.color }" />
-          {{ m.value }}
-        </div>
-      </div>
-    </div>
-
-    <!-- 双栏配置 -->
-    <div class="cols">
-      <!-- 目标平台(来自顶栏全局档案,只读回显;改在顶栏"编辑") -->
-      <div class="glass-card panel">
-        <div class="panel-title">目标平台</div>
-        <div class="plat-readonly" v-if="activePlatform">
-          <div class="pr-name">{{ activePlatform.name }}</div>
-          <div class="pr-row"><span>地址</span><b>{{ activePlatform.server_host }}:{{ activePlatform.server_port }}</b></div>
-          <div class="pr-row"><span>平台域</span><b>{{ activePlatform.server_domain }}</b></div>
-          <div class="pr-row"><span>传输</span><b>{{ activePlatform.transport }}</b></div>
-          <div class="fg-hint">平台参数在顶栏"目标平台"处切换/编辑,单设备与压测共用。</div>
-        </div>
-        <div class="fg" style="margin-top: 12px">
-          <label>国标版本</label>
-          <div class="seg">
-            <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">2022</button>
-            <button :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">2016</button>
+    <!-- 工作区:左=配置,右=实时监控。两列等分,填满宽屏、不再一长条空荡 -->
+    <div class="workspace">
+      <!-- ── 左列:配置 ── -->
+      <div class="ws-col">
+        <div class="glass-card panel">
+          <div class="panel-title">目标平台</div>
+          <div class="plat-readonly" v-if="activePlatform">
+            <div class="pr-name">{{ activePlatform.name }}</div>
+            <div class="pr-grid">
+              <div class="pr-row"><span>地址</span><b>{{ activePlatform.server_host }}:{{ activePlatform.server_port }}</b></div>
+              <div class="pr-row"><span>平台域</span><b>{{ activePlatform.server_domain }}</b></div>
+              <div class="pr-row"><span>传输</span><b>{{ activePlatform.transport }}</b></div>
+              <div class="pr-row"><span>编码</span><b>{{ activePlatform.signaling_encoding ?? 'GB18030' }}</b></div>
+            </div>
           </div>
+          <div class="fg" style="margin-top: 14px">
+            <label>国标版本</label>
+            <div class="seg">
+              <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">GB/T 2022</button>
+              <button :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">GB/T 2016</button>
+            </div>
+          </div>
+          <div class="fg-hint">平台参数在顶栏"目标平台"切换/编辑,单设备与压测共用。</div>
         </div>
-      </div>
 
-      <!-- 设备身份 -->
-      <div class="glass-card panel">
-        <div class="panel-title">设备身份</div>
-        <div class="fg">
-          <label>设备编号</label>
-          <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
-          <div class="fg-hint">SIP 认证密码用顶栏目标平台的密码。</div>
-        </div>
-        <div class="fg-row">
+        <div class="glass-card panel">
+          <div class="panel-title">设备身份</div>
+          <div class="fg">
+            <label>设备编号</label>
+            <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
+          </div>
           <div class="fg">
             <label>通道名称</label>
             <input v-model="form.channel_name" class="inp" />
           </div>
-          <div class="fg">
-            <label>视频源(可选)</label>
-            <div class="file-row">
-              <input v-model="form.video_source" class="inp" placeholder="H.264/MP4 文件路径(点右侧选择)" />
-              <button class="file-btn" @click="pickVideoSource">选择文件</button>
-            </div>
-            <div class="fg-hint">
-              留空则只做信令联调(注册/目录/心跳),平台点播会收流超时;要点播出画面请选一个 H.264/MP4 文件。
-            </div>
-          </div>
-        </div>
-        <div class="fg-row">
           <div class="fg">
             <label>目录模板</label>
             <select v-model="form.catalog_template" class="inp">
@@ -464,120 +442,114 @@ const metrics = computed(() => [
               <option value="civil-3x2">跨区划(3 区 × 2 通道)</option>
               <option value="large-16ch">16 通道大型监控</option>
             </select>
-            <div class="fg-hint">启动时载入模板,注册后平台即可同步多通道目录。留空为单通道兼容模式。</div>
+          </div>
+          <div class="fg">
+            <label>视频源(可选)</label>
+            <div class="file-row">
+              <input v-model="form.video_source" class="inp" placeholder="H.264 / MP4 文件路径" />
+              <button class="file-btn" @click="pickVideoSource">选择</button>
+            </div>
+            <div class="fg-hint">留空只做信令联调;要点播出画面请选 H.264/MP4(容器格式需系统装 ffmpeg)。</div>
+          </div>
+          <div class="action-row">
+            <n-button type="primary" :disabled="startDisabled" @click="startDevice">注册上线</n-button>
+            <n-button :disabled="stopDisabled" @click="stopDevice">注销</n-button>
+            <n-button :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
+            <n-button :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
           </div>
         </div>
 
-        <n-space style="margin-top: 18px">
-          <n-button type="primary" :disabled="startDisabled" @click="startDevice">注册上线</n-button>
-          <n-button :disabled="stopDisabled" @click="stopDevice">注销</n-button>
-          <n-button :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
-          <n-button :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
-        </n-space>
-      </div>
-    </div>
-
-    <!-- 云台控制可视化:平台下发 PTZ 时,球机随命令转动 -->
-    <div class="glass-card panel ptz-panel">
-      <div class="panel-title" style="margin: 0 0 4px">云台控制</div>
-      <div class="ptz-sub">平台下发 PTZ 命令时,下方球机实时演示转动方向与变倍(本设备为被控端)</div>
-      <div class="ptz-body">
-        <!-- 拟态摇杆:凹陷底盘 + 悬浮摇杆,随命令向对应方向偏移 -->
-        <div class="stick-wrap" :class="{ active: ptzActive, seeking }">
-          <div class="stick-base">
-            <span class="arr arr-u" :class="{ on: ptz.up }">▲</span>
-            <span class="arr arr-d" :class="{ on: ptz.down }">▼</span>
-            <span class="arr arr-l" :class="{ on: ptz.left }">◀</span>
-            <span class="arr arr-r" :class="{ on: ptz.right }">▶</span>
-            <div class="stick-knob" :style="knobStyle">
-              <div class="knob-face">
-                <div class="knob-dot" :class="{ zoom: ptz.zoom_in || ptz.zoom_out }"></div>
+        <div class="glass-card panel ptz-panel">
+          <div class="panel-title">云台控制</div>
+          <div class="ptz-sub">平台下发 PTZ 时,球机实时演示转动/变倍(本设备为被控端)</div>
+          <div class="ptz-body">
+            <div class="stick-wrap" :class="{ active: ptzActive, seeking }">
+              <div class="stick-base">
+                <span class="arr arr-u" :class="{ on: ptz.up }">▲</span>
+                <span class="arr arr-d" :class="{ on: ptz.down }">▼</span>
+                <span class="arr arr-l" :class="{ on: ptz.left }">◀</span>
+                <span class="arr arr-r" :class="{ on: ptz.right }">▶</span>
+                <div class="stick-knob" :style="knobStyle">
+                  <div class="knob-face">
+                    <div class="knob-dot" :class="{ zoom: ptz.zoom_in || ptz.zoom_out }"></div>
+                  </div>
+                </div>
+                <transition name="zoom-pop">
+                  <div v-if="ptz.zoom_in || ptz.zoom_out" class="zoom-badge" :class="ptz.zoom_in ? 'zin' : 'zout'">
+                    <span class="zoom-sign">{{ ptz.zoom_in ? '＋' : '－' }}</span>
+                    <span class="zoom-ring"></span>
+                  </div>
+                </transition>
               </div>
             </div>
-            <!-- 变倍指示:放大/缩小时中心浮出 +/− 徽标 + 脉冲动画 -->
-            <transition name="zoom-pop">
-              <div v-if="ptz.zoom_in || ptz.zoom_out" class="zoom-badge" :class="ptz.zoom_in ? 'zin' : 'zout'">
-                <span class="zoom-sign">{{ ptz.zoom_in ? '＋' : '－' }}</span>
-                <span class="zoom-ring"></span>
+            <div class="ptz-info">
+              <div class="ptz-stat"><span>朝向</span><b class="pose">{{ poseText }}</b></div>
+              <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
+              <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
+              <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
+              <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive || seeking }">{{ statusText }}</b></div>
+              <div class="ptz-stat presets">
+                <span>预置位</span>
+                <span class="preset-chips">
+                  <b v-for="id in [1,2,3,4,5]" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">{{ id }}</b>
+                </span>
               </div>
-            </transition>
-          </div>
-        </div>
-        <!-- 状态 -->
-        <div class="ptz-info">
-          <div class="ptz-stats">
-            <div class="ptz-stat"><span>当前朝向</span><b class="pose">{{ poseText }}</b></div>
-            <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
-            <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
-            <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
-            <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive || seeking }">{{ statusText }}</b></div>
-            <div class="ptz-stat presets">
-              <span>预置位</span>
-              <span class="preset-chips">
-                <b v-for="id in [1,2,3,4,5]" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">{{ id }}</b>
-              </span>
             </div>
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- OSD 配置(国标 A.2.3.2.11):展示平台下发的 OSD 设置命令,设备已按其应用 -->
-    <div class="glass-card panel osd-panel">
-      <div class="panel-title">OSD 设置(平台下发)</div>
-      <div v-if="!osd.received" class="osd-empty">
-        等待平台下发 OSD 配置命令(DeviceConfig + OSDConfig)…
-        <div class="fg-hint" style="margin-top:6px">
-          国标中 OSD 是平台→设备的配置命令(时间/信息显示开关)。平台下发后此处显示设备已应用的设置。
+      <!-- ── 右列:实时监控 ── -->
+      <div class="ws-col">
+        <div class="glass-card panel status-strip">
+          <div v-for="m in metrics" :key="m.label" class="ss-item">
+            <div class="ss-label">{{ m.label }}</div>
+            <div class="ss-value" :class="{ mono: m.mono }" :style="{ color: m.color }">
+              <span v-if="m.dot" class="mdot" :style="{ background: m.color }" />{{ m.value }}
+            </div>
+          </div>
         </div>
-      </div>
-      <div v-else class="osd-applied">
-        <div class="osd-row">
-          <span class="osd-label">时间叠加显示</span>
-          <span class="osd-badge" :class="osd.time_show ? 'on' : 'off'">{{ osd.time_show ? '开启' : '关闭' }}</span>
-          <span v-if="osd.time_show" class="osd-sample">{{ now }}</span>
-        </div>
-        <div class="osd-row">
-          <span class="osd-label">OSD 信息显示</span>
-          <span class="osd-badge" :class="osd.osd_show ? 'on' : 'off'">{{ osd.osd_show ? '开启' : '关闭' }}</span>
-          <span v-if="osd.osd_show" class="osd-sample">{{ form.channel_name || 'Camera-1' }}</span>
-        </div>
-        <div class="fg-hint">✓ 已应用平台 OSD 配置 · {{ osd.at }} · 设备已回 DeviceConfig 应答</div>
-      </div>
-    </div>
 
-    <!-- 长任务进度(抓拍上传 / 在线升级) -->
-    <div class="glass-card panel" v-if="progress">
-      <div class="panel-title">{{ kindLabel[progress.kind] ?? progress.kind }}进度</div>
-      <div class="prog-wrap">
-        <div class="prog-bar"><div class="prog-fill" :style="{ width: progress.percent + '%' }" /></div>
-        <div class="prog-txt">{{ progress.current }}/{{ progress.total }} · {{ progress.percent }}%</div>
-      </div>
-    </div>
-
-    <!-- 活跃订阅面板 -->
-    <div class="glass-card panel" v-if="subList.length">
-      <div class="panel-title">活跃订阅</div>
-      <div class="sub-list">
-        <div v-for="s in subList" :key="s.kind" class="sub-item">
-          <span class="sub-dot" />
-          <span class="sub-kind">{{ kindLabel[s.kind] ?? s.kind }}</span>
-          <span class="sub-count">已发 NOTIFY {{ s.notify_count }} 次</span>
+        <div class="glass-card panel">
+          <div class="panel-title">设备实时状态</div>
+          <div class="rt-block">
+            <div class="rt-label">活跃订阅</div>
+            <div v-if="subList.length" class="sub-list">
+              <div v-for="s in subList" :key="s.kind" class="sub-item">
+                <span class="sub-dot" /><span class="sub-kind">{{ kindLabel[s.kind] ?? s.kind }}</span>
+                <span class="sub-count">NOTIFY {{ s.notify_count }}</span>
+              </div>
+            </div>
+            <div v-else class="rt-idle">无(平台订阅目录/报警/位置后显示)</div>
+          </div>
+          <div class="rt-block">
+            <div class="rt-label">OSD 设置(平台下发)</div>
+            <div v-if="osd.received" class="osd-applied">
+              <span class="osd-badge" :class="osd.time_show ? 'on' : 'off'">时间 {{ osd.time_show ? '开' : '关' }}</span>
+              <span class="osd-badge" :class="osd.osd_show ? 'on' : 'off'">信息 {{ osd.osd_show ? '开' : '关' }}</span>
+              <span class="rt-time">{{ osd.at }}</span>
+            </div>
+            <div v-else class="rt-idle">无(平台下发 OSDConfig 后显示已应用状态)</div>
+          </div>
+          <div class="rt-block" v-if="progress">
+            <div class="rt-label">{{ kindLabel[progress.kind] ?? progress.kind }}进度</div>
+            <div class="prog-wrap">
+              <div class="prog-bar"><div class="prog-fill" :style="{ width: progress.percent + '%' }" /></div>
+              <div class="prog-txt">{{ progress.current }}/{{ progress.total }} · {{ progress.percent }}%</div>
+            </div>
+          </div>
         </div>
-      </div>
-    </div>
 
-    <!-- 平台命令时间线:平台下发了什么、设备回了什么 -->
-    <div class="glass-card panel">
-      <div class="panel-title">平台命令时间线</div>
-      <div v-if="commands.length === 0" class="cmd-empty">
-        等待平台下发命令(注册后平台会查目录、下发控制等)…
-      </div>
-      <div v-else class="cmd-list">
-        <div v-for="(c, i) in commands" :key="i" class="cmd-item">
-          <span class="cmd-ts">{{ fmtCmdTs(c.ts_ms) }}</span>
-          <span class="cmd-tag" :class="'k-' + c.kind">{{ kindLabel[c.kind] ?? c.kind }}</span>
-          <span class="cmd-sum">{{ c.summary }}</span>
+        <div class="glass-card panel">
+          <div class="panel-title">平台命令时间线</div>
+          <div v-if="commands.length === 0" class="rt-idle">等待平台下发命令(注册后平台会查目录、下发控制等)…</div>
+          <div v-else class="cmd-list">
+            <div v-for="(c, i) in commands" :key="i" class="cmd-item">
+              <span class="cmd-ts">{{ fmtCmdTs(c.ts_ms) }}</span>
+              <span class="cmd-tag" :class="'k-' + c.kind">{{ kindLabel[c.kind] ?? c.kind }}</span>
+              <span class="cmd-sum">{{ c.summary }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -633,6 +605,29 @@ const metrics = computed(() => [
 
 /* 配置区自适应:宽屏 3 列、中屏 2 列、窄屏 1 列,避免面板挤成一坨 */
 .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; align-items: start; }
+/* 工作区两列:左配置 / 右监控。窄屏(<1080)自动堆叠为一列 */
+.workspace { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(420px, 1.15fr); gap: 18px; align-items: start; }
+.ws-col { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+@media (max-width: 1080px) { .workspace { grid-template-columns: 1fr; } }
+
+/* 状态徽标条:紧凑一行四项,替代原 4 大卡 */
+.status-strip { display: flex; gap: 8px; padding: 14px 18px; }
+.ss-item { flex: 1; min-width: 0; }
+.ss-label { font-size: 11px; color: var(--text-tertiary); margin-bottom: 4px; }
+.ss-value { font-size: 15px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.ss-value.mono { font-family: "SF Mono", Menlo, monospace; font-size: 13px; letter-spacing: .5px; }
+
+/* 实时状态分块 */
+.rt-block { padding: 10px 0; border-top: 1px solid rgba(120,120,120,0.08); }
+.rt-block:first-of-type { border-top: none; padding-top: 0; }
+.rt-label { font-size: 12px; color: var(--text-secondary); font-weight: 600; margin-bottom: 8px; }
+.rt-idle { font-size: 12.5px; color: var(--text-tertiary); }
+.rt-time { font-size: 11.5px; color: var(--text-tertiary); margin-left: 6px; }
+
+/* 目标平台参数网格 + 操作按钮行 */
+.pr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; }
+.action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+
 .panel { padding: 22px 22px 24px; }
 .panel-title {
   font-size: 12px; font-weight: 600; color: var(--text-tertiary);
@@ -682,9 +677,9 @@ const metrics = computed(() => [
 .file-btn:hover { border-color: var(--accent); color: var(--accent); }
 
 /* 云台控制可视化 */
-.ptz-panel { margin-top: 18px; }
+.ptz-panel { margin-top: 0; }
 .ptz-sub { font-size: 12px; color: var(--text-tertiary); margin-bottom: 16px; }
-.ptz-body { display: flex; gap: 40px; align-items: center; }
+.ptz-body { display: flex; gap: 24px; align-items: center; }
 
 /* 拟态摇杆(neumorphism):凹陷底盘 + 悬浮圆钮 */
 .stick-wrap { flex: 0 0 auto; padding: 6px; }
@@ -771,10 +766,9 @@ const metrics = computed(() => [
 .zoom-pop-enter-from, .zoom-pop-leave-to { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
 .stick-wrap.active .stick-knob { box-shadow: 6px 6px 16px rgba(163,177,198,0.85), -4px -4px 12px rgba(255,255,255,0.95), 0 0 0 2px rgba(37,99,235,0.15); }
 
-.ptz-info { flex: 1 1 auto; display: flex; gap: 28px; align-items: center; }
-.ptz-stats { display: flex; flex-direction: column; gap: 10px; }
+.ptz-info { flex: 1 1 auto; display: flex; flex-direction: column; gap: 9px; min-width: 0; }
 .ptz-stat { display: flex; gap: 10px; align-items: baseline; }
-.ptz-stat span { font-size: 12px; color: var(--text-tertiary); width: 56px; }
+.ptz-stat span { font-size: 12px; color: var(--text-tertiary); width: 42px; flex-shrink: 0; }
 .ptz-stat b { font-size: 14px; color: var(--text-primary); }
 .ptz-stat b.hot { color: var(--accent); }
 .ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 13px; }
