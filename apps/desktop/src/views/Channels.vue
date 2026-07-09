@@ -221,6 +221,25 @@ onActivated(refresh);
 .label { color: var(--text-secondary); font-size: 13px; }
 .empty { color: var(--text-tertiary); font-size: 13px; margin-top: 12px; text-align: center; padding: 20px; }
 .chan-summary { font-size: 12.5px; color: var(--text-tertiary); margin-left: auto; }
+
+/* 表格半透明质感:去掉 naive-ui 默认白底,融入磨砂卡片 */
+:deep(.n-data-table),
+:deep(.n-data-table .n-data-table-th),
+:deep(.n-data-table .n-data-table-td),
+:deep(.n-data-table .n-data-table-table),
+:deep(.n-data-table-base-table) { background-color: transparent !important; }
+:deep(.n-data-table .n-data-table-th) {
+  background-color: rgba(120,130,150,0.06) !important;
+  color: var(--text-secondary); font-weight: 600;
+  border-bottom: 1px solid rgba(120,130,150,0.12) !important;
+}
+:deep(.n-data-table .n-data-table-td) {
+  border-bottom: 1px solid rgba(120,130,150,0.08) !important;
+}
+:deep(.n-data-table .n-data-table-tr:hover .n-data-table-td) {
+  background-color: rgba(56,132,255,0.05) !important;
+}
+:deep(.n-data-table .n-data-table-empty) { background-color: transparent !important; }
 .section-title { font-size: 16px; font-weight: 600; color: var(--text-primary); }
 .section-hint { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
 </style>

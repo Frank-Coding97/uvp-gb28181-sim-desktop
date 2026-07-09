@@ -400,6 +400,16 @@ const metrics = computed(() => [
       <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
     </div>
 
+    <!-- 状态徽标条:置顶,一行四项,一眼看清注册/时长/版本/传输 -->
+    <div class="glass-card panel status-strip">
+      <div v-for="m in metrics" :key="m.label" class="ss-item">
+        <div class="ss-label">{{ m.label }}</div>
+        <div class="ss-value" :class="{ mono: m.mono }" :style="{ color: m.color }">
+          <span v-if="m.dot" class="mdot" :style="{ background: m.color }" />{{ m.value }}
+        </div>
+      </div>
+    </div>
+
     <!-- 工作区:左=配置,右=实时监控。两列等分,填满宽屏、不再一长条空荡 -->
     <div class="workspace">
       <!-- ── 左列:配置 ── -->
@@ -502,14 +512,6 @@ const metrics = computed(() => [
 
       <!-- ── 右列:实时监控 ── -->
       <div class="ws-col">
-        <div class="glass-card panel status-strip">
-          <div v-for="m in metrics" :key="m.label" class="ss-item">
-            <div class="ss-label">{{ m.label }}</div>
-            <div class="ss-value" :class="{ mono: m.mono }" :style="{ color: m.color }">
-              <span v-if="m.dot" class="mdot" :style="{ background: m.color }" />{{ m.value }}
-            </div>
-          </div>
-        </div>
 
         <div class="glass-card panel">
           <div class="panel-title">设备实时状态</div>
@@ -746,22 +748,28 @@ const metrics = computed(() => [
 }
 .knob-dot.zoom { background: radial-gradient(circle at 35% 30%, #7dd3fc, var(--accent)); box-shadow: 0 0 10px var(--accent-glow); }
 
-/* 变倍中心徽标 + 脉冲环 */
+/* 变倍中心徽标 + 双脉冲环:柔和渐变,放大蓝青、缩小琥珀 */
 .zoom-badge {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  width: 44px; height: 44px; border-radius: 50%; z-index: 5;
+  width: 46px; height: 46px; border-radius: 50%; z-index: 5;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(37,99,235,0.92); box-shadow: 0 4px 14px var(--accent-glow);
+  background: linear-gradient(135deg, #38bdf8, #2563eb);
+  box-shadow: 0 6px 18px rgba(37,99,235,0.45), inset 0 1px 2px rgba(255,255,255,0.4);
 }
-.zoom-badge.zout { background: rgba(234,88,12,0.92); }
-.zoom-sign { color: #fff; font-size: 20px; font-weight: 700; line-height: 1; z-index: 2; }
+.zoom-badge.zout { background: linear-gradient(135deg, #fbbf24, #f97316); box-shadow: 0 6px 18px rgba(249,115,22,0.4), inset 0 1px 2px rgba(255,255,255,0.4); }
+.zoom-sign { color: #fff; font-size: 22px; font-weight: 700; line-height: 1; z-index: 2; text-shadow: 0 1px 2px rgba(0,0,0,0.2); }
 .zoom-ring {
   position: absolute; inset: 0; border-radius: 50%;
-  border: 2px solid rgba(255,255,255,0.7); animation: zoomPulse 1s ease-out infinite;
+  border: 2px solid rgba(56,189,248,0.6); animation: zoomPulse 1.4s ease-out infinite;
+}
+.zoom-badge.zout .zoom-ring { border-color: rgba(251,191,36,0.6); }
+.zoom-ring::after {
+  content: ""; position: absolute; inset: -1px; border-radius: 50%;
+  border: 2px solid inherit; animation: zoomPulse 1.4s ease-out infinite 0.7s;
 }
 @keyframes zoomPulse {
-  0% { transform: scale(1); opacity: 0.8; }
-  100% { transform: scale(1.8); opacity: 0; }
+  0% { transform: scale(1); opacity: 0.7; }
+  100% { transform: scale(2); opacity: 0; }
 }
 .zoom-pop-enter-active, .zoom-pop-leave-active { transition: opacity 0.2s, transform 0.2s; }
 .zoom-pop-enter-from, .zoom-pop-leave-to { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
@@ -826,7 +834,7 @@ const metrics = computed(() => [
   border-radius: 6px; padding: 3px 12px; font-size: 12px; color: var(--text-secondary); cursor: pointer;
 }
 .trace-log {
-  height: 240px; overflow-y: auto; border-radius: var(--radius-sm);
+  height: 300px; overflow-y: auto; overflow-x: hidden; border-radius: var(--radius-sm);
   background: rgba(15, 23, 42, 0.03); border: 1px solid var(--border-default);
   padding: 8px 10px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
 }
