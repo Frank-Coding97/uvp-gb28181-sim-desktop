@@ -500,6 +500,188 @@ fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Fr
     frames
 }
 
+/// 实时采集视频源:用 ffmpeg avfoundation(macOS)/dshow(Windows)/v4l2(Linux)
+/// 采集摄像头/屏幕,实时编码为 H.264 Annex B,边采边推(把电脑当真实 IPC)。
+///
+/// ffmpeg 进程 stdout 输出 Annex B 裸流,后台线程按起始码切帧塞入队列,
+/// `next_frame()` 从队列取;队列空(采集慢于消费)时返回上一关键帧维持画面。
+pub struct LiveSource {
+    /// 帧队列接收端(后台采集线程 → 消费)。
+    rx: std::sync::mpsc::Receiver<Frame>,
+    /// ffmpeg 子进程句柄(drop 时 kill,停止采集)。
+    child: std::process::Child,
+    /// 最近一个关键帧(队列空时重复发送,避免花屏/断流)。
+    last_key: Option<Frame>,
+}
+
+impl LiveSource {
+    /// 采集指定输入设备。`input` 为平台相关设备标识:
+    /// macOS avfoundation 用 `"0"`(视频设备序号)或 `"0:0"`(视频:音频);
+    /// 屏幕用列出的 "Capture screen" 序号。`fps` 目标帧率。
+    ///
+    /// 仅视频(音频采集/对讲另行处理)。缺 ffmpeg 返回错误。
+    pub fn capture(input: &str, fps: u32) -> Result<Self> {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let ffmpeg = ffmpeg_bin()
+            .ok_or_else(|| Error::Media("实时采集需要 ffmpeg,但未找到;请安装 ffmpeg".into()))?;
+
+        // 平台采集输入格式。
+        let fmt = if cfg!(target_os = "macos") {
+            "avfoundation"
+        } else if cfg!(target_os = "windows") {
+            "dshow"
+        } else {
+            "v4l2"
+        };
+        let fps_s = fps.max(1).to_string();
+
+        // 采集 → H.264 Annex B(baseline,低延迟,周期 IDR 便于点播随时进流)。
+        let mut child = Command::new(&ffmpeg)
+            .args([
+                "-f",
+                fmt,
+                "-framerate",
+                &fps_s,
+                "-i",
+                input,
+                "-an", // 仅视频
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                &fps_s, // 每秒一个 IDR
+                "-f",
+                "h264",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Error::Media(format!("启动 ffmpeg 采集失败: {e}")))?;
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Media("无法获取 ffmpeg stdout".into()))?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+        // 后台线程:持续读 stdout,按 Annex B 起始码累积成帧后塞队列。
+        std::thread::spawn(move || {
+            let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+            let mut chunk = [0u8; 32 * 1024];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break, // ffmpeg 退出
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        // 从 buf 切出完整帧(保留最后一个不完整帧)。
+                        drain_frames(&mut buf, &tx);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(LiveSource {
+            rx,
+            child,
+            last_key: None,
+        })
+    }
+}
+
+impl Drop for LiveSource {
+    fn drop(&mut self) {
+        let _ = self.child.kill(); // 停止采集,释放摄像头
+    }
+}
+
+impl VideoSource for LiveSource {
+    fn next_frame(&mut self) -> Option<Frame> {
+        // 取队列里最新可用帧;为避免积压延迟,尽量取到最近一帧。
+        let mut frame = None;
+        while let Ok(f) = self.rx.try_recv() {
+            frame = Some(f);
+        }
+        if let Some(f) = frame {
+            if f.key_frame {
+                self.last_key = Some(f.clone());
+            }
+            Some(f)
+        } else {
+            // 队列暂空:重复最近关键帧维持画面(实时源不循环文件)。
+            self.last_key.clone()
+        }
+    }
+}
+
+/// 从缓冲区切出完整 H.264 访问单元并发送;保留尾部不完整数据。
+/// 以"下一个 SPS(type 7)或非连续 IDR 起点"作帧边界的简化实现:
+/// 每遇到一个 AUD/SPS 或新的 VCL 起点就切一帧。
+fn drain_frames(buf: &mut Vec<u8>, tx: &std::sync::mpsc::Sender<Frame>) {
+    // 找所有起始码位置。
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+            starts.push(i);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    if starts.len() < 2 {
+        return; // 不足两个起始码,等更多数据
+    }
+    // 按 VCL slice(type 1/5)为帧边界:遇到含 VCL 的 NAL 后,下一个 VCL 起点切帧。
+    // 简化:把 [start[k], start[k+1]) 作为一个 NAL,累积到遇到新 VCL 且已有 VCL。
+    let mut cur: Vec<u8> = Vec::new();
+    let mut cur_key = false;
+    let mut has_vcl = false;
+    // 保留最后一个起始码之后的数据(可能不完整)。
+    let last = *starts.last().unwrap();
+    let complete = &buf[..last];
+    // 重新在 complete 上切 NAL。
+    let mut positions: Vec<usize> = starts.iter().copied().filter(|&p| p < last).collect();
+    positions.push(last);
+    for w in positions.windows(2) {
+        let nal = &complete[w[0]..w[1]];
+        let hdr_off = if nal.len() >= 4 && nal[2] == 0 { 4 } else { 3 };
+        let nal_type = nal.get(hdr_off).map(|b| b & 0x1f).unwrap_or(0);
+        let is_vcl = nal_type == 1 || nal_type == 5;
+        if is_vcl && has_vcl {
+            let _ = tx.send(Frame {
+                data: std::mem::take(&mut cur),
+                key_frame: cur_key,
+            });
+            cur_key = false;
+            has_vcl = false;
+        }
+        if nal_type == 5 || nal_type == 7 || nal_type == 8 {
+            cur_key = true;
+        }
+        if is_vcl {
+            has_vcl = true;
+        }
+        cur.extend_from_slice(nal);
+    }
+    if !cur.is_empty() {
+        let _ = tx.send(Frame {
+            data: cur,
+            key_frame: cur_key,
+        });
+    }
+    // 丢弃已处理部分,保留尾部不完整帧。
+    buf.drain(..last);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +698,37 @@ mod tests {
                 .unwrap_or(false);
             assert!(ok, "ffmpeg_bin 返回的 {bin} 应可执行");
         }
+    }
+
+    #[test]
+    fn drain_frames_切帧并保留不完整尾部() {
+        use std::sync::mpsc;
+        // 两个完整访问单元(SPS+PPS+IDR / 非关键帧 slice)+ 一个不完整尾部起始码。
+        let mut buf: Vec<u8> = Vec::new();
+        // 帧1:SPS(7) PPS(8) IDR(5)
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00]);
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce]);
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x11, 0x22]);
+        // 帧2:非关键 slice(1)
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x33, 0x44]);
+        // 不完整尾部:又一个 slice 起点(应保留等后续数据)
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x55]);
+        let (tx, rx) = mpsc::channel::<Frame>();
+        drain_frames(&mut buf, &tx);
+        drop(tx);
+        let frames: Vec<Frame> = rx.into_iter().collect();
+        // 帧1(含 IDR)为关键帧,帧2 非关键;第三个不完整不发。
+        assert_eq!(frames.len(), 2, "应切出 2 个完整帧");
+        assert!(frames[0].key_frame, "SPS/PPS/IDR 帧应为关键帧");
+        assert!(!frames[1].key_frame);
+        // buf 应保留最后一个不完整帧(起始码 + 数据;3/4 字节起始码重叠使保留 5-6 字节均可)。
+        assert!(
+            buf.len() >= 5 && buf.len() <= 6,
+            "保留不完整尾部,实际 {}",
+            buf.len()
+        );
+        // 尾部应以起始码开头(下一轮拼接后可继续切帧)。
+        assert!(buf.starts_with(&[0, 0, 1]) || buf.starts_with(&[0, 0, 0, 1]));
     }
 
     /// 造一个含 SPS/PPS/IDR + 非关键帧的 Annex B 流。
