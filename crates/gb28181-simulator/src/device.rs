@@ -1976,15 +1976,24 @@ impl DeviceSimulator {
         // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 TCP-ACTIVE(RFC 4571)。
         let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
 
-        // 按配置选择视频源:C 档(文件)优先,其次 B 档(轻量伪流),否则 A 档(不推流)。
+        // 按配置选择视频源:实时采集(live:) > 文件(C档) > 轻量伪流(B档) > 不推流(A档)。
         let fps = self.config.video_fps;
         let source: Option<Box<dyn media_rtp::VideoSource>> =
             if let Some(ref path) = self.config.video_source {
-                // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
-                Some(Box::new(
-                    media_rtp::FileSource::from_path_av(path, fps)
-                        .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))?,
-                ))
+                if let Some(input) = path.strip_prefix("live:") {
+                    // 实时采集摄像头/屏幕(把电脑当真实 IPC)。live:0 采集视频设备 0。
+                    let input = if input.is_empty() { "0" } else { input };
+                    Some(Box::new(
+                        media_rtp::LiveSource::capture(input, fps)
+                            .map_err(|e| Error::Media(format!("实时采集失败: {e}")))?,
+                    ))
+                } else {
+                    // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
+                    Some(Box::new(
+                        media_rtp::FileSource::from_path_av(path, fps)
+                            .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))?,
+                    ))
+                }
             } else {
                 self.config
                     .light_bitrate_kbps

@@ -457,10 +457,15 @@ const metrics = computed(() => [
           <div class="fg">
             <label>视频源(可选)</label>
             <div class="file-row">
-              <input v-model="form.video_source" class="inp" placeholder="H.264 / MP4 文件路径" />
-              <button class="file-btn" @click="pickVideoSource">选择</button>
+              <input v-model="form.video_source" class="inp" placeholder="H.264/MP4 文件,或 live:0 摄像头" />
+              <button class="file-btn" @click="pickVideoSource">选择文件</button>
             </div>
-            <div class="fg-hint">留空只做信令联调;要点播出画面请选 H.264/MP4(容器格式需系统装 ffmpeg)。</div>
+            <div class="src-quick">
+              <button class="chip-btn" @click="form.video_source = 'live:0'">📷 摄像头</button>
+              <button class="chip-btn" @click="form.video_source = 'live:2'">🖥 屏幕</button>
+              <button class="chip-btn" v-if="form.video_source" @click="form.video_source = ''">清除</button>
+            </div>
+            <div class="fg-hint">留空只做信令联调;文件需 H.264/MP4(容器需装 ffmpeg);live:N 实时采集摄像头/屏幕(把电脑当真实 IPC,需 ffmpeg)。</div>
           </div>
           <div class="action-row">
             <n-button type="primary" :disabled="startDisabled" @click="startDevice">注册上线</n-button>
@@ -678,6 +683,13 @@ const metrics = computed(() => [
   cursor: pointer; white-space: nowrap;
 }
 .file-btn:hover { border-color: var(--accent); color: var(--accent); }
+.src-quick { display: flex; gap: 8px; margin-top: 8px; }
+.chip-btn {
+  font-size: 12px; padding: 4px 12px; border-radius: 14px; cursor: pointer;
+  background: rgba(120,130,150,0.08); border: 1px solid var(--border-default);
+  color: var(--text-secondary); transition: all 0.15s;
+}
+.chip-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(56,132,255,0.08); }
 
 /* 云台控制可视化 */
 .ptz-panel { margin-top: 0; }
