@@ -291,17 +291,18 @@ let unlistenPtz: UnlistenFn | null = null;
 let unlistenPreset: UnlistenFn | null = null;
 onMounted(async () => {
   unlistenPtz = await listen<PtzAction>("ptz_action", (e) => {
-    ptz.value = e.payload;
-    // 自动停止兜底:部分平台(如 WVP)松手时不发显式停止命令,持续运动命令后
-    // 若 1.2s 内无新命令,自动归零,避免 UI 一直显示"转动中"。收到显式停止(全 false)则不再计时。
-    if (ptzStopTimer) { clearTimeout(ptzStopTimer); ptzStopTimer = null; }
     const m = e.payload;
     const active = m.up || m.down || m.left || m.right || m.zoom_in || m.zoom_out;
+    // 收到显式停止(全 false)立即归零(WVP 松手会发 0x00 停止命令,设备已实时应答)。
+    ptz.value = e.payload;
+    if (ptzStopTimer) { clearTimeout(ptzStopTimer); ptzStopTimer = null; }
+    // 仅作安全兜底:极少数平台松手不发停止命令时,3s 无新命令才自动归零。
+    // 放宽到 3s 避免"按住时因平台重发间隔较长被误判停止"。
     if (active) {
       ptzStopTimer = window.setTimeout(() => {
         ptz.value = { up: false, down: false, left: false, right: false,
           zoom_in: false, zoom_out: false, pan_speed: 0, tilt_speed: 0, zoom_speed: 0 };
-      }, 1200);
+      }, 3000);
     }
   });
   // 预置位调用:平滑巡航到目标位(未登记的预置位随机造一个目标演示)。
