@@ -1303,6 +1303,10 @@ impl DeviceSimulator {
                 if aux.on { "开" } else { "关" }
             );
         }
+        // FI 光圈/聚焦。
+        if let Some(fi) = ctrl.fi_op() {
+            return fi.label();
+        }
         // 其它:录像/布防/复位/看守位/精准云台/升级/抓拍/配置等,用 kind()。
         if let Some(v) = ctrl.record_cmd.as_deref() {
             return format!("录像控制:{v}");
@@ -1571,13 +1575,13 @@ impl DeviceSimulator {
                         .on_event(common::DeviceEvent::PtzPresetCall { preset: idx });
                 }
                 None => {
-                    // 先识别巡航/辅助/聚焦(均 0x8x/聚焦位),否则按方向/变倍运动。
+                    // 优先级:巡航/辅助(0x8x)→ FI 光圈聚焦(0x4x)→ 方向/变倍运动。
                     if let Some(op) = ctrl.cruise_op() {
                         self.apply_cruise_op(op);
                     } else if let Some(aux) = ctrl.aux_op() {
                         tracing::info!(func = aux.function.label(), on = aux.on, "辅助控制");
-                    } else if let Some((near, far)) = ctrl.focus_op() {
-                        tracing::info!(near, far, "聚焦/光圈控制");
+                    } else if let Some(fi) = ctrl.fi_op() {
+                        tracing::info!(fi = %fi.label(), "FI 光圈/聚焦控制");
                     } else if let Some(m) = ctrl.ptz_motion() {
                         // 方向/变倍运动:解析后上报观察者(供 UI 云台动画)。
                         tracing::info!(ptz = %ptz, up=m.up, down=m.down, left=m.left, right=m.right,

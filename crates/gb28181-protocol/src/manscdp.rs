@@ -542,7 +542,10 @@ impl Control {
         }
         let cmd = bytes[3];
         if cmd & 0x80 != 0 {
-            return None; // 预置位等扩展指令,不是运动
+            return None; // 预置位/巡航/辅助等扩展指令(0x8x),不是运动
+        }
+        if cmd & 0x40 != 0 {
+            return None; // FI 指令(0x4x:光圈/聚焦),用 focus_op 解析,不是方向运动
         }
         Some(PtzMotion {
             // 指令码位定义(GB/T 28181-2016 附录 A.3.1,实测 WVP 一致):
@@ -613,20 +616,72 @@ impl Control {
         })
     }
 
-    /// 解析聚焦/光圈(PTZCmd byte3)。
+    /// 解析 FI 指令(光圈/聚焦,GB/T 28181-2022 表 A.6)。
     ///
-    /// GB/T 28181 标准 PTZ 指令码 bit6=聚焦近、bit7=聚焦远。但 bit7(0x80)与本项目
-    /// 预置位/巡航/辅助的扩展码(0x8x)高位冲突,故:仅当 byte3 恰为 0x40(纯聚焦近)
-    /// 或 0x80(纯聚焦远)时识别为聚焦,返回 (near, far);否则 None。
-    ///
-    /// ⚠️ 未在真实 WVP 抓包核对(记忆教训:PTZ 字节位不凭标准猜),仅作最小可用识别,
-    /// 后续接入真机再校正。
-    pub fn focus_op(&self) -> Option<(bool, bool)> {
+    /// 指令码(byte4/`bytes[3]`)的 bit6=1 标识 FI 指令(0x4X):
+    /// bit3=光圈缩小、bit2=光圈放大、bit1=聚焦近、bit0=聚焦远;对应位清 0 即停止。
+    /// 例:0x42 聚焦近、0x41 聚焦远、0x48 光圈缩小、0x44 光圈放大、0x40 停止、0x49 组合。
+    /// byte5=聚焦速度、byte6=光圈速度。返回 None 表示非 FI 指令。
+    pub fn fi_op(&self) -> Option<FiOp> {
         let b = self.ptz_bytes()?;
-        match b[3] {
-            0x40 => Some((true, false)),
-            0x80 => Some((false, true)),
-            _ => None,
+        let cmd = b[3];
+        // 必须是 FI 指令:bit6=1(0x40),bit7=0。
+        if cmd & 0x40 == 0 || cmd & 0x80 != 0 {
+            return None;
+        }
+        Some(FiOp {
+            iris_close: cmd & 0x08 != 0,
+            iris_open: cmd & 0x04 != 0,
+            focus_near: cmd & 0x02 != 0,
+            focus_far: cmd & 0x01 != 0,
+            focus_speed: b[4],
+            iris_speed: b[5],
+        })
+    }
+}
+
+/// FI(光圈/聚焦)指令解析结果(GB/T 28181-2022 表 A.6)。全 false 为停止 FI 动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FiOp {
+    /// 光圈缩小(bit3)。
+    pub iris_close: bool,
+    /// 光圈放大(bit2)。
+    pub iris_open: bool,
+    /// 聚焦近(bit1)。
+    pub focus_near: bool,
+    /// 聚焦远(bit0)。
+    pub focus_far: bool,
+    /// 聚焦速度(byte5,0-255)。
+    pub focus_speed: u8,
+    /// 光圈速度(byte6,0-255)。
+    pub iris_speed: u8,
+}
+
+impl FiOp {
+    /// 是否为停止(无任何光圈/聚焦动作)。
+    pub fn is_stop(&self) -> bool {
+        !(self.iris_close || self.iris_open || self.focus_near || self.focus_far)
+    }
+
+    /// 人类可读描述(供 UI/日志)。
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.iris_close {
+            parts.push("光圈−");
+        }
+        if self.iris_open {
+            parts.push("光圈+");
+        }
+        if self.focus_near {
+            parts.push("聚焦近");
+        }
+        if self.focus_far {
+            parts.push("聚焦远");
+        }
+        if parts.is_empty() {
+            "FI 停止".into()
+        } else {
+            parts.join("+")
         }
     }
 }
@@ -2612,11 +2667,24 @@ mod tests {
         // 辅助控制关:byte3=0x8A, aux=2(红外灯)
         let aux2 = mk("A50F018A020000").aux_op().unwrap();
         assert!(!aux2.on && aux2.function == AuxFunction::InfraredLight);
-        // 聚焦近:byte3=0x40
-        assert_eq!(mk("A50F0140000000").focus_op(), Some((true, false)));
-        // 方向命令不应误判为巡航/辅助/聚焦。
+        // FI 指令(表 A.6):0x42 聚焦近、0x41 聚焦远、0x48 光圈缩小、0x44 光圈放大。
+        let near = mk("A50F0142000000").fi_op().unwrap();
+        assert!(near.focus_near && !near.focus_far && !near.iris_open && !near.iris_close);
+        let far = mk("A50F0141000000").fi_op().unwrap();
+        assert!(far.focus_far && !far.focus_near);
+        let iris_close = mk("A50F0148000000").fi_op().unwrap();
+        assert!(iris_close.iris_close && !iris_close.iris_open);
+        let iris_open = mk("A50F0144000000").fi_op().unwrap();
+        assert!(iris_open.iris_open);
+        // 0x40 停止 FI(全 false)。
+        assert!(mk("A50F0140000000").fi_op().unwrap().is_stop());
+        // 方向命令(0x08 上)不应误判为 FI/巡航;FI(0x42)不应误判为方向运动。
         assert!(mk("A50F0108320000").cruise_op().is_none());
-        assert!(mk("A50F0108320000").focus_op().is_none());
+        assert!(mk("A50F0108320000").fi_op().is_none());
+        assert!(
+            mk("A50F0142000000").ptz_motion().is_none(),
+            "FI 不应被当方向运动"
+        );
     }
 
     #[test]

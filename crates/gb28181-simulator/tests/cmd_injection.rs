@@ -170,3 +170,51 @@ async fn 设备配置控制注入应答() {
     );
     eprintln!("✅ DeviceControl 应答 CmdType=DeviceControl");
 }
+
+/// 多通道点播:载入 8ch NVR 模板后,平台向子通道发 INVITE 应能建立推流会话。
+/// 用 B 档轻量伪流(light_bitrate,无需 ffmpeg)验证路由+会话,不依赖真实视频文件。
+#[tokio::test]
+async fn 多通道子通道点播建立会话() {
+    let mut c = cfg();
+    c.light_bitrate_kbps = Some(256); // B 档伪流,任意通道可推
+    let sim = Arc::new(DeviceSimulator::new(c));
+    sim.load_catalog_template("nvr-8ch");
+    let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let platform_addr = platform_tp.local_addr().unwrap();
+    sim.set_local_addr_for_test("127.0.0.1", device_tp.local_addr().unwrap().port());
+
+    // 子通道 ID(nvr-8ch 模板第 1 个视频通道)。
+    let tree = sim.catalog_tree();
+    let ch = tree
+        .iter()
+        .find(|n| n.node_type == gb28181_protocol::id_codec::CatalogNodeType::VideoChannel)
+        .expect("模板应有视频通道");
+    let recv = platform_tp.local_addr().unwrap();
+    let sdp = format!(
+        "v=0\r\no=34020000002000000001 0 0 IN IP4 127.0.0.1\r\ns=Play\r\n\
+         c=IN IP4 {ip}\r\nt=0 0\r\nm=video {port} RTP/AVP 96\r\n\
+         a=rtpmap:96 PS/90000\r\na=recvonly\r\ny=0000000001\r\n",
+        ip = recv.ip(),
+        port = recv.port()
+    );
+    let mut h = sip_core::Headers::new();
+    h.set("From", "<sip:34020000002000000001@3402>;tag=inv1");
+    h.set("To", format!("<sip:{}@3402>", ch.id));
+    h.set("Call-ID", "invite-ch-1");
+    h.set("CSeq", "1 INVITE");
+    h.set("Content-Type", "application/sdp");
+    let inc = Incoming {
+        message: SipMessage::Request(Request {
+            method: Method::Invite,
+            uri: format!("sip:{}@127.0.0.1", ch.id),
+            headers: h,
+            body: sdp.into_bytes(),
+        }),
+        from: platform_addr,
+    };
+    // 应答不报错(建立会话);再发 BYE 停止,避免残留。
+    let ok = sim.answer_inbound(&device_tp, &inc).await;
+    assert!(ok.is_ok(), "子通道 INVITE 应成功建立会话,实际: {ok:?}");
+    eprintln!("✅ 多通道子通道 {} 点播建立会话", ch.id);
+}
