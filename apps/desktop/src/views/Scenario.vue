@@ -97,7 +97,7 @@ function buildToml(): string {
   lines.push(
     `[device_info]`,
     `device_name = "UVP-Sim"`, `manufacturer = "UVP"`,
-    `model = "Desktop-Sim"`, `firmware = "0.1.0"`,
+    `model = "Desktop-Sim"`, `firmware = "0.1.2"`,
   );
   return lines.join("\n");
 }
