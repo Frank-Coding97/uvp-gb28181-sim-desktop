@@ -5,8 +5,13 @@
 
 pub mod builder;
 pub mod device;
+pub mod home_position;
 
 pub use device::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator, DeviceState};
+pub use home_position::{
+    fixed_cases, FaultProfile, MatrixCase, MatrixReport, MatrixTransport, QueryMode,
+    HOME_POSITION_SCENARIO_IDS, MATRIX_SCHEMA_VERSION,
+};
 
 // 转出媒体侧的视频源预处理(桌面在设备上线前预热容器转封装缓存,避免 INVITE 阻塞)。
 pub use media_rtp::prepare_video_source;

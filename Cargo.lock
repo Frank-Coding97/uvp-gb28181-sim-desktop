@@ -940,6 +940,8 @@ dependencies = [
  "gb28181-protocol",
  "media-rtp",
  "rand",
+ "serde",
+ "serde_json",
  "sip-core",
  "tokio",
  "tracing",

@@ -2018,8 +2018,8 @@ impl AlarmStatusResponse {
 
 /// 看守位查询应答(HomePositionQuery,设备 → 平台)。
 ///
-/// ResetTime 固定 30(平台下发不落存);PresetIndex 表"有无看守位"(1/0),非真实编号
-///(与上游 uvp-gb28181-sim 一致)。
+/// GB/T 28181 要求配置放在嵌套的 `<HomePosition>` 中。没有配置时省略该
+/// 节点表示 no-data；不能用平铺的 Enabled/ResetTime/PresetIndex 代替。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "Response")]
 pub struct HomePositionQueryResponse {
@@ -2029,27 +2029,35 @@ pub struct HomePositionQueryResponse {
     pub sn: u32,
     #[serde(rename = "DeviceID")]
     pub device_id: String,
-    /// 是否启用看守位(1/0)。
-    #[serde(rename = "Enabled")]
-    pub enabled: u8,
-    /// 自动归位时间(秒),固定 30。
-    #[serde(rename = "ResetTime")]
-    pub reset_time: u32,
-    /// 归位预置位标志(有看守位=1,否则 0)。
-    #[serde(rename = "PresetIndex")]
-    pub preset_index: u32,
+    /// 已知配置。`None` 表示设备没有可返回的看守位数据。
+    #[serde(rename = "HomePosition", skip_serializing_if = "Option::is_none")]
+    pub home_position: Option<HomePosition>,
 }
 
 impl HomePositionQueryResponse {
-    /// 用是否启用/是否已设看守位构造。
+    /// 用是否启用/是否已设看守位构造(兼容旧调用方的默认值)。
     pub fn new(device_id: impl Into<String>, sn: u32, enabled: bool, has_home: bool) -> Self {
+        Self::with_config(device_id, sn, enabled, 30, has_home.then_some(1), has_home)
+    }
+
+    /// 用设备真实配置构造嵌套应答。`has_home=false` 时输出 no-data。
+    pub fn with_config(
+        device_id: impl Into<String>,
+        sn: u32,
+        enabled: bool,
+        reset_time: u32,
+        preset_index: Option<u32>,
+        has_home: bool,
+    ) -> Self {
         HomePositionQueryResponse {
             cmd_type: "HomePositionQuery".into(),
             sn,
             device_id: device_id.into(),
-            enabled: enabled as u8,
-            reset_time: 30,
-            preset_index: has_home as u32,
+            home_position: has_home.then(|| HomePosition {
+                enabled: enabled as u8,
+                reset_time,
+                preset_index: preset_index.unwrap_or(0),
+            }),
         }
     }
 
@@ -2603,9 +2611,25 @@ mod tests {
             .to_xml()
             .unwrap();
         assert!(xml.contains("<CmdType>HomePositionQuery</CmdType>"));
+        assert!(xml.contains("<HomePosition>"));
         assert!(xml.contains("<Enabled>1</Enabled>"));
         assert!(xml.contains("<ResetTime>30</ResetTime>"));
         assert!(xml.contains("<PresetIndex>1</PresetIndex>"));
+        assert!(!xml.contains("<Response><CmdType>HomePositionQuery</CmdType><SN>2</SN><DeviceID>dev</DeviceID><Enabled>"));
+    }
+
+    #[test]
+    fn home_position_query_is_nested() {
+        let xml = HomePositionQueryResponse::with_config("dev", 3, false, 45, Some(7), true)
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<HomePosition><Enabled>0</Enabled><ResetTime>45</ResetTime><PresetIndex>7</PresetIndex></HomePosition>"));
+
+        let no_data = HomePositionQueryResponse::with_config("dev", 4, true, 30, None, false)
+            .to_xml()
+            .unwrap();
+        assert!(!no_data.contains("<HomePosition>"));
+        assert!(!no_data.contains("<Enabled>"));
     }
 
     #[test]

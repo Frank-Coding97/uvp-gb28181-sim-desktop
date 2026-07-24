@@ -11,6 +11,8 @@ sip-core = { path = "../sip-core" }
 gb28181-protocol = { path = "../gb28181-protocol" }
 media-rtp = { path = "../media-rtp" }
 encoding_rs = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 rand.workspace = true
