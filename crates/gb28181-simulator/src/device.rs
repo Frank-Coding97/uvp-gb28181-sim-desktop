@@ -229,6 +229,10 @@ pub struct ControlState {
     pub home_enabled: bool,
     /// 是否已设看守位(HomePositionQuery 的 PresetIndex 标志)。
     pub home_set: bool,
+    /// 看守位自动归位时间(秒),查询应答回显设备最后一次配置。
+    pub home_reset_time: u32,
+    /// 看守位目标预置位编号,查询应答回显设备最后一次配置。
+    pub home_preset_index: u32,
     /// 巡航轨迹:轨迹号 → 该轨迹的预置位号列表(增点/删点维护)。
     pub cruise_tracks: std::collections::BTreeMap<u32, Vec<u32>>,
     /// 最近一次精准云台姿态(pan 度, tilt 度, zoom 倍)。
@@ -240,7 +244,11 @@ impl Default for ControlState {
         ControlState {
             alarming: false,
             home_enabled: true,
-            home_set: false,
+            // 默认设备带一个标准看守位配置,保证 simulator 的生产默认响应
+            // 是嵌套 HomePosition 有数据,而不是旧的平铺标志。
+            home_set: true,
+            home_reset_time: 30,
+            home_preset_index: 1,
             cruise_tracks: std::collections::BTreeMap::new(),
             precise_pose: (0.0, 0.0, 1.0),
         }
@@ -1500,14 +1508,28 @@ impl DeviceSimulator {
                 resp.to_xml()
             }
             "HomePositionQuery" => {
-                // 看守位查询(FR-17):ResetTime 固定 30,PresetIndex 为"有无看守位"标志。
-                let (enabled, has_home) = self
+                // 看守位查询(FR-17):返回嵌套 HomePosition,并回显真实配置。
+                let (enabled, reset_time, preset_index, has_home) = self
                     .control_state
                     .lock()
-                    .map(|s| (s.home_enabled, s.home_set))
-                    .unwrap_or((true, false));
-                HomePositionQueryResponse::new(&query.device_id, query.sn, enabled, has_home)
-                    .to_xml()
+                    .map(|s| {
+                        (
+                            s.home_enabled,
+                            s.home_reset_time,
+                            s.home_preset_index,
+                            s.home_set,
+                        )
+                    })
+                    .unwrap_or((true, 30, 1, true));
+                HomePositionQueryResponse::with_config(
+                    &query.device_id,
+                    query.sn,
+                    enabled,
+                    reset_time,
+                    Some(preset_index),
+                    has_home,
+                )
+                .to_xml()
             }
             "SDCardStatus" => {
                 // 存储卡状态查询(FR-17):模拟单张 32G 卡余 24G。
@@ -1636,7 +1658,10 @@ impl DeviceSimulator {
         if let Some(hp) = &ctrl.home_position {
             if let Ok(mut s) = self.control_state.lock() {
                 s.home_enabled = hp.enabled != 0;
-                s.home_set = hp.enabled != 0;
+                // 关闭看守位仍保留配置,后续查询必须回显 Enabled=0 及原值。
+                s.home_set = true;
+                s.home_reset_time = hp.reset_time;
+                s.home_preset_index = hp.preset_index;
             }
             tracing::info!(enabled = hp.enabled, preset = hp.preset_index, "看守位设置");
         }
@@ -2786,6 +2811,37 @@ mod tests {
         };
         sim.handle_control(&guard).await.unwrap();
         assert!(sim.control_state.lock().unwrap().alarming);
+
+        // 看守位关闭仍保留真实配置,查询必须使用嵌套 HomePosition 回显。
+        let home = Control {
+            cmd_type: "DeviceControl".into(),
+            device_id: "d".into(),
+            sn: 4,
+            home_position: Some(gb28181_protocol::manscdp::HomePosition {
+                enabled: 0,
+                reset_time: 45,
+                preset_index: 7,
+            }),
+            ..Default::default()
+        };
+        sim.handle_control(&home).await.unwrap();
+        let query = gb28181_protocol::manscdp::Query {
+            cmd_type: "HomePositionQuery".into(),
+            sn: 5,
+            device_id: "d".into(),
+            interval: None,
+            group_id: None,
+            config_type: None,
+            start_time: None,
+            end_time: None,
+            record_type: None,
+            indistinct_query: None,
+            stream_number: None,
+        };
+        let home_xml = sim.handle_query(&query).unwrap();
+        assert!(home_xml.contains(
+            "<HomePosition><Enabled>0</Enabled><ResetTime>45</ResetTime><PresetIndex>7</PresetIndex></HomePosition>"
+        ));
     }
 
     #[tokio::test]
