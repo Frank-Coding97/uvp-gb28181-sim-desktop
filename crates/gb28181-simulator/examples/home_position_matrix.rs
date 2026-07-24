@@ -1,9 +1,9 @@
 //! HomePosition T13.1 矩阵 runner。
 //!
-//! 当前仓库没有可携带 UVP token/SIP 配置的 CI 网络环境，因此默认输出离线
-//! fixture。它仍执行同一套固定 scenario/schema/loopback 门禁；接入真实平台
-//! 时应在此 runner 中把 `fixed_cases()` 映射到 DeviceSimulator 网络会话，
-//! 不要把平台状态机复制进协议 crate。
+//! 当前仓库没有可携带 UVP token/SIP 配置的 CI 网络环境，因此只有显式传入
+//! `--offline` 才生成离线 fixture。默认真实路径缺少环境或 runner 未接入时会
+//! 非零退出且不写报告。接入真实平台时应把 `fixed_cases()` 映射到
+//! DeviceSimulator 网络会话，不要把平台状态机复制进协议 crate。
 
 use gb28181_simulator::home_position::{MatrixReport, HOME_POSITION_SCENARIO_IDS};
 use std::env;
