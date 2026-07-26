@@ -11,7 +11,7 @@ import {
 import type { MenuOption } from "naive-ui";
 import {
   SpeedometerOutline, HardwareChipOutline, ServerOutline,
-  PulseOutline, GitNetworkOutline,
+  PulseOutline, GitNetworkOutline, VideocamOutline,
 } from "@vicons/ionicons5";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
@@ -24,10 +24,11 @@ function icon(comp: any) {
 }
 
 const menuOptions: MenuOption[] = [
-  { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
+  { label: "设备模拟",   key: "/simulator", icon: icon(VideocamOutline) },
   { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
   { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
   { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
+  { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
 ];
 
 // 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
@@ -56,6 +57,8 @@ const encodingOptions = [
 ];
 
 const activeKey = computed(() => route.path);
+// 设备模拟页隐藏全局顶栏(目标平台下拉 + 状态胶囊),该页自己管配置与状态。
+const hideTopbar = computed(() => route.path === "/simulator");
 function onMenuSelect(key: string) {
   router.push(key);
 }
@@ -132,7 +135,9 @@ const themeOverrides = {
 
             <!-- 主区 -->
             <main class="main">
-              <header class="topbar">
+              <!-- 设备模拟页自带 SIP 配置与状态,不显示全局顶栏(避免两处配置打架)。
+                   顶栏暂留给压测页用,待 SIP 配置提为唯一真相源后整体撤掉。 -->
+              <header v-if="!hideTopbar" class="topbar">
                 <!-- 全局目标平台:单设备/压测共用,下拉切换 + 编辑 -->
                 <div class="platform-bar">
                   <n-icon :component="ServerOutline" class="plat-icon" />
@@ -170,7 +175,7 @@ const themeOverrides = {
                   <span class="pill-text">{{ statusMeta.text }}</span>
                 </div>
               </header>
-              <section class="content">
+              <section class="content" :class="{ 'no-topbar': hideTopbar }">
                 <!-- keep-alive:切换标签页不销毁组件,保留各页表单/运行/曲线状态。 -->
                 <router-view v-slot="{ Component }">
                   <keep-alive>
@@ -230,5 +235,8 @@ const themeOverrides = {
   font-size: 12.5px; color: var(--text-secondary);
 }
 .pill-dot { width: 8px; height: 8px; border-radius: 50%; transition: background var(--transition); }
-.content { flex: 1; overflow-y: auto; padding: 4px 28px 28px; }
+.content { flex: 1; overflow-y: auto; padding: 4px 28px 28px; min-height: 0; }
+/* 无顶栏时补回顶部呼吸;并让子页能用 height:100% 撑满(设备模拟页靠它填满高度) */
+.content.no-topbar { padding-top: 24px; display: flex; flex-direction: column; overflow: hidden; }
+.content.no-topbar > * { min-height: 0; }
 </style>

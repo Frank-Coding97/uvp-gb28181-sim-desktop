@@ -5,6 +5,7 @@ import { createApp } from "vue";
 import { createRouter, createWebHashHistory } from "vue-router";
 import "./theme.css";
 import App from "./App.vue";
+import Simulator from "./views/Simulator.vue";
 import Dashboard from "./views/Dashboard.vue";
 import Device from "./views/Device.vue";
 import Channels from "./views/Channels.vue";
@@ -13,7 +14,9 @@ import Scenario from "./views/Scenario.vue";
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: "/", redirect: "/dashboard" },
+    { path: "/", redirect: "/simulator" },
+    // 设备模拟(新首页):SIP 配置 + 画面源 + 预览。
+    { path: "/simulator", component: Simulator },
     { path: "/dashboard", component: Dashboard },
     { path: "/device",    component: Device },
     { path: "/channels",  component: Channels },
