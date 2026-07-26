@@ -34,6 +34,12 @@ struct DeviceHandle {
     local_host: String,
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
+    /// 后台任务是否已退出(正常结束或 panic)。
+    ///
+    /// 后台任务拿不到 Tauri managed state,无法自己清理容器,故用共享标志对账:
+    /// 任务退出时置 true,命令侧据此把容器复位。不这样做的话,注册失败后
+    /// `device` 容器永远是 `Some`,`start_device` 的 `is_some()` 会拦死重试。
+    exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -48,7 +54,16 @@ impl AppState {
     }
 }
 
-/// 把设备事件映射成 `device_state` 字符串,通过 Tauri 事件推给前端(状态灯)。
+/// 发送 `device_state` 事件。payload 为 `{ state, error }` 结构化对象:
+/// 失败原因必须随状态一起送到前端,否则界面只能显示"注册失败"却说不出为什么。
+fn emit_device_state(app: &AppHandle, state: &str, error: Option<String>) {
+    let _ = app.emit(
+        "device_state",
+        serde_json::json!({ "state": state, "error": error }),
+    );
+}
+
+/// 把设备事件映射成 `device_state` 事件,推给前端(状态灯 + 失败原因)。
 struct StateEmitter {
     app: AppHandle,
 }
@@ -58,7 +73,20 @@ impl DeviceObserver for StateEmitter {
         let state = match event {
             DeviceEvent::RegisterAttempt => "Registering",
             DeviceEvent::RegisterSuccess => "Registered",
-            DeviceEvent::RegisterFailure(_) => "Failed",
+            // 注册失败:带上原因分类,前端常驻展示。
+            //
+            // 注意 FailureKind 只有超时/被拒/其它三档,拿不到平台返回的原始
+            // 401 reason-phrase —— 要更细的原因得改 common::DeviceEvent 的
+            // 契约(设备层目前也没把它传出来),不在本期范围。
+            DeviceEvent::RegisterFailure(kind) => {
+                let reason = match kind {
+                    common::FailureKind::Timeout => "注册超时:平台无响应(检查 IP/端口/防火墙)",
+                    common::FailureKind::Rejected => "平台拒绝注册(检查服务器 ID/域/密码)",
+                    common::FailureKind::Other => "注册失败:网络或其它错误",
+                };
+                emit_device_state(&self.app, "Failed", Some(reason.into()));
+                return;
+            }
             DeviceEvent::StreamStart => "InCall",
             DeviceEvent::StreamStop => "Registered",
             // 心跳事件不改变状态灯。
@@ -138,7 +166,7 @@ impl DeviceObserver for StateEmitter {
                 return;
             }
         };
-        let _ = self.app.emit("device_state", state);
+        emit_device_state(&self.app, state, None);
     }
 }
 
@@ -308,10 +336,14 @@ async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_js
     Ok(serde_json::json!({ "running": running, "device_count": device_count }))
 }
 
-/// 查询单设备运行状态(UI 切页后对账用)。running=设备实例是否存在。
+/// 查询单设备运行状态(UI 切页后对账用)。
+///
+/// running 反映**后台任务是否真的还活着**,不只看容器是否 `Some`——
+/// 否则设备失败退出后这里会一直报 running。
 #[tauri::command]
 async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let running = state.device.lock().await.is_some();
+    let mut guard = state.device.lock().await;
+    let running = !reap_if_exited(&mut guard);
     Ok(serde_json::json!({ "running": running }))
 }
 
@@ -394,7 +426,8 @@ async fn start_device(
     app: AppHandle,
 ) -> Result<String, String> {
     let mut guard = state.device.lock().await;
-    if guard.is_some() {
+    // 先回收已退出的旧设备,注册失败后无需手工「注销」即可直接重试。
+    if !reap_if_exited(&mut guard) {
         return Err("已有设备在运行,请先停止".into());
     }
 
@@ -484,12 +517,26 @@ async fn start_device(
     let sim_run = sim.clone();
     let tp_run = udp.clone();
     let host_run = local_host.clone();
+    // 退出标志:后台任务结束(含 panic)时置位,供命令侧对账清理容器。
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited_run = exited.clone();
+    let app_run = app.clone();
     tokio::spawn(async move {
-        sim_run
-            .run(tp_run, host_run, local_port, async move {
-                let _ = stop_rx.await;
-            })
-            .await;
+        // JoinHandle 包一层:run() 内部 panic 时也要落到退出分支,
+        // 否则容器永远 Some,用户改对参数也无法重试。
+        let joined = tokio::spawn(async move {
+            sim_run
+                .run(tp_run, host_run, local_port, async move {
+                    let _ = stop_rx.await;
+                })
+                .await;
+        })
+        .await;
+        exited_run.store(true, std::sync::atomic::Ordering::SeqCst);
+        // panic 要告知前端;正常退出不覆盖已有状态(可能是注册失败原因)。
+        if joined.is_err() {
+            emit_device_state(&app_run, "Failed", Some("设备任务异常退出(panic)".into()));
+        }
     });
 
     *guard = Some(DeviceHandle {
@@ -498,8 +545,23 @@ async fn start_device(
         local_host,
         local_port,
         stop_tx,
+        exited,
     });
     Ok("设备已启动".into())
+}
+
+/// 若后台任务已退出,清空设备容器并返回 true(表示当前无活设备)。
+///
+/// 所有读写 `device` 容器的命令都先走这一步对账,否则失败退出的设备会把
+/// 容器永久占住:`get_device_status` 报假 running、`start_device` 拒绝重试。
+fn reap_if_exited(guard: &mut Option<DeviceHandle>) -> bool {
+    let dead = guard
+        .as_ref()
+        .is_some_and(|h| h.exited.load(std::sync::atomic::Ordering::SeqCst));
+    if dead {
+        *guard = None;
+    }
+    guard.is_none()
 }
 
 /// 停止当前设备。
@@ -509,7 +571,7 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
     match guard.take() {
         Some(h) => {
             let _ = h.stop_tx.send(());
-            let _ = app.emit("device_state", "Disconnected");
+            emit_device_state(&app, "Disconnected", None);
             Ok("设备已停止".into())
         }
         None => Err("没有正在运行的设备".into()),
