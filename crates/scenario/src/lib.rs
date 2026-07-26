@@ -29,8 +29,12 @@ pub struct LinearScenario {
     pub server_host: String,
     /// 平台端口。
     pub server_port: u16,
-    /// 平台域。
+    /// 平台域(10 位区划中心编码)。
     pub server_domain: String,
+    /// 平台 SIP ID(20 位国标编号)。留空则回退用 `server_domain`,
+    /// 既有 TOML 不含该键时行为不变。
+    #[serde(default)]
+    pub server_id: String,
     /// 传输方式。
     #[serde(default = "default_transport")]
     pub transport: Transport,
@@ -153,6 +157,7 @@ impl Scenario for LinearScenario {
                 server_host: self.server_host.clone(),
                 server_port: self.server_port,
                 server_domain: self.server_domain.clone(),
+                server_id: self.server_id.clone(),
                 transport: self.transport,
                 heartbeat_interval_secs: self.heartbeat_interval_secs,
                 channels,
@@ -195,6 +200,52 @@ impl LinearScenario {
 mod tests {
     use super::*;
 
+    /// 旧 TOML 不含 `server_id` 键时仍可解析,且该字段为空(走回退)。
+    /// 保证既有压测场景文件不因新增字段而失效。
+    #[test]
+    fn 旧toml无server_id时可解析且为空() {
+        let toml = r#"
+base_device_id = "34020000001320000001"
+password = "12345678"
+server_host = "1.2.3.4"
+server_port = 5060
+server_domain = "34020000002000000001"
+[device_info]
+device_name = "Dev"
+manufacturer = "UVP"
+model = "Sim"
+firmware = "0.1"
+"#;
+        let sc = LinearScenario::from_toml_str(toml).expect("旧 TOML 应能解析");
+        assert_eq!(sc.server_id, "", "缺省 server_id 应为空串以触发回退");
+        assert_eq!(sc.server_domain, "34020000002000000001");
+    }
+
+    /// 新 TOML 可显式区分 20 位平台 ID 与 10 位域。
+    #[test]
+    fn 新toml可分别指定平台id与域() {
+        let toml = r#"
+base_device_id = "34020000001320000001"
+password = "12345678"
+server_host = "1.2.3.4"
+server_port = 5060
+server_domain = "3402000000"
+server_id = "34020000002000000001"
+[device_info]
+device_name = "Dev"
+manufacturer = "UVP"
+model = "Sim"
+firmware = "0.1"
+"#;
+        let sc = LinearScenario::from_toml_str(toml).expect("新 TOML 应能解析");
+        assert_eq!(sc.server_id, "34020000002000000001");
+        assert_eq!(sc.server_domain, "3402000000");
+        // 生成的设备配置应把两者分别透传下去。
+        let cfgs = sc.generate(1).expect("生成设备配置应成功");
+        assert_eq!(cfgs[0].server_id, "34020000002000000001");
+        assert_eq!(cfgs[0].server_domain, "3402000000");
+    }
+
     #[test]
     fn 线性场景生成_id_递增() {
         let sc = LinearScenario {
@@ -203,6 +254,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_domain: "34020000002000000001".into(),
+            server_id: String::new(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             channels_per_device: 1,
@@ -241,6 +293,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_domain: "34020000002000000001".into(),
+            server_id: String::new(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             channels_per_device: 1,
@@ -276,6 +329,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_domain: "34020000002000000001".into(),
+            server_id: String::new(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             channels_per_device: 1,

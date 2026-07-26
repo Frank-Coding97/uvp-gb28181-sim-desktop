@@ -15,6 +15,7 @@ fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
         server_host: "192.168.10.222".into(),
         server_port: 8160,
         server_domain: "3502000000".into(),
+        server_id: String::new(),
         transport: Transport::Udp,
         gb_version: GbVersion::V2022,
         signaling_encoding: common::SignalingEncoding::Gb18030,
