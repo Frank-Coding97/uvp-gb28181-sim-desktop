@@ -41,6 +41,8 @@ async fn main() {
         .parse()
         .expect("SERVER_PORT 非法");
     let server_domain = env_or("SERVER_DOMAIN", "34020000002000000001");
+    // 平台 20 位 SIP ID;留空则回退用 SERVER_DOMAIN(兼容只填一个值的老用法)。
+    let server_id = env_or("SERVER_ID", "");
     let device_id_str = env_or("DEVICE_ID", "34020000001320000001");
     let password = env_or("PASSWORD", "12345678");
 
@@ -62,7 +64,7 @@ async fn main() {
         server_host: server_host.clone(),
         server_port,
         server_domain,
-        server_id: String::new(),
+        server_id,
         transport: Transport::Udp,
         heartbeat_interval_secs: 60,
         channels,
