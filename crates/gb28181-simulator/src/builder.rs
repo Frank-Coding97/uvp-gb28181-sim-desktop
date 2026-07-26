@@ -91,13 +91,28 @@ fn device_aor(cfg: &DeviceConfig) -> String {
     format!("sip:{}@{}", cfg.device_id, cfg.server_domain)
 }
 
-/// 平台侧 SIP URI:`sip:<server_id>@<domain>`(server_id 用平台域的中心编码,
-/// 这里以 domain 作为 server_id 前缀不可得时退化为 domain 本身)。
+/// 平台 SIP ID(目标 URI 的 user 部分)。
+///
+/// 优先用显式配置的 20 位 [`DeviceConfig::server_id`];留空则回退为
+/// [`DeviceConfig::server_domain`]——兼容只填了一个值的既有配置(压测场景
+/// TOML 等),回退后所有报文与加字段之前逐字节一致。
+fn platform_id(cfg: &DeviceConfig) -> &str {
+    if cfg.server_id.is_empty() {
+        &cfg.server_domain
+    } else {
+        &cfg.server_id
+    }
+}
+
+/// 平台侧目标 URI:`sip:<平台 SIP ID>@<host>:<port>`。
+///
+/// REGISTER / MESSAGE / 对话内 NOTIFY 三类请求的 Request-URI 共用此函数。
 fn platform_uri(cfg: &DeviceConfig) -> String {
-    // Request-URI 指向平台:sip:<domain>@<host:port>
     format!(
         "sip:{}@{}:{}",
-        cfg.server_domain, cfg.server_host, cfg.server_port
+        platform_id(cfg),
+        cfg.server_host,
+        cfg.server_port
     )
 }
 
@@ -165,9 +180,10 @@ pub fn message_xml(
         ),
     );
     headers.append("From", format!("<{aor}>;tag={}", ids.from_tag));
+    // 目标 To:user=平台 SIP ID,host=SIP 域。原实现两处都填了 server_domain。
     headers.append(
         "To",
-        format!("<sip:{}@{}>", cfg.server_domain, cfg.server_domain),
+        format!("<sip:{}@{}>", platform_id(cfg), cfg.server_domain),
     );
     headers.append("Call-ID", ids.call_id.clone());
     headers.append("CSeq", format!("{cseq} MESSAGE"));
@@ -363,6 +379,108 @@ mod tests {
         let u = encode_xml_body(xml, common::SignalingEncoding::Utf8);
         assert!(u.windows(5).any(|w| w == b"UTF-8"));
         assert!(decode_xml_body(&u, common::SignalingEncoding::Utf8).contains("前门相机"));
+    }
+
+    /// 同 [`cfg`],但显式区分 20 位平台 SIP ID 与 10 位 SIP 域。
+    fn cfg_dual_id() -> DeviceConfig {
+        DeviceConfig {
+            server_domain: "3402000000".into(),
+            server_id: "34020000002000000001".into(),
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn server_id_填充时_register_request_uri_用平台id() {
+        let ids = DialogIds::new();
+        let req = register(&cfg_dual_id(), &ids, 1, "5.6.7.8", 5070, None, 3600);
+        let text = String::from_utf8(req.to_bytes()).unwrap();
+        // Request-URI 的 user 部分是 20 位平台 ID,不是 10 位域。
+        assert!(
+            text.starts_with("REGISTER sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"),
+            "实际:{}",
+            text.lines().next().unwrap_or("")
+        );
+        // 设备 AOR(From/To)的 host 部分才是域。
+        assert!(
+            text.contains("From: <sip:34020000001320000001@3402000000>"),
+            "From 应用设备 AOR(host=域)"
+        );
+        assert!(text.contains("To: <sip:34020000001320000001@3402000000>"));
+    }
+
+    #[test]
+    fn server_id_填充时_message_to_区分id与域() {
+        let ids = DialogIds::new();
+        let req = message_xml(&cfg_dual_id(), &ids, 3, "5.6.7.8", 5070, "<Notify/>");
+        let text = String::from_utf8(req.to_bytes()).unwrap();
+        // 目标 To:user=平台 ID,host=域(原实现两处都填了域)。
+        assert!(
+            text.contains("To: <sip:34020000002000000001@3402000000>"),
+            "MESSAGE 的 To 应为 平台ID@域"
+        );
+        assert!(text.starts_with("MESSAGE sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"));
+    }
+
+    #[test]
+    fn server_id_填充时_notify_request_uri_用平台id() {
+        let dialog = NotifyDialog {
+            call_id: "sub-call-xyz@plat".into(),
+            local_tag: "devtag123".into(),
+            remote_from: "<sip:34020000002000000001@3402000000>;tag=plat99".into(),
+            event: "Catalog".into(),
+            expires: 3600,
+        };
+        let req = notify_in_dialog(&cfg_dual_id(), &dialog, 7, "5.6.7.8", 5070, "<Notify/>");
+        let text = String::from_utf8(req.to_bytes()).unwrap();
+        assert!(
+            text.starts_with("NOTIFY sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"),
+            "NOTIFY 的 Request-URI 也走 platform_uri,须用平台 ID"
+        );
+        // NOTIFY 的 To 沿用平台 SUBSCRIBE 的 From,不由 config 重建。
+        assert!(text.contains("tag=plat99"), "To 应沿用平台 From");
+    }
+
+    /// 回退保护:`server_id` 留空时三类报文的目标 URI 与改动前逐字节一致。
+    /// 这是压测链路(只填一个 server_domain)不被破坏的唯一保障。
+    #[test]
+    fn server_id_留空时_三类报文uri_与旧行为逐字节一致() {
+        let c = cfg();
+        assert!(c.server_id.is_empty(), "fixture 应为空以验证回退");
+        // 旧行为:server_domain 同时充当平台 ID,故 URI 的 user 就是它。
+        let expect_uri = "sip:34020000002000000001@1.2.3.4:5060";
+
+        let ids = DialogIds::new();
+        let reg = String::from_utf8(register(&c, &ids, 1, "5.6.7.8", 5070, None, 3600).to_bytes())
+            .unwrap();
+        assert!(reg.starts_with(&format!("REGISTER {expect_uri} SIP/2.0\r\n")));
+
+        let msg =
+            String::from_utf8(message_xml(&c, &ids, 3, "5.6.7.8", 5070, "<x/>").to_bytes()).unwrap();
+        assert!(msg.starts_with(&format!("MESSAGE {expect_uri} SIP/2.0\r\n")));
+        // 旧 MESSAGE 的 To 是 域@域,回退后必须保持这个形状。
+        assert!(msg.contains("To: <sip:34020000002000000001@34020000002000000001>"));
+
+        let dialog = NotifyDialog {
+            call_id: "c@p".into(),
+            local_tag: "t1".into(),
+            remote_from: "<sip:x@y>;tag=p9".into(),
+            event: "Catalog".into(),
+            expires: 3600,
+        };
+        let ntf =
+            String::from_utf8(notify_in_dialog(&c, &dialog, 7, "5.6.7.8", 5070, "<x/>").to_bytes())
+                .unwrap();
+        assert!(ntf.starts_with(&format!("NOTIFY {expect_uri} SIP/2.0\r\n")));
+    }
+
+    #[test]
+    fn device_aor_不受server_id影响() {
+        // AOR 只由 device_id 与 server_domain 决定,与平台 ID 无关。
+        assert_eq!(
+            device_aor(&cfg_dual_id()),
+            "sip:34020000001320000001@3402000000"
+        );
     }
 
     #[test]
