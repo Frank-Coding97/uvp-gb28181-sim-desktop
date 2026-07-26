@@ -15,6 +15,7 @@ fn cfg() -> DeviceConfig {
         server_host: "127.0.0.1".into(),
         server_port: 5060,
         server_domain: "3402000000".into(),
+        server_id: String::new(),
         transport: Transport::Udp,
         gb_version: GbVersion::V2022,
         signaling_encoding: common::SignalingEncoding::Gb18030,

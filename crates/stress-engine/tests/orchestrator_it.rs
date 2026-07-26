@@ -65,6 +65,7 @@ fn scenario_for(port: u16) -> LinearScenario {
         server_host: "127.0.0.1".into(),
         server_port: port,
         server_domain: "34020000002000000001".into(),
+        server_id: String::new(),
         transport: common::Transport::Udp,
         heartbeat_interval_secs: 3600,
         channels_per_device: 1,

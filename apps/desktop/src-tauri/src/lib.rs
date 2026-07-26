@@ -390,6 +390,9 @@ struct DeviceCfg {
     server_host: String,
     server_port: u16,
     server_domain: String,
+    /// 平台 SIP ID(20 位)。留空回退用 `server_domain`,兼容旧前端调用。
+    #[serde(default)]
+    server_id: String,
     device_id: String,
     password: String,
     #[serde(default)]
@@ -433,7 +436,8 @@ async fn start_device(
 
     let device_id = DeviceId::new(config.device_id.clone()).map_err(|e| e.to_string())?;
     // 通道 ID:设备 ID 前 17 位 + 132(视频通道类型码)。
-    let channel_id_str = format!("{}132", &config.device_id[..17]);
+    // 切片用已校验的 device_id(DeviceId::new 保证 20 位数字),不依赖未校验的入参。
+    let channel_id_str = format!("{}132", &device_id.as_str()[..17]);
     let channel_id = DeviceId::new(channel_id_str).map_err(|e| e.to_string())?;
     let gb_version = if config.gb_version == "2016" {
         GbVersion::V2016
@@ -458,6 +462,7 @@ async fn start_device(
         server_host: config.server_host.clone(),
         server_port: config.server_port,
         server_domain: config.server_domain.clone(),
+        server_id: config.server_id.clone(),
         transport,
         heartbeat_interval_secs: 60,
         channels: vec![ChannelConfig {

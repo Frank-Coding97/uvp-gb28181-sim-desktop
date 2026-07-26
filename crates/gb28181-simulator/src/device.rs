@@ -129,8 +129,16 @@ pub struct DeviceConfig {
     pub server_host: String,
     /// 上级平台 SIP 服务端口。
     pub server_port: u16,
-    /// 上级平台域(SIP domain / 服务器 ID 中心编码)。
+    /// 上级平台 SIP 域(10 位行政区划中心编码,如 `3402000000`)。
+    ///
+    /// 用于设备 AOR 的 host 部分:`sip:<device_id>@<server_domain>`。
     pub server_domain: String,
+    /// 上级平台 SIP ID(20 位国标编号,如 `34020000002000000001`)。
+    ///
+    /// 国标里平台 ID 与 SIP 域是**两个不同概念**,前者 20 位、后者 10 位。
+    /// 用于目标 Request-URI 的 user 部分。留空则回退为 [`Self::server_domain`],
+    /// 兼容只填了一个值的既有配置(压测场景 TOML 等)。
+    pub server_id: String,
     /// 信令传输方式。
     pub transport: Transport,
     /// 心跳间隔(秒)。
@@ -2267,6 +2275,7 @@ mod tests {
             server_host: host.into(),
             server_port: port,
             server_domain: "34020000002000000001".into(),
+            server_id: String::new(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             channels: vec![],

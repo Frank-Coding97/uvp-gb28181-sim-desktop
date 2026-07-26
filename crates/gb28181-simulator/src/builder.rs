@@ -299,6 +299,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_domain: "34020000002000000001".into(),
+            server_id: String::new(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             channels: vec![],
