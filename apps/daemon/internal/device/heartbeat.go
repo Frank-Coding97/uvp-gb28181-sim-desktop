@@ -116,15 +116,16 @@ func (h *Heartbeat) onSuccess() {
 
 // onFail 心跳失败:计数+1,推 error 事件,达到阈值降级。
 func (h *Heartbeat) onFail(err error) {
+	// P0-2 fix: 先判 ctx.Canceled 再累加,避免 shutdown 期间误计数
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// 正常 shutdown 路径,不算失败
+		return
+	}
+
 	n := h.failCount.Add(1)
 	slog.Warn("heartbeat fail",
 		"consecutive_fails", n,
 		"error", err)
-
-	// ctx.Canceled 不计入,避免 shutdown 期间误降级
-	if errors.Is(err, context.Canceled) {
-		return
-	}
 
 	payload := map[string]any{
 		"ok":                false,
