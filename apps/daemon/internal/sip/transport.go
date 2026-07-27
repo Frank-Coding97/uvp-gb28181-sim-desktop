@@ -1,7 +1,7 @@
 // Package sip 封装 sipgo UAC 能力,对上层业务提供最小接口:
 // Transport (UDP/TCP 传输初始化)、Client (自动处理 401 Digest)。
 //
-// M1 仅实现 UDP + Digest MD5 基础流程。TCP 归 M4,Trace observer 归 M2。
+// M1 UDP + Digest MD5 · M2 Trace observer · M4 起 TCP + Digest 方言。
 package sip
 
 import (
@@ -14,7 +14,8 @@ import (
 
 // TransportConfig 是 Transport 初始化参数。
 type TransportConfig struct {
-	// Protocol 是传输协议: "udp" 或 "tcp"。M1 仅支持 "udp"。
+	// Protocol 是传输协议: "udp" (默认) 或 "tcp"。
+	// TCP 自 M4 起支持。TLS/WS 归后续 spec。
 	Protocol string
 
 	// LocalAddr 是本地绑定地址,格式 "host:port"。
@@ -46,12 +47,12 @@ func NewTransport(cfg TransportConfig) (*Transport, error) {
 		protocol = "udp"
 	}
 	if protocol != "udp" && protocol != "tcp" {
-		return nil, fmt.Errorf("unsupported protocol: %s (M1 仅支持 udp,TCP 归 M4)", cfg.Protocol)
-	}
-	if protocol == "tcp" {
-		return nil, fmt.Errorf("TCP 传输归 M4,当前 M1 仅支持 udp")
+		return nil, fmt.Errorf("unsupported protocol: %s (仅支持 udp/tcp)", cfg.Protocol)
 	}
 
+	// sipgo v1.4.0 内建 UDP + TCP,UA 层不需要区分。
+	// Client 层通过 Request-URI 的 transport 参数 + SetDestination 让 sipgo
+	// 选正确的 socket 类型。TCP 分帧按 Content-Length 严格处理 (RFC 3261 §18.3)。
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgent("UVP-Sim-Desktop/0.2.0"),
 	)
