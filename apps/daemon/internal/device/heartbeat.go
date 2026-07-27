@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -154,12 +155,20 @@ func (h *Heartbeat) onFail(err error) {
 // CSeq 从 session.cseqCounter 单调递增 (spec Q10)。
 func (h *Heartbeat) buildKeepaliveRequest(sn int) (*sip.Request, error) {
 	cfg := h.session.cfg
+	isTCP := strings.EqualFold(cfg.Transport, "tcp")
 
 	// Request-URI 与 REGISTER 相同 (发给平台 AOR)
 	requestURIStr := gb28181.BuildRegisterRequestURI(cfg)
 	var requestURI sip.Uri
 	if err := sip.ParseUri(requestURIStr, &requestURI); err != nil {
 		return nil, fmt.Errorf("parse request-URI %q: %w", requestURIStr, err)
+	}
+	// M4 TCP: 加 transport=tcp 参数 (与 REGISTER 一致,让 LiveGBS 等平台按 TCP 路由)
+	if isTCP {
+		if requestURI.UriParams == nil {
+			requestURI.UriParams = sip.NewParams()
+		}
+		requestURI.UriParams.Add("transport", "tcp")
 	}
 
 	req := sip.NewRequest(sip.MESSAGE, requestURI)
