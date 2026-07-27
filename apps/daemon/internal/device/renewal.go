@@ -11,9 +11,9 @@ import (
 
 // renewalMinFloor 是续约触发时机下限保护。
 //
-// 若 expires 极短 (<=60s),按公式算的 max(expires*0.8, expires-60) 会得到负值。
-// 退化:留 5s 余量,确保还有一次机会尝试续约。
-const renewalMinFloor = 5 * time.Second
+// 若 expires 极短 (< 5s),按公式算会得到 <= 0,退化到此下限。
+// 500ms 兼顾 (a) 生产场景不会用这么短 (b) 测试可跑短周期不阻塞。
+const renewalMinFloor = 500 * time.Millisecond
 
 // Renewal 是到期续约循环。
 //
