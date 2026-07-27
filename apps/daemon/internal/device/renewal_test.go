@@ -3,6 +3,7 @@ package device
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +42,7 @@ func TestRenewal_ComputeWait_Formula(t *testing.T) {
 
 // renewalFakeClient: 路由 REGISTER 到脚本化的多轮响应,记录 CSeq 递增。
 type renewalFakeClient struct {
+	mu                sync.Mutex
 	registerResponses []mockResponse
 	registerErr       error
 	idx               int
@@ -48,6 +50,8 @@ type renewalFakeClient struct {
 }
 
 func (c *renewalFakeClient) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.calls = append(c.calls, req)
 	if req.Method != sip.REGISTER {
 		return nil, errors.New("renewalFakeClient only serves REGISTER")
@@ -76,7 +80,7 @@ func TestRenewal_TriggerFires(t *testing.T) {
 			{statusCode: 200, expiresHeader: "6"}, // 首次续约
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	bus := &captureBus{}
 	session.SetPublisher(bus)
 	if err := session.Start(context.Background()); err != nil {
@@ -126,7 +130,7 @@ func TestRenewal_SuccessKeepsRegistered(t *testing.T) {
 			{statusCode: 200, expiresHeader: "6"},
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	if err := session.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -154,7 +158,7 @@ func TestRenewal_FailureMarksFailed(t *testing.T) {
 			{statusCode: 403, reason: "Forbidden"}, // 续约被拒
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	bus := &captureBus{}
 	session.SetPublisher(bus)
 	if err := session.Start(context.Background()); err != nil {
@@ -202,7 +206,7 @@ func TestRenewal_CtxCancelExits(t *testing.T) {
 			{statusCode: 200, expiresHeader: "3600"}, // 大 Expires → wait ~ 3540s
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	if err := session.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

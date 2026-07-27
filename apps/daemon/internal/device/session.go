@@ -73,6 +73,27 @@ type RegistrationSession struct {
 	// 但保存引用便于测试断言与后续 stats)。
 	heartbeat *Heartbeat
 	renewal   *Renewal
+
+	// heartbeatOverride 是测试用:覆盖 cfg.HeartbeatIntervalSecs 的短周期。
+	// 生产路径为 0 (读 cfg)。
+	heartbeatOverride time.Duration
+
+	// disableBackgroundLoops 是测试标记:Start 成功不 spawn heartbeat/renewal。
+	// 用于 T1 / T2 / T3 单元测试独立跑各自的 loop,不受 auto-spawn 干扰。
+	// 生产路径永远为 false。
+	disableBackgroundLoops bool
+}
+
+// DisableBackgroundLoopsForTest 关闭 Start 后 auto-spawn heartbeat/renewal。
+// 仅测试路径使用 —— 生产代码不应调用。
+func (s *RegistrationSession) DisableBackgroundLoopsForTest() {
+	s.disableBackgroundLoops = true
+}
+
+// SetHeartbeatInterval 覆盖心跳周期 (测试用,生产路径读 cfg.HeartbeatIntervalSecs)。
+// 必须在 Start 之前调用才生效。
+func (s *RegistrationSession) SetHeartbeatInterval(d time.Duration) {
+	s.heartbeatOverride = d
 }
 
 // NewRegistrationSession 创建会话。
@@ -144,7 +165,32 @@ func (s *RegistrationSession) Start(parentCtx context.Context) error {
 		"registered_expires_secs", expires,
 		"platform_server", resp.GetHeader("Server"))
 
+	// M3 T4: 注册成功后自动启动 heartbeat + renewal。
+	// 两个 goroutine 都绑 s.ctx —— Stop() cancel 后一起收。
+	s.spawnBackgroundLoops()
+
 	return nil
+}
+
+// spawnBackgroundLoops 启动心跳 + 续约循环 (T4)。
+//
+// 只在 REGISTER 200 OK 后调用一次。ctx 用 s.ctx (Stop cancel 后子任务退)。
+// disableBackgroundLoops (仅测试路径) 时跳过。
+func (s *RegistrationSession) spawnBackgroundLoops() {
+	if s.disableBackgroundLoops {
+		return
+	}
+	interval := s.heartbeatOverride
+	if interval <= 0 {
+		interval = time.Duration(s.cfg.HeartbeatIntervalSecs) * time.Second
+	}
+	s.heartbeat = NewHeartbeat(s, interval)
+	s.renewal = NewRenewal(s)
+
+	// 从 s.ctx 派生就够 (每个 loop 自己 handle ctx.Done)
+	ctx := s.ctx
+	go s.heartbeat.Run(ctx)
+	go s.renewal.Run(ctx)
 }
 
 // Stop 主动停止会话。

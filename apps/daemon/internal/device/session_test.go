@@ -80,6 +80,14 @@ func (m *mockSipClient) lastCall() *sip.Request {
 	return m.calls[len(m.calls)-1]
 }
 
+// newRawTestSession 创建一个禁用 auto-spawn heartbeat/renewal 的 session,
+// 便于 T1/T2/T3 各自独立单元测试内部 loop,不受 T4 auto-spawn 干扰。
+func newRawTestSession(client SipClient, cfg *gb28181.SipConfig) *RegistrationSession {
+	s := NewRegistrationSession(client, cfg)
+	s.DisableBackgroundLoopsForTest()
+	return s
+}
+
 func newTestConfig() *gb28181.SipConfig {
 	return &gb28181.SipConfig{
 		DeviceID:     "34020000001320000001",

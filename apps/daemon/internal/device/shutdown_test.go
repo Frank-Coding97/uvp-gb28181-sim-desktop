@@ -88,7 +88,7 @@ func TestShutdown_SendsExpiresZero(t *testing.T) {
 			{statusCode: 200}, // 注销 REGISTER
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	if err := session.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestShutdown_TimeoutForceCleanup(t *testing.T) {
 		// 让注销 REGISTER 慢 8s (超过 6s 超时)
 		delayPerCall: []time.Duration{0, 8 * time.Second},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	if err := session.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestShutdown_CancelsChildTasks(t *testing.T) {
 			{statusCode: 200},
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	if err := session.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestShutdown_IdempotentStop(t *testing.T) {
 			{statusCode: 200},
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	_ = session.Start(context.Background())
 
 	for i := 0; i < 3; i++ {
@@ -225,7 +225,7 @@ func TestShutdown_SkipsIfNotRegistered(t *testing.T) {
 			{statusCode: 403, reason: "Forbidden"}, // 初始注册失败
 		},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	_ = session.Start(context.Background()) // 会失败 → Failed
 
 	if err := session.Stop(); err != nil {
