@@ -32,9 +32,24 @@ jobs:
       - name: 单元 + 集成测试
         run: cargo test --workspace
 
+  # ── Go daemon 质量门:-race 检测 + 集成测试 ─────────────
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Go 单元测试 (race detector)
+        working-directory: apps/daemon
+        run: go test -race -short ./...
+      - name: Go 集成测试 (race detector)
+        working-directory: apps/daemon
+        run: go test -race -tags=integration ./test/integration/...
+
   # ── 三平台桌面安装包 ─────────────────────────────────
   build-desktop:
-    needs: rust-check
+    needs: [rust-check, go-test]
     strategy:
       fail-fast: false
       matrix:
