@@ -20,6 +20,7 @@ import (
 
 	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/internal/device"
 	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/internal/gb28181"
+	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/internal/ipc"
 	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/internal/sip"
 )
 
@@ -50,8 +51,8 @@ func main() {
 	// M2 Tauri 场景下 daemon 以子进程方式启动,stdin=命令帧 / stdout=响应+事件 / stderr=slog。
 	if *stdio {
 		slog.Info("uvp-daemon start", "version", Version, "mode", "stdio")
-		if err := runStdioLoop(ctx, os.Stdin, os.Stdout); err != nil && !errors.Is(err, io.EOF) {
-			slog.Error("stdio loop failed", "error", err)
+		if err := runStdioServer(ctx); err != nil && !errors.Is(err, io.EOF) {
+			slog.Error("stdio server failed", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -94,10 +95,95 @@ func initLogger(level string) {
 	slog.SetDefault(slog.New(handler))
 }
 
-// runStdioLoop 是 --stdio 主循环:按行读 stdin → 解 JSON-RPC 帧 → 派发 → 写响应到 stdout。
+// runStdioServer 是 M2 完整 stdio 主循环。
 //
-// T0 阶段实现最小骨架:只支持 ping method,返回 {"pong": true}。
-// T1 会替换成 ipc.Server + Router,支持完整 method 派发 + 双队列 event 推送。
+// 组装:
+//   1. ipc.Server + Router (T1)
+//   2. RegisterBuiltins (ping)
+//   3. DeviceManager 挂 3 个业务 handler (T3),factory 里真建 sip.Transport / Client / Session
+//   4. TracePublisher 桥接 sip → ipc.Server.Publish("sip_trace", ..., false) (T2)
+//
+// stdin EOF / ctx cancel → 优雅退出,drainAndFlush 剩余帧。
+func runStdioServer(ctx context.Context) error {
+	router := ipc.NewRouter()
+	ipc.RegisterBuiltins(router)
+	server := ipc.NewServer(router)
+
+	dm := ipc.NewDeviceManager()
+	dm.SetFactory(newProductionSessionFactory(server))
+	dm.RegisterHandlers(router, server)
+
+	return server.Run(ctx, os.Stdin, os.Stdout)
+}
+
+// tracerToIPC 把 sip.TracePublisher 事件转发到 ipc.Server.Publish。
+type tracerToIPC struct {
+	server *ipc.Server
+}
+
+// Emit 实现 sip.TracePublisher。sip_trace 走 bulk(允许丢弃, plan R3)。
+func (t *tracerToIPC) Emit(e sip.TraceEvent) {
+	t.server.Publish("sip_trace", map[string]any{
+		"direction":   e.Direction,
+		"method":      e.Method,
+		"status_code": e.StatusCode,
+		"cseq":        e.CSeq,
+		"call_id":     e.CallID,
+		"peer":        e.Peer,
+		"summary":     e.Summary,
+		"raw":         e.RawText,
+	}, false)
+}
+
+// sessionAdapter 让 *device.RegistrationSession (返回 device.State) 满足 ipc.Session (返回 string)。
+type sessionAdapter struct {
+	inner *device.RegistrationSession
+}
+
+func (a *sessionAdapter) Start(ctx context.Context) error { return a.inner.Start(ctx) }
+func (a *sessionAdapter) Stop() error                     { return a.inner.Stop() }
+func (a *sessionAdapter) State() string                   { return a.inner.State().String() }
+func (a *sessionAdapter) RegisteredExpires() int          { return a.inner.RegisteredExpires() }
+
+// newProductionSessionFactory 返回生产用的 SessionFactory。
+// 每次 start_device 建全新 transport / client / session,不复用(spec Q10 全期 Call-ID 已经在 session 里保证)。
+func newProductionSessionFactory(server *ipc.Server) ipc.SessionFactory {
+	tracer := &tracerToIPC{server: server}
+	return func(params ipc.StartDeviceParams) (ipc.Session, error) {
+		cfg, err := params.ToSipConfig()
+		if err != nil {
+			return nil, fmt.Errorf("factory: %w", err)
+		}
+
+		// 探测本机对外 IP (与 runOnce 一致的做法)
+		tmpTransport, err := sip.NewTransport(sip.TransportConfig{Protocol: cfg.Transport})
+		if err != nil {
+			return nil, fmt.Errorf("factory: new tmp transport: %w", err)
+		}
+		localHost := tmpTransport.DiscoverLocalIP(fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort))
+		tmpTransport.Close()
+
+		transport, err := sip.NewTransport(sip.TransportConfig{
+			Protocol:  cfg.Transport,
+			LocalAddr: "0.0.0.0:0",
+			LocalHost: localHost,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("factory: new transport: %w", err)
+		}
+
+		client := sip.NewClient(transport, sip.ClientConfig{
+			Username: cfg.DeviceID,
+			Password: cfg.Password,
+			Tracer:   tracer,
+		})
+		session := device.NewRegistrationSession(client, cfg)
+		return &sessionAdapter{inner: session}, nil
+	}
+}
+
+// runStdioLoop 是 T0 遗留的最小骨架,保留供 stdio_test.go 单元测试用(不含 ipc.Server)。
+// 生产路径走 runStdioServer。
 //
 // 帧格式(plan §2.2, JSON-RPC 2.0):
 //   请求: {"jsonrpc":"2.0","method":"ping","id":1}
