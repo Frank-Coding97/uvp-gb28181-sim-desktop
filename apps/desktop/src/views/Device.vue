@@ -90,7 +90,9 @@ async function startDevice() {
     // 合并全局平台参数 + 本页设备参数。
     const config = {
       server_host: p.server_host, server_port: p.server_port,
-      server_domain: p.server_domain, password: p.password, transport: p.transport,
+      server_domain: p.server_domain,
+      server_id: p.server_id || "", // 20 位平台 ID,留空时后端回退 server_domain
+      password: p.password, transport: p.transport,
       signaling_encoding: p.signaling_encoding ?? "GB18030",
       ...form.value,
       video_source: form.value.video_source.trim() || null,
@@ -421,6 +423,7 @@ const metrics = computed(() => [
             <div class="pr-grid">
               <div class="pr-row"><span>地址</span><b>{{ activePlatform.server_host }}:{{ activePlatform.server_port }}</b></div>
               <div class="pr-row"><span>平台域</span><b>{{ activePlatform.server_domain }}</b></div>
+              <div class="pr-row" v-if="activePlatform.server_id"><span>平台ID</span><b>{{ activePlatform.server_id }}</b></div>
               <div class="pr-row"><span>传输</span><b>{{ activePlatform.transport }}</b></div>
               <div class="pr-row"><span>编码</span><b>{{ activePlatform.signaling_encoding ?? 'GB18030' }}</b></div>
             </div>

@@ -38,7 +38,7 @@ const profileOptions = computed(() =>
   profiles.value.map((p) => ({ label: `${p.name}  (${p.server_host}:${p.server_port})`, value: p.id }))
 );
 // 顶栏编辑弹层用的临时表单。
-const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP", signaling_encoding: "GB18030" });
+const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", server_id: "", password: "", transport: "UDP", signaling_encoding: "GB18030" });
 function openEdit() {
   if (active.value) Object.assign(editForm.value, active.value);
 }
@@ -47,7 +47,7 @@ function saveEdit() {
 }
 function addNew() {
   addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
-    server_domain: "34020000002000000001", password: "12345678", transport: "UDP", signaling_encoding: "GB18030" });
+    server_domain: "34020000002000000001", server_id: "34020000002000000001", password: "12345678", transport: "UDP", signaling_encoding: "GB18030" });
   openEdit();
 }
 const transportOptions = [{ label: "UDP", value: "UDP" }, { label: "TCP", value: "TCP" }];
@@ -158,7 +158,8 @@ const themeOverrides = {
                       <n-input v-model:value="editForm.name" size="small" placeholder="档案名称" />
                       <n-input v-model:value="editForm.server_host" size="small" placeholder="平台 IP" />
                       <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
-                      <n-input v-model:value="editForm.server_domain" size="small" placeholder="平台域 ID" />
+                      <n-input v-model:value="editForm.server_domain" size="small" placeholder="平台域 ID(10位)" />
+                      <n-input v-model:value="editForm.server_id" size="small" placeholder="平台 ID(20位，留空则用域ID)" />
                       <n-input v-model:value="editForm.password" size="small" type="password" show-password-on="click" placeholder="SIP 密码" />
                       <n-select v-model:value="editForm.transport" size="small" :options="transportOptions" />
                       <n-select v-model:value="editForm.signaling_encoding" size="small" :options="encodingOptions" />

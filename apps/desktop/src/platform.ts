@@ -7,7 +7,11 @@ export interface PlatformProfile {
   name: string;
   server_host: string;
   server_port: number;
+  /** 10 位域 ID(旧标识符,仍用于 device_aor/NOTIFY To 等) */
   server_domain: string;
+  /** 20 位平台 ID(新标识符),用于 REGISTER/MESSAGE Request-URI 与平台 AOR。
+   * 留空时回退 server_domain,保持向后兼容。 */
+  server_id?: string;
   password: string;
   transport: string; // "UDP" | "TCP"
   signaling_encoding?: string; // "GB18030"(默认) | "UTF-8"
@@ -24,17 +28,19 @@ function defaultProfiles(): PlatformProfile[] {
       server_host: "192.168.10.222",
       server_port: 8160,
       server_domain: "3502000000",
+      server_id: "35020000002000000001", // 20 位平台 ID
       password: "wvp_sip_password",
       transport: "UDP",
       signaling_encoding: "GB18030",
     },
     {
       id: "local",
-      name: "本地",
+      name: "本地开发",
       server_host: "127.0.0.1",
       server_port: 5060,
-      server_domain: "34020000002000000001",
-      password: "12345678",
+      server_domain: "3402000000",
+      server_id: "34020000002000000001",
+      password: "admin123",
       transport: "UDP",
       signaling_encoding: "GB18030",
     },

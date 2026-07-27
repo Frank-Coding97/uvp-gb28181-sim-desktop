@@ -74,7 +74,9 @@ async function reconcile() {
 function buildToml(): string {
   const p = activePlatform.value ?? {
     server_host: "127.0.0.1", server_port: 5060,
-    server_domain: "34020000002000000001", password: "12345678", transport: "UDP",
+    server_domain: "34020000002000000001",
+    server_id: "34020000002000000001",
+    password: "12345678", transport: "UDP",
   };
   const lines = [
     `base_device_id = "${form.value.base_device_id}"`,
@@ -82,6 +84,7 @@ function buildToml(): string {
     `server_host = "${p.server_host}"`,
     `server_port = ${p.server_port}`,
     `server_domain = "${p.server_domain}"`,
+    `server_id = "${p.server_id || p.server_domain}"`, // 留空时回退 server_domain
     `transport = "${p.transport}"`,
     `heartbeat_interval_secs = ${form.value.heartbeat_interval}`,
     `channels_per_device = ${form.value.channels_per_device}`,
