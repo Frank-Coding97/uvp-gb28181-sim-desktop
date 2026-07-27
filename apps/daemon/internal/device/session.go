@@ -187,6 +187,11 @@ func (s *RegistrationSession) buildRegisterRequest() (*sip.Request, error) {
 	// Contact 头由 sipgo 在发送时根据传输层实际 host:port 自动填充。
 	// 若需自定义 Contact (M2 Trace 需要),再显式 AppendHeader。
 
+	// 显式设置目的地址:国标 Request-URI 的 host 是 SIP 域 (10 位数字或域名 ID),
+	// sipgo 默认按 host 做 DNS 解析会打到错的 IP。用 SetDestination 显式指定
+	// 平台真实地址 (ServerHost:ServerPort),绕过 URI host 的 DNS 步骤。
+	req.SetDestination(fmt.Sprintf("%s:%d", s.cfg.ServerHost, s.cfg.ServerPort))
+
 	return req, nil
 }
 
