@@ -1,33 +1,81 @@
-# UVP GB28181 Desktop
+# UVP GB28181 Desktop v2
 
-**多系统桌面端 GB/T 28181-2022 国标设备模拟器 + 压力测试工具**
+> **状态: 重构中** · v2 分支完全重写，v1 代码已清零
 
-把一台普通电脑模拟成一台（或成千上万台）GB28181 下级设备（IPC），注册到国标上级平台（WVP-Pro / EasyGBS / LiveGBS / UVP 等）进行联调与**压力测试**，无需真实摄像头、无需 Android 手机。
-
-支持 Windows / macOS / Linux，下载安装即用，无需额外运行时依赖。
+GB/T 28181-2022 国标设备模拟器桌面端（Tauri 2 + Vue 3）。
 
 ---
 
-## 核心能力
+## v2 重构路线（2026-07-27 启动）
 
-- **设备模拟**：注册（Digest 鉴权）/ 心跳保活+超时重注册 / **网络校时**（SIP Date）/ OPTIONS 探活 / 目录、设备信息、状态、录像、配置、预置位查询 / GB-2016·2022 双版本
-- **媒体**：实时点播 INVITE·ACK·BYE·CANCEL / **历史回放 + 倍速播放 + 录像下载** / H.264·H.265 PS 封装 RTP over UDP·TCP / **音视频复合流（H.264 + G.711A）** / **MP4·FLV·MKV 容器**（ffmpeg 转封装）
-- **设备控制**：PTZ 云台方向·变倍 / **预置位设置·调用·删除** / 看守位 / 强制关键帧
-- **订阅通知**：目录 / 报警（对话内 NOTIFY）/ 移动位置周期上报；主动上报报警 / GPS 位置
-- **压力测试**（差异化能力）：海量虚拟设备并发注册、心跳、目录应答、RTP 推流 + **批量定位/报警主动上报**，测量上级平台承载能力与成功率
-- **可视化**：**SIP 信令实时追踪** / **云台控制拟态摇杆演示**（方向/变倍/预置位巡航）/ 注册·心跳·点播成功率曲线 / 失败原因统计 / 压测报告导出
+基于 Codex 联合评审结论，v2 按以下顺序重建：
+
+1. **媒体 IPC 重构** — localhost WebSocket 二进制 H.264 Annex-B（替换 v1 逐帧 JSON）
+2. **SIP 事务层** — ezk-sip-core 兼容性验证或从零实现完整 RFC 3261 事务状态机
+3. **压测 daemon** — 独立进程 gRPC/UDS 通信，Tokio 分片调度器
+
+**当前进度**: 清场完成，前端只剩 Simulator.vue 单页 + App.vue 壳，后端 Rust crates 全部删除。
 
 ---
 
-## 技术栈
+## 开发
 
-| 层 | 技术 |
-|---|---|
-| 桌面壳 | Tauri 2 |
-| 前端 UI | Vue 3 + TypeScript + Naive UI + ECharts |
-| 核心引擎 | Rust + Tokio |
-| UI↔引擎 | Tauri IPC 命令 + 事件流 |
-| 媒体转封装 | 系统 ffmpeg(仅 MP4 等容器源 / 音频抽取时需要) |
+### 前端（apps/desktop/）
+
+```bash
+npm run tauri dev    # 开发模式
+npx vue-tsc --noEmit # 类型检查
+npm run build        # 生产构建
+```
+
+### 后端（apps/desktop/src-tauri/）
+
+```bash
+cargo check          # 快速检查
+cargo fmt            # 格式化
+cargo clippy         # Lint
+cargo test           # 单元测试
+```
+
+---
+
+## 架构（v2 规划）
+
+```
+apps/desktop/
+├── src-tauri/       # Tauri 后端（Rust，从零重写）
+└── src/             # Vue 3 前端（保留 v1 UI 样式）
+    ├── App.vue      # 应用壳（frost-blue 磨砂侧边栏）
+    └── views/
+        └── Simulator.vue  # 设备模拟单页（840 行）
+```
+
+**后端 crates 待重建**（按需、按 v2 路线图顺序引入）：
+- [ ] 媒体推流（H.264 采集 + WebSocket 二进制推送）
+- [ ] SIP 栈（ezk-sip-core 或自研完整事务层）
+- [ ] GB28181 协议（MANSCDP / id_codec）
+- [ ] 设备状态机（注册 / 心跳 / INVITE / PTZ）
+- [ ] 压测 daemon（独立进程，gRPC）
+
+---
+
+## v1 vs v2
+
+| | v1 (develop 分支) | v2 (v2 分支) |
+|---|---|---|
+| 状态 | 已封版，仅 bug 修复 | 重构中 |
+| 后端 | 7 个 crates (12k 行) | 空壳（从零重写）|
+| 前端 | 3 页（Dashboard / Channels / Simulator）| 1 页（Simulator）|
+| 依赖 | 自研 sip-core + gb28181-simulator + stress-engine | 待重建 |
+
+v1 代码可用 `git show develop:<path>` 查看，但 v2 **严禁直接拷贝** v1 代码（避免隐雷：事务层不完整 / broadcast Lagged / 逐帧 JSON IPC）。
+
+---
+
+## License
+
+MIT
+
 
 > 压测报告当前导出为最终指标快照 JSON;时序指标落 SQLite 为规划中(见 `docs/20-architecture/data-model.md`)。
 
