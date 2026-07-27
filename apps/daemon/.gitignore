@@ -1,3 +1,6 @@
-uvp-daemon
-uvp-daemon.exe
+# 编译产物 (锚定到 daemon 根,不匹配 cmd/uvp-daemon 目录)
+/uvp-daemon
+/uvp-daemon.exe
+
+# 含真实密码的测试配置
 test-cfg-*.json
