@@ -9,26 +9,21 @@ use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use serde::Deserialize;
 use sip_core::UdpTransport;
-use stress_engine::{Metrics, Orchestrator};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter}; // Tauri 2 emit 需要 Emitter trait
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
 
-/// 应用全局状态（托管在 Tauri managed state）。
+/// 应用全局状态(托管在 Tauri managed state)。
 struct AppState {
-    /// 当前压测的停止发射端；None 表示空闲。
-    stop_tx: Mutex<Option<broadcast::Sender<()>>>,
-    /// 当前压测的实时指标；None 表示空闲。
-    metrics: Mutex<Option<Arc<Metrics>>>,
-    /// 最近一次压测的指标快照(停止后保留,供导出报告)。
-    last_metrics: Mutex<Option<stress_engine::MetricsSnapshot>>,
-    /// 最近一次启动使用的场景 TOML 与设备数（报告导出用）。
-    last_scenario: Mutex<Option<(String, usize)>>,
-    /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
+    /// 单设备:当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
 }
 
 /// 单设备运行句柄。
+///
+/// `transport` / `local_host` / `local_port` 在 v2 首波清场后暂无 IPC 调用者(报警/位置/
+/// trace 开关已删),但 v2 后续要拆媒体 IPC + 对讲 + 主动通知重接,仍会用到,先保留。
+#[allow(dead_code)]
 struct DeviceHandle {
     sim: Arc<DeviceSimulator>,
     transport: Arc<UdpTransport>,
@@ -49,10 +44,6 @@ struct DeviceHandle {
 impl AppState {
     fn new() -> Self {
         AppState {
-            stop_tx: Mutex::new(None),
-            metrics: Mutex::new(None),
-            last_metrics: Mutex::new(None),
-            last_scenario: Mutex::new(None),
             device: Mutex::new(None),
         }
     }
@@ -226,120 +217,6 @@ impl sip_core::TraceObserver for TraceEmitter {
 
 // ── IPC 命令 ─────────────────────────────────────────────
 
-/// 引擎连通性自检（M0 已有，保留）。
-#[tauri::command]
-fn engine_version() -> String {
-    format!("stress-engine v{} 就绪", env!("CARGO_PKG_VERSION"))
-}
-
-/// 校验场景 YAML/TOML 并返回摘要，不启动压测。
-#[tauri::command]
-async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
-    let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
-    Ok(ScenarioSummary {
-        name: sc.device_info.device_name.clone(),
-        device_count: 0, // 由前端传 count 参数
-        server_host: sc.server_host.clone(),
-        server_port: sc.server_port,
-    })
-}
-
-/// 启动压测。`toml` 为场景内容，`count` 为设备数。
-/// 成功后每秒向前端发送 `metrics_tick` 事件。
-#[tauri::command]
-async fn start_stress(
-    toml: String,
-    count: usize,
-    position_interval: u64,
-    alarm_interval: u64,
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let mut stop_guard = state.stop_tx.lock().await;
-    if stop_guard.is_some() {
-        return Err("已有压测在运行，请先停止".into());
-    }
-
-    let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
-    let orch = Orchestrator::new(&sc, count).map_err(|e| e.to_string())?;
-
-    let (tx, _) = broadcast::channel::<()>(1);
-    *stop_guard = Some(tx.clone());
-
-    let metrics = Arc::clone(&orch.metrics);
-    *state.metrics.lock().await = Some(Arc::clone(&metrics));
-    *state.last_scenario.lock().await = Some((toml.clone(), count));
-    drop(stop_guard);
-
-    // 压测任务(含批量主动上报:0=关闭)。
-    let tx2 = tx.clone();
-    tokio::spawn(async move {
-        let _ = orch.run(tx2, position_interval, alarm_interval).await;
-    });
-
-    // 每秒推送指标快照给前端。
-    let app2 = app.clone();
-    let m2 = Arc::clone(&metrics);
-    let mut tick_stop = tx.subscribe();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            tokio::select! {
-                _ = tick_stop.recv() => break,
-                _ = interval.tick() => {
-                    let snap = m2.snapshot();
-                    if let Ok(json) = serde_json::to_string(&snap) {
-                        let _ = app2.emit("metrics_tick", json);
-                    }
-                }
-            }
-        }
-    });
-
-    Ok(format!("已启动 {count} 台设备压测"))
-}
-
-/// 停止当前压测。
-#[tauri::command]
-async fn stop_stress(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let mut stop_guard = state.stop_tx.lock().await;
-    match stop_guard.take() {
-        Some(tx) => {
-            let _ = tx.send(());
-            // 停止前保留最后指标快照(供停止后导出报告)。
-            if let Some(m) = state.metrics.lock().await.take() {
-                *state.last_metrics.lock().await = Some(m.snapshot());
-            }
-            Ok("压测已停止".into())
-        }
-        None => Err("没有正在运行的压测".into()),
-    }
-}
-
-/// 查询当前指标快照（供按需轮询；实时更新通过 metrics_tick 事件）。
-#[tauri::command]
-async fn get_metrics(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    match &*state.metrics.lock().await {
-        Some(m) => serde_json::to_string(&m.snapshot()).map_err(|e| e.to_string()),
-        None => Err("无正在运行的压测".into()),
-    }
-}
-
-/// 查询压测运行状态(供 UI 页面切换后与引擎真实状态对账,消除组件重建导致的状态丢失)。
-/// running=是否有压测在跑;device_count=当前场景设备数(无则 0)。
-#[tauri::command]
-async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let running = state.stop_tx.lock().await.is_some();
-    let device_count = state
-        .last_scenario
-        .lock()
-        .await
-        .as_ref()
-        .map(|(_, c)| *c)
-        .unwrap_or(0);
-    Ok(serde_json::json!({ "running": running, "device_count": device_count }))
-}
-
 /// 查询单设备运行状态(UI 切页后对账用)。
 ///
 /// running 反映**后台任务是否真的还活着**,不只看容器是否 `Some`——
@@ -349,41 +226,6 @@ async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_js
     let mut guard = state.device.lock().await;
     let running = !reap_if_exited(&mut guard);
     Ok(serde_json::json!({ "running": running }))
-}
-
-/// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
-/// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
-#[tauri::command]
-async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    // 优先取运行中指标,否则取最近一次压测保留的快照。
-    let snap = match &*state.metrics.lock().await {
-        Some(m) => m.snapshot(),
-        None => match &*state.last_metrics.lock().await {
-            Some(s) => s.clone(),
-            None => return Err("无压测数据可导出(尚未运行过压测)".into()),
-        },
-    };
-    let scenario = state.last_scenario.lock().await.clone();
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let report = serde_json::json!({
-        "generated_at_epoch_secs": ts,
-        "scenario_toml": scenario.as_ref().map(|(t, _)| t),
-        "device_count": scenario.as_ref().map(|(_, c)| c),
-        "metrics": snap,
-    });
-
-    let dir = std::env::temp_dir().join("uvp-reports");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建报告目录失败: {e}"))?;
-    let path = dir.join(format!("report-{ts}.json"));
-    let content = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    std::fs::write(&path, content).map_err(|e| format!("写报告失败: {e}"))?;
-
-    Ok(path.to_string_lossy().to_string())
 }
 
 // ── 单设备联调命令 ────────────────────────────────────────
@@ -590,58 +432,6 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
             Ok("设备已停止".into())
         }
         None => Err("没有正在运行的设备".into()),
-    }
-}
-
-/// 主动上报一条报警。
-#[tauri::command]
-async fn fire_alarm(
-    description: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    match &*guard {
-        Some(h) => {
-            let desc = if description.is_empty() {
-                "移动侦测报警".to_string()
-            } else {
-                description
-            };
-            let code = h
-                .sim
-                .report_alarm(&h.transport, &h.local_host, h.local_port, &desc)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(format!("报警上报完成(平台响应 {code})"))
-        }
-        None => Err("设备未启动".into()),
-    }
-}
-
-/// 主动上报一条 GPS 位置。
-#[tauri::command]
-async fn fire_position(
-    longitude: f64,
-    latitude: f64,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    match &*guard {
-        Some(h) => {
-            let code = h
-                .sim
-                .report_position(
-                    &h.transport,
-                    &h.local_host,
-                    h.local_port,
-                    longitude,
-                    latitude,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(format!("位置上报完成(平台响应 {code})"))
-        }
-        None => Err("设备未启动".into()),
     }
 }
 
@@ -852,174 +642,6 @@ async fn unsubscribe_preview(state: tauri::State<'_, AppState>) -> Result<String
     Ok("预览已取消".into())
 }
 
-/// 开关 SIP 信令追踪(FR-43)。开启后每条收发报文以 `sip_trace` 事件推给前端。
-#[tauri::command]
-async fn set_sip_trace(
-    enabled: bool,
-    state: tauri::State<'_, AppState>,
-    app: AppHandle,
-) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    match &*guard {
-        Some(h) => {
-            if enabled {
-                h.transport
-                    .set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
-                Ok("信令追踪已开启".into())
-            } else {
-                h.transport.set_tracer(None);
-                Ok("信令追踪已关闭".into())
-            }
-        }
-        None => Err("设备未启动".into()),
-    }
-}
-
-// ── 数据传输对象 ──────────────────────────────────────────
-
-/// 目录节点 DTO(前端多通道管理 ⇄ 引擎 CatalogNode)。
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct ChannelNodeDto {
-    id: String,
-    /// 类型:Device/BusinessGroup/VirtualOrg/VideoChannel/AlarmChannel。
-    node_type: String,
-    name: String,
-    parent_id: String,
-    #[serde(default)]
-    civil_code: Option<String>,
-    #[serde(default = "default_on")]
-    status: String,
-}
-
-fn default_on() -> String {
-    "ON".into()
-}
-
-fn node_type_from_str(s: &str) -> gb28181_protocol::id_codec::CatalogNodeType {
-    use gb28181_protocol::id_codec::CatalogNodeType::*;
-    match s {
-        "BusinessGroup" => BusinessGroup,
-        "VirtualOrg" => VirtualOrg,
-        "AlarmChannel" => AlarmChannel,
-        "Device" => Device,
-        _ => VideoChannel,
-    }
-}
-
-fn node_type_to_str(t: gb28181_protocol::id_codec::CatalogNodeType) -> &'static str {
-    use gb28181_protocol::id_codec::CatalogNodeType::*;
-    match t {
-        Device => "Device",
-        BusinessGroup => "BusinessGroup",
-        VirtualOrg => "VirtualOrg",
-        VideoChannel => "VideoChannel",
-        AlarmChannel => "AlarmChannel",
-    }
-}
-
-impl From<&gb28181_protocol::id_codec::CatalogNode> for ChannelNodeDto {
-    fn from(n: &gb28181_protocol::id_codec::CatalogNode) -> Self {
-        ChannelNodeDto {
-            id: n.id.clone(),
-            node_type: node_type_to_str(n.node_type).into(),
-            name: n.name.clone(),
-            parent_id: n.parent_id.clone(),
-            civil_code: n.civil_code.clone(),
-            status: n.status.clone(),
-        }
-    }
-}
-
-impl From<ChannelNodeDto> for gb28181_protocol::id_codec::CatalogNode {
-    fn from(d: ChannelNodeDto) -> Self {
-        let mut node = gb28181_protocol::id_codec::CatalogNode::new(
-            d.id,
-            node_type_from_str(&d.node_type),
-            d.name,
-            d.parent_id,
-        );
-        node.civil_code = d.civil_code;
-        node.status = d.status;
-        node
-    }
-}
-
-/// 载入内置目录模板(single/nvr-8ch/civil-3x2/large-16ch),返回加载后的节点列表(FR-34)。
-#[tauri::command]
-async fn load_catalog_template(
-    template: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<ChannelNodeDto>, String> {
-    let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动,请先在单设备页启动设备")?;
-    h.sim.load_catalog_template(&template);
-    // 增量 NOTIFY 推送是副作用,后台发送不阻塞 UI 返回(平台不及时回 200 时事务会退避重传数秒)。
-    spawn_catalog_notify(h);
-    Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
-}
-
-/// 获取当前目录树节点(FR-34)。
-#[tauri::command]
-async fn get_catalog_tree(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<ChannelNodeDto>, String> {
-    let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
-    Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
-}
-
-/// 新增/更新一个目录通道节点,触发增量 NOTIFY(FR-34)。
-#[tauri::command]
-async fn upsert_channel(
-    node: ChannelNodeDto,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
-    let added = h.sim.upsert_channel(node.into());
-    spawn_catalog_notify(h);
-    Ok(if added {
-        "已新增通道".into()
-    } else {
-        "已更新通道".into()
-    })
-}
-
-/// 删除一个目录通道节点,触发增量 NOTIFY(FR-34)。
-#[tauri::command]
-async fn remove_channel(id: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
-    if h.sim.remove_channel(&id) {
-        spawn_catalog_notify(h);
-        Ok("已删除通道".into())
-    } else {
-        Err("通道不存在".into())
-    }
-}
-
-/// 后台推送目录增量 NOTIFY(fire-and-forget)。
-///
-/// NOTIFY 是通知平台的副作用,不该阻塞 IPC 返回:目录订阅存在但平台不及时回 200 时,
-/// SIP 客户端事务会按 T1 退避重传,最坏阻塞约 4 秒。放后台 spawn 让 UI 立即拿到目录树。
-fn spawn_catalog_notify(h: &DeviceHandle) {
-    let sim = Arc::clone(&h.sim);
-    let transport = Arc::clone(&h.transport);
-    tokio::spawn(async move {
-        if let Err(e) = sim.notify_catalog_changed(&transport).await {
-            tracing::warn!(error = %e, "目录增量 NOTIFY 推送失败");
-        }
-    });
-}
-
-#[derive(serde::Serialize)]
-struct ScenarioSummary {
-    name: String,
-    device_count: usize,
-    server_host: String,
-    server_port: u16,
-}
-
 // ── 应用入口 ──────────────────────────────────────────────
 
 /// 初始化日志、注册命令、启动 Tauri 事件循环。
@@ -1029,26 +651,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
-            engine_version,
-            validate_scenario,
-            start_stress,
-            stop_stress,
-            get_metrics,
-            export_report,
             start_device,
             stop_device,
-            fire_alarm,
-            fire_position,
-            set_sip_trace,
+            get_device_status,
             list_cameras,
             subscribe_preview,
             unsubscribe_preview,
-            get_stress_status,
-            get_device_status,
-            load_catalog_template,
-            get_catalog_tree,
-            upsert_channel,
-            remove_channel,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

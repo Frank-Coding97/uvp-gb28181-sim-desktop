@@ -8,9 +8,7 @@ import {
   NMenu, NIcon, zhCN, dateZhCN,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
-import {
-  SpeedometerOutline, GitNetworkOutline, VideocamOutline,
-} from "@vicons/ionicons5";
+import { VideocamOutline } from "@vicons/ionicons5";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const route = useRoute();
@@ -21,9 +19,7 @@ function icon(comp: any) {
 }
 
 const menuOptions: MenuOption[] = [
-  { label: "设备模拟",   key: "/simulator", icon: icon(VideocamOutline) },
-  { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
-  { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
+  { label: "设备模拟", key: "/simulator", icon: icon(VideocamOutline) },
 ];
 
 const activeKey = computed(() => route.path);

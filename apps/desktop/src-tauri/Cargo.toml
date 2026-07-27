@@ -15,11 +15,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# 桌面端后端直接内嵌压测引擎(第一阶段同进程;后续可拆为独立 engine)。
-stress-engine     = { path = "../../../crates/stress-engine" }
-scenario          = { path = "../../../crates/scenario" }
+# v2 起桌面壳只做设备模拟(单设备信令+媒体预览)。压测/场景相关 crate 已从
+# invoke_handler 清出,依赖也一起摘掉,后续拆压测 daemon 时再单独引入。
 gb28181-simulator = { path = "../../../crates/gb28181-simulator" }
-gb28181-protocol  = { path = "../../../crates/gb28181-protocol" }
 sip-core          = { path = "../../../crates/sip-core" }
 encoding_rs       = { workspace = true }
 common            = { path = "../../../crates/common" }
