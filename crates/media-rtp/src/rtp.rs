@@ -119,6 +119,7 @@ impl RtpSender {
     /// TCP-ACTIVE 模式:主动连接平台(WVP 的 TCP-PASSIVE 监听端),RFC 4571 分帧。
     pub async fn new_tcp(dst: SocketAddr, ssrc: u32) -> Result<Self> {
         let stream = TcpStream::connect(dst).await.map_err(Error::Io)?;
+        tracing::info!(?dst, "TCP RTP 连接成功");
         stream.set_nodelay(true).ok();
         Ok(RtpSender {
             channel: Channel::Tcp { stream },
@@ -161,6 +162,9 @@ impl RtpSender {
                     let len = (pkt.len() as u16).to_be_bytes();
                     stream.write_all(&len).await.map_err(Error::Io)?;
                     stream.write_all(&pkt).await.map_err(Error::Io)?;
+                    if self.seq == 0 {
+                        tracing::debug!(pkt_len = pkt.len(), "TCP RTP 首包已发");
+                    }
                 }
             }
             self.seq = self.seq.wrapping_add(1);

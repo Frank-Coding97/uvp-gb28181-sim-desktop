@@ -2045,8 +2045,15 @@ impl DeviceSimulator {
             .strip_prefix("sip:")
             .and_then(|s| s.split('@').next())
             .unwrap_or(self.config.device_id.as_str());
-        let local_sdp =
-            sip_core::SessionDescription::new_device_response(channel, local_ip, 0, ssrc, use_tcp);
+        // 回显平台 y= 原文,保住国标 10 位 SSRC 的前导零(平台按字符串匹配来流)。
+        let local_sdp = sip_core::SessionDescription::new_device_response(
+            channel,
+            local_ip,
+            0,
+            ssrc,
+            platform_sdp.media.ssrc_raw.clone(),
+            use_tcp,
+        );
         let sdp_body = local_sdp.to_string();
 
         let mut resp = builder::response_ok(req);
