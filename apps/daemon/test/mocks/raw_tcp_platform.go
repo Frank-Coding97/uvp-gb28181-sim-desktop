@@ -139,6 +139,9 @@ func (m *RawTCPMockPlatform) handleConn(conn net.Conn) {
 	defer m.wg.Done()
 	defer conn.Close()
 
+	// 连接唯一标识 (用 RemoteAddr 作 ID,测试断言用)
+	connID := conn.RemoteAddr().String()
+
 	reader := bufio.NewReader(conn)
 
 	for {
@@ -165,6 +168,7 @@ func (m *RawTCPMockPlatform) handleConn(conn net.Conn) {
 		}
 
 		req := parseRequestGeneric(raw)
+		req.ConnectionID = connID // 标记连接 ID
 
 		m.mu.Lock()
 		m.received = append(m.received, req)
