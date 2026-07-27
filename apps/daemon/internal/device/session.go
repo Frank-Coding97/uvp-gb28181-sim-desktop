@@ -184,8 +184,19 @@ func (s *RegistrationSession) buildRegisterRequest() (*sip.Request, error) {
 	cl := sip.ContentLengthHeader(0)
 	req.AppendHeader(&cl)
 
-	// Contact 头由 sipgo 在发送时根据传输层实际 host:port 自动填充。
-	// 若需自定义 Contact (M2 Trace 需要),再显式 AppendHeader。
+	// Contact 头 (RFC 3261 §10.2 强制,GB28181 平台没这个会静默拒绝)。
+	// user 用设备 ID,host:port 用本机对外 IP + 期望的 UDP 端口。
+	// M1 客户端没绑固定端口,用 sipgo 挑的临时端口 (0=让平台从 Via 头拿)。
+	// 这里先写占位 IP:0,由 sipgo 传输层在 WriteMsg 前根据实际 socket 改写。
+	contactURI := sip.Uri{
+		User: s.cfg.DeviceID,
+		Host: s.cfg.ServerHost, // 占位,sipgo 会用实际 laddr 覆盖
+		Port: 0,
+	}
+	req.AppendHeader(&sip.ContactHeader{
+		Address: contactURI,
+		Params:  sip.NewParams(),
+	})
 
 	// 显式设置目的地址:国标 Request-URI 的 host 是 SIP 域 (10 位数字或域名 ID),
 	// sipgo 默认按 host 做 DNS 解析会打到错的 IP。用 SetDestination 显式指定

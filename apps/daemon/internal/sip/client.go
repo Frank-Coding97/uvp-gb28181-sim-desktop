@@ -8,6 +8,7 @@ import (
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/icholy/digest"
 )
 
 // ClientConfig 是 Client 初始化参数。
@@ -97,34 +98,88 @@ func (c *Client) Do(ctx context.Context, req *sip.Request) (*sip.Response, error
 //
 // 使用 sipgo 内建 DoDigestAuth,支持 MD5 + qop=auth (RFC 7616 主流子集)。
 // 若平台 stale=true 或 nonce 过期,sipgo 内部会重新解析新 nonce,不缓存复用 (spec R4)。
+// doDigestChallenge 处理 401 挑战。**不用 sipgo 内建 DoDigestAuth**,原因:
+//
+// sipgo 内部把 `Options.URI` 设成 `req.Recipient.Addr()`,格式是
+// `<user>@<host>[:port]` **不带 "sip:" 前缀**。
+// 但 GB28181 平台 (WVP-Pro 等) 期望 Authorization 头里 `uri="sip:..."` 带前缀
+// (对齐 Request-URI),否则 hash 校验失败静默丢包。
+//
+// 修法:手工用 icholy/digest 库,`Options.URI` 显式带 "sip:" 前缀。
+// 2026-07-27 M1 真机联调 WVP-Pro v2.7.4 定位到该问题。
 func (c *Client) doDigestChallenge(
 	ctx context.Context,
 	req *sip.Request,
 	challenge *sip.Response,
 ) (*sip.Response, error) {
-	authOpts := sipgo.DigestAuth{
+	wwwAuth := challenge.GetHeader("WWW-Authenticate")
+	if wwwAuth == nil {
+		return nil, fmt.Errorf("%w: 401 without WWW-Authenticate header", ErrProtocol)
+	}
+	chal, err := digest.ParseChallenge(wwwAuth.Value())
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse challenge %q: %v", ErrProtocol, wwwAuth.Value(), err)
+	}
+	// sipgo 里有句 "Fix lower case algorithm although not supported by rfc",照抄
+	chal.Algorithm = sip.ASCIIToUpper(chal.Algorithm)
+
+	// Recipient.Addr() 已经含 "sip:" 前缀 (Uri.Addr() 内部拼 scheme)
+	digestURI := req.Recipient.Addr()
+
+	cred, err := digest.Digest(chal, digest.Options{
+		Method:   req.Method.String(),
+		URI:      digestURI,
 		Username: c.username,
 		Password: c.password,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: compute digest: %v", ErrProtocol, err)
 	}
-	slog.Debug("[trace] >>> outbound (digest retry)",
-		"method", req.Method, "uri", req.Recipient.String())
 
-	resp, err := c.client.DoDigestAuth(ctx, req, challenge, authOpts)
+	// 把 Authorization 头装到原 req 上;CSeq 递增 + Via 重建交给 sipgo TransactionRequest
+	req.RemoveHeader("Authorization")
+	req.AppendHeader(sip.NewHeader("Authorization", cred.String()))
+
+	// 手工 CSeq++ (对齐 sipgo digestTransactionRequest 的行为)
+	if cseq := req.CSeq(); cseq != nil {
+		cseq.SeqNo++
+	}
+	req.RemoveHeader("Via")
+
+	slog.Debug("[trace] >>> outbound (digest retry)",
+		"method", req.Method, "uri", req.Recipient.String(),
+		"digest_uri", digestURI,
+		"raw", req.String())
+
+	// 走标准 TransactionRequest,sipgo 会自动补 Via
+	tx, err := c.client.TransactionRequest(ctx, req, sipgo.ClientRequestAddVia)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return nil, fmt.Errorf("%w: %v (digest challenge stage)", ErrTimeout, err)
+			return nil, fmt.Errorf("%w: %v (digest retry stage)", ErrTimeout, err)
 		}
-		return nil, fmt.Errorf("%w: %v", ErrOther, err)
+		return nil, fmt.Errorf("%w: transaction: %v", ErrOther, err)
 	}
+	defer tx.Terminate()
 
-	slog.Debug("[trace] <<< inbound (digest retry)",
-		"status", resp.StatusCode, "reason", resp.Reason,
-		"raw", resp.String())
-
-	if resp.StatusCode >= 400 {
-		return resp, fmt.Errorf("%w: %d %s (鉴权后)", ErrPlatformRejected, resp.StatusCode, resp.Reason)
+	for {
+		select {
+		case resp := <-tx.Responses():
+			if resp.IsProvisional() {
+				continue
+			}
+			slog.Debug("[trace] <<< inbound (digest retry)",
+				"status", resp.StatusCode, "reason", resp.Reason,
+				"raw", resp.String())
+			if resp.StatusCode >= 400 {
+				return resp, fmt.Errorf("%w: %d %s (鉴权后)", ErrPlatformRejected, resp.StatusCode, resp.Reason)
+			}
+			return resp, nil
+		case <-tx.Done():
+			return nil, fmt.Errorf("%w: transaction done: %v", ErrOther, tx.Err())
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w: %v (digest retry stage)", ErrTimeout, ctx.Err())
+		}
 	}
-	return resp, nil
 }
 
 // SipgoClient 暴露原始 sipgo.Client 给需要底层能力的调用者 (谨慎使用)。
