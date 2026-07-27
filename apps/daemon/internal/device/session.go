@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,7 +30,15 @@ type SipClient interface {
 // M1 生命周期:
 //   Start() → 构造 REGISTER → 发送 → 拿 200 OK → 状态转 Registered → 结束
 //
-// M3 会扩展:注册后启动 heartbeat + renewal goroutine,Stop() 发 Expires=0。
+// M3 生命周期:
+//   Start(parent ctx) → REGISTER → 200 OK → 派生根 ctx (s.ctx) →
+//   spawn heartbeat + renewal goroutine 各绑 s.ctx →
+//   Stop() → cancel s.ctx (所有子 goroutine 收 Done 退出) → 状态 Disconnected。
+//
+// 并发不变式 (spec R5):
+//   - s.ctx / s.cancel 只在 Start 内部初始化 (原子 CAS 保护)
+//   - Stop 幂等 (多次调用不 panic,sync.Once 包裹 cancel)
+//   - 子 goroutine 必须绑 s.ctx,不允许长驻在 context.Background() 里
 type RegistrationSession struct {
 	client SipClient // 通过接口注入,便于 mock
 
@@ -47,6 +56,13 @@ type RegistrationSession struct {
 	// 平台确认的 Expires 值 (spec Q9):
 	// 响应 Contact 头 expires 参数 > 响应 Expires 头 > 请求发出去的值。
 	registeredExpires atomic.Int64
+
+	// 生命周期根 ctx。Start 内初始化,Stop 内 cancel。
+	// 子 goroutine (heartbeat / renewal) 从这里派生。
+	ctxMu    sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stopOnce sync.Once
 }
 
 // NewRegistrationSession 创建会话。
@@ -65,16 +81,31 @@ func NewRegistrationSession(client SipClient, cfg *gb28181.SipConfig) *Registrat
 
 // Start 发起注册。同步阻塞至注册结果确定 (成功 / 失败 / 超时)。
 //
-// M1 简化:注册成功后立即返回,不启动 heartbeat/renewal goroutine。
-// 上层调用者 (main.go runOnce) 拿到 nil error 表示 200 OK,可以退出进程。
-func (s *RegistrationSession) Start(ctx context.Context) error {
+// M3 变化:
+//   - Start 内部派生 s.ctx (来自 context.Background,不受 parent ctx 束缚)
+//   - parent ctx 只用来给这一次 REGISTER 请求做超时/取消 (原语义保留)
+//   - 注册成功后 s.ctx 保持存活给 heartbeat / renewal 用,直到 Stop() cancel
+//   - 注册失败后 s.ctx 立即 cancel (避免上层残留 goroutine)
+//
+// 上层调用者 (main.go runOnce / stdio handler) 拿到 nil error 表示 200 OK。
+// heartbeat / renewal 的 spawn 见 T4 (session.go Start 收尾处)。
+func (s *RegistrationSession) Start(parentCtx context.Context) error {
 	if !s.state.CompareAndSwap(int32(StateDisconnected), int32(StateRegistering)) {
 		return errors.New("session already started")
 	}
 
+	// 派生根 ctx。用 context.Background 作父级 —— parentCtx 只用于这次 REGISTER 请求,
+	// 不能让 parentCtx cancel 就把 heartbeat/renewal 也带走 (上层可能只想给单个 RPC 定 15s
+	// 超时,不想影响 daemon 长驻的心跳循环)。
+	s.ctxMu.Lock()
+	if s.ctx == nil {
+		s.ctx, s.cancel = context.WithCancel(context.Background())
+	}
+	s.ctxMu.Unlock()
+
 	req, err := s.buildRegisterRequest()
 	if err != nil {
-		s.state.Store(int32(StateFailed))
+		s.markFailedLocked()
 		return fmt.Errorf("build REGISTER: %w", err)
 	}
 
@@ -83,14 +114,14 @@ func (s *RegistrationSession) Start(ctx context.Context) error {
 		"call_id", s.callID,
 		"request_uri", req.Recipient.String())
 
-	resp, err := s.client.Do(ctx, req)
+	resp, err := s.client.Do(parentCtx, req)
 	if err != nil {
-		s.state.Store(int32(StateFailed))
+		s.markFailedLocked()
 		return fmt.Errorf("REGISTER: %w", err)
 	}
 
 	if resp.StatusCode != 200 {
-		s.state.Store(int32(StateFailed))
+		s.markFailedLocked()
 		return fmt.Errorf("REGISTER unexpected status: %d %s", resp.StatusCode, resp.Reason)
 	}
 
@@ -106,10 +137,53 @@ func (s *RegistrationSession) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop 主动停止会话。M1 简化:直接置 Disconnected,不发 Expires=0 (那是 M3)。
+// Stop 主动停止会话。cancel 根 ctx → heartbeat / renewal / 任意从 s.ctx 派生的子任务收 Done。
+//
+// 幂等 (spec AC-11): 多次调用不 panic,不重复推送事件。
+// M3 T3 会扩展:Stop 内先发 Expires=0 REGISTER,再 cancel。
 func (s *RegistrationSession) Stop() error {
-	s.state.Store(int32(StateDisconnected))
+	s.stopOnce.Do(func() {
+		s.ctxMu.Lock()
+		cancel := s.cancel
+		s.ctxMu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+		s.state.Store(int32(StateDisconnected))
+	})
 	return nil
+}
+
+// InternalContext 返回 session 生命周期根 ctx。
+//
+// 用于 heartbeat / renewal / shutdown 等内部 goroutine 从这里派生 ctx。
+// Start() 之前返回 nil,Start() 后返回一个未 cancel 的 ctx (或 Failed 后已 cancel 的 ctx)。
+// 外部调用者应视为**只读**:不要在这里再 cancel,统一走 session.Stop()。
+func (s *RegistrationSession) InternalContext() context.Context {
+	s.ctxMu.Lock()
+	defer s.ctxMu.Unlock()
+	return s.ctx
+}
+
+// markFailedLocked 把 session 迁移到 Failed 状态,并 cancel 根 ctx。
+// 用于 Start 失败路径与 heartbeat 3 次连续失败 (T1) 场景。
+func (s *RegistrationSession) markFailedLocked() {
+	s.state.Store(int32(StateFailed))
+	s.stopOnce.Do(func() {
+		s.ctxMu.Lock()
+		cancel := s.cancel
+		s.ctxMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
+}
+
+// markFailed 是 markFailedLocked 的公开别名,给 heartbeat / renewal 用。
+func (s *RegistrationSession) markFailed(reason string) {
+	slog.Warn("session marked failed", "reason", reason)
+	s.markFailedLocked()
 }
 
 // State 返回当前状态 (原子读,无锁)。
