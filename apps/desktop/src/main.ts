@@ -7,23 +7,20 @@ import "./theme.css";
 import App from "./App.vue";
 import Simulator from "./views/Simulator.vue";
 import Dashboard from "./views/Dashboard.vue";
-import Device from "./views/Device.vue";
 import Channels from "./views/Channels.vue";
-import Scenario from "./views/Scenario.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: "/", redirect: "/simulator" },
-    // 设备模拟(新首页):SIP 配置 + 画面源 + 预览。
     { path: "/simulator", component: Simulator },
     { path: "/dashboard", component: Dashboard },
-    { path: "/device",    component: Device },
-    { path: "/channels",  component: Channels },
-    // 压力测试(场景编排 + 实时监控已合并到一页)。
-    { path: "/scenario",  component: Scenario },
-    { path: "/monitor",   redirect: "/scenario" }, // 旧路由兼容,重定向到合并页
-    { path: "/config",    redirect: "/device" },   // 平台配置已并入顶栏,旧路由重定向
+    { path: "/channels", component: Channels },
+    // 旧路由重定向到设备模拟(单设备联调 / 压测 / 平台配置已合并或移除)。
+    { path: "/device", redirect: "/simulator" },
+    { path: "/scenario", redirect: "/simulator" },
+    { path: "/monitor", redirect: "/simulator" },
+    { path: "/config", redirect: "/simulator" },
   ],
 });
 
