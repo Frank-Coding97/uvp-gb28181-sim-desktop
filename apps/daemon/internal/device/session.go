@@ -63,6 +63,16 @@ type RegistrationSession struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stopOnce sync.Once
+
+	// 事件推送 (M3 T5):heartbeat_result / device_state 等推给 ipc 层。
+	// 允许为 nil (M1 runOnce 路径不需要推事件)。
+	pubMu     sync.RWMutex
+	publisher EventPublisher
+
+	// M3 子任务实例,Stop() 时需要一起收 (虽然 ctx cancel 会让它们退,
+	// 但保存引用便于测试断言与后续 stats)。
+	heartbeat *Heartbeat
+	renewal   *Renewal
 }
 
 // NewRegistrationSession 创建会话。
@@ -184,6 +194,52 @@ func (s *RegistrationSession) markFailedLocked() {
 func (s *RegistrationSession) markFailed(reason string) {
 	slog.Warn("session marked failed", "reason", reason)
 	s.markFailedLocked()
+}
+
+// reregister 发一个新的 REGISTER 请求做续约 (T2)。
+//
+// 复用 buildRegisterRequest 走完整 Digest 挑战 (401 → AUTH → 200),
+// CSeq 自动递增 (spec Q10),Call-ID / From tag 保持 (全期复用)。
+// 成功 → 更新 registeredExpires (spec Q9),状态保持 Registered。
+// 失败 → 返错,由调用方决定是否 markFailed。
+func (s *RegistrationSession) reregister(ctx context.Context) error {
+	req, err := s.buildRegisterRequest()
+	if err != nil {
+		return fmt.Errorf("build re-REGISTER: %w", err)
+	}
+	slog.Info("sending re-REGISTER (renewal)",
+		"cseq", req.CSeq().SeqNo,
+		"call_id", s.callID)
+
+	resp, err := s.client.Do(ctx, req)
+	if err != nil {
+		return fmt.Errorf("re-REGISTER: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("re-REGISTER unexpected status: %d %s", resp.StatusCode, resp.Reason)
+	}
+	expires := s.parseResponseExpires(resp)
+	s.registeredExpires.Store(int64(expires))
+	return nil
+}
+
+// SetPublisher 注入事件推送器 (可为 nil,禁用推送)。
+// 生产路径由 main.go stdioserver 传 ipc.Server;测试路径传 captureBus。
+func (s *RegistrationSession) SetPublisher(p EventPublisher) {
+	s.pubMu.Lock()
+	defer s.pubMu.Unlock()
+	s.publisher = p
+}
+
+// publishEvent 通过 publisher 推事件。publisher 未设置时静默丢弃。
+func (s *RegistrationSession) publishEvent(method string, payload map[string]any, priority bool) {
+	s.pubMu.RLock()
+	p := s.publisher
+	s.pubMu.RUnlock()
+	if p == nil {
+		return
+	}
+	p.Publish(method, payload, priority)
 }
 
 // State 返回当前状态 (原子读,无锁)。
