@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
@@ -18,6 +19,10 @@ type ClientConfig struct {
 
 	// Password 是 Digest 密码。
 	Password string
+
+	// Tracer 可选:非 nil 时,Client 在收发 SIP 报文前后调 Tracer.Emit,
+	// 让上层 (M2 stdio IPC) 把报文事件推到前端 SIP Trace 面板。
+	Tracer TracePublisher
 }
 
 // Client 封装 sipgo.Client,提供带 Digest 挑战应答的高层 Do 方法。
@@ -26,6 +31,7 @@ type Client struct {
 	client    *sipgo.Client
 	username  string
 	password  string
+	tracer    TracePublisher
 }
 
 // NewClient 基于 Transport 创建 sipgo Client。
@@ -54,7 +60,28 @@ func NewClient(transport *Transport, cfg ClientConfig) *Client {
 		client:    client,
 		username:  cfg.Username,
 		password:  cfg.Password,
+		tracer:    cfg.Tracer,
 	}
+}
+
+// emitTrace 若 tracer 已配置,推一条 TraceEvent。补齐 Summary / CSeq / Call-ID / Timestamp。
+// tracer 为 nil 时零成本(inline check),M1 路径不受影响。
+func (c *Client) emitTrace(dir string, method string, statusCode int, peer string, raw []byte) {
+	if c.tracer == nil {
+		return
+	}
+	c.tracer.Emit(TraceEvent{
+		Timestamp:  time.Now(),
+		Direction:  dir,
+		Method:     method,
+		StatusCode: statusCode,
+		CSeq:       ExtractCSeq(raw),
+		CallID:     ExtractCallID(raw),
+		Peer:       peer,
+		Summary:    SummarizeSIPBytes(raw),
+		RawBytes:   raw,
+		RawText:    string(raw),
+	})
 }
 
 // Sentinel errors。上层用 errors.Is 判定,不字符串匹配。
@@ -66,10 +93,19 @@ var (
 )
 
 // Do 发送请求并自动处理 401 挑战应答。
+//
+// 有 tracer 时在 outbound 发送前 / inbound 收到后各推一条 TraceEvent,
+// 让前端 SIP Trace 面板看到完整的 4 报文 (>>> REGISTER / <<< 401 / >>> AUTH / <<< 200)。
 func (c *Client) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	rawReq := []byte(req.String())
+	peer := req.Destination()
+	if peer == "" {
+		peer = req.Recipient.HostPort()
+	}
 	slog.Debug("[trace] >>> outbound",
 		"method", req.Method, "uri", req.Recipient.String(),
-		"raw", req.String())
+		"raw", string(rawReq))
+	c.emitTrace(DirectionOutbound, req.Method.String(), 0, peer, rawReq)
 
 	resp, err := c.client.Do(ctx, req)
 	if err != nil {
@@ -79,9 +115,12 @@ func (c *Client) Do(ctx context.Context, req *sip.Request) (*sip.Response, error
 		return nil, fmt.Errorf("%w: %v", ErrOther, err)
 	}
 
+	rawResp := []byte(resp.String())
 	slog.Debug("[trace] <<< inbound",
 		"status", resp.StatusCode, "reason", resp.Reason,
-		"raw", resp.String())
+		"raw", string(rawResp))
+	// inbound 的 method 沿用请求 method(方便前端配对),status_code 是响应码
+	c.emitTrace(DirectionInbound, req.Method.String(), int(resp.StatusCode), peer, rawResp)
 
 	if resp.StatusCode == 401 {
 		return c.doDigestChallenge(ctx, req, resp)
@@ -146,10 +185,16 @@ func (c *Client) doDigestChallenge(
 	}
 	req.RemoveHeader("Via")
 
+	rawRetry := []byte(req.String())
+	peer := req.Destination()
+	if peer == "" {
+		peer = req.Recipient.HostPort()
+	}
 	slog.Debug("[trace] >>> outbound (digest retry)",
 		"method", req.Method, "uri", req.Recipient.String(),
 		"digest_uri", digestURI,
-		"raw", req.String())
+		"raw", string(rawRetry))
+	c.emitTrace(DirectionOutbound, req.Method.String(), 0, peer, rawRetry)
 
 	// 走标准 TransactionRequest,sipgo 会自动补 Via
 	tx, err := c.client.TransactionRequest(ctx, req, sipgo.ClientRequestAddVia)
@@ -167,9 +212,11 @@ func (c *Client) doDigestChallenge(
 			if resp.IsProvisional() {
 				continue
 			}
+			rawResp := []byte(resp.String())
 			slog.Debug("[trace] <<< inbound (digest retry)",
 				"status", resp.StatusCode, "reason", resp.Reason,
-				"raw", resp.String())
+				"raw", string(rawResp))
+			c.emitTrace(DirectionInbound, req.Method.String(), int(resp.StatusCode), peer, rawResp)
 			if resp.StatusCode >= 400 {
 				return resp, fmt.Errorf("%w: %d %s (鉴权后)", ErrPlatformRejected, resp.StatusCode, resp.Reason)
 			}
