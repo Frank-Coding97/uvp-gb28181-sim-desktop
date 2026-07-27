@@ -1,0 +1,13 @@
+{
+  "_comment": "示例 SIP 配置。复制为 test-cfg-wvp.json 后按环境修改。",
+  "_readme": "字段说明见 apps/daemon/internal/gb28181/config.go SipConfig 结构体",
+
+  "device_id": "34020000001320000001",
+  "server_host": "127.0.0.1",
+  "server_port": 5060,
+  "server_id": "34020000002000000001",
+  "server_domain": "3402000000",
+  "password": "admin123",
+  "transport": "udp",
+  "expires_secs": 3600
+}
