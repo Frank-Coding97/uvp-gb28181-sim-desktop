@@ -3,9 +3,7 @@
 import { ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { NIcon } from "naive-ui";
-import {
-  HardwareChipOutline, LayersOutline, ServerOutline, PulseOutline,
-} from "@vicons/ionicons5";
+import { VideocamOutline, GitNetworkOutline } from "@vicons/ionicons5";
 import { invoke } from "@tauri-apps/api/core";
 
 const router = useRouter();
@@ -22,14 +20,11 @@ onMounted(async () => {
 });
 
 const features = [
-  { key: "/device", icon: HardwareChipOutline, color: "#3884ff",
-    title: "单设备联调", desc: "模拟一台国标 IPC,注册到上级平台,联调点播/报警/PTZ" },
-  { key: "/scenario", icon: LayersOutline, color: "#7a6cff",
-    title: "压力测试", desc: "海量虚拟设备并发注册/心跳/推流,量化平台承载", highlight: true },
-  { key: "/config", icon: ServerOutline, color: "#00b9d6",
-    title: "平台配置", desc: "配置上级平台(WVP/LiveGBS/EasyGBS)连接参数" },
-  { key: "/monitor", icon: PulseOutline, color: "#08b388",
-    title: "运行监控", desc: "实时曲线:注册成功率、心跳、推流带宽、失败归因" },
+  { key: "/simulator", icon: VideocamOutline, color: "#3884ff",
+    title: "设备模拟", desc: "配置 SIP,把本机模拟成一台国标 IPC 注册到上级平台",
+    highlight: true },
+  { key: "/channels", icon: GitNetworkOutline, color: "#08b388",
+    title: "多通道目录", desc: "编排目录树:业务分组/虚拟组织/视频与报警通道" },
 ];
 </script>
 
