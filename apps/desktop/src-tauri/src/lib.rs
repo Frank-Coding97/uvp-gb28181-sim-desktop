@@ -10,6 +10,7 @@ use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator
 use serde::Deserialize;
 use sip_core::UdpTransport;
 use stress_engine::{Metrics, Orchestrator};
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter}; // Tauri 2 emit 需要 Emitter trait
 use tokio::sync::{broadcast, Mutex};
 
@@ -40,6 +41,9 @@ struct DeviceHandle {
     /// 任务退出时置 true,命令侧据此把容器复位。不这样做的话,注册失败后
     /// `device` 容器永远是 `Some`,`start_device` 的 `is_some()` 会拦死重试。
     exited: Arc<std::sync::atomic::AtomicBool>,
+    /// 预览转发任务句柄(broadcast::Receiver → Tauri Channel)。
+    /// 前端订阅时 spawn,取消或设备停止时 abort。
+    preview_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AppState {
@@ -483,11 +487,13 @@ async fn start_device(
         signaling_encoding: common::SignalingEncoding::from_str_lenient(&config.signaling_encoding),
     };
 
-    // 预热视频源:容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会阻塞
-    // 200 OK 与首包推流,导致平台收流超时。这里在设备上线前先转好、缓存,
-    // INVITE 时命中缓存瞬时加载。ffmpeg 是阻塞调用,放 spawn_blocking。
+    // 预热视频源(仅文件源):容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会
+    // 阻塞 200 OK 与首包推流,导致平台收流超时。这里在设备上线前先转好、缓存,INVITE 时
+    // 命中缓存瞬时加载。ffmpeg 是阻塞调用,放 spawn_blocking。
+    // `live:*` 是运行时采集(摄像头/屏幕),没有可预热的文件,跳过。
     if let Some(ref vs) = config.video_source {
-        if !vs.trim().is_empty() {
+        let trimmed = vs.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("live:") {
             let vs = vs.clone();
             let prepared =
                 tokio::task::spawn_blocking(move || gb28181_simulator::prepare_video_source(&vs))
@@ -551,6 +557,7 @@ async fn start_device(
         local_port,
         stop_tx,
         exited,
+        preview_task: None,
     });
     Ok("设备已启动".into())
 }
@@ -574,7 +581,10 @@ fn reap_if_exited(guard: &mut Option<DeviceHandle>) -> bool {
 async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
     let mut guard = state.device.lock().await;
     match guard.take() {
-        Some(h) => {
+        Some(mut h) => {
+            if let Some(handle) = h.preview_task.take() {
+                handle.abort();
+            }
             let _ = h.stop_tx.send(());
             emit_device_state(&app, "Disconnected", None);
             Ok("设备已停止".into())
@@ -633,6 +643,213 @@ async fn fire_position(
         }
         None => Err("设备未启动".into()),
     }
+}
+
+// ── 摄像头设备枚举 ──────────────────────────────────────
+
+/// 摄像头设备条目(前端"摄像头"选择器用)。
+#[derive(serde::Serialize)]
+struct CameraDevice {
+    /// 传给 `video_source` 的输入值(不含 `live:` 前缀,前端拼)。
+    /// macOS 是 avfoundation 序号(如 "0");Windows 是 dshow 设备名;Linux 是 `/dev/videoN`。
+    id: String,
+    /// 展示名(设备型号/描述)。
+    name: String,
+}
+
+/// 枚举本机摄像头设备。
+///
+/// 用 `ffmpeg -list_devices` 探测:macOS avfoundation / Windows dshow;Linux 直接扫 `/dev/video*`。
+/// 无 ffmpeg 或探测失败时返回空列表(前端提示用户手填输入)。
+#[tauri::command]
+fn list_cameras() -> Vec<CameraDevice> {
+    let Some(ffmpeg) = gb28181_simulator::ffmpeg_bin() else {
+        return Vec::new();
+    };
+    if cfg!(target_os = "macos") {
+        list_cameras_avfoundation(&ffmpeg)
+    } else if cfg!(target_os = "windows") {
+        list_cameras_dshow(&ffmpeg)
+    } else {
+        list_cameras_v4l2()
+    }
+}
+
+/// macOS avfoundation:`ffmpeg -f avfoundation -list_devices true -i ""`
+/// stderr 输出形如:
+/// ```text
+/// [AVFoundation indev @ 0x...] AVFoundation video devices:
+/// [AVFoundation indev @ 0x...] [0] FaceTime HD Camera
+/// [AVFoundation indev @ 0x...] [1] Capture screen 0
+/// [AVFoundation indev @ 0x...] AVFoundation audio devices:
+/// ```
+/// 只取 video 段的行(遇到 audio 段头停止),且跳过屏幕采集条目(仅摄像头)。
+fn list_cameras_avfoundation(ffmpeg: &str) -> Vec<CameraDevice> {
+    let out = std::process::Command::new(ffmpeg)
+        .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut cams = Vec::new();
+    let mut in_video = false;
+    for line in stderr.lines() {
+        // 定位视频设备段。
+        if line.contains("AVFoundation video devices:") {
+            in_video = true;
+            continue;
+        }
+        if line.contains("AVFoundation audio devices:") {
+            break; // 遇到音频段,视频段结束
+        }
+        if !in_video {
+            continue;
+        }
+        // 解析 `[N] 名字`(前缀日志和方括号索引之间可能有空格)。
+        let Some(idx_open) = line.rfind('[') else {
+            continue;
+        };
+        let Some(idx_close_rel) = line[idx_open..].find(']') else {
+            continue;
+        };
+        let idx = line[idx_open + 1..idx_open + idx_close_rel].to_string();
+        // 只接受纯数字索引(排除 "AVFoundation indev @ 0x..." 那种前缀日志)。
+        if !idx.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let name = line[idx_open + idx_close_rel + 1..].trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // 跳过屏幕采集条目(用户只想选摄像头)。
+        if name.starts_with("Capture screen") {
+            continue;
+        }
+        cams.push(CameraDevice { id: idx, name });
+    }
+    cams
+}
+
+/// Windows dshow:`ffmpeg -f dshow -list_devices true -i dummy`。
+/// stderr 里每个视频设备为 `"<设备名>" (video)`;id 就是设备名本身(dshow 靠名字选)。
+fn list_cameras_dshow(ffmpeg: &str) -> Vec<CameraDevice> {
+    let out = std::process::Command::new(ffmpeg)
+        .args(["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut cams = Vec::new();
+    for line in stderr.lines() {
+        // 形如: [dshow @ 0x...]  "USB Camera" (video)
+        if !line.contains("(video)") {
+            continue;
+        }
+        // 取最后一对引号中间的内容。
+        let Some(start) = line.find('"') else { continue };
+        let rest = &line[start + 1..];
+        let Some(end) = rest.find('"') else { continue };
+        let name = &rest[..end];
+        cams.push(CameraDevice {
+            id: format!("video={name}"), // dshow 输入格式:`video=名字`
+            name: name.to_string(),
+        });
+    }
+    cams
+}
+
+/// Linux v4l2:扫 `/dev/video*`,读 `/sys/class/video4linux/<name>/name` 拿设备名。
+fn list_cameras_v4l2() -> Vec<CameraDevice> {
+    let mut cams = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/dev") else {
+        return cams;
+    };
+    let mut devs: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("video") && n[5..].chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    devs.sort();
+    for dev in devs {
+        let name = std::fs::read_to_string(format!("/sys/class/video4linux/{dev}/name"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| dev.clone());
+        cams.push(CameraDevice {
+            id: format!("/dev/{dev}"),
+            name,
+        });
+    }
+    cams
+}
+
+// ── 预览:H.264 帧旁路 → Tauri Channel ──────────────────
+
+/// 推给前端的一帧 H.264 数据。
+#[derive(Clone, serde::Serialize)]
+struct PreviewFrame {
+    /// H.264 Annex B(起始码 + NAL)。前端喂给 WebCodecs VideoDecoder。
+    data: Vec<u8>,
+    /// 是否关键帧(含 SPS/PPS/IDR)。前端首帧必须等到关键帧才能 configure。
+    key: bool,
+    /// 帧序号,前端可用来判断是否丢帧。
+    seq: u32,
+}
+
+/// 订阅推流预览:每帧 H.264 数据通过 Channel 送前端。
+///
+/// 前端建一个 `Channel<PreviewFrame>` 传进来,后端从 CameraStream 拿 broadcast::Receiver,
+/// spawn 一个 tokio 任务把帧转发到 Channel。任务会持有 Channel 与 Receiver 直到设备停止
+/// 或取消订阅。每次调用都会替换掉旧订阅任务(前端页面重挂时自动重建)。
+#[tauri::command]
+async fn subscribe_preview(
+    channel: Channel<PreviewFrame>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let mut guard = state.device.lock().await;
+    let h = guard.as_mut().ok_or("设备未启动")?;
+    // 已有订阅任务:先停,再重开(避免多个任务并行给同一 channel 塞帧)。
+    if let Some(handle) = h.preview_task.take() {
+        handle.abort();
+    }
+    let cam = h.sim.camera_stream().ok_or("摄像头流未启动(非 live 源?)")?;
+    let mut rx = cam.subscribe();
+
+    // 后台任务:阻塞地收 broadcast,转发到前端 Channel。
+    // Channel.send 是同步非阻塞;broadcast::recv 是 async。前端断开时 Channel.send 返回 Err
+    // (但 Tauri Channel 目前不区分,失败就静默;任务靠 abort() 或 broadcast Close 结束)。
+    let seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let handle = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = channel.send(PreviewFrame {
+                        data: frame.data,
+                        key: frame.key_frame,
+                        seq: n,
+                    });
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // 消费太慢丢了老帧,继续拿新的。
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break, // 上游关了
+            }
+        }
+    });
+    h.preview_task = Some(handle);
+    Ok("预览已订阅".into())
+}
+
+/// 取消预览订阅(停止转发任务)。
+#[tauri::command]
+async fn unsubscribe_preview(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let mut guard = state.device.lock().await;
+    if let Some(h) = guard.as_mut() {
+        if let Some(handle) = h.preview_task.take() {
+            handle.abort();
+        }
+    }
+    Ok("预览已取消".into())
 }
 
 /// 开关 SIP 信令追踪(FR-43)。开启后每条收发报文以 `sip_trace` 事件推给前端。
@@ -823,6 +1040,9 @@ pub fn run() {
             fire_alarm,
             fire_position,
             set_sip_trace,
+            list_cameras,
+            subscribe_preview,
+            unsubscribe_preview,
             get_stress_status,
             get_device_status,
             load_catalog_template,
