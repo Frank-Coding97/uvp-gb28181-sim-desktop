@@ -257,7 +257,8 @@ func (s *Server) Publish(method string, payload map[string]any, priority bool) {
 
 	frame := EncodeNotification(method, pcopy)
 
-	if priority {
+	// P0-3 fix: sip_trace 改走 priority 队列,避免丢关键 401/AUTH 报文
+	if priority || method == "sip_trace" {
 		s.priorityCh <- frame
 		return
 	}
