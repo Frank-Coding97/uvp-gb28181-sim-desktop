@@ -154,7 +154,8 @@ async fn read_stdout_loop(
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Value>>>>,
     app: AppHandle,
 ) -> Result<()> {
-    let reader = BufReader::new(stdout);
+    // P0-4 fix: 扩大 buffer 到 64KiB,防止 event 堆积时阻塞 daemon write stdout
+    let reader = BufReader::with_capacity(64 * 1024, stdout);
     let mut lines = reader.lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
