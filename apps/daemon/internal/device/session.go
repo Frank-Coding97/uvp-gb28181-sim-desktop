@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -299,12 +300,21 @@ func (s *RegistrationSession) RegisteredExpires() int {
 // buildRegisterRequest 构造 REGISTER 请求。
 //
 // URI 与头字段遵循国标 GB/T 28181 A.1.1 + spec Q5/Q10。
-// TODO(M2 T5): 加 Trace observer 后,把这里生成的报文推给前端。
+// M4 起 TCP 传输在 Request-URI 与 Contact 头都追加 ;transport=tcp,
+// 让平台按同一协议路由响应 (WVP-Pro / LiveGBS 惯例)。
 func (s *RegistrationSession) buildRegisterRequest() (*sip.Request, error) {
+	isTCP := strings.EqualFold(s.cfg.Transport, "tcp")
+
 	requestURIStr := gb28181.BuildRegisterRequestURI(s.cfg)
 	var requestURI sip.Uri
 	if err := sip.ParseUri(requestURIStr, &requestURI); err != nil {
 		return nil, fmt.Errorf("parse request-URI %q: %w", requestURIStr, err)
+	}
+	if isTCP {
+		if requestURI.UriParams == nil {
+			requestURI.UriParams = sip.NewParams()
+		}
+		requestURI.UriParams.Add("transport", "tcp")
 	}
 
 	req := sip.NewRequest(sip.REGISTER, requestURI)
@@ -361,10 +371,16 @@ func (s *RegistrationSession) buildRegisterRequest() (*sip.Request, error) {
 	// user 用设备 ID,host:port 用本机对外 IP + 期望的 UDP 端口。
 	// M1 客户端没绑固定端口,用 sipgo 挑的临时端口 (0=让平台从 Via 头拿)。
 	// 这里先写占位 IP:0,由 sipgo 传输层在 WriteMsg 前根据实际 socket 改写。
+	//
+	// M4: TCP 场景在 URI 上追加 ;transport=tcp,平台回连时按此协议建立 socket。
 	contactURI := sip.Uri{
 		User: s.cfg.DeviceID,
 		Host: s.cfg.ServerHost, // 占位,sipgo 会用实际 laddr 覆盖
 		Port: 0,
+	}
+	if isTCP {
+		contactURI.UriParams = sip.NewParams()
+		contactURI.UriParams.Add("transport", "tcp")
 	}
 	req.AppendHeader(&sip.ContactHeader{
 		Address: contactURI,
