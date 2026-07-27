@@ -275,12 +275,16 @@ func (s *RegistrationSession) SetPublisher(p EventPublisher) {
 	s.publisher = p
 }
 
-// publishEvent 通过 publisher 推事件。publisher 未设置时静默丢弃。
+// publishEvent 通过 publisher 推事件。publisher 未设置时静默丢弃 (记 debug 日志)。
 func (s *RegistrationSession) publishEvent(method string, payload map[string]any, priority bool) {
 	s.pubMu.RLock()
 	p := s.publisher
 	s.pubMu.RUnlock()
 	if p == nil {
+		// M1 runOnce 路径无 publisher,记 debug 级日志 (避免 panic 或排查困难)
+		slog.Debug("session.publishEvent: publisher nil, event dropped",
+			"method", method,
+			"payload", payload)
 		return
 	}
 	p.Publish(method, payload, priority)
