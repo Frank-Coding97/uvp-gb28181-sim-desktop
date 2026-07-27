@@ -72,13 +72,15 @@ const cameras = ref<CameraDevice[]>([]);
 const selectedCameraId = ref<string>("");
 const camerasLoaded = ref(false);
 async function loadCameras() {
+  // M2 阶段:后端 list_cameras command 未实现(视频源在 M3+ 点播时才需要)。
+  // 静默失败,让 UI 显示"未检测到摄像头"占位符,不打断用户注册流程。
   try {
     cameras.value = await invoke<CameraDevice[]>("list_cameras");
     if (cameras.value.length && !selectedCameraId.value) {
       selectedCameraId.value = cameras.value[0].id;
     }
-  } catch (e) {
-    message.error("枚举摄像头失败:" + String(e));
+  } catch {
+    cameras.value = [];
   } finally {
     camerasLoaded.value = true;
   }
@@ -134,47 +136,37 @@ async function startDevice() {
   if (!s.server_host.trim() || !s.server_port) { message.error("请填服务器地址与端口"); return; }
   if (!s.device_id.trim()) { message.error("请填设备 ID"); return; }
   try {
+    // M2 daemon 参数(与 Go 侧 ipc.StartDeviceParams 严格对齐)。
+    // v1 的 channel_name / video_source / catalog_template 归 M3+(点播/目录)。
     const config = {
+      device_id: s.device_id.trim(),
       server_host: s.server_host.trim(),
       server_port: s.server_port,
+      server_id: s.server_id.trim(), // 留空则后端回退 server_domain
       server_domain: s.server_domain.trim(),
-      server_id: s.server_id.trim(), // 留空后端回退 server_domain
-      device_id: s.device_id.trim(),
       password: s.password,
-      transport: s.transport,
-      gb_version: s.gb_version,
-      signaling_encoding: s.signaling_encoding,
-      channel_name: "Camera-1",
-      // 摄像头走 live: 前缀(后端 LiveSource 实时采集);文件直接传路径。
-      video_source: resolveVideoSource(),
-      catalog_template: "",
+      transport: s.transport.toLowerCase(), // daemon 期望 udp/tcp 小写
     };
-    const msg = await invoke<string>("start_device", { config });
+    // daemon 返 {request_id, started: true}(handler 立即返, REGISTER 走异步 device_state 事件)
+    const resp = await invoke<{ request_id: string; started: boolean }>(
+      "start_device",
+      { config },
+    );
     deviceLive.value = true;
-    message.success(msg);
+    message.success(`已提交注册请求 (${resp.request_id.slice(0, 8)})`);
     editing.value = false;
   } catch (e) {
     message.error(String(e));
     deviceLive.value = false;
   }
 }
-function resolveVideoSource(): string | null {
-  if (sourceKind.value === "camera") {
-    if (!selectedCameraId.value) return null;
-    return `live:${selectedCameraId.value}`;
-  }
-  if (sourceKind.value === "file") {
-    const p = filePath.value.trim();
-    return p || null;
-  }
-  return null;
-}
 
 async function stopDevice() {
   try {
-    await invoke<string>("stop_device");
+    // daemon 返 {stopped: true}, 具体状态由 device_state 事件回流。
+    await invoke<{ stopped: boolean }>("stop_device");
     deviceLive.value = false;
-    message.info("设备已停止");
+    message.info("已停止设备");
   } catch (e) { message.error(String(e)); }
 }
 
@@ -191,8 +183,9 @@ type TabKey = "command" | "trace";
 const tab = ref<TabKey>("command");
 
 interface CmdEntry { kind: string; summary: string; ts_ms: number; }
+// M2 阶段:平台命令订阅暂未实现(daemon 侧的 sip_message / catalog 事件归 M3)。
+// commands 数组保留供 UI 展示"暂无命令"占位符。
 const commands = ref<CmdEntry[]>([]);
-const MAX_CMD = 200;
 
 interface TraceEntry {
   ts_ms: number; direction: "in" | "out"; method: string;
@@ -215,102 +208,28 @@ function fmtTs(ms: number): string {
   return d.toLocaleTimeString("zh-CN", { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
-// ── 实时预览:H.264 帧 → WebCodecs VideoDecoder → canvas ──
-// Rust 侧通过 Tauri Channel 每帧推 H.264 Annex B;前端等到第一个关键帧才 configure
-// decoder(否则 SPS/PPS 不全会报错),之后连续 decode。慢消费时 Channel 内部有队列,
-// 后端 send 是非阻塞,不会拖慢推流。
+// ── 实时预览(占位符, M2 阶段不启用) ──
+// M2 仅打通注册, 视频预览归 M3+ INVITE 点播实现。
+// 保留 canvasRef / previewLive / previewChannel 是为了让 template 与 subscribe/unsubscribe
+// helper 编译通过, 后续 M3 补 WebCodecs decode 逻辑。
 const canvasRef = ref<HTMLCanvasElement | null>(null);
-const previewLive = ref(false); // 已收到至少 1 帧解码画面
-let decoder: VideoDecoder | null = null;
-let previewChannel: TauriChannel<PreviewFramePayload> | null = null;
-let ctx: CanvasRenderingContext2D | null = null;
-let lastSeq = -1;
-let droppedFrames = 0;
-
-interface PreviewFramePayload {
-  data: number[]; // serde 序列化 Vec<u8> 到 JSON 会变成数组
-  key: boolean;
-  seq: number;
-}
+const previewLive = ref(false);
+let previewChannel: TauriChannel<unknown> | null = null;
 
 function resetDecoder() {
-  try { decoder?.close(); } catch { /* 忽略已关闭 */ }
-  decoder = null;
   previewLive.value = false;
-  lastSeq = -1;
-}
-
-function initDecoder() {
-  if (typeof VideoDecoder === "undefined") {
-    message.warning("当前 WebView 不支持 WebCodecs,预览不可用");
-    return null;
-  }
-  const d = new VideoDecoder({
-    output: (frame: VideoFrame) => {
-      if (ctx && canvasRef.value) {
-        const c = canvasRef.value;
-        // 首次收帧时按视频真实分辨率调整 canvas 尺寸,避免拉伸。
-        if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) {
-          c.width = frame.displayWidth;
-          c.height = frame.displayHeight;
-        }
-        ctx.drawImage(frame, 0, 0);
-        previewLive.value = true;
-      }
-      frame.close();
-    },
-    error: (e) => {
-      // 解码错误常见于 codec 参数不匹配或帧被截断。重置等下一个关键帧。
-      console.warn("[preview] decoder error:", e);
-      resetDecoder();
-    },
-  });
-  // 固定 baseline 3.0,大部分 ffmpeg preset=ultrafast + baseline profile 兜住。
-  // 后续若换 profile 需要从 SPS 解析参数。
-  d.configure({ codec: "avc1.42E01E", optimizeForLatency: true } as VideoDecoderConfig);
-  return d;
 }
 
 async function subscribePreview() {
-  if (previewChannel) return; // 已订阅
-  previewChannel = new TauriChannel<PreviewFramePayload>();
-  previewChannel.onmessage = (payload) => {
-    // 首次或 decoder 断了:等关键帧再启动。
-    if (!decoder) {
-      if (!payload.key) return;
-      decoder = initDecoder();
-      if (!decoder) return;
-    }
-    // 丢帧统计(诊断用,不影响解码)。
-    if (lastSeq >= 0 && payload.seq !== lastSeq + 1) {
-      droppedFrames += payload.seq - lastSeq - 1;
-    }
-    lastSeq = payload.seq;
-
-    const bytes = new Uint8Array(payload.data);
-    try {
-      decoder.decode(new EncodedVideoChunk({
-        type: payload.key ? "key" : "delta",
-        timestamp: payload.seq * 40_000, // 25fps → 40ms 一帧的合成时间戳
-        data: bytes,
-      }));
-    } catch (e) {
-      console.warn("[preview] decode failed:", e);
-      resetDecoder();
-    }
-  };
-  try {
-    await invoke<string>("subscribe_preview", { channel: previewChannel });
-  } catch (e) {
-    console.warn("[preview] subscribe failed:", e);
-    previewChannel = null;
-  }
+  // M2 阶段:预览通道未实现(点播视频归 M3+ INVITE)。
+  // 保留占位符函数让 watch(deviceLive) 不报错。
+  if (previewChannel) return;
+  previewChannel = null; // 明确置空
 }
 
 async function unsubscribePreview() {
   previewChannel = null;
   resetDecoder();
-  try { await invoke<string>("unsubscribe_preview"); } catch { /* 忽略 */ }
 }
 
 // 设备启动 → 订阅预览;停止 → 退订。
@@ -322,38 +241,44 @@ watch(deviceLive, async (live) => {
   }
 });
 
-let unlistenCmd: UnlistenFn | null = null;
+// M3 会加 platform_command 事件订阅,当前 M2 只订 sip_trace。
 let unlistenTrace: UnlistenFn | null = null;
 onMounted(async () => {
-  // canvas 2D 上下文(每次绘制帧用)。alpha: false 略提升性能。
-  if (canvasRef.value) {
-    ctx = canvasRef.value.getContext("2d", { alpha: false });
-  }
+  // canvas 2D ctx 在 M3 预览接入时才用。M2 阶段留空引用避免类型报错。
 
   // 与后端对账一次:app 重启后仍能反映后台是否在跑。
+  // M2 daemon 返 { state, registered_expires_secs }, deviceLive = 状态不是 Disconnected。
   try {
-    const st = await invoke<{ running: boolean }>("get_device_status");
-    deviceLive.value = st.running;
+    const st = await invoke<{ state: string; registered_expires_secs: number }>(
+      "get_device_status",
+    );
+    deviceLive.value = st.state !== "Disconnected";
   } catch { /* 忽略 */ }
 
-  // 默认视频源是摄像头,进页即拉列表。
-  if (sourceKind.value === "camera") loadCameras();
-
-  unlistenCmd = await listen<CmdEntry>("platform_command", (e) => {
-    commands.value.unshift(e.payload);
-    if (commands.value.length > MAX_CMD) commands.value.splice(MAX_CMD);
-  });
-  unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
-    traces.value.unshift(e.payload);
+  // sip_trace 事件订阅:daemon 每收发一条 SIP 报文推一次。
+  // payload shape 见 daemon tracerToIPC.Emit:
+  //   { direction, method, status_code, cseq, call_id, peer, summary, raw, seq, ts_ms }
+  unlistenTrace = await listen<any>("sip_trace", (e) => {
+    const p = e.payload || {};
+    const entry: TraceEntry = {
+      ts_ms: typeof p.ts_ms === "number" ? p.ts_ms : Date.now(),
+      direction: p.direction === "in" ? "in" : "out",
+      method: p.method ?? "",
+      status: typeof p.status_code === "number" && p.status_code > 0 ? p.status_code : undefined,
+      cseq: p.cseq != null ? String(p.cseq) : undefined,
+      call_id: p.call_id ?? undefined,
+      peer: p.peer ?? "",
+      summary: p.summary ?? "",
+      raw: p.raw ?? undefined,
+    };
+    traces.value.unshift(entry);
     if (traces.value.length > MAX_TRACE) traces.value.splice(MAX_TRACE);
-    // 展开态锚在原条目上:新条目插到头部后,展开索引下移。
     if (expandedTrace.value !== null) expandedTrace.value += 1;
   });
 });
 onUnmounted(() => {
-  unlistenCmd?.();
   unlistenTrace?.();
-  // 退订预览 + 关闭解码器,不然切走再回来会漏帧或重复订阅。
+  // 预览取消订阅(M2 是 no-op, M3 真接入)。
   unsubscribePreview();
 });
 
