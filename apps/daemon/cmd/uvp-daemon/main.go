@@ -1,14 +1,17 @@
 // Command uvp-daemon 是 UVP GB28181 桌面模拟器的业务后端。
 //
-// M1 阶段仅支持 --once 一次性 REGISTER 模式,读 JSON 配置向上级平台注册。
-// 完整生命周期(心跳/续约/注销)与 stdio IPC 会在 M2/M3 加入。
+// M1 支持 --mode=once 一次性 REGISTER 验证注册闭环。
+// M2 起支持 --stdio,通过 stdin/stdout JSON-lines 与 Tauri 前端 IPC。
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -29,6 +32,7 @@ func main() {
 		mode        = flag.String("mode", "once", "运行模式: once (M1) | daemon (M2+ 未实现)")
 		configPath  = flag.String("config", "", "SIP 配置 JSON 文件路径 (mode=once 必填)")
 		logLevel    = flag.String("log-level", "info", "日志级别: debug|info|warn|error")
+		stdio       = flag.Bool("stdio", false, "stdio JSON-RPC 2.0 IPC 模式 (M2, 与 --mode 互斥)")
 	)
 	flag.Parse()
 
@@ -38,10 +42,22 @@ func main() {
 	}
 
 	initLogger(*logLevel)
-	slog.Info("uvp-daemon start", "version", Version, "mode", *mode)
 
 	ctx, cancel := signalContext()
 	defer cancel()
+
+	// --stdio 优先,与 --mode=once 互斥。
+	// M2 Tauri 场景下 daemon 以子进程方式启动,stdin=命令帧 / stdout=响应+事件 / stderr=slog。
+	if *stdio {
+		slog.Info("uvp-daemon start", "version", Version, "mode", "stdio")
+		if err := runStdioLoop(ctx, os.Stdin, os.Stdout); err != nil && !errors.Is(err, io.EOF) {
+			slog.Error("stdio loop failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	slog.Info("uvp-daemon start", "version", Version, "mode", *mode)
 
 	switch *mode {
 	case "once":
@@ -59,6 +75,9 @@ func main() {
 }
 
 // initLogger 初始化 slog 输出到 stderr,不污染 stdio(M2 stdio 用于 Tauri IPC)。
+//
+// stdio 模式下用 JSONHandler 便于 Tauri 侧 stderr 收到后转发到桌面窗口 devtools。
+// once 模式仍用 TextHandler,人类可读。
 func initLogger(level string) {
 	var lvl slog.Level
 	switch level {
@@ -73,6 +92,139 @@ func initLogger(level string) {
 	}
 	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
 	slog.SetDefault(slog.New(handler))
+}
+
+// runStdioLoop 是 --stdio 主循环:按行读 stdin → 解 JSON-RPC 帧 → 派发 → 写响应到 stdout。
+//
+// T0 阶段实现最小骨架:只支持 ping method,返回 {"pong": true}。
+// T1 会替换成 ipc.Server + Router,支持完整 method 派发 + 双队列 event 推送。
+//
+// 帧格式(plan §2.2, JSON-RPC 2.0):
+//   请求: {"jsonrpc":"2.0","method":"ping","id":1}
+//   响应: {"jsonrpc":"2.0","id":1,"result":{"pong":true}}
+//   错误: {"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}
+//
+// stdin EOF → 返回 io.EOF (调用方视为正常退出)。
+func runStdioLoop(ctx context.Context, stdin io.Reader, stdout io.Writer) error {
+	scanner := bufio.NewScanner(stdin)
+	// 单帧上限 1 MiB (Tauri 侧命令 payload 一般 <10 KiB,SIP Trace 长报文极端也 <100 KiB)。
+	// bufio.Scanner 默认 64 KiB 不够。
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	writer := bufio.NewWriter(stdout)
+	// 每写完一帧立即 Flush,避免 Tauri 侧 pipe buffer 卡帧。
+	// 性能不是瓶颈(每秒最多几十帧),Flush 开销可忽略。
+
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		line := scanner.Bytes()
+		if len(bytesTrim(line)) == 0 {
+			continue // 空行忽略,前端可能加换行分隔
+		}
+		respBytes := handleStdioFrame(line)
+		if respBytes == nil {
+			continue // Notification 不回复
+		}
+		if _, err := writer.Write(respBytes); err != nil {
+			return fmt.Errorf("write stdout: %w", err)
+		}
+		if err := writer.WriteByte('\n'); err != nil {
+			return fmt.Errorf("write newline: %w", err)
+		}
+		if err := writer.Flush(); err != nil {
+			return fmt.Errorf("flush stdout: %w", err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan stdin: %w", err)
+	}
+	// stdin 关闭 (EOF) → 正常退出
+	return io.EOF
+}
+
+// bytesTrim 去掉行首尾 ASCII 空白 (\r \n \t 空格) 用于空行判断。
+// 内联实现避免拉 strings 包(main.go 已经很杂了)。
+func bytesTrim(b []byte) []byte {
+	i, j := 0, len(b)
+	for i < j && isASCIISpace(b[i]) {
+		i++
+	}
+	for j > i && isASCIISpace(b[j-1]) {
+		j--
+	}
+	return b[i:j]
+}
+
+func isASCIISpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+// handleStdioFrame 解一帧 JSON-RPC 请求并返回响应字节 (不含换行)。
+// T0 只识别 ping;其他 method 返回 -32601 method not found。
+// Notification (无 id) 返回 nil,调用方跳过写 stdout。
+func handleStdioFrame(line []byte) []byte {
+	var req struct {
+		JSONRPC string          `json:"jsonrpc"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params,omitempty"`
+		ID      json.RawMessage `json:"id,omitempty"`
+	}
+	if err := json.Unmarshal(line, &req); err != nil {
+		// 解析失败:按 JSON-RPC 2.0 §5.1,parse error 用 null id。
+		return encodeErrorResponse(nil, -32700, "parse error: "+err.Error())
+	}
+
+	// Notification (id 缺失或为 null) — 不回响应。
+	isNotification := len(req.ID) == 0 || string(req.ID) == "null"
+
+	switch req.Method {
+	case "ping":
+		if isNotification {
+			return nil
+		}
+		return encodeResultResponse(req.ID, map[string]any{"pong": true})
+	default:
+		if isNotification {
+			return nil
+		}
+		return encodeErrorResponse(req.ID, -32601, "method not found: "+req.Method)
+	}
+}
+
+func encodeResultResponse(id json.RawMessage, result any) []byte {
+	resp := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  any             `json:"result"`
+	}{"2.0", id, result}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		// 极罕见:result 含 unmarshalable 类型。降级返 error。
+		return encodeErrorResponse(id, -32603, "internal error: marshal result: "+err.Error())
+	}
+	return b
+}
+
+func encodeErrorResponse(id json.RawMessage, code int, msg string) []byte {
+	if id == nil {
+		id = json.RawMessage("null")
+	}
+	resp := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   any             `json:"error"`
+	}{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}{code, msg},
+	}
+	b, _ := json.Marshal(resp) // struct 全为原生类型,不会失败
+	return b
 }
 
 // signalContext 派生一个响应 SIGINT/SIGTERM 的 context。
