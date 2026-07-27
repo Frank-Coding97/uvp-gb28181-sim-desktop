@@ -178,6 +178,8 @@ func newProductionSessionFactory(server *ipc.Server) ipc.SessionFactory {
 			Tracer:   tracer,
 		})
 		session := device.NewRegistrationSession(client, cfg)
+		// M3 T5: 把 heartbeat_result / renewal_result / device_state 推给前端
+		session.SetPublisher(server)
 		return &sessionAdapter{inner: session}, nil
 	}
 }

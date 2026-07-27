@@ -197,7 +197,8 @@ func (d *DeviceManager) startDevice(pub Publisher) Handler {
 // stopDevice 停当前 session。
 //
 // 幂等:无 session 也不报错。
-// M2 简化(spec R3): 直接调 session.Stop(),不等平台 200 OK 响应就清 session。
+// M3: session.Stop() 现在会发 Expires=0 REGISTER (6s 超时),放到 goroutine 里跑,
+// handler 立即返回避免阻塞 IPC。session 内部完成后会自己 publish device_state:Disconnected。
 func (d *DeviceManager) stopDevice(pub Publisher) Handler {
 	return func(ctx context.Context, raw json.RawMessage) (any, error) {
 		d.mu.Lock()
@@ -212,13 +213,18 @@ func (d *DeviceManager) stopDevice(pub Publisher) Handler {
 			publishState(pub, "Disconnected", 0, "")
 			return map[string]any{"stopped": true}, nil
 		}
-		if err := s.Stop(); err != nil {
-			slog.Warn("session.Stop error", "error", err)
-		}
-		if cancel != nil {
-			cancel()
-		}
-		publishState(pub, "Disconnected", 0, "")
+		// async 走 session.Stop:内部含 6s 超时 + 发 Expires=0 REGISTER,不阻塞 handler。
+		go func() {
+			if err := s.Stop(); err != nil {
+				slog.Warn("session.Stop error", "error", err)
+			}
+			if cancel != nil {
+				cancel()
+			}
+			// session 会自己 publish device_state:Disconnected;这里补一发,保证 UI
+			// 即便 session.Stop 里 publish 丢失也能收到最终态。
+			publishState(pub, "Disconnected", 0, "")
+		}()
 		return map[string]any{"stopped": true}, nil
 	}
 }

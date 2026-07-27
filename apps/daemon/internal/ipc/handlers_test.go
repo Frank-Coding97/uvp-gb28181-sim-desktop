@@ -173,6 +173,14 @@ func TestStopDevice_Idempotent(t *testing.T) {
 	if _, err := r.Dispatch(context.Background(), "stop_device", nil); err != nil {
 		t.Fatalf("stop_device 2: %v", err)
 	}
+	// M3: session.Stop() 走 goroutine 异步执行,给一点时间让它跑起来
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if fs.wasStopped() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !fs.wasStopped() {
 		t.Errorf("session.Stop 未被调")
 	}
