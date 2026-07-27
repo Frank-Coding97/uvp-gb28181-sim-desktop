@@ -4,10 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "UVP GB28181 桌面端(Tauri 后端)"
+description = "UVP GB28181 桌面端 v2(Tauri 后端)"
 
 [lib]
-# Tauri 2 推荐 lib + 薄 main 结构,便于移动端/测试复用。
 name = "uvp_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
@@ -15,15 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# v2 起桌面壳只做设备模拟(单设备信令+媒体预览)。压测/场景相关 crate 已从
-# invoke_handler 清出,依赖也一起摘掉,后续拆压测 daemon 时再单独引入。
-gb28181-simulator = { path = "../../../crates/gb28181-simulator" }
-sip-core          = { path = "../../../crates/sip-core" }
-encoding_rs       = { workspace = true }
-common            = { path = "../../../crates/common" }
+# v2 重构:所有 crates 依赖已删除,后端从零开始重写。
+# 按需逐步引入外部库(tokio / serde / tracing 等)。
 tauri = { version = "2", features = [] }
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-tracing.workspace = true
 tauri-plugin-dialog = "2.0.0-rc.8"
