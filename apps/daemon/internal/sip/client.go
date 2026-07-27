@@ -135,17 +135,17 @@ func (c *Client) Do(ctx context.Context, req *sip.Request) (*sip.Response, error
 
 // doDigestChallenge 处理 401 挑战:解析 WWW-Authenticate → 构造 Authorization → 重发。
 //
-// 使用 sipgo 内建 DoDigestAuth,支持 MD5 + qop=auth (RFC 7616 主流子集)。
-// 若平台 stale=true 或 nonce 过期,sipgo 内部会重新解析新 nonce,不缓存复用 (spec R4)。
-// doDigestChallenge 处理 401 挑战。**不用 sipgo 内建 DoDigestAuth**,原因:
+// **不用 sipgo 内建 DoDigestAuth**,原因:
 //
-// sipgo 内部把 `Options.URI` 设成 `req.Recipient.Addr()`,格式是
-// `<user>@<host>[:port]` **不带 "sip:" 前缀**。
-// 但 GB28181 平台 (WVP-Pro 等) 期望 Authorization 头里 `uri="sip:..."` 带前缀
-// (对齐 Request-URI),否则 hash 校验失败静默丢包。
+// M1 真机联调 WVP-Pro v2.7.4 发现: sipgo 内部把 Options.URI 设成 req.Recipient.Addr(),
+// 格式是 `<user>@<host>[:port]` **不带 "sip:" 前缀** (虽然 Uri.Addr() 方法会拼 scheme,
+// 但传给 DoDigestAuth 前的某个环节丢失了 —— sipgo v1.4.0 源码待确认具体位置)。
+// GB28181 平台期望 Authorization 头里 `uri="sip:..."` 带前缀对齐 Request-URI,
+// 否则 Digest response hash 校验失败,平台静默丢包 (WVP 不返 403,直接超时)。
+// M1 commit ea1796b (2026-07-27) 定位到该问题。
 //
-// 修法:手工用 icholy/digest 库,`Options.URI` 显式带 "sip:" 前缀。
-// 2026-07-27 M1 真机联调 WVP-Pro v2.7.4 定位到该问题。
+// 修法: 手工用 icholy/digest 库,Options.URI 显式取 req.Recipient.Addr() (已含 sip:)。
+// 未来若 sipgo 修复该 quirk,可切回 DoDigestAuth (需回归 WVP-Pro + LiveGBS 验证)。
 func (c *Client) doDigestChallenge(
 	ctx context.Context,
 	req *sip.Request,
