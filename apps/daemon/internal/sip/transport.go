@@ -20,6 +20,14 @@ type TransportConfig struct {
 	// LocalAddr 是本地绑定地址,格式 "host:port"。
 	// "0.0.0.0:0" 表示所有网卡+随机端口。
 	LocalAddr string
+
+	// LocalHost 是本机对外可达 IP (Contact 头 / Via 头 host 部分)。
+	// 空则由 DiscoverLocalIP 探测。
+	LocalHost string
+
+	// LocalPort 是希望绑定的本地 UDP 端口 (0=随机)。
+	// GB28181 场景一般是 5060,便于平台把响应发回同一端口。
+	LocalPort int
 }
 
 // Transport 封装 sipgo UserAgent + 本地 UDP/TCP socket。
@@ -27,6 +35,8 @@ type Transport struct {
 	ua        *sipgo.UserAgent
 	protocol  string
 	localAddr string // 实际绑定的 host:port
+	localHost string
+	localPort int
 }
 
 // NewTransport 创建 sipgo UserAgent 并绑定本地 socket。
@@ -53,7 +63,19 @@ func NewTransport(cfg TransportConfig) (*Transport, error) {
 		ua:        ua,
 		protocol:  protocol,
 		localAddr: cfg.LocalAddr,
+		localHost: cfg.LocalHost,
+		localPort: cfg.LocalPort,
 	}, nil
+}
+
+// LocalHost 返回本机对外可达 IP (Client 层构造 Contact / Via 用)。
+func (t *Transport) LocalHost() string {
+	return t.localHost
+}
+
+// LocalPort 返回期望绑定的本地 UDP 端口 (0=随机)。
+func (t *Transport) LocalPort() int {
+	return t.localPort
 }
 
 // UserAgent 暴露内部 sipgo.UserAgent 给 Client 层。
