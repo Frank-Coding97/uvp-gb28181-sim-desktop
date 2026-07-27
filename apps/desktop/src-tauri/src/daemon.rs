@@ -229,6 +229,14 @@ fn forward_event(app: &AppHandle, method: &str, params: Value) {
             // 前端可选订阅,用于展示丢包量
             let _ = app.emit("bulk_stats", params);
         }
+        "heartbeat_result" => {
+            // M3 T5: 心跳结果事件, Simulator.vue 订阅显示"心跳 ✅ / 异常 N/3"
+            let _ = app.emit("heartbeat_result", params);
+        }
+        "renewal_result" => {
+            // M3: 续约结果事件, 供前端指标面板用
+            let _ = app.emit("renewal_result", params);
+        }
         _ => {
             let mut wrapped = serde_json::Map::new();
             wrapped.insert("method".into(), Value::String(method.into()));

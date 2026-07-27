@@ -241,8 +241,38 @@ watch(deviceLive, async (live) => {
   }
 });
 
-// M3 会加 platform_command 事件订阅,当前 M2 只订 sip_trace。
+// ── M3 心跳事件订阅 ──
+// heartbeat_result payload:{ ok: bool, consecutive_fails: number, error?: string, ts_ms: number }
+interface HeartbeatEvent {
+  ok: boolean;
+  consecutive_fails: number;
+  error?: string;
+  ts_ms: number;
+}
+const heartbeat = ref<HeartbeatEvent | null>(null);
+const heartbeatCount = ref(0);
+// UI 显示的心跳状态文案 + 色调 (spec R4: 3 次内不告警,只累计;3 次时降级触发 device_state:Failed)
+const heartbeatMeta = computed(() => {
+  // 未注册或未收到心跳事件:不显示
+  if (!registered.value && heartbeat.value == null) {
+    return null;
+  }
+  if (heartbeat.value == null) {
+    return { text: "心跳等待", color: "var(--text-tertiary)" };
+  }
+  if (heartbeat.value.ok) {
+    return { text: `心跳正常 (${heartbeatCount.value})`, color: "var(--success)" };
+  }
+  const n = heartbeat.value.consecutive_fails;
+  if (n >= 3) {
+    return { text: `心跳超限 (${n}/3)`, color: "var(--error)" };
+  }
+  return { text: `心跳异常 (${n}/3)`, color: "var(--warning)" };
+});
+
+// M3 platform_command 事件订阅归 M4,当前只订 sip_trace + heartbeat_result。
 let unlistenTrace: UnlistenFn | null = null;
+let unlistenHeartbeat: UnlistenFn | null = null;
 onMounted(async () => {
   // canvas 2D ctx 在 M3 预览接入时才用。M2 阶段留空引用避免类型报错。
 
@@ -258,6 +288,18 @@ onMounted(async () => {
   // sip_trace 事件订阅:daemon 每收发一条 SIP 报文推一次。
   // payload shape 见 daemon tracerToIPC.Emit:
   //   { direction, method, status_code, cseq, call_id, peer, summary, raw, seq, ts_ms }
+  // heartbeat_result 事件订阅 (M3)
+  unlistenHeartbeat = await listen<any>("heartbeat_result", (e) => {
+    const p = e.payload || {};
+    heartbeat.value = {
+      ok: p.ok === true,
+      consecutive_fails: typeof p.consecutive_fails === "number" ? p.consecutive_fails : 0,
+      error: p.error,
+      ts_ms: typeof p.ts_ms === "number" ? p.ts_ms : Date.now(),
+    };
+    if (heartbeat.value.ok) heartbeatCount.value += 1;
+  });
+
   unlistenTrace = await listen<any>("sip_trace", (e) => {
     const p = e.payload || {};
     const entry: TraceEntry = {
@@ -278,6 +320,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   unlistenTrace?.();
+  unlistenHeartbeat?.();
   // 预览取消订阅(M2 是 no-op, M3 真接入)。
   unsubscribePreview();
 });
@@ -512,6 +555,10 @@ onUnmounted(() => { if (osdTimer) clearInterval(osdTimer); });
         <div class="reg-row">
           <span class="reg-state">
             <span class="reg-dot" :style="{ background: stateMeta.color }" />{{ stateMeta.text }}
+          </span>
+          <!-- 心跳状态 (M3):注册后每 60s 一次 tick,失败降级前显示 N/3 -->
+          <span class="reg-state" v-if="heartbeatMeta">
+            <span class="reg-dot" :style="{ background: heartbeatMeta.color }" />{{ heartbeatMeta.text }}
           </span>
           <n-button
             :type="deviceLive ? 'default' : 'primary'"
