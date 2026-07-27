@@ -147,20 +147,17 @@ func (s *RegistrationSession) Start(parentCtx context.Context) error {
 	return nil
 }
 
-// Stop 主动停止会话。cancel 根 ctx → heartbeat / renewal / 任意从 s.ctx 派生的子任务收 Done。
+// Stop 主动停止会话。
 //
-// 幂等 (spec AC-11): 多次调用不 panic,不重复推送事件。
-// M3 T3 会扩展:Stop 内先发 Expires=0 REGISTER,再 cancel。
+// spec AC-10/AC-11:
+//   - 当前 Registered → 发 Expires=0 REGISTER,6s 超时后强清
+//   - 其他状态 → 直接 cancel 根 ctx + 置 Disconnected
+//
+// 幂等:多次调用只执行一次注销 (sync.Once 保护)。
+// heartbeat / renewal 通过 ctx cancel 收 Done 退出。
 func (s *RegistrationSession) Stop() error {
 	s.stopOnce.Do(func() {
-		s.ctxMu.Lock()
-		cancel := s.cancel
-		s.ctxMu.Unlock()
-
-		if cancel != nil {
-			cancel()
-		}
-		s.state.Store(int32(StateDisconnected))
+		s.shutdownGracefully()
 	})
 	return nil
 }
