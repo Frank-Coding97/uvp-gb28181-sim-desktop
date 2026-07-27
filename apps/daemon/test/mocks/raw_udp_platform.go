@@ -58,6 +58,8 @@ type ReceivedRequest struct {
 	AuthQop           string
 	AuthOpaque        string
 	RawBytes          []byte
+	ConnectionID      string // TCP 场景:连接唯一标识 (UDP 场景留空)
+}
 }
 
 // RawMockPlatform 是独立 UDP mock 平台。
