@@ -53,7 +53,10 @@ func (r *Renewal) Run(ctx context.Context) {
 			slog.Info("renewal loop exit", "reason", ctx.Err())
 			return
 		case <-timer.C:
-			if err := r.session.reregister(ctx); err != nil {
+			// P0-1 fix: 派生 ctx 监听 s.ctx,让 Stop 能中断正在进行的 reregister
+			reqCtx, cancel := context.WithTimeout(r.session.InternalContext(), 15*time.Second)
+			if err := r.session.reregister(reqCtx); err != nil {
+				cancel()
 				slog.Warn("renewal failed", "error", err)
 				r.session.publishEvent("device_state", map[string]any{
 					"state":                   "Failed",
@@ -63,6 +66,7 @@ func (r *Renewal) Run(ctx context.Context) {
 				r.session.markFailed("续约失败")
 				return
 			}
+			cancel()
 			// 成功:状态保持 Registered,进入下一轮 (RegisteredExpires 已在 reregister 内更新)
 			slog.Info("renewal success",
 				"new_expires_secs", r.session.RegisteredExpires())
