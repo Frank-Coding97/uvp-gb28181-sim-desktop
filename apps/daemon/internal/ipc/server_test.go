@@ -83,7 +83,7 @@ func TestServer_PublishBulkMayDrop(t *testing.T) {
 
 	// 未启动 Run,pump 不消费,bulkCh 一定会满 → 后续 Publish 丢包。
 	for i := 0; i < 20; i++ {
-		s.Publish("sip_trace", map[string]any{"n": i}, false)
+		s.Publish("heartbeat_result", map[string]any{"n": i}, false)
 	}
 	dropped := s.DroppedCount()
 	if dropped == 0 {
