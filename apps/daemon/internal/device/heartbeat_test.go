@@ -122,7 +122,7 @@ func TestHeartbeat_TickerSendsKeepalive(t *testing.T) {
 		registerResp: mockResponse{statusCode: 200},
 		messageResp:  mockResponse{statusCode: 200},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	bus := &captureBus{}
 	session.SetPublisher(bus)
 
@@ -156,7 +156,7 @@ func TestHeartbeat_KeepaliveXMLBody(t *testing.T) {
 		registerResp: mockResponse{statusCode: 200},
 		messageResp:  mockResponse{statusCode: 200},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	bus := &captureBus{}
 	session.SetPublisher(bus)
 	_ = session.Start(context.Background())
@@ -205,7 +205,7 @@ func TestHeartbeat_FailCountReset(t *testing.T) {
 		messageResp:      mockResponse{statusCode: 200},
 		messageFailFirst: 1, // 只失败 1 次
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	bus := &captureBus{}
 	session.SetPublisher(bus)
 	_ = session.Start(context.Background())
@@ -243,7 +243,7 @@ func TestHeartbeat_ThreeConsecutiveFailsDown(t *testing.T) {
 		registerResp: mockResponse{statusCode: 200},
 		messageErr:   errors.New("mock permanent fail"),
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	bus := &captureBus{}
 	session.SetPublisher(bus)
 	_ = session.Start(context.Background())
@@ -287,7 +287,7 @@ func TestHeartbeat_CtxCancelExits(t *testing.T) {
 		registerResp: mockResponse{statusCode: 200},
 		messageResp:  mockResponse{statusCode: 200},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	_ = session.Start(context.Background())
 
 	// interval 长到不会触发,靠 cancel 退出
@@ -315,7 +315,7 @@ func TestHeartbeat_SessionStopCancels(t *testing.T) {
 		registerResp: mockResponse{statusCode: 200},
 		messageResp:  mockResponse{statusCode: 200},
 	}
-	session := NewRegistrationSession(client, newTestConfig())
+	session := newRawTestSession(client, newTestConfig())
 	_ = session.Start(context.Background())
 
 	hb := NewHeartbeat(session, 30*time.Millisecond)
