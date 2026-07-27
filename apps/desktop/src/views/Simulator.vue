@@ -1,62 +1,184 @@
 <script setup lang="ts">
-// 设备模拟(首页):SIP 配置 + 画面源选择 + 预览占位 + 能力状态。
-// 本版为静态页,不接后端 invoke;字段布局对齐手机端 uvp-gb28181-sim 主页。
-import { computed, ref } from "vue";
-import { NButton, NIcon } from "naive-ui";
+// 设备模拟(首页):SIP 配置 + 画面源选择 + 预览 + 平台命令 / SIP trace。
+// 用户在这里填 SIP → 点"注册" → 后端 start_device → device_state / sip_trace 事件回流。
+// SIP 配置持久化到 localStorage 单 key,重开应用保留上次填的值。
+import { computed, inject, onMounted, onUnmounted, ref, watch, type Ref } from "vue";
+import { NButton, NIcon, useMessage } from "naive-ui";
+import { Channel as TauriChannel, invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  VideocamOutline, DesktopOutline, FolderOpenOutline,
+  VideocamOutline, FolderOpenOutline, RefreshOutline,
   EyeOutline, EyeOffOutline, PencilOutline,
 } from "@vicons/ionicons5";
 
-// ── SIP 配置(手机端同款字段:服务器/服务器 ID/服务器域/设备 ID/密码/信令传输/对讲传输) ──
-const sip = ref({
-  server_host: "192.168.10.222",
-  server_port: 8160,
-  server_id: "35020000002000000001",
-  server_domain: "3502000000",
-  device_id: "35020000001310000001",
-  password: "12345678",
-  transport: "UDP" as "UDP" | "TCP",
-  talk_transport: "TCP_ACTIVE" as "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE",
-  gb_version: "2022" as "2022" | "2016",
-});
+const message = useMessage();
+
+// ── SIP 配置(持久化到 localStorage) ──
+interface SipConfig {
+  server_host: string;
+  server_port: number;
+  server_id: string;        // 20 位平台 ID(REGISTER Request-URI 的 user)
+  server_domain: string;    // 10 位域(设备 AOR 的 host)
+  device_id: string;        // 20 位设备国标 ID
+  password: string;
+  transport: "UDP" | "TCP";
+  signaling_encoding: "GB18030" | "UTF-8";
+  gb_version: "2022" | "2016";
+}
+const STORE_KEY = "uvp_sip_config";
+function defaults(): SipConfig {
+  return {
+    server_host: "192.168.10.222",
+    server_port: 8160,
+    server_id: "35020000002000000001",
+    server_domain: "3502000000",
+    device_id: "35020000001310000001",
+    password: "12345678",
+    transport: "UDP",
+    signaling_encoding: "GB18030",
+    gb_version: "2022",
+  };
+}
+function load(): SipConfig {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return { ...defaults(), ...JSON.parse(raw) };
+  } catch { /* 损坏数据回退默认 */ }
+  return defaults();
+}
+const sip = ref<SipConfig>(load());
+// 每次配置变更即持久化(表单编辑边填边存,避免忘记保存)。
+watch(sip, (v) => localStorage.setItem(STORE_KEY, JSON.stringify(v)), { deep: true });
+
 const editing = ref(false);
 const showPassword = ref(false);
 const maskedPassword = computed(() => "•".repeat(sip.value.password.length || 8));
 
-const talkOptions = [
-  { label: "UDP", value: "UDP" },
-  { label: "TCP 主动", value: "TCP_ACTIVE" },
-  { label: "TCP 被动", value: "TCP_PASSIVE" },
-] as const;
-
-// ── 画面源:摄像头 / 屏幕 / 文件三选一 ──
-type SourceKind = "camera" | "screen" | "file";
+// ── 画面源:摄像头 / 文件二选一 ──
+// (窗口/屏幕采集因 mac 上 ffmpeg 不支持窗口级采集,已决定不做。)
+type SourceKind = "camera" | "file";
 const sourceKind = ref<SourceKind>("camera");
 const filePath = ref("");
 const sources = [
   { kind: "camera" as SourceKind, icon: VideocamOutline, label: "摄像头", hint: "把电脑摄像头当作 IPC 镜头" },
-  { kind: "screen" as SourceKind, icon: DesktopOutline, label: "屏幕", hint: "共享桌面画面作为视频源" },
   { kind: "file" as SourceKind, icon: FolderOpenOutline, label: "文件", hint: "循环推送本地 MP4 / H.264" },
 ];
 const activeSource = computed(() => sources.find((s) => s.kind === sourceKind.value)!);
 
-// ── 注册状态(静态占位:本地切换,不接后端) ──
-type DState = "Disconnected" | "Registering" | "Registered";
-const state = ref<DState>("Disconnected");
+// 摄像头设备列表(切到"摄像头"时首次拉取,缓存)。
+interface CameraDevice { id: string; name: string; }
+const cameras = ref<CameraDevice[]>([]);
+const selectedCameraId = ref<string>("");
+const camerasLoaded = ref(false);
+async function loadCameras() {
+  try {
+    cameras.value = await invoke<CameraDevice[]>("list_cameras");
+    if (cameras.value.length && !selectedCameraId.value) {
+      selectedCameraId.value = cameras.value[0].id;
+    }
+  } catch (e) {
+    message.error("枚举摄像头失败:" + String(e));
+  } finally {
+    camerasLoaded.value = true;
+  }
+}
+// 切到摄像头时按需拉一次;点"刷新"重拉。
+watch(sourceKind, (v) => {
+  if (v === "camera" && !camerasLoaded.value) loadCameras();
+});
+async function refreshCameras() {
+  camerasLoaded.value = false;
+  await loadCameras();
+}
+
+async function pickVideoFile() {
+  try {
+    const picked = await openDialog({
+      multiple: false, directory: false,
+      filters: [{ name: "视频", extensions: ["h264", "264", "h265", "hevc", "mp4", "flv", "mkv", "mov"] }],
+    });
+    if (typeof picked === "string") filePath.value = picked;
+  } catch (e) { message.error("选择文件失败:" + String(e)); }
+}
+
+// ── 注册状态:App.vue 统一订阅 device_state,inject 共享 ──
+type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
+const deviceState = inject<Ref<DState>>("deviceState", ref<DState>("Disconnected"));
+const startedAt = inject<Ref<number | null>>("deviceStartedAt", ref<number | null>(null));
 const stateMeta = computed(() => {
-  switch (state.value) {
+  switch (deviceState.value) {
     case "Registering": return { text: "注册中", color: "var(--warning)" };
     case "Registered":  return { text: "已注册", color: "var(--success)" };
+    case "InCall":      return { text: "推流中", color: "var(--accent)" };
+    case "Failed":      return { text: "注册失败", color: "var(--error)" };
     default:            return { text: "未连接", color: "var(--text-tertiary)" };
   }
 });
-const registered = computed(() => state.value === "Registered");
-function toggleRegister() {
-  state.value = registered.value ? "Disconnected" : "Registered";
+const registered = computed(() =>
+  deviceState.value === "Registered" || deviceState.value === "InCall");
+// 后端是否有活跃设备实例(允许"注销"停止它,即使还在重试注册)。
+const deviceLive = ref(false);
+
+async function toggleRegister() {
+  if (deviceLive.value) {
+    await stopDevice();
+  } else {
+    await startDevice();
+  }
 }
 
-// ── 能力状态条(照搬手机端首页四项) ──
+async function startDevice() {
+  const s = sip.value;
+  // 前端粗校验:关键字段非空,避免把明显无效值扔给后端。
+  if (!s.server_host.trim() || !s.server_port) { message.error("请填服务器地址与端口"); return; }
+  if (!s.device_id.trim()) { message.error("请填设备 ID"); return; }
+  try {
+    const config = {
+      server_host: s.server_host.trim(),
+      server_port: s.server_port,
+      server_domain: s.server_domain.trim(),
+      server_id: s.server_id.trim(), // 留空后端回退 server_domain
+      device_id: s.device_id.trim(),
+      password: s.password,
+      transport: s.transport,
+      gb_version: s.gb_version,
+      signaling_encoding: s.signaling_encoding,
+      channel_name: "Camera-1",
+      // 摄像头走 live: 前缀(后端 LiveSource 实时采集);文件直接传路径。
+      video_source: resolveVideoSource(),
+      catalog_template: "",
+    };
+    const msg = await invoke<string>("start_device", { config });
+    deviceLive.value = true;
+    message.success(msg);
+    editing.value = false;
+  } catch (e) {
+    message.error(String(e));
+    deviceLive.value = false;
+  }
+}
+function resolveVideoSource(): string | null {
+  if (sourceKind.value === "camera") {
+    if (!selectedCameraId.value) return null;
+    return `live:${selectedCameraId.value}`;
+  }
+  if (sourceKind.value === "file") {
+    const p = filePath.value.trim();
+    return p || null;
+  }
+  return null;
+}
+
+async function stopDevice() {
+  try {
+    await invoke<string>("stop_device");
+    deviceLive.value = false;
+    message.info("设备已停止");
+  } catch (e) { message.error(String(e)); }
+}
+
+// ── 能力状态条 ──
 const capabilities = computed(() => [
   { label: "录像",     status: registered.value ? "就绪" : "未就绪" },
   { label: "报警",     status: registered.value ? "就绪" : "未就绪" },
@@ -64,62 +186,241 @@ const capabilities = computed(() => [
   { label: "目录订阅", status: "未订阅" },
 ]);
 
-// ── 平台交互(静态样例数据,接后端后换为 platform_command / sip_trace 事件) ──
+// ── 平台交互:命令时间线 + SIP trace ──
 type TabKey = "command" | "trace";
 const tab = ref<TabKey>("command");
 
-const DEMO_COMMANDS = [
-  { ts: "19:24:07.412", kind: "query",     summary: "查询设备目录 Catalog(SN=1)" },
-  { ts: "19:24:07.088", kind: "query",     summary: "查询设备信息 DeviceInfo" },
-  { ts: "19:24:06.735", kind: "subscribe", summary: "订阅目录变化 Catalog(有效期 3600s)" },
-  { ts: "19:23:58.204", kind: "invite",    summary: "实时点播 通道 1 · TCP 被动 · SSRC 0100000001" },
-  { ts: "19:23:41.667", kind: "control",   summary: "云台控制 向左 速度 128" },
-  { ts: "19:23:40.902", kind: "control",   summary: "云台控制 停止" },
-];
-const DEMO_TRACES = [
-  { ts: "19:24:07.410", dir: "out", summary: "200 OK (MESSAGE)",           cseq: "1 MESSAGE"  },
-  { ts: "19:24:07.402", dir: "in",  summary: "MESSAGE Catalog Query",      cseq: "1 MESSAGE"  },
-  { ts: "19:23:58.201", dir: "out", summary: "200 OK (INVITE) + SDP",      cseq: "20 INVITE"  },
-  { ts: "19:23:58.106", dir: "in",  summary: "INVITE 通道 1",              cseq: "20 INVITE"  },
-  { ts: "19:23:30.014", dir: "out", summary: "REGISTER (含 Authorization)", cseq: "2 REGISTER" },
-  { ts: "19:23:29.887", dir: "in",  summary: "401 Unauthorized",           cseq: "1 REGISTER" },
-];
+interface CmdEntry { kind: string; summary: string; ts_ms: number; }
+const commands = ref<CmdEntry[]>([]);
+const MAX_CMD = 200;
+
+interface TraceEntry {
+  ts_ms: number; direction: "in" | "out"; method: string;
+  status?: number; cseq?: string; call_id?: string; peer: string; summary: string; raw?: string;
+}
+const traces = ref<TraceEntry[]>([]);
+const MAX_TRACE = 200;
+const expandedTrace = ref<number | null>(null);
+function toggleTraceRow(i: number) {
+  expandedTrace.value = expandedTrace.value === i ? null : i;
+}
+
 const kindLabel: Record<string, string> = {
   query: "查询", control: "控制", invite: "点播", subscribe: "订阅", notify: "通知",
+  broadcast: "广播", Catalog: "目录", Alarm: "报警", MobilePosition: "移动位置",
+  PTZPosition: "PTZ精准位置", snapshot: "抓拍上传", upgrade: "在线升级",
 };
-// 未注册时不造假交互记录 —— 空态才是真实情况。
-const commands = computed(() => (registered.value ? DEMO_COMMANDS : []));
-const traces = computed(() => (registered.value ? DEMO_TRACES : []));
+function fmtTs(ms: number): string {
+  const d = new Date(ms);
+  return d.toLocaleTimeString("zh-CN", { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+
+// ── 实时预览:H.264 帧 → WebCodecs VideoDecoder → canvas ──
+// Rust 侧通过 Tauri Channel 每帧推 H.264 Annex B;前端等到第一个关键帧才 configure
+// decoder(否则 SPS/PPS 不全会报错),之后连续 decode。慢消费时 Channel 内部有队列,
+// 后端 send 是非阻塞,不会拖慢推流。
+const canvasRef = ref<HTMLCanvasElement | null>(null);
+const previewLive = ref(false); // 已收到至少 1 帧解码画面
+let decoder: VideoDecoder | null = null;
+let previewChannel: TauriChannel<PreviewFramePayload> | null = null;
+let ctx: CanvasRenderingContext2D | null = null;
+let lastSeq = -1;
+let droppedFrames = 0;
+
+interface PreviewFramePayload {
+  data: number[]; // serde 序列化 Vec<u8> 到 JSON 会变成数组
+  key: boolean;
+  seq: number;
+}
+
+function resetDecoder() {
+  try { decoder?.close(); } catch { /* 忽略已关闭 */ }
+  decoder = null;
+  previewLive.value = false;
+  lastSeq = -1;
+}
+
+function initDecoder() {
+  if (typeof VideoDecoder === "undefined") {
+    message.warning("当前 WebView 不支持 WebCodecs,预览不可用");
+    return null;
+  }
+  const d = new VideoDecoder({
+    output: (frame: VideoFrame) => {
+      if (ctx && canvasRef.value) {
+        const c = canvasRef.value;
+        // 首次收帧时按视频真实分辨率调整 canvas 尺寸,避免拉伸。
+        if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) {
+          c.width = frame.displayWidth;
+          c.height = frame.displayHeight;
+        }
+        ctx.drawImage(frame, 0, 0);
+        previewLive.value = true;
+      }
+      frame.close();
+    },
+    error: (e) => {
+      // 解码错误常见于 codec 参数不匹配或帧被截断。重置等下一个关键帧。
+      console.warn("[preview] decoder error:", e);
+      resetDecoder();
+    },
+  });
+  // 固定 baseline 3.0,大部分 ffmpeg preset=ultrafast + baseline profile 兜住。
+  // 后续若换 profile 需要从 SPS 解析参数。
+  d.configure({ codec: "avc1.42E01E", optimizeForLatency: true } as VideoDecoderConfig);
+  return d;
+}
+
+async function subscribePreview() {
+  if (previewChannel) return; // 已订阅
+  previewChannel = new TauriChannel<PreviewFramePayload>();
+  previewChannel.onmessage = (payload) => {
+    // 首次或 decoder 断了:等关键帧再启动。
+    if (!decoder) {
+      if (!payload.key) return;
+      decoder = initDecoder();
+      if (!decoder) return;
+    }
+    // 丢帧统计(诊断用,不影响解码)。
+    if (lastSeq >= 0 && payload.seq !== lastSeq + 1) {
+      droppedFrames += payload.seq - lastSeq - 1;
+    }
+    lastSeq = payload.seq;
+
+    const bytes = new Uint8Array(payload.data);
+    try {
+      decoder.decode(new EncodedVideoChunk({
+        type: payload.key ? "key" : "delta",
+        timestamp: payload.seq * 40_000, // 25fps → 40ms 一帧的合成时间戳
+        data: bytes,
+      }));
+    } catch (e) {
+      console.warn("[preview] decode failed:", e);
+      resetDecoder();
+    }
+  };
+  try {
+    await invoke<string>("subscribe_preview", { channel: previewChannel });
+  } catch (e) {
+    console.warn("[preview] subscribe failed:", e);
+    previewChannel = null;
+  }
+}
+
+async function unsubscribePreview() {
+  previewChannel = null;
+  resetDecoder();
+  try { await invoke<string>("unsubscribe_preview"); } catch { /* 忽略 */ }
+}
+
+// 设备启动 → 订阅预览;停止 → 退订。
+watch(deviceLive, async (live) => {
+  if (live) {
+    await subscribePreview();
+  } else {
+    await unsubscribePreview();
+  }
+});
+
+let unlistenCmd: UnlistenFn | null = null;
+let unlistenTrace: UnlistenFn | null = null;
+onMounted(async () => {
+  // canvas 2D 上下文(每次绘制帧用)。alpha: false 略提升性能。
+  if (canvasRef.value) {
+    ctx = canvasRef.value.getContext("2d", { alpha: false });
+  }
+
+  // 与后端对账一次:app 重启后仍能反映后台是否在跑。
+  try {
+    const st = await invoke<{ running: boolean }>("get_device_status");
+    deviceLive.value = st.running;
+  } catch { /* 忽略 */ }
+
+  // 默认视频源是摄像头,进页即拉列表。
+  if (sourceKind.value === "camera") loadCameras();
+
+  unlistenCmd = await listen<CmdEntry>("platform_command", (e) => {
+    commands.value.unshift(e.payload);
+    if (commands.value.length > MAX_CMD) commands.value.splice(MAX_CMD);
+  });
+  unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
+    traces.value.unshift(e.payload);
+    if (traces.value.length > MAX_TRACE) traces.value.splice(MAX_TRACE);
+    // 展开态锚在原条目上:新条目插到头部后,展开索引下移。
+    if (expandedTrace.value !== null) expandedTrace.value += 1;
+  });
+});
+onUnmounted(() => {
+  unlistenCmd?.();
+  unlistenTrace?.();
+  // 退订预览 + 关闭解码器,不然切走再回来会漏帧或重复订阅。
+  unsubscribePreview();
+});
+
+// 在线时长(OSD 里显示,以及未来指标用)。
+const now = ref(new Date().toLocaleString("zh-CN", { hour12: false }));
+const uptime = ref("--:--:--");
+let osdTimer: number | null = null;
+onMounted(() => {
+  osdTimer = window.setInterval(() => {
+    now.value = new Date().toLocaleString("zh-CN", { hour12: false });
+    if (startedAt.value) {
+      const s = Math.floor((Date.now() - startedAt.value) / 1000);
+      const h = String(Math.floor(s / 3600)).padStart(2, "0");
+      const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+      const ss = String(s % 60).padStart(2, "0");
+      uptime.value = `${h}:${m}:${ss}`;
+    } else {
+      uptime.value = "--:--:--";
+    }
+  }, 1000);
+});
+onUnmounted(() => { if (osdTimer) clearInterval(osdTimer); });
 </script>
 
 <template>
   <div class="page">
     <div class="layout">
-      <!-- ── 左:预览区(占位) ── -->
+      <!-- ── 左:预览区 + 能力条 + 平台交互 ── -->
       <div class="col-left">
         <div class="glass-card preview-card">
           <div class="preview-stage">
-            <template v-if="registered">
-              <!-- 注册后:占位画面 + OSD 叠加(国标要求设备端叠加时间/通道名) -->
-              <div class="osd osd-tl">2026-07-26 18:40:12</div>
+            <!-- 真实推流预览 canvas:平台点播后开始有画面(未点播时空)。 -->
+            <canvas ref="canvasRef" class="preview-canvas" :class="{ live: previewLive }" />
+
+            <!-- 已注册但还没画面(未点播 / 首帧未到):OSD 叠加 + 等待提示。 -->
+            <template v-if="registered && !previewLive">
+              <div class="osd osd-tl">{{ now }}</div>
               <div class="osd osd-tr">Camera-1</div>
-              <div class="osd osd-bl">1920×1080 · 25fps</div>
-              <div class="osd osd-br">H.264 · 2.1 Mbps</div>
-              <!-- 录制角标(对齐手机端 RecordingBadge:红点闪烁 + 源名 + 计时) -->
-              <div class="rec-badge">
-                <span class="rec-dot" />
-                <span class="rec-text">{{ activeSource.label }}  00:12</span>
-              </div>
+              <div class="osd osd-bl">在线 {{ uptime }}</div>
+              <div class="osd osd-br">{{ stateMeta.text }}</div>
               <div class="stage-center">
                 <n-icon :size="44" class="stage-icon"><component :is="activeSource.icon" /></n-icon>
-                <div class="stage-label">{{ activeSource.label }}预览</div>
+                <div class="stage-label">已注册,等待平台点播…</div>
               </div>
             </template>
-            <template v-else>
+
+            <!-- 直播画面就位后仍显示 OSD(时间/名字/状态),但不再显示"等待"文案。 -->
+            <template v-if="previewLive">
+              <div class="osd osd-tl">{{ now }}</div>
+              <div class="osd osd-tr">Camera-1</div>
+              <div class="osd osd-bl">在线 {{ uptime }}</div>
+              <div class="osd osd-br">推流中</div>
+              <div class="rec-badge">
+                <span class="rec-dot" />
+                <span class="rec-text">{{ activeSource.label }}</span>
+              </div>
+            </template>
+
+            <!-- 未注册:品牌封面。 -->
+            <template v-if="!registered">
               <div class="stage-idle">
                 <div class="idle-badge">GB/T 28181-{{ sip.gb_version }}</div>
                 <div class="idle-brand">UVP</div>
-                <div class="idle-hint">注册后开启预览</div>
+                <div class="idle-hint">
+                  {{ deviceState === "Registering" ? "注册中…" :
+                     deviceState === "Failed" ? "注册失败,请检查配置" : "填写 SIP 配置后点击注册" }}
+                </div>
               </div>
             </template>
           </div>
@@ -136,9 +437,22 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
             </button>
             <span class="src-hint">{{ activeSource.hint }}</span>
           </div>
+          <div v-if="sourceKind === 'camera'" class="file-row">
+            <select v-model="selectedCameraId" class="inp cam-select">
+              <option v-if="!cameras.length" value="" disabled>
+                {{ camerasLoaded ? "未检测到摄像头" : "加载中…" }}
+              </option>
+              <option v-for="c in cameras" :key="c.id" :value="c.id">
+                [{{ c.id }}] {{ c.name }}
+              </option>
+            </select>
+            <button class="file-btn" @click="refreshCameras" title="刷新设备列表">
+              <n-icon :size="14"><RefreshOutline /></n-icon>
+            </button>
+          </div>
           <div v-if="sourceKind === 'file'" class="file-row">
             <input v-model="filePath" class="inp" placeholder="选择本地 MP4 / H.264 文件" />
-            <button class="file-btn">浏览…</button>
+            <button class="file-btn" @click="pickVideoFile">浏览…</button>
           </div>
         </div>
 
@@ -152,37 +466,50 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
           </div>
         </div>
 
-        <!-- 平台交互:注册后用户最想盯的东西,吃掉剩余高度 -->
+        <!-- 平台交互 -->
         <div class="glass-card panel flow-card">
           <div class="flow-head">
             <div class="tabs">
-              <button :class="{ on: tab === 'command' }" @click="tab = 'command'">平台命令</button>
-              <button :class="{ on: tab === 'trace' }" @click="tab = 'trace'">SIP 信令</button>
+              <button :class="{ on: tab === 'command' }" @click="tab = 'command'">
+                平台命令 <span class="tab-count" v-if="commands.length">{{ commands.length }}</span>
+              </button>
+              <button :class="{ on: tab === 'trace' }" @click="tab = 'trace'">
+                SIP 信令 <span class="tab-count" v-if="traces.length">{{ traces.length }}</span>
+              </button>
             </div>
-            <span class="flow-count" v-if="registered">
-              {{ tab === "command" ? commands.length : traces.length }} 条
-            </span>
           </div>
 
           <div class="flow-body">
-            <div v-if="!registered" class="flow-empty">
-              注册上线后,平台下发的命令与收发的 SIP 报文将实时显示在这里
+            <div v-if="tab === 'command' && commands.length === 0" class="flow-empty">
+              {{ registered
+                ? "等待平台下发命令…"
+                : "注册上线后,平台下发的命令将实时显示在这里" }}
+            </div>
+            <div v-else-if="tab === 'trace' && traces.length === 0" class="flow-empty">
+              {{ deviceLive
+                ? "等待 SIP 报文…"
+                : "点击注册后,收发的 SIP 报文将实时显示在这里" }}
             </div>
 
             <template v-else-if="tab === 'command'">
               <div v-for="(c, i) in commands" :key="i" class="cmd-item">
-                <span class="mono-ts">{{ c.ts }}</span>
+                <span class="mono-ts">{{ fmtTs(c.ts_ms) }}</span>
                 <span class="cmd-tag" :class="'k-' + c.kind">{{ kindLabel[c.kind] ?? c.kind }}</span>
                 <span class="cmd-sum">{{ c.summary }}</span>
               </div>
             </template>
 
             <template v-else>
-              <div v-for="(t, i) in traces" :key="i" class="trace-item">
-                <span class="mono-ts">{{ t.ts }}</span>
-                <span class="trace-dir" :class="t.dir">{{ t.dir === "in" ? "◀ 收" : "▶ 发" }}</span>
-                <span class="trace-sum">{{ t.summary }}</span>
-                <span class="trace-cseq">{{ t.cseq }}</span>
+              <div v-for="(t, i) in traces" :key="i">
+                <div class="trace-item" @click="toggleTraceRow(i)">
+                  <span class="mono-ts">{{ fmtTs(t.ts_ms) }}</span>
+                  <span class="trace-dir" :class="t.direction">
+                    {{ t.direction === "in" ? "◀ 收" : "▶ 发" }}
+                  </span>
+                  <span class="trace-sum">{{ t.summary }}</span>
+                  <span class="trace-cseq">{{ t.cseq ?? "" }}</span>
+                </div>
+                <pre v-if="expandedTrace === i && t.raw" class="trace-raw">{{ t.raw }}</pre>
               </div>
             </template>
           </div>
@@ -209,7 +536,7 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
         </div>
         <div class="fg">
           <label>服务器 ID</label>
-          <input v-model="sip.server_id" class="inp" :disabled="!editing" placeholder="20 位平台 ID" />
+          <input v-model="sip.server_id" class="inp" :disabled="!editing" placeholder="20 位平台 ID(留空则用域 ID)" />
         </div>
         <div class="fg">
           <label>服务器域</label>
@@ -235,37 +562,38 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
         <div class="fg">
           <label>信令传输</label>
           <div class="seg">
-            <button :class="{ on: sip.transport === 'UDP' }" @click="sip.transport = 'UDP'">UDP</button>
-            <button :class="{ on: sip.transport === 'TCP' }" @click="sip.transport = 'TCP'">TCP</button>
+            <button :class="{ on: sip.transport === 'UDP' }" :disabled="!editing" @click="sip.transport = 'UDP'">UDP</button>
+            <button :class="{ on: sip.transport === 'TCP' }" :disabled="!editing" @click="sip.transport = 'TCP'">TCP</button>
           </div>
         </div>
         <div class="fg">
-          <label>对讲传输</label>
+          <label>信令编码</label>
           <div class="seg">
-            <button
-              v-for="t in talkOptions" :key="t.value"
-              :class="{ on: sip.talk_transport === t.value }"
-              @click="sip.talk_transport = t.value"
-            >{{ t.label }}</button>
+            <button :class="{ on: sip.signaling_encoding === 'GB18030' }" :disabled="!editing"
+                    @click="sip.signaling_encoding = 'GB18030'">GB18030</button>
+            <button :class="{ on: sip.signaling_encoding === 'UTF-8' }" :disabled="!editing"
+                    @click="sip.signaling_encoding = 'UTF-8'">UTF-8</button>
           </div>
         </div>
         <div class="fg">
           <label>国标版本</label>
           <div class="seg">
-            <button :class="{ on: sip.gb_version === '2022' }" @click="sip.gb_version = '2022'">GB/T 2022</button>
-            <button :class="{ on: sip.gb_version === '2016' }" @click="sip.gb_version = '2016'">GB/T 2016</button>
+            <button :class="{ on: sip.gb_version === '2022' }" :disabled="!editing" @click="sip.gb_version = '2022'">GB/T 2022</button>
+            <button :class="{ on: sip.gb_version === '2016' }" :disabled="!editing" @click="sip.gb_version = '2016'">GB/T 2016</button>
           </div>
         </div>
 
-        <!-- 注册按钮 + 状态:填完表单紧接着注册,顺序自然 -->
+        <!-- 注册按钮 + 状态 -->
         <div class="reg-row">
           <span class="reg-state">
             <span class="reg-dot" :style="{ background: stateMeta.color }" />{{ stateMeta.text }}
           </span>
           <n-button
-            :type="registered ? 'default' : 'primary'"
-            size="large" block @click="toggleRegister"
-          >{{ registered ? "注 销" : "注 册" }}</n-button>
+            :type="deviceLive ? 'default' : 'primary'"
+            size="large" block
+            :loading="deviceState === 'Registering'"
+            @click="toggleRegister"
+          >{{ deviceLive ? "注 销" : "注 册" }}</n-button>
         </div>
       </div>
     </div>
@@ -284,14 +612,13 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
 }
 .reg-dot { width: 8px; height: 8px; border-radius: 50%; transition: background var(--transition); }
 
-/* 左预览+交互 / 右配置。右栏定宽(输入框拉宽无意义),左栏吃掉余量 */
+/* 左预览+交互 / 右配置。右栏定宽,左栏吃余量 */
 .layout {
   flex: 1; min-height: 0;
   display: grid; grid-template-columns: minmax(420px, 1fr) 360px;
   gap: 18px; align-items: stretch;
 }
 .col-left { display: flex; flex-direction: column; gap: 18px; min-width: 0; min-height: 0; }
-/* 配置卡内容定高,超长时自身滚动,不撑破布局 */
 .layout > .panel { overflow-y: auto; align-self: start; max-height: 100%; }
 @media (max-width: 1080px) {
   .layout { grid-template-columns: 1fr; }
@@ -299,18 +626,21 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
 }
 
 /* ── 预览区 ── */
-/* flex-shrink:0 保住 16:9,不被下方面板挤扁 */
 .preview-card { padding: 18px; flex: 0 0 auto; }
-/* 底色与手机端 CameraPreview.kt BrandCover 对齐(#0B1E3F→#0F2A57→#1A4480) */
 .preview-stage {
   position: relative; aspect-ratio: 16 / 9; border-radius: var(--radius-md);
-  /* 超宽屏限高并居中,避免画面拉成一条横带 */
   max-height: 52vh; margin: 0 auto; width: 100%;
   overflow: hidden; display: flex; align-items: center; justify-content: center;
   background: linear-gradient(135deg, #0b1e3f, #0f2a57 55%, #1a4480);
 }
-
-/* 未注册:品牌封面。字号/字距/渐变取自手机端(60sp Black·letterSpacing 10sp·#FFF→#7CC4FF) */
+/* canvas 覆盖整个 stage,object-fit contain 让真实分辨率居中不拉伸;
+   未有画面时透明,让底层封面/OSD 露出。 */
+.preview-canvas {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: contain;
+  opacity: 0; transition: opacity var(--transition);
+}
+.preview-canvas.live { opacity: 1; }
 .stage-idle {
   position: absolute; inset: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -324,7 +654,6 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
 }
 .idle-brand {
   font-size: 76px; font-weight: 900; letter-spacing: 13px; margin: 14px 0 0;
-  /* letter-spacing 会在末字后多留一份间距,补偿使视觉居中 */
   text-indent: 13px;
   background: linear-gradient(90deg, #fff, #7cc4ff);
   -webkit-background-clip: text; background-clip: text; color: transparent;
@@ -333,8 +662,6 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
   position: absolute; bottom: 12px; left: 0; right: 0; text-align: center;
   font-size: 12px; color: rgba(255, 255, 255, 0.4);
 }
-
-/* 已注册:占位画面 + OSD */
 .stage-center { text-align: center; color: rgba(255, 255, 255, 0.62); }
 .stage-icon { color: rgba(255, 255, 255, 0.5); }
 .stage-label { font-size: 13px; margin-top: 8px; letter-spacing: 0.5px; }
@@ -343,7 +670,6 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
   font-size: 11.5px; color: rgba(255, 255, 255, 0.9);
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6); pointer-events: none;
 }
-/* 录制角标:黑底半透明胶囊 + 呼吸红点(手机端同款) */
 .rec-badge {
   position: absolute; top: 34px; left: 12px;
   display: inline-flex; align-items: center; gap: 5px;
@@ -386,6 +712,7 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
   color: var(--text-secondary); font-size: 13px;
 }
 .file-btn:hover { border-color: var(--accent); color: var(--accent); }
+.cam-select { cursor: pointer; padding-right: 28px; appearance: menulist; }
 
 /* 能力状态条 */
 .cap-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -400,7 +727,6 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
 .cap-status.ready .cap-dot { background: var(--success); }
 
 /* ── 平台交互 ── */
-/* 吃掉左栏剩余高度:内容越多越长,全屏时正好填满 */
 .flow-card {
   flex: 1; min-height: 180px;
   display: flex; flex-direction: column; overflow: hidden;
@@ -418,7 +744,10 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
   font-size: 12.5px; color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
 }
 .tabs button.on { background: var(--accent); color: #fff; box-shadow: 0 2px 6px var(--accent-glow); }
-.flow-count { font-size: 11.5px; color: var(--text-tertiary); }
+.tab-count {
+  display: inline-block; min-width: 18px; margin-left: 4px; padding: 0 5px;
+  font-size: 10.5px; border-radius: 9px; background: rgba(255,255,255,0.2);
+}
 .flow-body {
   flex: 1; min-height: 0; overflow-y: auto;
   border-radius: var(--radius-sm); border: 1px solid var(--border-default);
@@ -432,10 +761,10 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
   flex: 0 0 auto; font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 11px; color: var(--text-tertiary);
 }
-/* 平台命令行 */
 .cmd-item, .trace-item {
   display: flex; align-items: center; gap: 10px; padding: 6px 2px;
   border-bottom: 1px solid rgba(120, 130, 150, 0.08); font-size: 12.5px; white-space: nowrap;
+  cursor: pointer;
 }
 .cmd-item:last-child, .trace-item:last-child { border-bottom: none; }
 .cmd-tag {
@@ -449,13 +778,19 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
   flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   color: var(--text-primary);
 }
-/* SIP 信令行 */
 .trace-dir { flex: 0 0 auto; font-weight: 600; font-size: 12px; }
 .trace-dir.in { color: #0891b2; }
 .trace-dir.out { color: #7c3aed; }
 .trace-cseq {
   flex: 0 0 auto; font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 11px; color: var(--text-secondary);
+}
+.trace-raw {
+  margin: 0 2px 8px 78px; padding: 8px 10px;
+  background: rgba(15, 23, 42, 0.06); border-radius: 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px; color: var(--text-secondary); line-height: 1.5;
+  white-space: pre-wrap; word-break: break-all;
 }
 
 /* ── SIP 配置 ── */
@@ -501,4 +836,5 @@ const traces = computed(() => (registered.value ? DEMO_TRACES : []));
   font-size: 12.5px; color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
 }
 .seg button.on { background: var(--accent); color: #fff; box-shadow: 0 2px 6px var(--accent-glow); }
+.seg button:disabled { cursor: default; }
 </style>
