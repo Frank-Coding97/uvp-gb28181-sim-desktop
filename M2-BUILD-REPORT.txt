@@ -1,0 +1,57 @@
+M2 编译验证报告 (2026-07-27)
+============================
+
+## 构建目标
+- apps/daemon/uvp-daemon (Go 1.23, 8.1M dev binary)
+- apps/desktop/src-tauri (Rust 2021 edition, Tauri v2)
+- apps/desktop/dist (Vue 3 + Vite, 405kB bundle)
+
+## 验证结果
+
+### Go daemon
+✅ go build ./cmd/uvp-daemon → target/uvp-daemon (8.1M)
+✅ go test ./... -race → 所有单测通过 (ipc/sip/device/gb28181)
+✅ go test -tags=integration ./test/integration/ → 5 E2E 全绿
+
+### Rust Tauri
+✅ cargo check -p uvp-desktop → 0 warning
+✅ cargo build --bin uvp-desktop → target/debug/uvp-desktop (30M)
+
+### Vue frontend
+✅ npx vue-tsc --noEmit → 0 error
+✅ npm run build → dist/ (405kB gzip 127kB)
+
+## 测试覆盖
+
+daemon 单元测试 (23 case):
+- internal/ipc: protocol 7 / router 4 / server 4 / handlers 8
+- internal/sip: trace 6
+- cmd/uvp-daemon: stdio_test.go 基础 ping 1
+
+daemon 集成测试 (6 case, -tags=integration):
+- register_e2e_test.go: M1 --mode=once 路径 1
+- stdio_e2e_test.go: M2 stdio IPC 全链路 5 (start/stop/status/ping/not_found)
+
+## 运行方式
+
+### 开发模式 (daemon 独立)
+cd apps/daemon
+go run ./cmd/uvp-daemon --stdio
+
+### 开发模式 (Tauri + daemon)
+1. 先 build daemon: cd apps/daemon && go build -o ../daemon/uvp-daemon ./cmd/uvp-daemon
+2. cd apps/desktop && npm run tauri dev
+   (lib.rs locate_daemon_binary 会从 CARGO_MANIFEST_DIR 找 ../../daemon/uvp-daemon)
+
+### 生产打包 (TODO M4)
+npm run tauri build
+(需配 tauri.conf.json bundle.externalBin 把 uvp-daemon 打成 sidecar)
+
+## 已知限制 (M2 范围内)
+
+1. 前端摄像头/预览/平台命令面板是 M1 遗留,功能占位但后端未实现
+   (list_cameras / subscribe_preview / platform_command 静默失败)
+2. daemon 子进程崩溃时前端无 explicit 通知 (依赖 stdout EOF → 事件流断)
+3. sidecar 打包配置留待 M4 (当前 dev 模式手工 build + 相对路径)
+4. M2 只做注册,视频点播/目录/订阅/云台归 M3+
+
