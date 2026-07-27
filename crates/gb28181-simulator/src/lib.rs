@@ -14,4 +14,4 @@ pub use home_position::{
 };
 
 // 转出媒体侧的视频源预处理(桌面在设备上线前预热容器转封装缓存,避免 INVITE 阻塞)。
-pub use media_rtp::prepare_video_source;
+pub use media_rtp::{ffmpeg_bin, prepare_video_source};
