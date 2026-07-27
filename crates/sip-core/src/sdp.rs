@@ -73,8 +73,15 @@ pub struct MediaDescription {
     pub fmt: Vec<String>,
     /// rtpmap(如 "96 PS/90000")。
     pub rtpmap: Option<String>,
-    /// SSRC(GB28181 y= 行)。
+    /// SSRC 数值(GB28181 y= 行),用于填 RTP 头。
     pub ssrc: Option<u32>,
+    /// SSRC 原始文本,用于回显 y= 行。
+    ///
+    /// 国标 SSRC 是**定长 10 位十进制字符串**(首位 0=实时/1=回放,
+    /// 中 5 位域区号,末 4 位序号),如 `0200004235`。若按 u32 解析再
+    /// 序列化会丢掉前导零(变成 `200004235`),平台按字符串匹配收不到流。
+    /// 故解析时保留原文,回显时原样写回。
+    pub ssrc_raw: Option<String>,
 }
 
 impl SessionDescription {
@@ -87,6 +94,7 @@ impl SessionDescription {
         let mut media_desc = None;
         let mut rtpmap = None;
         let mut ssrc = None;
+        let mut ssrc_raw = None;
         let mut download_speed = None;
 
         for line in text.lines() {
@@ -112,13 +120,19 @@ impl SessionDescription {
                     download_speed = spd.split(':').next().and_then(|s| s.trim().parse().ok());
                 }
             } else if let Some(rest) = line.strip_prefix("y=") {
-                ssrc = rest.trim().parse::<u32>().ok();
+                let raw = rest.trim();
+                ssrc = raw.parse::<u32>().ok();
+                // 保留原文以便回显时不丢前导零(国标 SSRC 定长 10 位)。
+                if ssrc.is_some() {
+                    ssrc_raw = Some(raw.to_string());
+                }
             }
         }
 
         let mut media = media_desc.ok_or_else(|| Error::Sip("SDP 缺少 m= 行".into()))?;
         media.rtpmap = rtpmap;
         media.ssrc = ssrc;
+        media.ssrc_raw = ssrc_raw;
 
         Ok(SessionDescription {
             origin: origin.ok_or_else(|| Error::Sip("SDP 缺少 o= 行".into()))?,
@@ -134,11 +148,15 @@ impl SessionDescription {
     ///
     /// - `username`:o= 行用户名,填设备/通道 ID(平台 ACK 会据此定位)。
     /// - `tcp`:true 时 m= proto 用 `TCP/RTP/AVP`(与平台一致),否则 `RTP/AVP`。
+    /// - `ssrc_raw`:平台 `y=` 行原文。国标 SSRC 定长 10 位,含前导零(如
+    ///   `0200004235`),平台按**字符串**匹配来流,故必须原样回显;传 None 时
+    ///   按数值格式化(仅在平台未给 SSRC 的退化场景)。
     pub fn new_device_response(
         username: &str,
         local_ip: IpAddr,
         rtp_port: u16,
         ssrc: u32,
+        ssrc_raw: Option<String>,
         tcp: bool,
     ) -> Self {
         let ip_str = local_ip.to_string();
@@ -170,6 +188,7 @@ impl SessionDescription {
                 fmt: vec!["96".into()],
                 rtpmap: Some("96 PS/90000".into()),
                 ssrc: Some(ssrc),
+                ssrc_raw,
             },
             download_speed: None,
         }
@@ -208,7 +227,16 @@ impl fmt::Display for SessionDescription {
         if let Some(ref rm) = self.media.rtpmap {
             write!(f, "a=rtpmap:{}\r\n", rm)?;
         }
-        if let Some(ssrc) = self.media.ssrc {
+        // TCP 模式:设备侧 200 OK 必须回 a=setup:active + a=sendonly。
+        if self.media.proto.contains("TCP") {
+            write!(f, "a=setup:active\r\n")?;
+            write!(f, "a=connection:new\r\n")?;
+            write!(f, "a=sendonly\r\n")?;
+        }
+        // 优先写回原文,保住国标定长 10 位 SSRC 的前导零。
+        if let Some(ref raw) = self.media.ssrc_raw {
+            write!(f, "y={}\r\n", raw)?;
+        } else if let Some(ssrc) = self.media.ssrc {
             write!(f, "y={}\r\n", ssrc)?;
         }
         Ok(())
@@ -299,6 +327,7 @@ fn parse_media(s: &str) -> Result<MediaDescription> {
         fmt: parts[3..].iter().map(|&s| s.to_string()).collect(),
         rtpmap: None,
         ssrc: None,
+        ssrc_raw: None,
     })
 }
 
@@ -349,6 +378,7 @@ y=1234567890\r
             ip,
             8000,
             0xAABBCCDD,
+            None,
             false,
         );
         let text = sdp.to_string();
@@ -358,7 +388,7 @@ y=1234567890\r
         assert!(text.contains("y=2864434397")); // 0xAABBCCDD
 
         // TCP 模式 proto 应为 TCP/RTP/AVP。
-        let sdp_tcp = SessionDescription::new_device_response("dev", ip, 8000, 1, true);
+        let sdp_tcp = SessionDescription::new_device_response("dev", ip, 8000, 1, None, true);
         assert!(sdp_tcp.to_string().contains("m=video 8000 TCP/RTP/AVP 96"));
     }
 
