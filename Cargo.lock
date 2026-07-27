@@ -3975,13 +3975,10 @@ version = "0.1.0"
 dependencies = [
  "common",
  "encoding_rs",
- "gb28181-protocol",
  "gb28181-simulator",
- "scenario",
  "serde",
  "serde_json",
  "sip-core",
- "stress-engine",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
