@@ -225,6 +225,9 @@ pub struct DeviceSimulator {
     catalog_tree: std::sync::Mutex<Vec<gb28181_protocol::id_codec::CatalogNode>>,
     /// 上次推给平台的目录快照(用于计算增量 NOTIFY 的 diff)。
     catalog_snapshot: std::sync::Mutex<gb28181_protocol::manscdp::CatalogSnapshot>,
+    /// 摄像头长驻采集(仅 `video_source: live:*` 时启);持有 broadcast 分发器。
+    /// UI 预览与推流都从这订阅,避免 ffmpeg 抢占摄像头。注册后启动,设备停止时 drop 释放。
+    camera_stream: std::sync::Mutex<Option<Arc<media_rtp::CameraStream>>>,
 }
 
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
@@ -304,6 +307,7 @@ impl DeviceSimulator {
             catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
             }),
+            camera_stream: std::sync::Mutex::new(None),
         }
     }
 
@@ -326,7 +330,13 @@ impl DeviceSimulator {
             catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
             }),
+            camera_stream: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 拿到当前摄像头流(用于订阅预览)。未启动/非 live 源时返回 None。
+    pub fn camera_stream(&self) -> Option<Arc<media_rtp::CameraStream>> {
+        self.camera_stream.lock().unwrap().clone()
     }
 
     /// 本端信令 host(run 启动后有效,未设时回退 0.0.0.0)。
@@ -2010,16 +2020,16 @@ impl DeviceSimulator {
         let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
 
         // 按配置选择视频源:实时采集(live:) > 文件(C档) > 轻量伪流(B档) > 不推流(A档)。
+        // 实时采集不再新起 ffmpeg —— 从注册后启动的长驻 CameraStream 订阅 broadcast,
+        // 与 UI 预览共享同一路采集,避免摄像头被 ffmpeg 独占后前端预览拿不到。
         let fps = self.config.video_fps;
         let source: Option<Box<dyn media_rtp::VideoSource>> =
             if let Some(ref path) = self.config.video_source {
-                if let Some(input) = path.strip_prefix("live:") {
-                    // 实时采集摄像头/屏幕(把电脑当真实 IPC)。live:0 采集视频设备 0。
-                    let input = if input.is_empty() { "0" } else { input };
-                    Some(Box::new(
-                        media_rtp::LiveSource::capture(input, fps)
-                            .map_err(|e| Error::Media(format!("实时采集失败: {e}")))?,
-                    ))
+                if path.starts_with("live:") {
+                    // 长驻采集流由 run() 在注册后启动;这里只订阅。
+                    let cam = self.camera_stream()
+                        .ok_or_else(|| Error::Media("摄像头流未启动(应在注册后启动)".into()))?;
+                    Some(Box::new(media_rtp::BroadcastSource::new(cam.subscribe())))
                 } else {
                     // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
                     Some(Box::new(
@@ -2219,6 +2229,24 @@ impl DeviceSimulator {
             }
         }
         tracing::info!(device=%self.config.device_id, "注册成功");
+
+        // 注册成功即启动摄像头长驻采集(真 IPC 行为:开机就在采,不等平台点播)。
+        // 仅 `live:*` 源需要;文件源在 INVITE 时按需加载,不需要长驻。
+        if let Some(ref path) = self.config.video_source {
+            if let Some(input) = path.strip_prefix("live:") {
+                let input = if input.is_empty() { "0" } else { input };
+                match media_rtp::CameraStream::start(input, self.config.video_fps) {
+                    Ok(stream) => {
+                        tracing::info!(device=%self.config.device_id, %input, "摄像头长驻采集已启动");
+                        *self.camera_stream.lock().unwrap() = Some(stream);
+                    }
+                    Err(e) => {
+                        tracing::warn!(device=%self.config.device_id, error=%e,
+                            "摄像头采集启动失败,后续 INVITE 会拿不到画面");
+                    }
+                }
+            }
+        }
 
         // 心跳主循环 + 注册续约(FR-32)。
         // 注册有效期 3600s(与 builder::register 一致),到期前 80%(2880s)主动重注册续约。

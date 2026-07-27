@@ -5,6 +5,8 @@
 //! - `LightSource`:合成低码率伪包 —— B 档(测 RTP 通道/带宽,内容不要求可解码)
 //! - `FileSource`:H.264 文件循环 —— C 档 / 单设备联调
 
+use std::sync::Arc;
+
 use common::{Error, Result};
 
 /// 判断字节流是否以 Annex B 起始码开头(`00 00 01` 或 `00 00 00 01`)。
@@ -500,27 +502,29 @@ fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Fr
     frames
 }
 
-/// 实时采集视频源:用 ffmpeg avfoundation(macOS)/dshow(Windows)/v4l2(Linux)
-/// 采集摄像头/屏幕,实时编码为 H.264 Annex B,边采边推(把电脑当真实 IPC)。
+/// 实时采集视频流(长驻,一份采集多路分发):
+/// ffmpeg 采集 → 后台线程切帧 → tokio broadcast 广播给 N 个消费者(预览 UI / 推流)。
 ///
-/// ffmpeg 进程 stdout 输出 Annex B 裸流,后台线程按起始码切帧塞入队列,
-/// `next_frame()` 从队列取;队列空(采集慢于消费)时返回上一关键帧维持画面。
-pub struct LiveSource {
-    /// 帧队列接收端(后台采集线程 → 消费)。
-    rx: std::sync::mpsc::Receiver<Frame>,
-    /// ffmpeg 子进程句柄(drop 时 kill,停止采集)。
-    child: std::process::Child,
-    /// 最近一个关键帧(队列空时重复发送,避免花屏/断流)。
-    last_key: Option<Frame>,
+/// 同一时刻同一摄像头只能被一个 ffmpeg 占用,故不能"预览一份+推流一份"两个进程并行。
+/// 用 broadcast 分发解决:一份采集,任意订阅方拿独立 Receiver 消费。慢消费者会丢老帧
+/// (`RecvError::Lagged`),不阻塞其他消费者。设备停止时 drop CameraStream → ffmpeg kill。
+pub struct CameraStream {
+    /// 帧广播端(clone 即可,发送方在后台线程)。
+    tx: tokio::sync::broadcast::Sender<Frame>,
+    /// ffmpeg 子进程句柄(drop 时 kill,停止采集,释放摄像头 LED)。
+    child: std::sync::Mutex<Option<std::process::Child>>,
+    /// 采集输入描述(诊断用)。
+    _input: String,
+    /// 目标帧率(供 BroadcastSource 计算音视频同步等,当前未用到)。
+    fps: u32,
 }
 
-impl LiveSource {
-    /// 采集指定输入设备。`input` 为平台相关设备标识:
-    /// macOS avfoundation 用 `"0"`(视频设备序号)或 `"0:0"`(视频:音频);
-    /// 屏幕用列出的 "Capture screen" 序号。`fps` 目标帧率。
+impl CameraStream {
+    /// 启动一路摄像头采集。`input` 见 [`Self::capture`] 的说明。
     ///
-    /// 仅视频(音频采集/对讲另行处理)。缺 ffmpeg 返回错误。
-    pub fn capture(input: &str, fps: u32) -> Result<Self> {
+    /// broadcast 容量选 64:1080p@25fps 每帧几百 KB,64 帧 ~= 2.5s 缓冲;
+    /// 消费者若跟不上会丢老帧(Lagged),不会阻塞采集与其他消费者。
+    pub fn start(input: &str, fps: u32) -> Result<Arc<Self>> {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
@@ -546,17 +550,19 @@ impl LiveSource {
                 &fps_s,
                 "-i",
                 input,
-                "-an", // 仅视频
+                "-an",
                 "-c:v",
                 "libx264",
                 "-preset",
                 "ultrafast",
                 "-tune",
                 "zerolatency",
+                "-profile:v",
+                "baseline", // 显式 baseline,匹配前端 avc1.42E01E 解码器
                 "-pix_fmt",
                 "yuv420p",
                 "-g",
-                &fps_s, // 每秒一个 IDR
+                &fps_s,
                 "-f",
                 "h264",
                 "-",
@@ -571,60 +577,159 @@ impl LiveSource {
             .take()
             .ok_or_else(|| Error::Media("无法获取 ffmpeg stdout".into()))?;
 
-        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        // 后台线程:持续读 stdout,按 Annex B 起始码累积成帧后塞队列。
+        let (tx, _rx0) = tokio::sync::broadcast::channel::<Frame>(64);
+        let tx_bg = tx.clone();
+        // 后台线程:持续读 ffmpeg stdout,按 Annex B 切帧后广播。
+        // 用 std::thread 而非 tokio::task 因为 stdout.read 是阻塞 IO。
         std::thread::spawn(move || {
             let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
             let mut chunk = [0u8; 32 * 1024];
             loop {
                 match stdout.read(&mut chunk) {
-                    Ok(0) => break, // ffmpeg 退出
+                    Ok(0) => break,
                     Ok(n) => {
                         buf.extend_from_slice(&chunk[..n]);
-                        // 从 buf 切出完整帧(保留最后一个不完整帧)。
-                        drain_frames(&mut buf, &tx);
+                        drain_frames_broadcast(&mut buf, &tx_bg);
                     }
                     Err(_) => break,
                 }
             }
         });
 
-        Ok(LiveSource {
-            rx,
-            child,
-            last_key: None,
-        })
+        Ok(Arc::new(CameraStream {
+            tx,
+            child: std::sync::Mutex::new(Some(child)),
+            _input: input.to_string(),
+            fps,
+        }))
+    }
+
+    /// 订阅一路帧接收器。每个订阅者独立消费,互不影响。
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Frame> {
+        self.tx.subscribe()
+    }
+
+    /// 当前订阅者数(诊断用)。
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
+    /// 目标帧率(推流用来计算取帧间隔)。
+    pub fn fps(&self) -> u32 {
+        self.fps
     }
 }
 
-impl Drop for LiveSource {
+impl Drop for CameraStream {
     fn drop(&mut self) {
-        let _ = self.child.kill(); // 停止采集,释放摄像头
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+        }
     }
 }
 
-impl VideoSource for LiveSource {
-    fn next_frame(&mut self) -> Option<Frame> {
-        // 取队列里最新可用帧;为避免积压延迟,尽量取到最近一帧。
-        let mut frame = None;
-        while let Ok(f) = self.rx.try_recv() {
-            frame = Some(f);
+/// 从共享摄像头帧广播中拉帧的 VideoSource。
+///
+/// 用途:INVITE 到达时,`push_stream` 需要一个 `VideoSource`;不新起 ffmpeg,而是订阅
+/// 已有的 `CameraStream`,与 UI 预览共享同一路采集。
+pub struct BroadcastSource {
+    rx: tokio::sync::broadcast::Receiver<Frame>,
+    /// 最近一个关键帧,queue 空/lag 时兜底返回,避免推流断流花屏。
+    last_key: Option<Frame>,
+}
+
+impl BroadcastSource {
+    pub fn new(rx: tokio::sync::broadcast::Receiver<Frame>) -> Self {
+        BroadcastSource {
+            rx,
+            last_key: None,
         }
-        if let Some(f) = frame {
+    }
+}
+
+impl VideoSource for BroadcastSource {
+    fn next_frame(&mut self) -> Option<Frame> {
+        use tokio::sync::broadcast::error::TryRecvError;
+        // 尽量抽出所有堆积帧,只取最后一个(消费慢时不累积延迟)。
+        let mut latest: Option<Frame> = None;
+        loop {
+            match self.rx.try_recv() {
+                Ok(f) => latest = Some(f),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Lagged(_)) => continue, // 丢帧信号,继续取新的
+                Err(TryRecvError::Closed) => break,       // 上游已关闭
+            }
+        }
+        if let Some(f) = latest {
             if f.key_frame {
                 self.last_key = Some(f.clone());
             }
             Some(f)
         } else {
-            // 队列暂空:重复最近关键帧维持画面(实时源不循环文件)。
             self.last_key.clone()
         }
     }
 }
 
+/// 从缓冲区切出完整 H.264 访问单元并广播;保留尾部不完整数据。
+/// 与 [`drain_frames`] 同逻辑,只是 sink 换成 broadcast::Sender(允许无订阅者场景不阻塞)。
+fn drain_frames_broadcast(buf: &mut Vec<u8>, tx: &tokio::sync::broadcast::Sender<Frame>) {
+    // 与 drain_frames 逻辑相同;差异在 send 语义:broadcast 无消费者时 send 返回 Err,忽略即可。
+    let mut positions = Vec::new();
+    let mut i = 0;
+    while i + 3 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+            positions.push(i);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    if positions.len() < 2 {
+        return;
+    }
+    let mut cur: Vec<u8> = Vec::new();
+    let mut cur_key = false;
+    let mut has_vcl = false;
+    let last = *positions.last().unwrap();
+    let mut ps: Vec<usize> = positions.iter().copied().filter(|&p| p < last).collect();
+    ps.push(last);
+    for w in ps.windows(2) {
+        let nal = &buf[w[0]..w[1]];
+        let hdr_off = if nal.len() >= 4 && nal[2] == 0 { 4 } else { 3 };
+        let nal_type = nal.get(hdr_off).map(|b| b & 0x1f).unwrap_or(0);
+        let is_vcl = nal_type == 1 || nal_type == 5;
+        if is_vcl && has_vcl {
+            let _ = tx.send(Frame {
+                data: std::mem::take(&mut cur),
+                key_frame: cur_key,
+            });
+            cur_key = false;
+            has_vcl = false;
+        }
+        if nal_type == 5 || nal_type == 7 || nal_type == 8 {
+            cur_key = true;
+        }
+        if is_vcl {
+            has_vcl = true;
+        }
+        cur.extend_from_slice(nal);
+    }
+    if !cur.is_empty() {
+        let _ = tx.send(Frame {
+            data: cur,
+            key_frame: cur_key,
+        });
+    }
+    buf.drain(..last);
+}
+
 /// 从缓冲区切出完整 H.264 访问单元并发送;保留尾部不完整数据。
 /// 以"下一个 SPS(type 7)或非连续 IDR 起点"作帧边界的简化实现:
 /// 每遇到一个 AUD/SPS 或新的 VCL 起点就切一帧。
+///
+/// 保留此 mpsc 版本仅供单元测试用;生产采集走 [`drain_frames_broadcast`]。
+#[allow(dead_code)]
 fn drain_frames(buf: &mut Vec<u8>, tx: &std::sync::mpsc::Sender<Frame>) {
     // 找所有起始码位置。
     let mut starts = Vec::new();
