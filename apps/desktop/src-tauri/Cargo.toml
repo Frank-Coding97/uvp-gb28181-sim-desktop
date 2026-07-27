@@ -14,7 +14,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# v2 重构:所有 crates 依赖已删除,后端从零开始重写。
-# 按需逐步引入外部库(tokio / serde / tracing 等)。
+# v2 M2: 引入 tokio + serde + serde_json + tracing + tauri channel。
+# daemon 子进程通信走 stdio (JSON-lines),tokio 异步 pipe + async command。
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.0.0-rc.8"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
