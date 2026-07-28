@@ -37,8 +37,12 @@ pub struct Daemon {
 impl Daemon {
     /// 拉起 daemon 子进程。
     ///
-    /// binary 由调用方给出(方便测试 mock 与生产切换)。生产由 lib.rs 定位:
-    /// dev 模式相对路径 apps/daemon/uvp-daemon,release 打包后走 sidecar。
+    /// binary 由调用方给出(方便测试 mock 与生产切换)。生产路径通过 lib.rs
+    /// locate_daemon_binary 定位,支持多个 fallback:
+    ///   1. 环境变量 UVP_DAEMON_PATH (dev / 手工调试)
+    ///   2. 与 Tauri 可执行文件同目录 (打包后 sidecar)
+    ///   3. resource_dir 相对路径 ../../daemon (dev 模式)
+    ///   4. CARGO_MANIFEST_DIR 相对路径 (build 时嵌入)
     pub async fn spawn(binary_path: std::path::PathBuf, app: AppHandle) -> Result<Self> {
         tracing::info!("spawning daemon: {}", binary_path.display());
         let mut child = Command::new(&binary_path)
