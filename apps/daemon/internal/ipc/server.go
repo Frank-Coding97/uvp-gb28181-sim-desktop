@@ -15,7 +15,7 @@ import (
 // Server 是 stdio JSON-RPC 2.0 服务器,负责:
 //   - stdin 按行读入 → 派发 Router → 写响应到 stdout
 //   - Publish() 供业务层推事件,内部按 priority/bulk 双队列走 stdout
-//   - 每 60s 汇报一次 bulk 丢弃统计(plan R3)
+//   - 每 5 分钟汇报一次 bulk 丢弃统计(plan R3,P2-5 调整频率)
 //
 // 双队列设计(plan §2.2 + R3):
 //   priorityCh — 命令响应 + device_state 等业务关键事件,永不丢弃(cap 大 + 阻塞发送)。
@@ -41,7 +41,7 @@ type Server struct {
 type ServerOptions struct {
 	PriorityBufferSize int           // 默认 1024
 	BulkBufferSize     int           // 默认 256
-	StatsInterval      time.Duration // 默认 60s;<=0 禁用统计广播
+	StatsInterval      time.Duration // 默认 5 分钟;<=0 禁用统计广播
 }
 
 // NewServer 建 Server(默认队列容量)。
@@ -61,7 +61,7 @@ func NewServerWithOptions(router *Router, opts ServerOptions) *Server {
 	}
 	interval := opts.StatsInterval
 	if interval == 0 {
-		interval = 60 * time.Second
+		interval = 5 * time.Minute // P2-5: 60s → 5min,bulk 丢包是异常,不需频繁推送
 	}
 	return &Server{
 		router:        router,
@@ -271,6 +271,7 @@ func (s *Server) Publish(method string, payload map[string]any, priority bool) {
 }
 
 // statsLoop 周期发布 bulk_stats notification,让前端知道丢包量。
+// M2 初版是 60s,实际场景 bulk 丢包是异常事件,5 分钟足够(减少前端无用刷新)。
 func (s *Server) statsLoop(ctx context.Context) {
 	tick := time.NewTicker(s.statsInterval)
 	defer tick.Stop()
