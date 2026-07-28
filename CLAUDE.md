@@ -106,23 +106,44 @@ cargo clippy --all-targets -- -D warnings  # Lint(0 警告)
 cargo test       # 单元测试
 ```
 
-### Go daemon（apps/daemon/，尚未创建）
+### Go daemon（apps/daemon/）
 
 ```bash
 cd apps/daemon
 go mod tidy      # 依赖整理
-go build ./...   # 全量编译
+go build ./...   # 全量编译（只做语法/类型检查, 不生成运行时二进制）
 go test ./...    # 单元测试
 go vet ./...     # 静态检查
 gofmt -w .       # 格式化(提交前必跑)
 golangci-lint run  # Lint(需装 golangci-lint)
 ```
 
+> [!warning] **改了 Go 代码必须重编 daemon 二进制**（2026-07-28 加，血泪教训）
+>
+> Tauri dev/打包模式会 spawn **`apps/daemon/uvp-daemon` 二进制**（不是每次跑 `go run`），
+> 只跑 `go build ./...` 不会更新这个可执行文件 → 前端 `invoke` 走到 daemon 还是**旧逻辑**，
+> 常见症状:
+> - "daemon 未就绪, 通道管理暂不可用" (healthz 方法不存在, poll 10s 超时)
+> - "method not found: xxx" (新加的 handler 没进二进制)
+>
+> **正确姿势**（Go 代码改动后必跑）:
+> ```bash
+> cd apps/daemon
+> go build -o uvp-daemon ./cmd/uvp-daemon   # 重生成运行时二进制
+> ```
+> 然后重启 `npm run tauri dev` (dev 模式) 或者重新打包 (release)。
+>
+> **快速验证 daemon 就绪**:
+> ```bash
+> echo '{"jsonrpc":"2.0","id":1,"method":"healthz","params":{}}' | apps/daemon/uvp-daemon --stdio
+> # 期望: {"jsonrpc":"2.0","id":1,"result":{"ready":true,"version":"..."}}
+> ```
+
 ### 全量验证（提交前三件套）
 
 **前端**: `npx vue-tsc --noEmit && npm run build`
 **Rust 壳**: `cargo fmt && cargo clippy -- -D warnings && cargo test`
-**Go daemon**: `gofmt -w . && go vet ./... && go test ./...`
+**Go daemon**: `gofmt -w . && go vet ./... && go test ./... && go build -o uvp-daemon ./cmd/uvp-daemon`
 
 ---
 
