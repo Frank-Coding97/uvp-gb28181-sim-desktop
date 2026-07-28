@@ -40,8 +40,19 @@ export function loadFromLocalStorage(): HydrateResult & { channels?: Channel[]; 
   const rawChannels = localStorage.getItem(STORE_CHANNELS);
   const rawEncoding = localStorage.getItem(STORE_ENCODING);
 
+  // 兼容历史脏数据: 早期 handleSave 崩溃时把字面量 "undefined" 写进过 localStorage
+  // (JSON.stringify(undefined) === undefined → localStorage 存成字符串 "undefined")
+  // 这些值不合法, 静默清掉当 fresh 处理, 避免 hydrate 死锁.
+  const cleanChannels = rawChannels === "undefined" || rawChannels === "null" ? null : rawChannels;
+  const cleanEncoding = rawEncoding === "undefined" || rawEncoding === "null" ? null : rawEncoding;
+  if (cleanChannels !== rawChannels || cleanEncoding !== rawEncoding) {
+    console.warn("[hydrate] 检测到 localStorage 脏数据 'undefined'/'null', 自动清理");
+    if (cleanChannels === null) localStorage.removeItem(STORE_CHANNELS);
+    if (cleanEncoding === null) localStorage.removeItem(STORE_ENCODING);
+  }
+
   // fresh: 全无
-  if (!rawChannels && !rawEncoding) {
+  if (!cleanChannels && !cleanEncoding) {
     return { kind: "fresh" };
   }
 
@@ -49,8 +60,8 @@ export function loadFromLocalStorage(): HydrateResult & { channels?: Channel[]; 
   let channels: Channel[] = [];
   let encoding: EncodingMode = "GB18030";
   try {
-    if (rawChannels) {
-      const parsed = JSON.parse(rawChannels);
+    if (cleanChannels) {
+      const parsed = JSON.parse(cleanChannels);
       if (!Array.isArray(parsed)) {
         return { kind: "corrupted", err: "channels 不是数组" };
       }
@@ -61,11 +72,11 @@ export function loadFromLocalStorage(): HydrateResult & { channels?: Channel[]; 
       }
       channels = parsed;
     }
-    if (rawEncoding) {
-      if (!validateEncoding(rawEncoding)) {
-        return { kind: "corrupted", err: `encoding 值非法: ${rawEncoding}` };
+    if (cleanEncoding) {
+      if (!validateEncoding(cleanEncoding)) {
+        return { kind: "corrupted", err: `encoding 值非法: ${cleanEncoding}` };
       }
-      encoding = rawEncoding;
+      encoding = cleanEncoding;
     }
   } catch (e) {
     return { kind: "corrupted", err: "JSON 解析失败: " + String(e) };
