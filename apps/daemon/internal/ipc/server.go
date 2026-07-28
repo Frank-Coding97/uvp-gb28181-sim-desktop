@@ -105,6 +105,14 @@ func (s *Server) Run(ctx context.Context, stdin io.Reader, stdout io.Writer) err
 	}
 
 	// pump: select priorityCh / bulkCh / ctx.Done / readerDone
+	//
+	// 双队列 select 顺序语义(P2-6 注释):
+	//   Go select 在多 case 同时 ready 时随机选一个,但因为 priorityCh cap=1024
+	//   大于 bulkCh cap=256,实际上 priority 更不容易满,大部分时候两个 ch 都有
+	//   数据时会随机选。真正的"优先级"靠 producer 侧:device_state 等关键事件
+	//   走 priority(阻塞直到入队),sip_trace 走 bulk(满即丢)。这里的 select
+	//   只是"公平消费",不是"优先调度"。
+	//
 	// 优先输出 priorityCh:每轮先非阻塞尝试 priorityCh,拿到就写,否则再走完整 select。
 	for {
 		// 优先偏置(plan R3):同轮先 drain priority,再看 bulk。
