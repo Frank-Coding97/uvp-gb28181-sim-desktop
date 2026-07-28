@@ -70,6 +70,83 @@ async fn get_device_status(state: State<'_, DaemonState>) -> Result<Value, Strin
         .map_err(|e| e.to_string())
 }
 
+// ──────── M5 目录查询三件套 commands (T12) ────────
+// 6 个 Tauri command 转发到 daemon stdio JSON-RPC (pkg/ipc/handlers.go).
+// 前端 Channels.vue + App.vue.hydrateConfig 走这些接口, 对齐 D4 契约.
+
+/// 列出所有通道 (list_channels). 返回 Channel[] (不套信封).
+#[tauri::command]
+async fn list_channels(state: State<'_, DaemonState>) -> Result<Value, String> {
+    state
+        .get()
+        .await?
+        .call("list_channels", json!({}))
+        .await
+        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
+        .map_err(|e| e.to_string())
+}
+
+/// 更新单个通道 (update_channel). 前端: invoke("update_channel", { req: { channel } })
+#[tauri::command]
+async fn update_channel(req: Value, state: State<'_, DaemonState>) -> Result<Value, String> {
+    state
+        .get()
+        .await?
+        .call("update_channel", json!({ "req": req }))
+        .await
+        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
+        .map_err(|e| e.to_string())
+}
+
+/// 删除单个通道 (delete_channel). 前端: invoke("delete_channel", { req: { id } })
+#[tauri::command]
+async fn delete_channel(req: Value, state: State<'_, DaemonState>) -> Result<Value, String> {
+    state
+        .get()
+        .await?
+        .call("delete_channel", json!({ "req": req }))
+        .await
+        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
+        .map_err(|e| e.to_string())
+}
+
+/// 原子提交 encoding + channels (apply_config, D1 唯一保存路径, R3-B2 真原子锁).
+/// 前端: invoke("apply_config", { req: { encoding, channels } })
+#[tauri::command]
+async fn apply_config(req: Value, state: State<'_, DaemonState>) -> Result<Value, String> {
+    state
+        .get()
+        .await?
+        .call("apply_config", json!({ "req": req }))
+        .await
+        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
+        .map_err(|e| e.to_string())
+}
+
+/// 读当前 MANSCDP 编码 (get_manscdp_encoding).
+#[tauri::command]
+async fn get_manscdp_encoding(state: State<'_, DaemonState>) -> Result<Value, String> {
+    state
+        .get()
+        .await?
+        .call("get_manscdp_encoding", json!({}))
+        .await
+        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
+        .map_err(|e| e.to_string())
+}
+
+/// daemon 就绪探针 (healthz, D6 hydrate 门禁).
+#[tauri::command]
+async fn healthz(state: State<'_, DaemonState>) -> Result<Value, String> {
+    state
+        .get()
+        .await?
+        .call("healthz", json!({}))
+        .await
+        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
+        .map_err(|e| e.to_string())
+}
+
 // ──────── App 启动 ────────
 
 /// Tauri 应用入口。
@@ -78,8 +155,9 @@ pub fn run() {
     // 初始化 tracing,写到 stderr,便于开发时看日志
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,uvp_desktop_lib=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,uvp_desktop_lib=debug")
+            }),
         )
         .with_writer(std::io::stderr)
         .try_init();
@@ -101,6 +179,13 @@ pub fn run() {
             start_device,
             stop_device,
             get_device_status,
+            // M5 目录查询三件套 (T12)
+            list_channels,
+            update_channel,
+            delete_channel,
+            apply_config,
+            get_manscdp_encoding,
+            healthz,
         ])
         .build(tauri::generate_context!())
         .expect("Tauri 应用启动失败")
@@ -145,7 +230,11 @@ fn locate_daemon_binary(app: &AppHandle) -> Result<PathBuf> {
     }
 
     // 打包后:与 Tauri 可执行文件同目录
-    if let Ok(exe_dir) = std::env::current_exe().and_then(|p| p.parent().map(|p| p.to_path_buf()).ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))) {
+    if let Ok(exe_dir) = std::env::current_exe().and_then(|p| {
+        p.parent()
+            .map(|p| p.to_path_buf())
+            .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }) {
         let candidate = exe_dir.join(daemon_binary_name());
         if candidate.exists() {
             return Ok(candidate);
@@ -163,7 +252,9 @@ fn locate_daemon_binary(app: &AppHandle) -> Result<PathBuf> {
     {
         // 尝试各种可能的 dev 布局
         let candidates = [
-            resource_dir.join("../../../daemon").join(daemon_binary_name()),
+            resource_dir
+                .join("../../../daemon")
+                .join(daemon_binary_name()),
             resource_dir.join("../../daemon").join(daemon_binary_name()),
         ];
         for c in candidates.iter() {
@@ -175,8 +266,9 @@ fn locate_daemon_binary(app: &AppHandle) -> Result<PathBuf> {
 
     // 最后兜底:从 CARGO_MANIFEST_DIR (仅 dev, build 时嵌入)
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let candidate =
-        PathBuf::from(manifest_dir).join("../../daemon").join(daemon_binary_name());
+    let candidate = PathBuf::from(manifest_dir)
+        .join("../../daemon")
+        .join(daemon_binary_name());
     if candidate.exists() {
         return Ok(candidate);
     }

@@ -250,4 +250,3 @@ fn forward_event(app: &AppHandle, method: &str, params: Value) {
         }
     }
 }
-
