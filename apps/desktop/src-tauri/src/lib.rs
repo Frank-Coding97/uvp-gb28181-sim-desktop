@@ -37,37 +37,51 @@ impl DaemonState {
 
 // ──────── Tauri Commands ────────
 
+/// 解开 daemon 返回的 JSON-RPC 帧: 有 `result` 返 result, 有 `error` 抛错.
+fn unwrap_daemon_result(resp: Value) -> Result<Value, String> {
+    if let Some(err_obj) = resp.get("error") {
+        let msg = err_obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon error")
+            .to_string();
+        return Err(msg);
+    }
+    // 没 error 也没 result 时视为空对象 (兼容 method 无返回值)
+    Ok(resp.get("result").cloned().unwrap_or(json!({})))
+}
+
 /// 启动设备:把前端的 SipConfig 透传给 daemon。
 #[tauri::command]
 async fn start_device(config: Value, state: State<'_, DaemonState>) -> Result<Value, String> {
     let daemon = state.get().await?;
-    daemon
+    let resp = daemon
         .call("start_device", config)
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 /// 停止设备。
 #[tauri::command]
 async fn stop_device(state: State<'_, DaemonState>) -> Result<Value, String> {
     let daemon = state.get().await?;
-    daemon
+    let resp = daemon
         .call("stop_device", json!({}))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 /// 查询设备当前状态(启动时前端会调一次做对账)。
 #[tauri::command]
 async fn get_device_status(state: State<'_, DaemonState>) -> Result<Value, String> {
     let daemon = state.get().await?;
-    daemon
+    let resp = daemon
         .call("get_device_status", json!({}))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 // ──────── M5 目录查询三件套 commands (T12) ────────
@@ -77,74 +91,71 @@ async fn get_device_status(state: State<'_, DaemonState>) -> Result<Value, Strin
 /// 列出所有通道 (list_channels). 返回 Channel[] (不套信封).
 #[tauri::command]
 async fn list_channels(state: State<'_, DaemonState>) -> Result<Value, String> {
-    state
-        .get()
-        .await?
+    let d = state.get().await?;
+    let resp = d
         .call("list_channels", json!({}))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 /// 更新单个通道 (update_channel). 前端: invoke("update_channel", { req: { channel } })
+///
+/// Tauri 把前端参数按名字反序列化到 fn 参数; 前端传 { req: X } 时 Rust 侧 `req: Value` 拿到 X.
+/// daemon Go handler 期望 { req: X } 结构, 所以这里要重新包一层.
 #[tauri::command]
 async fn update_channel(req: Value, state: State<'_, DaemonState>) -> Result<Value, String> {
-    state
-        .get()
-        .await?
+    let d = state.get().await?;
+    let resp = d
         .call("update_channel", json!({ "req": req }))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 /// 删除单个通道 (delete_channel). 前端: invoke("delete_channel", { req: { id } })
 #[tauri::command]
 async fn delete_channel(req: Value, state: State<'_, DaemonState>) -> Result<Value, String> {
-    state
-        .get()
-        .await?
+    let d = state.get().await?;
+    let resp = d
         .call("delete_channel", json!({ "req": req }))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 /// 原子提交 encoding + channels (apply_config, D1 唯一保存路径, R3-B2 真原子锁).
 /// 前端: invoke("apply_config", { req: { encoding, channels } })
 #[tauri::command]
 async fn apply_config(req: Value, state: State<'_, DaemonState>) -> Result<Value, String> {
-    state
-        .get()
-        .await?
+    let d = state.get().await?;
+    let resp = d
         .call("apply_config", json!({ "req": req }))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 /// 读当前 MANSCDP 编码 (get_manscdp_encoding).
 #[tauri::command]
 async fn get_manscdp_encoding(state: State<'_, DaemonState>) -> Result<Value, String> {
-    state
-        .get()
-        .await?
+    let d = state.get().await?;
+    let resp = d
         .call("get_manscdp_encoding", json!({}))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 /// daemon 就绪探针 (healthz, D6 hydrate 门禁).
 #[tauri::command]
 async fn healthz(state: State<'_, DaemonState>) -> Result<Value, String> {
-    state
-        .get()
-        .await?
+    let d = state.get().await?;
+    let resp = d
         .call("healthz", json!({}))
         .await
-        .map(|resp| resp.get("result").cloned().unwrap_or(resp))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    unwrap_daemon_result(resp)
 }
 
 // ──────── App 启动 ────────

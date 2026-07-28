@@ -190,7 +190,11 @@ async function handleSave() {
     const result = await invoke<ApplyConfigResp>("apply_config", {
       req: { encoding: encoding.value, channels: draft.value },
     });
-    // daemon 成功了才落 localStorage (R3-H1)
+    // 防御性 check: daemon 返回格式不对时早停 (R3-H1)
+    if (!result || !Array.isArray(result.channels) || !result.encoding) {
+      throw new Error(`daemon 返回格式异常: ${JSON.stringify(result)}`);
+    }
+    // daemon 成功了才落 localStorage
     localStorage.setItem(STORE_CHANNELS, JSON.stringify(result.channels));
     localStorage.setItem(STORE_ENCODING, result.encoding);
     // 更新 saved 快照
