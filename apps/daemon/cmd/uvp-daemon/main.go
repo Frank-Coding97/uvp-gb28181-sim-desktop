@@ -22,6 +22,10 @@ import (
 	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/internal/gb28181"
 	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/internal/ipc"
 	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/internal/sip"
+	// M5 目录查询三件套 handler + 领域层
+	pkgdevice "github.com/menglulu/uvp-gb28181-sim-desktop/daemon/pkg/device"
+	pkgipc "github.com/menglulu/uvp-gb28181-sim-desktop/daemon/pkg/ipc"
+	"github.com/menglulu/uvp-gb28181-sim-desktop/daemon/pkg/manscdp"
 )
 
 // Version 由 build tag 注入,默认与 apps/daemon 语义版本对齐。
@@ -113,7 +117,35 @@ func runStdioServer(ctx context.Context) error {
 	dm.SetFactory(newProductionSessionFactory(server))
 	dm.RegisterHandlers(router, server)
 
+	// M5 目录查询三件套: 注册 6 个 pkg/ipc handler.
+	// deviceID 用占位值创建 ConfigStore, 前端 apply_config 首次调用会把真通道灌进来.
+	// 占位设备 ID: 全零占位设备 (类型码 200).
+	// 前端 hydrate 时会用真实 device_id 前缀的通道 apply_config, 到时会覆盖.
+	// 注: ConfigStore 内保留 deviceID 用于通道 ID 前缀校验, 目前先用占位值让 daemon 起来,
+	//     T21 真机验收时前端配置 SIP + 保存通道后此校验才发挥作用. 若 deviceID
+	//     和通道 ID 前缀不匹配, apply_config 会返错(校验拦截), 老板可从错误提示定位.
+	// TODO 未来 M6+: daemon 从 SIP config 拿真实 device_id 后动态重建 ConfigStore.
+	configStore, err := pkgdevice.NewConfigStore("34020000002000000001", manscdp.EncodingGB18030)
+	if err != nil {
+		return fmt.Errorf("create config store: %w", err)
+	}
+	pkgipc.RegisterAll(&routerAdapter{router}, &pkgipc.Deps{
+		ConfigStore: configStore,
+		Version:     Version,
+	})
+	slog.Info("M5 pkg/ipc handlers registered",
+		"methods", []string{"list_channels", "update_channel", "delete_channel",
+			"apply_config", "get_manscdp_encoding", "healthz"})
+
 	return server.Run(ctx, os.Stdin, os.Stdout)
+}
+
+// routerAdapter 把 internal/ipc.Router 适配到 pkg/ipc.Registrar interface.
+// 两边 Handler 签名完全一致 (func(ctx, params) (any, error)), 只是包不同.
+type routerAdapter struct{ r *ipc.Router }
+
+func (a *routerAdapter) Register(method string, h func(ctx context.Context, params json.RawMessage) (any, error)) {
+	a.r.Register(method, ipc.Handler(h))
 }
 
 // tracerToIPC 把 sip.TracePublisher 事件转发到 ipc.Server.Publish。

@@ -81,6 +81,21 @@ export interface HydrateState {
   status: Ref<HydrateResult["kind"] | "pending">;
 }
 
+/** 等 daemon 就绪 (poll healthz, 最多 10s). */
+async function waitDaemonReady(timeoutMs = 10000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const resp = await invoke<{ ready: boolean }>("healthz");
+      if (resp?.ready) return true;
+    } catch {
+      // daemon 还没起来, 继续 poll
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
 /** hydrateConfig: 启动时把 localStorage 灌到 daemon. */
 export async function hydrateConfig(state: HydrateState): Promise<void> {
   state.status.value = "pending";
@@ -93,6 +108,15 @@ export async function hydrateConfig(state: HydrateState): Promise<void> {
     // 浏览器直连 vite 场景 (老板不常用), 跳过 hydrate 让 UI 出现
     state.status.value = "fresh";
     state.ready.value = true;
+    return;
+  }
+
+  // 0. 先等 daemon 起来 (Tauri spawn daemon 是 async, 前端可能先于 daemon 挂载)
+  const daemonReady = await waitDaemonReady();
+  if (!daemonReady) {
+    state.error.value = "daemon 10s 内未就绪, 请检查日志";
+    state.ready.value = false;
+    state.status.value = "corrupted";
     return;
   }
 
@@ -118,9 +142,12 @@ export async function hydrateConfig(state: HydrateState): Promise<void> {
     state.status.value = loaded.kind; // fresh | restored
     state.ready.value = true;
   } catch (e) {
-    state.error.value = "daemon apply_config 失败: " + String(e);
-    state.ready.value = false;
-    state.status.value = "corrupted"; // 视为 daemon 端 corrupted
+    // apply_config 失败不阻断注册 (D3: 通道空也允许注册, AC-11)
+    // 只标 warning, 让 UI 显示但仍允许注册
+    console.warn("[hydrate] apply_config 失败, 但 daemon 已就绪, 允许注册:", e);
+    state.error.value = "配置未同步 (daemon 就绪, 可注册)";
+    state.status.value = "fresh";
+    state.ready.value = true; // ← 关键: daemon 就绪就允许注册, 通道另外配
   }
 }
 
