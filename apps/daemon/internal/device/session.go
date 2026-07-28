@@ -50,8 +50,11 @@ type RegistrationSession struct {
 
 	// SIP 会话标识 (spec Q10):
 	// 整个 device 生命周期复用同一 Call-ID / From tag,CSeq 全局单调递增。
-	callID      string
-	fromTag     string
+	callID  string
+	fromTag string
+	// CSeq 计数器(uint64,理论上 2^64 次请求后溢出回 0,但实际场景不可能:
+	// 假设每秒 10 次请求,需连续运行 5.8 亿年。RFC 3261 允许 CSeq 回绕,
+	// 平台应按 Call-ID + From tag + To tag 区分会话,不依赖 CSeq 绝对大小)。
 	cseqCounter atomic.Uint64
 
 	// 平台确认的 Expires 值 (spec Q9):
