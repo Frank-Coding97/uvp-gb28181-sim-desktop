@@ -5,7 +5,8 @@
 // 手写 401/200 响应字节。反同源污染:测试 daemon 生成的字节确实合规,
 // 而不是"我们的解析器能解析我们自己的生成器"。
 //
-// 与 UDP 版共享 MockOpts / ReceivedRequest / 报文构造 / Digest 校验逻辑。
+// P2-4 fix: 解析/构造逻辑已提取到 raw_common.go,UDP/TCP 复用。
+// 与 UDP 版共享 MockOpts / ReceivedRequest / ResponseBuilder / RequestParser。
 package mocks
 
 import (
@@ -24,6 +25,8 @@ import (
 type RawTCPMockPlatform struct {
 	opts     MockOpts
 	listener net.Listener
+	parser   *RequestParser
+	builder  *ResponseBuilder
 
 	mu       sync.Mutex
 	received []ReceivedRequest
@@ -51,8 +54,13 @@ func StartRawTCPMockPlatform(opts MockOpts) (*RawTCPMockPlatform, error) {
 	m := &RawTCPMockPlatform{
 		opts:     opts,
 		listener: l,
+		parser:   &RequestParser{},
 		stopCh:   make(chan struct{}),
 		nonce:    generateNonce(),
+	}
+	m.builder = &ResponseBuilder{
+		Opts: opts,
+		Port: m.Port(),
 	}
 	m.wg.Add(1)
 	go m.acceptLoop()
@@ -167,7 +175,7 @@ func (m *RawTCPMockPlatform) handleConn(conn net.Conn) {
 			return
 		}
 
-		req := parseRequestGeneric(raw)
+		req := m.parser.Parse(raw)
 		req.ConnectionID = connID // 标记连接 ID
 
 		m.mu.Lock()
@@ -176,26 +184,26 @@ func (m *RawTCPMockPlatform) handleConn(conn net.Conn) {
 
 		// 只处理 REGISTER;其他方法一律 200 OK
 		if req.Method != "REGISTER" {
-			_, _ = conn.Write(buildSimple200OK(req))
+			_, _ = conn.Write(BuildSimple200OK(req))
 			continue
 		}
 
 		if !req.HasAuthorization {
-			_, _ = conn.Write(m.build401TCP(req))
+			_, _ = conn.Write(m.builder.Build401(req, m.nonce))
 			continue
 		}
 
-		if !m.validateAuthTCP(req) {
-			_, _ = conn.Write(m.buildStatusTCP(req, 403, "Forbidden"))
+		if !ValidateAuthBasic(req, m.nonce) {
+			_, _ = conn.Write(m.builder.BuildStatus(req, 403, "Forbidden"))
 			continue
 		}
 
 		if m.opts.ForceReject != 0 {
-			_, _ = conn.Write(m.buildStatusTCP(req, m.opts.ForceReject, "Forbidden"))
+			_, _ = conn.Write(m.builder.BuildStatus(req, m.opts.ForceReject, "Forbidden"))
 			continue
 		}
 
-		_, _ = conn.Write(m.build200OKTCP(req))
+		_, _ = conn.Write(m.builder.Build200OK(req))
 	}
 }
 
@@ -249,114 +257,4 @@ func readSIPMessage(reader *bufio.Reader) ([]byte, error) {
 	}
 
 	return headerBuf.Bytes(), nil
-}
-
-// parseRequestGeneric 复用 UDP 版的 regexp 解析逻辑。
-func parseRequestGeneric(raw []byte) ReceivedRequest {
-	// 与 RawMockPlatform.parseRequest 逻辑一致,抽成独立函数便于 TCP 复用
-	req := ReceivedRequest{RawBytes: raw}
-	text := string(raw)
-	lines := strings.Split(text, "\r\n")
-
-	if len(lines) > 0 {
-		firstLine := strings.Fields(lines[0])
-		if len(firstLine) >= 2 {
-			req.Method = firstLine[0]
-			req.RequestURI = firstLine[1]
-		}
-	}
-
-	for _, line := range lines[1:] {
-		if line == "" {
-			break // 头部结束
-		}
-		low := strings.ToLower(line)
-		switch {
-		case strings.HasPrefix(low, "call-id:"):
-			req.CallID = strings.TrimSpace(line[len("Call-ID:"):])
-		case strings.HasPrefix(low, "cseq:"):
-			cseq := strings.TrimSpace(line[len("CSeq:"):])
-			parts := strings.Fields(cseq)
-			if len(parts) >= 2 {
-				n, _ := strconv.Atoi(parts[0])
-				req.CSeqNum = n
-				req.CSeqMethod = parts[1]
-			}
-		case strings.HasPrefix(low, "from:"):
-			if m := reFromTag.FindStringSubmatch(line); len(m) > 1 {
-				req.FromTag = m[1]
-			}
-		case strings.HasPrefix(low, "authorization:"):
-			req.HasAuthorization = true
-			parseAuthLine(line, &req)
-		}
-	}
-	return req
-}
-
-// parseAuthLine 从 Authorization 头一行解析各子字段。
-// 与 RawMockPlatform.parseAuthHeader 逻辑一致,提为包内函数 (TCP 也用)。
-func parseAuthLine(line string, req *ReceivedRequest) {
-	if x := reAuthResponse.FindStringSubmatch(line); len(x) > 1 {
-		req.AuthResponse = x[1]
-	}
-	if x := reAuthNonce.FindStringSubmatch(line); len(x) > 1 {
-		req.AuthNonce = x[1]
-	}
-	if x := reAuthNC.FindStringSubmatch(line); len(x) > 1 {
-		req.AuthNonceCount = x[1]
-	}
-	if x := reAuthQop.FindStringSubmatch(line); len(x) > 1 {
-		req.AuthQop = x[1]
-	}
-	if x := reAuthOpaque.FindStringSubmatch(line); len(x) > 1 {
-		req.AuthOpaque = x[1]
-	}
-}
-
-// validateAuthTCP 与 UDP 版一致的最小校验逻辑。
-func (m *RawTCPMockPlatform) validateAuthTCP(req ReceivedRequest) bool {
-	if req.AuthNonce != m.nonce {
-		return false
-	}
-	return req.AuthResponse != ""
-}
-
-// build401TCP 构造 401 挑战响应。共用 UDP 版的头拼装 (buildResponseHeaders)。
-func (m *RawTCPMockPlatform) build401TCP(req ReceivedRequest) []byte {
-	auth := `Digest realm="` + m.opts.Realm + `", nonce="` + m.nonce + `", algorithm=` + m.opts.AuthAlgo
-	if m.opts.Qop != "" {
-		auth += `, qop="` + m.opts.Qop + `"`
-	}
-	if m.opts.Opaque != "" {
-		auth += `, opaque="` + m.opts.Opaque + `"`
-	}
-	return []byte(buildResponseHeaders(req, 401, "Unauthorized",
-		"WWW-Authenticate: "+auth+"\r\n"))
-}
-
-// build200OKTCP 构造 200 OK。
-func (m *RawTCPMockPlatform) build200OKTCP(req ReceivedRequest) []byte {
-	var extra strings.Builder
-	if m.opts.ExpiresReply > 0 {
-		extra.WriteString("Expires: ")
-		extra.WriteString(strconv.Itoa(m.opts.ExpiresReply))
-		extra.WriteString("\r\n")
-	}
-	if m.opts.ContactExpiresParam > 0 {
-		extra.WriteString("Contact: <sip:mock@127.0.0.1:")
-		extra.WriteString(strconv.Itoa(m.Port()))
-		extra.WriteString(">;expires=")
-		extra.WriteString(strconv.Itoa(m.opts.ContactExpiresParam))
-		extra.WriteString("\r\n")
-	}
-	extra.WriteString("Server: raw-mock-tcp/0.1\r\nDate: ")
-	extra.WriteString(time.Now().UTC().Format(time.RFC1123))
-	extra.WriteString("\r\n")
-	return []byte(buildResponseHeaders(req, 200, "OK", extra.String()))
-}
-
-// buildStatusTCP 通用状态码响应。
-func (m *RawTCPMockPlatform) buildStatusTCP(req ReceivedRequest, code int, reason string) []byte {
-	return []byte(buildResponseHeaders(req, code, reason, ""))
 }
