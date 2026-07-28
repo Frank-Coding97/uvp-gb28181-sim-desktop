@@ -402,24 +402,26 @@ func (s *RegistrationSession) buildRegisterRequest() (*sip.Request, error) {
 // parseResponseExpires 解析平台 200 OK 中的实际 Expires (spec Q9)。
 //
 // 优先级:Contact 头 expires 参数 > 独立 Expires 头 > 请求发出去的默认值。
+// 调整解析顺序让优先级高的先检查(Contact 参数优先,有则直接返回;
+// 无则再检查独立 Expires 头),避免冗余路径。
 func (s *RegistrationSession) parseResponseExpires(resp *sip.Response) int {
-	// 1. Contact 头 expires 参数
+	// 1. Contact 头 expires 参数(spec Q9 优先级最高)
 	if contact := resp.Contact(); contact != nil {
 		if expiresStr, ok := contact.Params.Get("expires"); ok {
-			if n, err := strconv.Atoi(expiresStr); err == nil {
+			if n, err := strconv.Atoi(expiresStr); err == nil && n > 0 {
 				return n
 			}
 		}
 	}
 
-	// 2. 独立 Expires 头
+	// 2. Contact 无 expires 参数,读独立 Expires 头
 	if expiresHdr := resp.GetHeader("Expires"); expiresHdr != nil {
-		if n, err := strconv.Atoi(expiresHdr.Value()); err == nil {
+		if n, err := strconv.Atoi(expiresHdr.Value()); err == nil && n > 0 {
 			return n
 		}
 	}
 
-	// 3. 兜底:请求的默认值 + warn log (spec Q11)
+	// 3. 兜底:两者都无,fallback 到请求发出去的值(spec Q11)
 	slog.Warn("platform 200 OK missing Expires header and Contact expires param, fallback to request value",
 		"fallback_expires_secs", s.cfg.ExpiresSecs)
 	return s.cfg.ExpiresSecs
