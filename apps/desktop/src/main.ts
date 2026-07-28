@@ -6,12 +6,14 @@ import { createRouter, createWebHashHistory } from "vue-router";
 import "./theme.css";
 import App from "./App.vue";
 import Simulator from "./views/Simulator.vue";
+import Channels from "./views/Channels.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: "/", redirect: "/simulator" },
     { path: "/simulator", component: Simulator },
+    { path: "/channels", component: Channels },  // M5 目录查询通道管理
     { path: "/:pathMatch(.*)*", redirect: "/simulator" },
   ],
 });

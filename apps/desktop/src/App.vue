@@ -8,8 +8,9 @@ import {
   NMenu, NIcon, zhCN, dateZhCN,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
-import { VideocamOutline } from "@vicons/ionicons5";
+import { VideocamOutline, ListOutline } from "@vicons/ionicons5";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { createHydrateState, hydrateConfig } from "./composables/useHydrate";
 
 const route = useRoute();
 const router = useRouter();
@@ -20,7 +21,14 @@ function icon(comp: any) {
 
 const menuOptions: MenuOption[] = [
   { label: "设备模拟", key: "/simulator", icon: icon(VideocamOutline) },
+  { label: "通道管理", key: "/channels", icon: icon(ListOutline) },  // M5
 ];
+
+// D6: hydrate 状态 provide 给 Simulator.vue (注册按钮门禁) + Channels.vue
+const hydrateState = createHydrateState();
+provide("hydrateReady", hydrateState.ready);
+provide("hydrateError", hydrateState.error);
+provide("hydrateStatus", hydrateState.status);
 
 const activeKey = computed(() => route.path);
 // 设备模拟页自带 SIP 配置与状态,不显示全局顶栏(避免两处配置打架)。
@@ -53,6 +61,13 @@ provide("deviceStartedAt", startedAt);
 const inTauri = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
 let unlisten: UnlistenFn | null = null;
 onMounted(async () => {
+  // M5 D6: 应用启动时 hydrate (localStorage → daemon apply_config)
+  // 三态: fresh (无值 → 空 apply) / restored (有值合法) / corrupted (阻断, 不 apply 空)
+  await hydrateConfig(hydrateState);
+  if (hydrateState.error.value) {
+    console.warn("[UVP] hydrate 失败:", hydrateState.error.value);
+  }
+
   if (!inTauri) {
     console.warn("[UVP] 未检测到 Tauri 环境。请用 `npm run tauri dev` 启动桌面应用,而不是直接访问 vite dev URL。");
     return;

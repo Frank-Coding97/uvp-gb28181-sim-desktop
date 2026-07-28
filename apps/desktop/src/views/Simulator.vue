@@ -108,6 +108,10 @@ async function pickVideoFile() {
 type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
 const deviceState = inject<Ref<DState>>("deviceState", ref<DState>("Disconnected"));
 const startedAt = inject<Ref<number | null>>("deviceStartedAt", ref<number | null>(null));
+
+// M5 D6: hydrate 门禁 - daemon 未 ready 时禁止注册, 避免用错误配置注册
+const hydrateReady = inject<Ref<boolean>>("hydrateReady", ref(true));
+const hydrateError = inject<Ref<string | null>>("hydrateError", ref(null));
 const stateMeta = computed(() => {
   switch (deviceState.value) {
     case "Registering": return { text: "注册中", color: "var(--warning)" };
@@ -564,8 +568,13 @@ onUnmounted(() => { if (osdTimer) clearInterval(osdTimer); });
             :type="deviceLive ? 'default' : 'primary'"
             size="large" block
             :loading="deviceState === 'Registering'"
+            :disabled="!hydrateReady && !deviceLive"
+            :title="!hydrateReady ? (hydrateError ?? '配置同步中, 请稍候') : ''"
             @click="toggleRegister"
           >{{ deviceLive ? "注 销" : "注 册" }}</n-button>
+          <div v-if="!hydrateReady && !deviceLive" class="hydrate-hint">
+            ⚠️ {{ hydrateError ?? "配置同步中..." }}
+          </div>
         </div>
       </div>
     </div>
