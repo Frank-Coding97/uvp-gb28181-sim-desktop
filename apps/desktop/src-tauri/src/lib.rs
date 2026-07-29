@@ -1122,6 +1122,30 @@ struct ScenarioSummary {
     server_port: u16,
 }
 
+// ── 系统信息:日志 ────────────────────────────────────────
+
+/// 设置全局日志级别(error/warn/info/debug/trace,或 EnvFilter 语法)。返回生效后的级别。
+#[tauri::command]
+fn set_log_level(level: String) -> Result<String, String> {
+    if common::logging::set_level(&level) {
+        Ok(common::logging::current_level())
+    } else {
+        Err(format!("无效的日志级别: {level}"))
+    }
+}
+
+/// 查询当前日志级别。
+#[tauri::command]
+fn get_log_level() -> String {
+    common::logging::current_level()
+}
+
+/// 拉取最近缓冲的日志(前端打开日志页时补历史)。
+#[tauri::command]
+fn get_recent_logs(max: Option<usize>) -> Vec<common::logging::LogLine> {
+    common::logging::recent(max.unwrap_or(500))
+}
+
 // ── 应用入口 ──────────────────────────────────────────────
 
 /// 初始化日志、注册命令、启动 Tauri 事件循环。
@@ -1130,6 +1154,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
+        .setup(|app| {
+            // 注册实时日志回调:每条日志发 `log_line` 事件给前端日志页。
+            let handle = app.handle().clone();
+            common::logging::set_callback(move |line| {
+                let _ = handle.emit("log_line", line);
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             engine_version,
             validate_scenario,
@@ -1150,6 +1182,9 @@ pub fn run() {
             get_catalog_tree,
             upsert_channel,
             remove_channel,
+            set_log_level,
+            get_log_level,
+            get_recent_logs,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

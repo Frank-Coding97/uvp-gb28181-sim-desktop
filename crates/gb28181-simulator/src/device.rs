@@ -1969,6 +1969,8 @@ impl DeviceSimulator {
         let body_str = std::str::from_utf8(&req.body)
             .map_err(|_| Error::Sip("INVITE body 非 UTF-8".into()))?;
         let platform_sdp = sip_core::SessionDescription::parse(body_str)?;
+        // 打完整 SDP,便于诊断 TCP 方向(active/passive)/端口/SSRC 等推流问题。
+        tracing::info!(sdp = %body_str.replace('\r', "").replace('\n', " | "), "INVITE:平台完整 SDP");
         tracing::info!(proto=%platform_sdp.media.proto, "INVITE SDP 媒体协议");
         let rtp_host: IpAddr = platform_sdp
             .connection
