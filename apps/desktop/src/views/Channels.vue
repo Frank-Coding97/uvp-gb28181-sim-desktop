@@ -5,11 +5,12 @@
 import { ref, onMounted, onActivated } from "vue";
 import {
   NButton, NSpace, NSelect, NDataTable, NModal, NForm, NFormItem, NInput,
-  NTag, useMessage, type DataTableColumns,
+  NTag, useDialog, useMessage, type DataTableColumns,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 
 const message = useMessage();
+const dialog = useDialog();
 
 interface ChannelNode {
   id: string;
@@ -98,14 +99,22 @@ async function saveNode() {
   }
 }
 
-async function removeNode(row: ChannelNode) {
-  try {
-    await invoke<string>("remove_channel", { id: row.id });
-    message.success("已删除通道");
-    await refresh();
-  } catch (e) {
-    message.error(String(e));
-  }
+function removeNode(row: ChannelNode) {
+  dialog.warning({
+    title: "删除目录节点",
+    content: `确定删除“${row.name}”（${row.id}）吗？该操作会向已订阅平台发送增量通知。`,
+    positiveText: "删除",
+    negativeText: "取消",
+    async onPositiveClick() {
+      try {
+        await invoke<string>("remove_channel", { id: row.id });
+        message.success("已删除通道");
+        await refresh();
+      } catch (e) {
+        message.error(String(e));
+      }
+    },
+  });
 }
 
 const typeTagType: Record<string, "warning" | "info" | "success" | "default"> = {
