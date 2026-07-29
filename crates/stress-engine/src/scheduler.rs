@@ -15,12 +15,31 @@ pub struct Orchestrator {
     pub metrics: Arc<Metrics>,
     /// 爬坡速率:每秒拉起多少台(0 = 一次性)。
     ramp_per_second: u32,
+    /// 用于探测本机对平台可达地址的目标端点。
+    server_host: String,
+    server_port: u16,
 }
 
 impl Orchestrator {
     /// 用场景批量创建设备实例(含共享 Metrics 注入)。
     pub fn new(scenario: &dyn Scenario, count: usize) -> Result<Self> {
+        if !(1..=10_000).contains(&count) {
+            return Err(common::Error::Config(
+                "压测设备数量必须在 1..=10000 之间".into(),
+            ));
+        }
         let configs = scenario.generate(count)?;
+        if configs.len() != count {
+            return Err(common::Error::Config(format!(
+                "场景生成设备数异常:期望 {count},实际 {}",
+                configs.len()
+            )));
+        }
+        let first = configs
+            .first()
+            .ok_or_else(|| common::Error::Config("场景未生成任何设备".into()))?;
+        let server_host = first.server_host.clone();
+        let server_port = first.server_port;
         let ramp_per_second = scenario.ramp_per_second();
         let metrics = Arc::new(Metrics::default());
         let devices: Vec<Arc<DeviceSimulator>> = configs
@@ -39,6 +58,8 @@ impl Orchestrator {
             devices,
             metrics,
             ramp_per_second,
+            server_host,
+            server_port,
         })
     }
 
@@ -53,12 +74,33 @@ impl Orchestrator {
         position_secs: u64,
         alarm_secs: u64,
     ) -> Result<()> {
-        // 单个共享 transport(所有设备复用一个 UDP socket)。bind 已返回 Arc。
+        let stop_rx = stop.subscribe();
+        self.run_with_stop_receiver(stop, stop_rx, position_secs, alarm_secs)
+            .await
+    }
+
+    /// 使用调用方预先创建的停止接收器运行。
+    ///
+    /// 桌面端在发布“运行中”状态前创建接收器，从而保证用户启动后立即点击停止时，
+    /// 广播信号也不会因调度任务尚未首次轮询而丢失。
+    pub async fn run_with_stop_receiver(
+        &self,
+        stop: tokio::sync::broadcast::Sender<()>,
+        mut ramp_stop: tokio::sync::broadcast::Receiver<()>,
+        position_secs: u64,
+        alarm_secs: u64,
+    ) -> Result<()> {
+        // 单个共享 transport(所有设备复用一个 UDP socket)。
         let transport = sip_core::UdpTransport::bind("0.0.0.0:0").await?;
-        let local_addr = transport.local_addr()?;
-        let local_port = local_addr.port();
-        // 简化:用本地 IP(实际应用需 discover_local_ip)。
-        let local_host = local_addr.ip().to_string();
+        let local_port = transport.local_addr()?.port();
+
+        // 不能把 bind 得到的 0.0.0.0 写进 Via/Contact。通过连接目标平台探测
+        // 操作系统实际选择的出口地址(UDP connect 不会发送数据)。
+        let probe = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        probe
+            .connect((self.server_host.as_str(), self.server_port))
+            .await?;
+        let local_host = probe.local_addr()?.ip().to_string();
         tracing::info!(%local_host, local_port, "共享 SIP 传输已绑定");
 
         // 爬坡:每拉起 ramp_per_second 台后等 1 秒,避免瞬时注册风暴(FR-21)。
@@ -68,30 +110,46 @@ impl Orchestrator {
         // 批量启动设备 run 任务。
         let mut handles = Vec::new();
         for (i, dev) in self.devices.iter().enumerate() {
-            // 爬坡节流:每满一批(ramp 台)暂停 1 秒。
+            // 爬坡等待必须可被停止打断,否则停止后仍会继续创建新设备,且晚订阅者
+            // 收不到之前已经发送过的 broadcast 信号。
             if ramp > 0 && i > 0 && (i as u32) % ramp == 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = ramp_stop.recv() => {
+                        tracing::info!(started = i, "爬坡阶段收到停止信号");
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
             }
+            // 先为本轮所有潜在子任务预建 receiver，再检查全局停止状态：
+            // stop 若发生在订阅前会被 ramp_stop 捕获，发生在订阅后则由子任务 receiver 捕获。
+            let mut stop_rx = stop.subscribe();
+            let stop_rep = (position_secs > 0 || alarm_secs > 0).then(|| stop.subscribe());
+            match ramp_stop.try_recv() {
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                _ => {
+                    tracing::info!(started = i, "启动设备前收到停止信号");
+                    break;
+                }
+            }
+
             let dev_clone = dev.clone();
             let tp = Arc::clone(&transport);
             let host = local_host.clone();
-            let mut stop_rx = stop.subscribe();
-            let handle = tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 dev_clone
                     .run(tp, host, local_port, async move {
                         let _ = stop_rx.recv().await;
                     })
                     .await;
-            });
-            handles.push(handle);
+            }));
 
             // 主动上报施压:为该设备挂一个周期任务(定位/报警),随 stop 退出。
-            if position_secs > 0 || alarm_secs > 0 {
+            if let Some(mut stop_rep) = stop_rep {
                 let dev_rep = dev.clone();
                 let tp_rep = Arc::clone(&transport);
                 let host_rep = local_host.clone();
                 let metrics = Arc::clone(&self.metrics);
-                let mut stop_rep = stop.subscribe();
                 handles.push(tokio::spawn(async move {
                     Self::report_loop(
                         dev_rep,
@@ -108,11 +166,13 @@ impl Orchestrator {
             }
         }
 
-        tracing::info!(task_count = handles.len(), "所有设备 run 任务已启动");
+        tracing::info!(task_count = handles.len(), "设备任务已启动");
 
-        // 等待所有任务完成(stop 触发后自然退出)。
-        for h in handles {
-            let _ = h.await;
+        // 等待所有任务完成(stop 触发后自然退出),同时记录异常退出。
+        for handle in handles {
+            if let Err(error) = handle.await {
+                tracing::warn!(%error, "压测设备任务异常退出");
+            }
         }
         tracing::info!("所有设备已停止");
         Ok(())

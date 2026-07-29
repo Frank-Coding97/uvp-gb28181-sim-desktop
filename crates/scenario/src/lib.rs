@@ -106,6 +106,57 @@ pub enum MediaProfile {
 
 impl Scenario for LinearScenario {
     fn generate(&self, count: usize) -> Result<Vec<DeviceConfig>> {
+        const MAX_DEVICES: usize = 10_000;
+        const MAX_CHANNELS_PER_DEVICE: usize = 8;
+
+        if count == 0 || count > MAX_DEVICES {
+            return Err(common::Error::Config(format!(
+                "设备数量必须在 1..={MAX_DEVICES} 之间,实际为 {count}"
+            )));
+        }
+        if self.server_host.trim().is_empty() || self.server_port == 0 {
+            return Err(common::Error::Config("平台 IP/端口不能为空或 0".into()));
+        }
+        if format!("{}:{}", self.server_host, self.server_port)
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
+            return Err(common::Error::Config(
+                "平台地址必须是有效的 IP:端口（当前不支持域名）".into(),
+            ));
+        }
+        if self.transport != Transport::Udp {
+            return Err(common::Error::Config(
+                "当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into(),
+            ));
+        }
+        if self.heartbeat_interval_secs == 0 {
+            return Err(common::Error::Config("心跳间隔必须大于 0 秒".into()));
+        }
+        if !(1..=MAX_CHANNELS_PER_DEVICE).contains(&self.channels_per_device) {
+            return Err(common::Error::Config(format!(
+                "每设备通道数必须在 1..={MAX_CHANNELS_PER_DEVICE} 之间"
+            )));
+        }
+        if !(1..=120).contains(&self.video_fps) {
+            return Err(common::Error::Config("视频帧率必须在 1..=120 之间".into()));
+        }
+        if !self.active_ratio.is_finite() || !(0.0..=1.0).contains(&self.active_ratio) {
+            return Err(common::Error::Config(
+                "推流占比必须在 0.0..=1.0 之间".into(),
+            ));
+        }
+        if self.media_profile == MediaProfile::C
+            && self
+                .video_source
+                .as_deref()
+                .map_or(true, |source| source.trim().is_empty())
+        {
+            return Err(common::Error::Config(
+                "C 档真实媒体压测必须选择视频源".into(),
+            ));
+        }
+
         let _base = DeviceId::new(&self.base_device_id)?;
         // 20 位 ID 超出 u64 范围(~1.8e19),用 u128 承载递增。
         let base_num: u128 = self
@@ -114,27 +165,27 @@ impl Scenario for LinearScenario {
             .map_err(|_| common::Error::Gb28181("基础设备 ID 非纯数字".into()))?;
 
         // FR-24:仅前 active_count 台带媒体源真推流,其余只维持信令。
-        let ratio = self.active_ratio.clamp(0.0, 1.0);
-        let active_count = (count as f32 * ratio).ceil() as usize;
+        let active_count = (count as f32 * self.active_ratio).ceil() as usize;
 
         let mut configs = Vec::with_capacity(count);
         for i in 0..count {
             let is_active = i < active_count;
-            let device_num = base_num + i as u128;
+            let device_num = base_num
+                .checked_add(i as u128)
+                .ok_or_else(|| common::Error::Config("设备 ID 递增溢出".into()))?;
             let device_id_str = format!("{:020}", device_num);
             let device_id = DeviceId::new(&device_id_str)?;
 
             // 通道 ID:设备 ID 基础上改后 3 位为 132/133/...
-            let channels: Vec<ChannelConfig> = (0..self.channels_per_device)
-                .map(|ch_idx| {
-                    let channel_id_str = format!("{}{:03}", &device_id_str[..17], 132 + ch_idx);
-                    ChannelConfig {
-                        channel_id: DeviceId::new(channel_id_str).unwrap(),
-                        name: format!("Camera-{}", ch_idx + 1),
-                        status: "ON".into(),
-                    }
-                })
-                .collect();
+            let mut channels = Vec::with_capacity(self.channels_per_device);
+            for ch_idx in 0..self.channels_per_device {
+                let channel_id_str = format!("{}{:03}", &device_id_str[..17], 132 + ch_idx);
+                channels.push(ChannelConfig {
+                    channel_id: DeviceId::new(channel_id_str)?,
+                    name: format!("Camera-{}", ch_idx + 1),
+                    status: "ON".into(),
+                });
+            }
 
             let video_source = match self.media_profile {
                 MediaProfile::C if is_active => self.video_source.clone(),
