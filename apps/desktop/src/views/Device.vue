@@ -6,6 +6,7 @@ import { NButton, useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import ThreePtzCamera from "../components/ThreePtzCamera.vue";
 
 const message = useMessage();
 
@@ -409,6 +410,15 @@ interface PtzAction {
   zoom_in: boolean; zoom_out: boolean;
   pan_speed: number; tilt_speed: number; zoom_speed: number;
 }
+interface PtzPresetPayload { id: number; name: string; }
+const PRESET_IDS = [1, 2, 3, 4, 5] as const;
+const DEFAULT_PRESET_NAMES: Record<number, string> = {
+  1: "大门入口",
+  2: "停车场",
+  3: "接待大厅",
+  4: "东侧通道",
+  5: "西侧通道",
+};
 const ptz = ref<PtzAction>({
   up: false, down: false, left: false, right: false,
   zoom_in: false, zoom_out: false, pan_speed: 0, tilt_speed: 0, zoom_speed: 0,
@@ -416,10 +426,36 @@ const ptz = ref<PtzAction>({
 const ptzActive = computed(() =>
   ptz.value.up || ptz.value.down || ptz.value.left || ptz.value.right ||
   ptz.value.zoom_in || ptz.value.zoom_out);
+const lastPtzAction = ref("STOP");
+const lastPtzAt = ref("尚未收到平台 PTZ 命令");
+const ptzButtons = computed(() => [
+  { key: "up", label: "上", active: ptz.value.up },
+  { key: "down", label: "下", active: ptz.value.down },
+  { key: "left", label: "左", active: ptz.value.left },
+  { key: "right", label: "右", active: ptz.value.right },
+  { key: "zoom-in", label: "放大", active: ptz.value.zoom_in },
+  { key: "zoom-out", label: "缩小", active: ptz.value.zoom_out },
+  { key: "stop", label: "STOP", active: !ptzActive.value && !seeking.value },
+]);
 
-// 云台连续姿态:pan/tilt 角度(度)+ zoom 倍数。手动 PTZ 实时改,预置位调用平滑转到目标。
-const pan = ref(0);    // 水平 -180~180
-const tilt = ref(0);   // 俯仰 -60~60
+function ptzTimestamp(): string {
+  return new Date().toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function describePtzAction(action: PtzAction): string {
+  const labels: string[] = [];
+  if (action.up) labels.push("上");
+  if (action.down) labels.push("下");
+  if (action.left) labels.push("左");
+  if (action.right) labels.push("右");
+  if (action.zoom_in) labels.push("放大");
+  if (action.zoom_out) labels.push("缩小");
+  return labels.length ? labels.join(" + ") : "STOP";
+}
+
+// 云台连续姿态：pan 保留累计角度，可连续跨越任意圈；tilt/zoom 保持物理边界。
+const pan = ref(0);
+const tilt = ref(0);   // 俯仰 -90~90（UI 模拟物理范围，并非国标强制机械限位）
 const zoom = ref(1);   // 变倍 1~4
 // 预置位目标位(演示用固定映射:每个预置位一个 pan/tilt/zoom)。
 const PRESET_POS: Record<number, { pan: number; tilt: number; zoom: number }> = {
@@ -433,16 +469,24 @@ const PRESET_POS: Record<number, { pan: number; tilt: number; zoom: number }> = 
 const target = ref<{ pan: number; tilt: number; zoom: number } | null>(null);
 const seeking = ref(false);
 const activePreset = ref<number | null>(null);
+const activePresetName = ref("");
+const presetNames = ref<Record<number, string>>({ ...DEFAULT_PRESET_NAMES });
 
 // 是否在方向转动(不含变焦,变焦不算"转动")。
 const moving = computed(() => {
   const m = ptz.value;
   return m.up || m.down || m.left || m.right;
 });
-const zoomText = computed(() =>
-  ptz.value.zoom_in ? "放大 +" : ptz.value.zoom_out ? "缩小 −" : "—");
+const zoomText = computed(() => {
+  const value = `${zoom.value.toFixed(1)}×`;
+  if (ptz.value.zoom_in) return `${value} · 放大中`;
+  if (ptz.value.zoom_out) return `${value} · 缩小中`;
+  return value;
+});
 const dirText = computed(() => {
-  if (seeking.value && activePreset.value) return `转向预置位 ${activePreset.value}`;
+  if (seeking.value && activePreset.value) {
+    return `转向 ${activePresetName.value || `预置位 ${activePreset.value}`}`;
+  }
   const m = ptz.value;
   const v = m.up ? "上" : m.down ? "下" : "";
   const h = m.left ? "左" : m.right ? "右" : "";
@@ -465,28 +509,26 @@ const statusText = computed(() => {
   if (seeking.value) return "巡航中";
   if (moving.value) return "转动中";
   if (ptz.value.zoom_in || ptz.value.zoom_out) return "变焦中";
-  return "静止";
+  return "STOP · 静止";
 });
-// 摇杆偏移:反映当前 pan/tilt(相对目标视角),像真摇杆推向运动方向。
-const knobStyle = computed(() => {
-  const m = ptz.value;
-  let dx = 0, dy = 0;
-  if (seeking.value) {
-    // 巡航中:摇杆指向目标方向。
-    const t = target.value!;
-    dx = Math.max(-1, Math.min(1, (t.pan - pan.value) / 30)) * 22;
-    dy = Math.max(-1, Math.min(1, (t.tilt - tilt.value) / 20)) * -22;
-  } else {
-    dx = (m.left ? -22 : 0) + (m.right ? 22 : 0);
-    dy = (m.up ? -22 : 0) + (m.down ? 22 : 0);
-  }
-  const z = 0.9 + (zoom.value - 1) * 0.06 + (m.zoom_in ? 0.04 : m.zoom_out ? -0.04 : 0);
-  return { transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) scale(${z.toFixed(2)})` };
-});
+const normalizedPan = computed(() => ((pan.value % 360) + 360) % 360);
+// 刻度盘反向旋转，保持固定指针显示当前绝对方位。
+const compassDialStyle = computed(() => ({
+  transform: `rotate(${(-normalizedPan.value).toFixed(1)}deg)`,
+}));
+const tiltMarkerStyle = computed(() => ({
+  transform: `translateY(${((-tilt.value / 90) * 30).toFixed(1)}px)`,
+}));
 
 // 视野方位角文本(演示"摄像头当前朝向")。
 const poseText = computed(() =>
-  `方位 ${pan.value.toFixed(0)}° · 俯仰 ${tilt.value.toFixed(0)}° · ${zoom.value.toFixed(1)}×`);
+  `方位 ${normalizedPan.value.toFixed(0).padStart(3, "0")}° · 累计 ${pan.value.toFixed(0)}° · 俯仰 ${tilt.value.toFixed(0)}° · ${zoom.value.toFixed(1)}×`);
+
+function nearestEquivalentPan(heading: number): number {
+  const normalizedTarget = ((heading % 360) + 360) % 360;
+  const delta = ((normalizedTarget - normalizedPan.value + 540) % 360) - 180;
+  return pan.value + delta;
+}
 
 // 60ms 动画帧:手动 PTZ 按速度连续改 pan/tilt/zoom;预置位巡航平滑补间到目标。
 let poseTimer: number | null = null;
@@ -507,10 +549,10 @@ function poseTick() {
   const m = ptz.value;
   const ps = (m.pan_speed / 255) * 4 + 1.5;
   const ts = (m.tilt_speed / 255) * 4 + 1.5;
-  if (m.left)  pan.value = Math.max(-180, pan.value - ps);
-  if (m.right) pan.value = Math.min(180, pan.value + ps);
-  if (m.up)    tilt.value = Math.min(60, tilt.value + ts);
-  if (m.down)  tilt.value = Math.max(-60, tilt.value - ts);
+  if (m.left)  pan.value -= ps;
+  if (m.right) pan.value += ps;
+  if (m.up)    tilt.value = Math.min(90, tilt.value + ts);
+  if (m.down)  tilt.value = Math.max(-90, tilt.value - ts);
   if (m.zoom_in)  zoom.value = Math.min(4, zoom.value + 0.03);
   if (m.zoom_out) zoom.value = Math.max(1, zoom.value - 0.03);
 }
@@ -523,8 +565,15 @@ onMounted(async () => {
   unlistenPtz = await listen<PtzAction>("ptz_action", (e) => {
     const m = e.payload;
     const active = m.up || m.down || m.left || m.right || m.zoom_in || m.zoom_out;
+    // 手动命令（包括显式 STOP）立即抢占预置位巡航，避免姿态补间吞掉平台控制。
+    seeking.value = false;
+    target.value = null;
+    activePreset.value = null;
+    activePresetName.value = "";
     // 收到显式停止(全 false)立即归零(WVP 松手会发 0x00 停止命令,设备已实时应答)。
     ptz.value = e.payload;
+    lastPtzAction.value = describePtzAction(m);
+    lastPtzAt.value = ptzTimestamp();
     if (ptzStopTimer) { clearTimeout(ptzStopTimer); ptzStopTimer = null; }
     // 仅作安全兜底:极少数平台松手不发停止命令时,3s 无新命令才自动归零。
     // 放宽到 3s 避免"按住时因平台重发间隔较长被误判停止"。
@@ -532,16 +581,26 @@ onMounted(async () => {
       ptzStopTimer = window.setTimeout(() => {
         ptz.value = { up: false, down: false, left: false, right: false,
           zoom_in: false, zoom_out: false, pan_speed: 0, tilt_speed: 0, zoom_speed: 0 };
+        lastPtzAction.value = "STOP（超时保护）";
+        lastPtzAt.value = ptzTimestamp();
       }, 3000);
     }
   });
-  // 预置位调用:平滑巡航到目标位(未登记的预置位随机造一个目标演示)。
-  unlistenPreset = await listen<number>("ptz_preset", (e) => {
-    const id = e.payload;
+  // 预置位调用:使用设备按国标 PresetName 保存的名称，并平滑巡航到演示姿态。
+  unlistenPreset = await listen<PtzPresetPayload>("ptz_preset", (e) => {
+    const { id, name } = e.payload;
+    if (ptzStopTimer) { clearTimeout(ptzStopTimer); ptzStopTimer = null; }
+    ptz.value = { up: false, down: false, left: false, right: false,
+      zoom_in: false, zoom_out: false, pan_speed: 0, tilt_speed: 0, zoom_speed: 0 };
     activePreset.value = id;
-    target.value = PRESET_POS[id] ?? {
-      pan: ((id * 53) % 360) - 180, tilt: ((id * 37) % 100) - 50, zoom: 1 + (id % 3),
+    activePresetName.value = name || `预置位${id}`;
+    presetNames.value = { ...presetNames.value, [id]: activePresetName.value };
+    const preset = PRESET_POS[id] ?? {
+      pan: (id * 53) % 360, tilt: ((id * 37) % 180) - 90, zoom: 1 + (id % 3),
     };
+    target.value = { ...preset, pan: nearestEquivalentPan(preset.pan) };
+    lastPtzAction.value = `调用 ${activePresetName.value}（${id}）`;
+    lastPtzAt.value = ptzTimestamp();
     seeking.value = true;
   });
   unlistenTrace = await listen<TraceEntry>("sip_trace", (e) => {
@@ -606,7 +665,7 @@ onActivated(reconcile);
     <div class="page-header">
       <div class="page-title">单设备联调</div>
       <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
-        </div>
+    </div>
 
 
     <!-- 设备身份与媒体源占满整行，避免窄列挤压复杂配置。 -->
@@ -689,7 +748,6 @@ onActivated(reconcile);
                 <div>
                   <label>音频设备</label>
                   <select v-model="selectedMicrophone" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-.chip-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(56,132,255,0.08); }
                     <option value="none">不采集音频（画面将没有声音）</option>
                     <option v-if="selectedMicrophone !== 'none' && !liveCatalog.microphones.some(item => String(item.index) === selectedMicrophone)" :value="selectedMicrophone" disabled>
                       [{{ selectedMicrophone }}] 当前音频设备不可用
@@ -803,86 +861,112 @@ onActivated(reconcile);
             <div v-if="probeState" class="probe-result" :class="probeState.kind">{{ probeState.message }}</div>
           </div>
           <div class="action-row">
-            <n-button type="primary" :disabled="startDisabled" @click="startDevice">注册上线</n-button>
+            <n-button type="primary" :disabled="registrationDisabled" @click="startDevice">注册上线</n-button>
             <n-button :disabled="stopDisabled" @click="stopDevice">注销</n-button>
             <n-button :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
             <n-button :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
           </div>
     </div>
 
+    <!-- 下方工作区：所有卡片全宽单列，按云台、状态、时间线顺序阅读。 -->
+    <div class="workspace">
+      <div class="ws-col">
         <div class="glass-card panel ptz-panel">
           <div class="panel-title">云台控制</div>
-          <div class="ptz-sub">平台下发 PTZ 时,球机实时演示转动/变倍(本设备为被控端)</div>
+          <div class="ptz-sub">平台下发 PTZ 时，桌面球机按真实水平转台、球形机芯和光学变倍实时联动</div>
           <div class="ptz-body">
-            <div class="stick-wrap" :class="{ active: ptzActive, seeking }">
-              <div class="stick-base">
-                <span class="arr arr-u" :class="{ on: ptz.up }">▲</span>
-                <span class="arr arr-d" :class="{ on: ptz.down }">▼</span>
-                <span class="arr arr-l" :class="{ on: ptz.left }">◀</span>
-                <span class="arr arr-r" :class="{ on: ptz.right }">▶</span>
-                <div class="stick-knob" :style="knobStyle">
-                  <div class="knob-face">
-                    <div class="knob-dot" :class="{ zoom: ptz.zoom_in || ptz.zoom_out }"></div>
-                  </div>
-                </div>
-                <transition name="zoom-pop">
-                  <div v-if="ptz.zoom_in || ptz.zoom_out" class="zoom-badge" :class="ptz.zoom_in ? 'zin' : 'zout'">
-                    <span class="zoom-sign">{{ ptz.zoom_in ? '＋' : '－' }}</span>
-                    <span class="zoom-ring"></span>
-                  </div>
-                </transition>
+            <div class="ptz-stage" :class="{ active: ptzActive, seeking }">
+              <div class="stage-grid"></div>
+              <div class="stage-caption">
+                <span class="live-dot"></span>
+                <b>PTZ LIVE</b>
+                <em>{{ statusText }}</em>
               </div>
+              <div class="compass-ring" aria-hidden="true">
+                <div class="compass-dial" :style="compassDialStyle">
+                  <span class="north">N</span><span class="east">E</span><span class="south">S</span><span class="west">W</span>
+                </div>
+                <b class="heading-readout">{{ normalizedPan.toFixed(0).padStart(3, "0") }}°</b>
+              </div>
+              <div class="direction-hud" aria-hidden="true">
+                <span class="hud-up" :class="{ on: ptz.up }">↑</span>
+                <span class="hud-down" :class="{ on: ptz.down }">↓</span>
+                <span class="hud-left" :class="{ on: ptz.left }">←</span>
+                <span class="hud-right" :class="{ on: ptz.right }">→</span>
+              </div>
+              <div class="tilt-gauge" aria-hidden="true">
+                <span class="tilt-plus">+90°</span><span class="tilt-zero">0°</span><span class="tilt-minus">−90°</span>
+                <i class="tilt-track"></i>
+                <b class="tilt-marker" :style="tiltMarkerStyle">{{ tilt.toFixed(0) }}°</b>
+              </div>
+              <ThreePtzCamera
+                :pan="pan"
+                :tilt="tilt"
+                :zoom="zoom"
+                :active="ptzActive"
+                :seeking="seeking"
+              />
+              <div class="axis-label pan-axis">PAN · 水平 360°</div>
+              <div class="axis-label tilt-axis">TILT · 俯仰 ±90°</div>
             </div>
             <div class="ptz-info">
-              <div class="ptz-stat"><span>朝向</span><b class="pose">{{ poseText }}</b></div>
+              <div class="ptz-stat pose-stat"><span>朝向</span><b class="pose">{{ poseText }}</b></div>
               <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
               <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
               <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
               <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive || seeking }">{{ statusText }}</b></div>
+              <div class="ptz-stat action-state">
+                <span>平台按钮实时状态 · {{ lastPtzAt }}</span>
+                <span class="action-chips">
+                  <b v-for="button in ptzButtons" :key="button.key" class="action-chip" :class="{ on: button.active, stop: button.key === 'stop' }">{{ button.label }}</b>
+                </span>
+                <em>最近命令：{{ lastPtzAction }}</em>
+              </div>
               <div class="ptz-stat presets">
-                <span>预置位</span>
+                <span>预置位 · GB/T 28181 PresetName</span>
                 <span class="preset-chips">
-                  <b v-for="id in [1,2,3,4,5]" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">{{ id }}</b>
+                  <b v-for="id in PRESET_IDS" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">
+                    <small>{{ id }}</small>{{ presetNames[id] }}
+                  </b>
                 </span>
               </div>
             </div>
           </div>
+          <section class="ptz-runtime" aria-labelledby="ptz-runtime-title">
+            <div id="ptz-runtime-title" class="ptz-runtime-title">平台实时状态</div>
+            <div class="ptz-runtime-grid">
+              <div class="rt-block">
+                <div class="rt-label">活跃订阅</div>
+                <div v-if="subList.length" class="sub-list">
+                  <div v-for="s in subList" :key="s.kind" class="sub-item">
+                    <span class="sub-dot" /><span class="sub-kind">{{ kindLabel[s.kind] ?? s.kind }}</span>
+                    <span class="sub-count">NOTIFY {{ s.notify_count }}</span>
+                  </div>
+                </div>
+                <div v-else class="rt-idle">无（平台订阅目录、报警或位置后显示）</div>
+              </div>
+              <div class="rt-block">
+                <div class="rt-label">OSD 设置（平台下发）</div>
+                <div v-if="osd.received" class="osd-applied">
+                  <span class="osd-badge" :class="osd.time_show ? 'on' : 'off'">时间 {{ osd.time_show ? '开' : '关' }}</span>
+                  <span class="osd-badge" :class="osd.osd_show ? 'on' : 'off'">信息 {{ osd.osd_show ? '开' : '关' }}</span>
+                  <span class="rt-time">{{ osd.at }}</span>
+                </div>
+                <div v-else class="rt-idle">无（平台下发 OSDConfig 后显示）</div>
+              </div>
+              <div v-if="progress" class="rt-block progress-block">
+                <div class="rt-label">{{ kindLabel[progress.kind] ?? progress.kind }}进度</div>
+                <div class="prog-wrap">
+                  <div class="prog-bar"><div class="prog-fill" :style="{ width: progress.percent + '%' }" /></div>
+                  <div class="prog-txt">{{ progress.current }}/{{ progress.total }} · {{ progress.percent }}%</div>
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
 
-      <!-- ── 右列:实时监控 ── -->
       <div class="ws-col">
-
-        <div class="glass-card panel">
-          <div class="panel-title">设备实时状态</div>
-          <div class="rt-block">
-            <div class="rt-label">活跃订阅</div>
-            <div v-if="subList.length" class="sub-list">
-              <div v-for="s in subList" :key="s.kind" class="sub-item">
-                <span class="sub-dot" /><span class="sub-kind">{{ kindLabel[s.kind] ?? s.kind }}</span>
-                <span class="sub-count">NOTIFY {{ s.notify_count }}</span>
-              </div>
-            </div>
-            <div v-else class="rt-idle">无(平台订阅目录/报警/位置后显示)</div>
-          </div>
-          <div class="rt-block">
-            <div class="rt-label">OSD 设置(平台下发)</div>
-            <div v-if="osd.received" class="osd-applied">
-              <span class="osd-badge" :class="osd.time_show ? 'on' : 'off'">时间 {{ osd.time_show ? '开' : '关' }}</span>
-              <span class="osd-badge" :class="osd.osd_show ? 'on' : 'off'">信息 {{ osd.osd_show ? '开' : '关' }}</span>
-              <span class="rt-time">{{ osd.at }}</span>
-            </div>
-            <div v-else class="rt-idle">无(平台下发 OSDConfig 后显示已应用状态)</div>
-          </div>
-          <div class="rt-block" v-if="progress">
-            <div class="rt-label">{{ kindLabel[progress.kind] ?? progress.kind }}进度</div>
-            <div class="prog-wrap">
-              <div class="prog-bar"><div class="prog-fill" :style="{ width: progress.percent + '%' }" /></div>
-              <div class="prog-txt">{{ progress.current }}/{{ progress.total }} · {{ progress.percent }}%</div>
-            </div>
-          </div>
-        </div>
-
         <div class="glass-card panel">
           <div class="panel-title">平台命令时间线</div>
           <div v-if="commands.length === 0" class="rt-idle">等待平台下发命令(注册后平台会查目录、下发控制等)…</div>
@@ -1001,139 +1085,220 @@ onActivated(reconcile);
 }
 .pwd-eye:hover { color: var(--accent); }
 
-/* 视频源文件选择 */
+/* 专业媒体源选择器 */
+.media-source-field { margin-top: 18px; }
+.source-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.source-lock { font-size: 11px; color: var(--warning); }
+.source-modes {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;
+}
+.source-modes button {
+  min-width: 0; border: 1px solid var(--border-default); border-radius: 10px;
+  background: rgba(255,255,255,0.52); padding: 10px 12px; text-align: left;
+  color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
+}
+.source-modes button:hover:not(:disabled) { border-color: var(--accent); background: rgba(56,132,255,0.06); }
+.source-modes button.on {
+  border-color: var(--accent); background: rgba(56,132,255,0.1);
+  box-shadow: inset 0 0 0 1px rgba(56,132,255,0.12);
+}
+.source-modes button:disabled { cursor: not-allowed; opacity: .62; }
+.source-modes b { display: block; font-size: 12.5px; color: var(--text-primary); margin-bottom: 3px; }
+.source-modes button.on b { color: var(--accent); }
+.source-modes span { display: block; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-config {
+  margin-top: 10px; padding: 12px; border-radius: 10px;
+  border: 1px solid rgba(120,130,150,0.13); background: rgba(255,255,255,0.34);
+}
+.source-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 10px; }
+.camera-source-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, .85fr); }
+.source-grid label, .screen-profile-grid label { display: block; font-size: 11.5px; color: var(--text-secondary); margin-bottom: 5px; }
+.screen-profile-grid {
+  display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, .8fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px; margin-top: 10px;
+}
+.screen-bitrate-input { display: flex; align-items: center; gap: 6px; }
+.screen-bitrate-input .inp { min-width: 0; }
+.screen-bitrate-input span { flex: 0 0 auto; color: var(--text-tertiary); font-size: 12px; }
+.screen-bitrate-input .inp { flex: 1 1 auto; }
+.source-capability {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+  color: var(--text-secondary); font-size: 11.5px;
+}
+.cap-badge { padding: 2px 8px; border-radius: 10px; font-size: 10.5px; font-weight: 650; }
+.cap-badge.ok { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
+.cap-badge.warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
 .file-row { display: flex; gap: 8px; align-items: stretch; }
 .file-row .inp { flex: 1 1 auto; }
-.fg-hint { font-size: 11.5px; color: var(--text-tertiary); margin-top: 6px; line-height: 1.5; }
+.fg-hint { font-size: 11.5px; color: var(--text-tertiary); margin-top: 8px; line-height: 1.5; }
 .file-btn {
   flex: 0 0 auto; border: 1px solid var(--border-default); background: rgba(255,255,255,0.6);
-  border-radius: var(--radius-sm); padding: 0 14px; font-size: 13px; color: var(--text-secondary);
-  cursor: pointer; white-space: nowrap;
+  border-radius: var(--radius-sm); padding: 0 14px; font-size: 12px; color: var(--text-secondary);
+  cursor: pointer; white-space: nowrap; min-height: 34px;
 }
-.file-btn:hover { border-color: var(--accent); color: var(--accent); }
-.src-quick { display: flex; gap: 8px; margin-top: 8px; }
-.chip-btn {
-  font-size: 12px; padding: 4px 12px; border-radius: 14px; cursor: pointer;
-  background: rgba(120,130,150,0.08); border: 1px solid var(--border-default);
-  color: var(--text-secondary); transition: all 0.15s;
+.file-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.file-btn:disabled { cursor: not-allowed; opacity: .55; }
+.file-btn.compact { min-height: 30px; padding: 0 11px; }
+.file-btn.primary { border-color: var(--accent); color: #fff; background: var(--accent); }
+.source-notice { display: flex; flex-direction: column; gap: 3px; margin-top: 9px; padding: 8px 10px; border-radius: 7px; font-size: 11px; line-height: 1.45; }
+.source-notice.error { color: var(--error); background: color-mix(in srgb, var(--error) 8%, transparent); }
+.source-footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin-top: 10px; }
+.source-uri { min-width: 0; flex: 1; }
+.source-uri > span { display: block; font-size: 10.5px; color: var(--text-tertiary); margin-bottom: 3px; }
+.source-uri code {
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-secondary); font-size: 10.5px; font-family: "SF Mono", Menlo, monospace;
+}
+.source-actions { display: flex; gap: 7px; flex: 0 0 auto; }
+.probe-result { margin-top: 9px; padding: 8px 10px; border-radius: 7px; font-size: 11.5px; line-height: 1.45; }
+.probe-result.loading { color: var(--accent); background: rgba(56,132,255,0.08); }
+.probe-result.success { color: var(--success); background: color-mix(in srgb, var(--success) 10%, transparent); }
+.probe-result.warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
+.probe-result.error { color: var(--error); background: color-mix(in srgb, var(--error) 9%, transparent); }
+@media (max-width: 580px) {
+  .source-modes, .source-grid, .screen-profile-grid { grid-template-columns: 1fr; }
+  .source-footer { align-items: stretch; flex-direction: column; }
 }
 
 /* 云台控制可视化 */
 .ptz-panel { margin-top: 0; }
 .ptz-sub { font-size: 12px; color: var(--text-tertiary); margin-bottom: 16px; }
-.ptz-body { display: flex; gap: 24px; align-items: center; }
+.ptz-body { display: flex; gap: 28px; align-items: stretch; }
+@media (max-width: 820px) {
+  .ptz-body { flex-direction: column; }
+  .ptz-stage { flex-basis: 300px; min-height: 300px; width: 100%; }
+}
 
-/* 拟态摇杆(neumorphism):凹陷底盘 + 悬浮圆钮 */
-.stick-wrap { flex: 0 0 auto; padding: 6px; }
-.stick-base {
-  position: relative;
-  width: 176px; height: 176px; border-radius: 50%;
-  background: linear-gradient(145deg, #e4e9ef, #c8cfd8);
-  /* 外凸底座 + 内凹碗:双向阴影营造立体 */
-  box-shadow:
-    8px 8px 20px rgba(163, 177, 198, 0.65),
-    -8px -8px 20px rgba(255, 255, 255, 0.9),
-    inset 3px 3px 8px rgba(163, 177, 198, 0.5),
-    inset -3px -3px 8px rgba(255, 255, 255, 0.7);
-  display: flex; align-items: center; justify-content: center;
+/* 桌面球机：固定底座承载水平转台，U 型支架夹持可俯仰球形机芯。 */
+.ptz-stage {
+  position: relative; flex: 0 0 390px; min-height: 340px; overflow: hidden;
+  border-radius: 20px; perspective: 900px; isolation: isolate;
+  background:
+    radial-gradient(circle at 50% 38%, rgba(78,145,255,.2), transparent 31%),
+    linear-gradient(155deg, rgba(245,250,255,.98), rgba(215,229,245,.78));
+  border: 1px solid rgba(91,126,171,.2);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -28px 60px rgba(57,87,126,.09);
 }
-/* 碗内深凹槽 */
-.stick-base::before {
-  content: ""; position: absolute; width: 128px; height: 128px; border-radius: 50%;
-  background: linear-gradient(145deg, #cfd6de, #eef2f6);
-  box-shadow:
-    inset 6px 6px 14px rgba(163, 177, 198, 0.7),
-    inset -6px -6px 14px rgba(255, 255, 255, 0.85);
+.stage-grid {
+  position: absolute; inset: 54% -12% -36%; transform: rotateX(65deg); transform-origin: center top;
+  background-image: linear-gradient(rgba(68,111,166,.12) 1px, transparent 1px), linear-gradient(90deg, rgba(68,111,166,.12) 1px, transparent 1px);
+  background-size: 28px 28px; mask-image: linear-gradient(to bottom, #000, transparent 82%);
 }
-/* 方向箭头(碗沿):统一 14px 内边距,居中对齐,箭头等宽盒子避免字形宽度差导致压边 */
-.arr {
-  position: absolute; z-index: 3;
-  width: 16px; height: 16px; line-height: 16px; text-align: center;
-  font-size: 12px; color: #9aa5b1;
-  transition: color 0.15s, text-shadow 0.15s, transform 0.15s;
+.stage-caption {
+  position: absolute; z-index: 9; left: 15px; top: 14px; display: flex; align-items: center; gap: 6px;
+  padding: 5px 9px; border-radius: 9px; color: #527196; background: rgba(255,255,255,.66);
+  border: 1px solid rgba(92,126,168,.14); box-shadow: 0 4px 14px rgba(39,67,103,.08);
 }
-.arr-u { top: 14px; left: 50%; transform: translateX(-50%); }
-.arr-d { bottom: 14px; left: 50%; transform: translateX(-50%); }
-.arr-l { left: 14px; top: 50%; transform: translateY(-50%); }
-.arr-r { right: 14px; top: 50%; transform: translateY(-50%); }
-.arr.on { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
-/* 点亮时放大,保留各自的居中位移(不被基类 transform 覆盖) */
-.arr-u.on { transform: translateX(-50%) scale(1.4); }
-.arr-d.on { transform: translateX(-50%) scale(1.4); }
-.arr-l.on { transform: translateY(-50%) scale(1.4); }
-.arr-r.on { transform: translateY(-50%) scale(1.4); }
-/* 悬浮摇杆钮 */
-.stick-knob {
-  position: relative; z-index: 2;
-  width: 92px; height: 92px; border-radius: 50%;
-  background: linear-gradient(145deg, #f4f7fa, #d2d9e1);
-  box-shadow:
-    5px 5px 14px rgba(163, 177, 198, 0.75),
-    -4px -4px 12px rgba(255, 255, 255, 0.95);
-  transition: transform 0.18s cubic-bezier(.34,1.56,.64,1);
-  display: flex; align-items: center; justify-content: center;
+.stage-caption .live-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+.stage-caption b { font: 800 9px/1 "SF Mono", Menlo, monospace; letter-spacing: .7px; }
+.stage-caption em { padding-left: 6px; border-left: 1px solid rgba(82,113,150,.18); font-size: 9px; font-style: normal; color: var(--text-tertiary); }
+.ptz-stage.active .stage-caption .live-dot { background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: liveBlink 1s ease-in-out infinite; }
+@keyframes liveBlink { 50% { opacity: .35; } }
+.compass-ring {
+  position: absolute; z-index: 2; left: 50%; top: 63%; width: 246px; height: 82px;
+  margin-left: -123px; border-radius: 50%; transform: rotateX(68deg);
+  border: 2px solid rgba(56,132,255,.3); box-shadow: 0 0 0 8px rgba(255,255,255,.3), inset 0 0 24px rgba(56,132,255,.12);
 }
-.knob-face {
-  width: 66px; height: 66px; border-radius: 50%;
-  background: linear-gradient(145deg, #eaeef3, #ffffff);
-  box-shadow: inset 2px 2px 6px rgba(163,177,198,0.5), inset -2px -2px 6px rgba(255,255,255,0.9);
-  display: flex; align-items: center; justify-content: center;
+.compass-dial {
+  position: absolute; inset: 5px; border-radius: 50%; transition: transform .12s linear;
+  background: repeating-conic-gradient(from -1deg, rgba(61,105,158,.58) 0 2deg, transparent 2deg 10deg);
 }
-.knob-dot {
-  width: 14px; height: 14px; border-radius: 50%;
-  background: radial-gradient(circle at 35% 30%, #9aa5b1, #64748b);
-  box-shadow: inset 0 1px 2px rgba(255,255,255,0.4);
-  transition: all 0.15s;
+.compass-dial::after { content: ""; position: absolute; inset: 27%; border-radius: 50%; border: 1px dashed rgba(56,132,255,.24); }
+.compass-dial span { position: absolute; color: #52749e; font-size: 10px; font-weight: 800; text-shadow: 0 1px #fff; }
+.compass-dial .north { left: 50%; top: -2px; transform: translateX(-50%); color: var(--accent); }
+.compass-dial .east { right: 2px; top: 50%; transform: translateY(-50%); }
+.compass-dial .south { left: 50%; bottom: -2px; transform: translateX(-50%); }
+.compass-dial .west { left: 2px; top: 50%; transform: translateY(-50%); }
+.heading-readout {
+  position: absolute; z-index: 2; left: 50%; top: 50%; transform: translate(-50%, -50%) rotateX(-68deg);
+  color: var(--accent); font: 800 11px/1 "SF Mono", Menlo, monospace; background: rgba(255,255,255,.88);
+  padding: 4px 8px; border-radius: 9px; box-shadow: 0 2px 9px rgba(43,68,100,.14);
 }
-.knob-dot.zoom { background: radial-gradient(circle at 35% 30%, #7dd3fc, var(--accent)); box-shadow: 0 0 10px var(--accent-glow); }
+.direction-hud span {
+  position: absolute; z-index: 10; display: grid; place-items: center; width: 28px; height: 28px;
+  border-radius: 9px; color: #8ba0bb; background: rgba(255,255,255,.58); border: 1px solid rgba(101,129,166,.17);
+  font-size: 17px; transition: .18s ease;
+}
+.direction-hud span.on { color: #fff; background: var(--accent); box-shadow: 0 0 18px var(--accent-glow); transform: scale(1.13); }
+.hud-up { top: 14px; left: calc(50% - 14px); }
+.hud-down { bottom: 14px; left: calc(50% - 14px); }
+.hud-left { left: 14px; top: calc(50% - 14px); }
+.hud-right { right: 14px; top: calc(50% - 14px); }
+.tilt-gauge {
+  position: absolute; z-index: 9; right: 22px; top: 69px; width: 46px; height: 100px;
+  color: #7890ad; font: 700 8px/1 "SF Mono", Menlo, monospace;
+}
+.tilt-gauge > span { position: absolute; right: 0; }
+.tilt-plus { top: 0; } .tilt-zero { top: 46px; } .tilt-minus { bottom: 0; }
+.tilt-track { position: absolute; left: 5px; top: 4px; width: 2px; height: 92px; border-radius: 2px; background: linear-gradient(var(--accent), #a9bdd5); }
+.tilt-track::before, .tilt-track::after { content: ""; position: absolute; left: -3px; width: 8px; height: 1px; background: #7890ad; }
+.tilt-track::before { top: 0; } .tilt-track::after { bottom: 0; }
+.tilt-marker {
+  position: absolute; left: -1px; top: 43px; min-width: 29px; height: 15px; padding-left: 10px; border-radius: 7px;
+  color: #fff; background: var(--accent); font-size: 8px; line-height: 15px; box-shadow: 0 3px 9px var(--accent-glow);
+  transition: transform .12s linear;
+}
+.tilt-marker::before { content: ""; position: absolute; left: -3px; top: 5px; border-width: 3px 4px 3px 0; border-style: solid; border-color: transparent var(--accent) transparent transparent; }
+.axis-label { position: absolute; z-index: 8; color: #7890ad; font: 700 8px/1 "SF Mono", Menlo, monospace; letter-spacing: .4px; }
+.pan-axis { left: 22px; bottom: 20px; } .tilt-axis { right: 18px; bottom: 20px; }
+.ptz-stage.active { box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -28px 60px rgba(57,87,126,.09), 0 0 0 2px rgba(56,132,255,.18); }
+.ptz-stage.seeking { animation: stageSeekPulse 1.15s ease-in-out infinite; }
+@keyframes stageSeekPulse { 50% { box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -28px 60px rgba(57,87,126,.09), 0 0 26px rgba(56,132,255,.32); } }
 
-/* 变倍中心徽标 + 双脉冲环:柔和渐变,放大蓝青、缩小琥珀 */
-.zoom-badge {
-  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  width: 46px; height: 46px; border-radius: 50%; z-index: 5;
-  display: flex; align-items: center; justify-content: center;
-  background: linear-gradient(135deg, #38bdf8, #2563eb);
-  box-shadow: 0 6px 18px rgba(37,99,235,0.45), inset 0 1px 2px rgba(255,255,255,0.4);
+.ptz-info { flex: 1 1 auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0; align-content: center; }
+.ptz-stat {
+  display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 13px 14px; border-radius: 12px;
+  background: linear-gradient(145deg, rgba(255,255,255,.7), rgba(239,245,252,.46));
+  border: 1px solid rgba(105,132,167,.14);
 }
-.zoom-badge.zout { background: linear-gradient(135deg, #fbbf24, #f97316); box-shadow: 0 6px 18px rgba(249,115,22,0.4), inset 0 1px 2px rgba(255,255,255,0.4); }
-.zoom-sign { color: #fff; font-size: 22px; font-weight: 700; line-height: 1; z-index: 2; text-shadow: 0 1px 2px rgba(0,0,0,0.2); }
-.zoom-ring {
-  position: absolute; inset: 0; border-radius: 50%;
-  border: 2px solid rgba(56,189,248,0.6); animation: zoomPulse 1.4s ease-out infinite;
-}
-.zoom-badge.zout .zoom-ring { border-color: rgba(251,191,36,0.6); }
-.zoom-ring::after {
-  content: ""; position: absolute; inset: -1px; border-radius: 50%;
-  border: 2px solid inherit; animation: zoomPulse 1.4s ease-out infinite 0.7s;
-}
-@keyframes zoomPulse {
-  0% { transform: scale(1); opacity: 0.7; }
-  100% { transform: scale(2); opacity: 0; }
-}
-.zoom-pop-enter-active, .zoom-pop-leave-active { transition: opacity 0.2s, transform 0.2s; }
-.zoom-pop-enter-from, .zoom-pop-leave-to { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
-.stick-wrap.active .stick-knob { box-shadow: 6px 6px 16px rgba(163,177,198,0.85), -4px -4px 12px rgba(255,255,255,0.95), 0 0 0 2px rgba(37,99,235,0.15); }
-
-.ptz-info { flex: 1 1 auto; display: flex; flex-direction: column; gap: 9px; min-width: 0; }
-.ptz-stat { display: flex; gap: 10px; align-items: baseline; }
-.ptz-stat span { font-size: 12px; color: var(--text-tertiary); width: 42px; flex-shrink: 0; }
-.ptz-stat b { font-size: 14px; color: var(--text-primary); }
+.ptz-stat span { font-size: 11px; color: var(--text-tertiary); width: auto; flex-shrink: 0; text-transform: uppercase; letter-spacing: .4px; }
+.ptz-stat b { font-size: 14px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ptz-stat b.hot { color: var(--accent); }
 .ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 13px; }
-.ptz-stat.presets { align-items: center; }
-.preset-chips { display: inline-flex; gap: 6px; }
-.pchip {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 22px; height: 22px; border-radius: 6px; font-size: 12px; font-weight: 600;
-  color: var(--text-tertiary); background: rgba(255,255,255,0.5);
-  border: 1px solid var(--border-default); transition: all 0.15s;
+.ptz-stat.pose-stat, .ptz-stat.action-state, .ptz-stat.presets { grid-column: 1 / -1; }
+.action-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.action-chip {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 38px; height: 24px; padding: 0 8px;
+  border-radius: 7px; color: var(--text-tertiary); background: rgba(255,255,255,.55);
+  border: 1px solid var(--border-default); font-size: 11px; transition: all .16s ease;
 }
-.pchip.on { color: #fff; background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: scale(1.12); }
-/* 巡航中底盘泛蓝光 */
-.stick-wrap.seeking .stick-base { box-shadow:
-  8px 8px 20px rgba(163,177,198,0.65), -8px -8px 20px rgba(255,255,255,0.9),
-  inset 3px 3px 8px rgba(163,177,198,0.5), inset -3px -3px 8px rgba(255,255,255,0.7),
-  0 0 0 3px rgba(37,99,235,0.25); }
+.action-chip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); transform: translateY(-1px); }
+.action-chip.stop.on { background: #64748b; border-color: #64748b; box-shadow: 0 0 12px rgba(100,116,139,.25); }
+.action-state em { color: var(--text-secondary); font-size: 11px; font-style: normal; }
+.ptz-stat.presets { justify-content: center; }
+.preset-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.pchip {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-width: 84px; height: 26px; padding: 0 9px; border-radius: 7px;
+  font-size: 11px; font-weight: 600; color: var(--text-secondary);
+  background: rgba(255,255,255,0.5); border: 1px solid var(--border-default); transition: all 0.15s;
+}
+.pchip small {
+  display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 5px;
+  color: var(--accent); background: var(--accent-dim); font: 700 9px/1 "SF Mono", Menlo, monospace;
+}
+.pchip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: translateY(-1px); }
+.pchip.on small { color: var(--accent); background: #fff; }
+
+.ptz-runtime {
+  margin-top: 20px; padding-top: 18px; border-top: 1px solid rgba(105,132,167,.16);
+}
+.ptz-runtime-title {
+  margin-bottom: 11px; color: var(--text-secondary); font-size: 12px; font-weight: 650;
+  letter-spacing: .4px; text-transform: uppercase;
+}
+.ptz-runtime-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.ptz-runtime .rt-block {
+  min-width: 0; padding: 12px 14px; border: 1px solid rgba(105,132,167,.13); border-radius: 11px;
+  background: rgba(255,255,255,.38);
+}
+.ptz-runtime .rt-label { margin-bottom: 7px; }
+.ptz-runtime .sub-list { margin-top: 0; }
+.ptz-runtime .progress-block { grid-column: 1 / -1; }
+@media (max-width: 820px) {
+  .ptz-runtime-grid { grid-template-columns: 1fr; }
+  .ptz-runtime .progress-block { grid-column: auto; }
+}
 
 /* 长任务进度 */
 .prog-wrap { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
