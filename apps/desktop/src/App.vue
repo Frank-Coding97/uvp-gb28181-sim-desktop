@@ -46,7 +46,7 @@ function saveEdit() {
 }
 function addNew() {
   addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
-    server_domain: "34020000002000000001", password: "12345678", transport: "UDP", signaling_encoding: "GB18030" });
+    server_domain: "34020000002000000001", password: "change-me", transport: "UDP", signaling_encoding: "GB18030" });
   openEdit();
 }
 const transportOptions = [{ label: "UDP", value: "UDP" }, { label: "TCP", value: "TCP" }];
