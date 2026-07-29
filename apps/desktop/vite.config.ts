@@ -14,5 +14,20 @@ export default defineConfig({
   build: {
     target: "es2021",
     outDir: "dist",
+    chunkSizeWarningLimit: 700,
+    // Vite 8 / Rolldown：按稳定依赖域拆分静态 vendor chunk。页面仍保持静态
+    // import，避免 Tauri 自定义协议下按路由懒加载造成空白，同时降低单文件解析成本。
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: "charts", test: /node_modules[\\/](echarts|zrender)[\\/]/, priority: 30 },
+            { name: "ui", test: /node_modules[\\/](naive-ui|vueuc|treemate|css-render|vdirs|vooks|date-fns|date-fns-tz)[\\/]/, priority: 20 },
+            { name: "framework", test: /node_modules[\\/](@vue|vue|vue-router)[\\/]/, priority: 15 },
+            { name: "vendor", test: /node_modules[\\/]/, priority: 10 },
+          ],
+        },
+      },
+    },
   },
 });
