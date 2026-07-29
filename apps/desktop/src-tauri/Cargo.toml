@@ -12,7 +12,7 @@ name = "uvp_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 # 桌面端后端直接内嵌压测引擎(第一阶段同进程;后续可拆为独立 engine)。
@@ -23,9 +23,9 @@ gb28181-protocol  = { path = "../../../crates/gb28181-protocol" }
 sip-core          = { path = "../../../crates/sip-core" }
 encoding_rs       = { workspace = true }
 common            = { path = "../../../crates/common" }
-tauri = { version = "2", features = [] }
+tauri = { version = "=2.11.5", features = [] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tauri-plugin-dialog = "2.0.0-rc.8"
+tauri-plugin-dialog = "=2.7.1"
