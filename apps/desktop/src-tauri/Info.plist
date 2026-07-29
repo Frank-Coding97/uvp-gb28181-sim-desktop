@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Tauri v2 会把本文件的键合并进最终 .app 的 Info.plist。
+     实时媒体源需要向用户说明摄像头、麦克风以及屏幕/系统音频用途。
+     ScreenCaptureKit 的实际授权仍由 macOS TCC 管理，用户可在
+     “系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中调整；
+     本项目不使用私有 screen-capture entitlement。 -->
+<plist version="1.0">
+<dict>
+    <key>NSCameraUsageDescription</key>
+    <string>用于把本机或连续互通摄像头作为国标 IPC 视频源，实时推流到用户配置的上级平台。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>用于把用户选择的麦克风音频与摄像头画面一起推流到用户配置的国标平台。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>用于把用户选择的电脑屏幕实时画面和系统声音推流到用户配置的国标平台。</string>
+</dict>
+</plist>
