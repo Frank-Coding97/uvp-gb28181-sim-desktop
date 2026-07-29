@@ -3,8 +3,8 @@
 
 # 起始设备 ID(20 位),后续设备 ID 递增。
 base_device_id = "34020000001320000001"
-# 所有设备共享的 SIP 认证密码。
-password = "12345678"
+# 所有设备共享的 SIP 认证密码（仅为示例占位值，请按目标平台修改）。
+password = "change-me"
 
 # 上级平台(如 WVP-Pro)。
 server_host = "127.0.0.1"

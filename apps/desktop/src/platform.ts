@@ -17,28 +17,17 @@ const STORE_KEY = "uvp_platform_profiles";
 const ACTIVE_KEY = "uvp_platform_active";
 
 function defaultProfiles(): PlatformProfile[] {
-  return [
-    {
-      id: "wvp-test",
-      name: "WVP-测试",
-      server_host: "192.168.10.222",
-      server_port: 8160,
-      server_domain: "3502000000",
-      password: "wvp_sip_password",
-      transport: "UDP",
-      signaling_encoding: "GB18030",
-    },
-    {
-      id: "local",
-      name: "本地",
-      server_host: "127.0.0.1",
-      server_port: 5060,
-      server_domain: "34020000002000000001",
-      password: "12345678",
-      transport: "UDP",
-      signaling_encoding: "GB18030",
-    },
-  ];
+  // 仅提供无私密信息的本地示例；真实平台地址和密码由用户在界面中配置。
+  return [{
+    id: "local",
+    name: "本地示例",
+    server_host: "127.0.0.1",
+    server_port: 5060,
+    server_domain: "34020000002000000001",
+    password: "change-me",
+    transport: "UDP",
+    signaling_encoding: "GB18030",
+  }];
 }
 
 // 单例响应式状态(整个应用共享一份)。

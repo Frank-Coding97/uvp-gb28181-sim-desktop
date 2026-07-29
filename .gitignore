@@ -28,6 +28,7 @@ apps/desktop/src-tauri/gen/
 
 # ---- 保留 AI 记忆目录不入库 ----
 .claude/
+semantic-review/
 
 # 生成的测试码流(用 assets/media/gen-test-h264.sh 重建)
 assets/media/*.h264

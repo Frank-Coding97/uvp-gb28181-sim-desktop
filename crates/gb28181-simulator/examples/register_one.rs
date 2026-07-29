@@ -6,7 +6,7 @@
 //! ```bash
 //! SERVER_HOST=127.0.0.1 SERVER_PORT=5060 \
 //! SERVER_DOMAIN=34020000002000000001 \
-//! DEVICE_ID=34020000001320000001 PASSWORD=12345678 \
+//! DEVICE_ID=34020000001320000001 PASSWORD=change-me \
 //! cargo run -p gb28181-simulator --example register_one
 //! ```
 
@@ -42,7 +42,7 @@ async fn main() {
         .expect("SERVER_PORT 非法");
     let server_domain = env_or("SERVER_DOMAIN", "34020000002000000001");
     let device_id_str = env_or("DEVICE_ID", "34020000001320000001");
-    let password = env_or("PASSWORD", "12345678");
+    let password = env_or("PASSWORD", "change-me");
 
     let device_id = DeviceId::new(device_id_str.clone()).expect("DEVICE_ID 非法(需 20 位数字)");
 

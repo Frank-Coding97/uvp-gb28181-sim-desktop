@@ -1,4 +1,4 @@
-//! WVP 真机联调测试(需 VPN 连通 192.168.10.222)。
+//! WVP 真机联调测试(运行前需通过环境变量提供受控测试平台参数)。
 //! `cargo test -p gb28181-simulator --test wvp_live -- --nocapture --ignored`
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,14 +7,20 @@ use common::{DeviceId, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use sip_core::UdpTransport;
 
+fn required_env(key: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| panic!("缺少联调环境变量 {key}"))
+}
+
 fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
     DeviceConfig {
-        device_id: DeviceId::new("35020000001310000001").unwrap(),
-        username: "35020000001310000001".into(),
-        password: "wvp_sip_password".into(),
-        server_host: "192.168.10.222".into(),
-        server_port: 8160,
-        server_domain: "3502000000".into(),
+        device_id: DeviceId::new(required_env("WVP_DEVICE_ID")).unwrap(),
+        username: required_env("WVP_DEVICE_ID"),
+        password: required_env("WVP_SIP_PASSWORD"),
+        server_host: required_env("WVP_SERVER_HOST"),
+        server_port: required_env("WVP_SERVER_PORT")
+            .parse()
+            .expect("WVP_SERVER_PORT 非法"),
+        server_domain: required_env("WVP_SERVER_DOMAIN"),
         transport: Transport::Udp,
         gb_version: GbVersion::V2022,
         signaling_encoding: common::SignalingEncoding::Gb18030,
@@ -44,9 +50,9 @@ async fn wvp联调_注册运行并应答查询() {
     }];
     let sim = Arc::new(DeviceSimulator::new(wvp_cfg(ch)));
     let tp = UdpTransport::bind("0.0.0.0:0").await.unwrap();
-    let local_host = "10.8.0.3".to_string();
+    let local_host = required_env("WVP_LOCAL_HOST");
     let local_port = tp.local_addr().unwrap().port();
-    eprintln!("本端 {local_host}:{local_port} → WVP 192.168.10.222:8160");
+    eprintln!("本端 {local_host}:{local_port} → WVP 联调目标");
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let run = tokio::spawn(

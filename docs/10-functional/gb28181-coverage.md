@@ -6,7 +6,7 @@
 
 图例:✅ 已实现并对真实 WVP 验证 · 🟢 已实现(单测,未逐一真机) · 🚧 部分 · ⬜ 规划 · 🚫 明确不做
 
-> 真机验证平台:WVP-Pro `192.168.10.222:8160`(SIP 域 `3502000000`),设备 `35020000001310000001`。
+> 真机验证平台:WVP-Pro `<WVP_SERVER_HOST>:<WVP_SERVER_PORT>`(SIP 域 `<WVP_SERVER_DOMAIN>`),设备 `<WVP_DEVICE_ID>`。
 
 ---
 
