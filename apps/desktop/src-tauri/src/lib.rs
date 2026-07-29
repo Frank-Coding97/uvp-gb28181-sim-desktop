@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sip_core::UdpTransport;
 use stress_engine::{Metrics, Orchestrator};
 use tauri::{AppHandle, Emitter}; // Tauri 2 emit 需要 Emitter trait
@@ -134,6 +134,18 @@ impl DeviceObserver for StateEmitter {
                 let _ = self.app.emit(
                     "task_progress",
                     serde_json::json!({ "kind": kind, "current": current, "total": total, "percent": percent }),
+                );
+                return;
+            }
+            // 运行时错误(如点播采集失败)→ 前端全局错误条。
+            DeviceEvent::RuntimeError { scope, message } => {
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = self.app.emit(
+                    "device_error",
+                    serde_json::json!({ "scope": scope, "message": message, "ts_ms": ts_ms }),
                 );
                 return;
             }
@@ -352,6 +364,143 @@ async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, Stri
 
 // ── 单设备联调命令 ────────────────────────────────────────
 
+#[derive(Serialize)]
+struct LiveScreenDto {
+    display_id: u32,
+    width: u32,
+    height: u32,
+    name: String,
+    uri: String,
+}
+
+#[derive(Serialize)]
+struct LiveAvDeviceDto {
+    index: u32,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct LiveSourceCatalogDto {
+    ffmpeg_available: bool,
+    aac_available: bool,
+    opus_available: bool,
+    screens: Vec<LiveScreenDto>,
+    cameras: Vec<LiveAvDeviceDto>,
+    microphones: Vec<LiveAvDeviceDto>,
+    screen_error: Option<String>,
+    avfoundation_error: Option<String>,
+}
+
+impl From<media_rtp::LiveSourceCatalog> for LiveSourceCatalogDto {
+    fn from(catalog: media_rtp::LiveSourceCatalog) -> Self {
+        Self {
+            ffmpeg_available: catalog.ffmpeg_available,
+            aac_available: catalog.aac_available,
+            opus_available: catalog.opus_available,
+            screens: catalog
+                .screens
+                .into_iter()
+                .map(|screen| LiveScreenDto {
+                    display_id: screen.display_id,
+                    width: screen.width,
+                    height: screen.height,
+                    name: screen.name,
+                    uri: screen.uri,
+                })
+                .collect(),
+            cameras: catalog
+                .cameras
+                .into_iter()
+                .map(|device| LiveAvDeviceDto {
+                    index: device.index,
+                    name: device.name,
+                })
+                .collect(),
+            microphones: catalog
+                .microphones
+                .into_iter()
+                .map(|device| LiveAvDeviceDto {
+                    index: device.index,
+                    name: device.name,
+                })
+                .collect(),
+            screen_error: catalog.screen_error,
+            avfoundation_error: catalog.avfoundation_error,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LiveProbeDto {
+    uri: String,
+    video_ready: bool,
+    audio_requested: bool,
+    audio_ready: Option<bool>,
+    message: String,
+}
+
+/// 枚举可用于规范实时源 URI 的摄像头、麦克风和显示器。
+#[tauri::command]
+async fn list_live_sources() -> Result<LiveSourceCatalogDto, String> {
+    tokio::task::spawn_blocking(media_rtp::list_live_sources)
+        .await
+        .map_err(|error| format!("实时源枚举任务异常: {error}"))?
+        .map(LiveSourceCatalogDto::from)
+        .map_err(|error| error.to_string())
+}
+
+/// 启动一次短时采集探测。请求音频时，用户应确保麦克风或系统正在产生声音。
+#[tauri::command]
+async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
+    let spec = media_rtp::LiveSourceSpec::parse(uri.trim()).map_err(|error| error.to_string())?;
+    let canonical_uri = uri.trim().to_string();
+    let audio_requested = match spec {
+        media_rtp::LiveSourceSpec::Camera { audio_index, .. } => audio_index.is_some(),
+        media_rtp::LiveSourceSpec::Screen { audio, .. } => audio.is_enabled(),
+    };
+    tokio::task::spawn_blocking(move || {
+        use media_rtp::VideoSource;
+
+        let mut source = media_rtp::LiveSource::capture(&canonical_uri, 25)
+            .map_err(|error| error.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut video_ready = false;
+        let mut audio_ready = !audio_requested;
+        while std::time::Instant::now() < deadline {
+            video_ready |= source.next_frame().is_some();
+            if audio_requested {
+                audio_ready |= !source.next_audio().is_empty();
+            }
+            if video_ready && audio_ready {
+                break;
+            }
+            if let Some(error) = source.take_error() {
+                return Err(error);
+            }
+            if !source.is_live() {
+                return Err("实时采集在探测完成前停止".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let message = if video_ready && audio_ready {
+            "视频与请求的音频采集正常".to_string()
+        } else if video_ready && audio_requested {
+            "视频采集正常，但未检测到音频；请播放系统声音或对麦克风说话后重试".to_string()
+        } else {
+            "未检测到视频帧，请检查设备占用和 macOS 隐私权限".to_string()
+        };
+        Ok(LiveProbeDto {
+            uri: canonical_uri,
+            video_ready,
+            audio_requested,
+            audio_ready: audio_requested.then_some(audio_ready),
+            message,
+        })
+    })
+    .await
+    .map_err(|error| format!("实时采集探测任务异常: {error}"))?
+}
+
 /// 前端传入的单设备配置。
 #[derive(Deserialize)]
 struct DeviceCfg {
@@ -389,13 +538,113 @@ fn discover_local_ip(server: &str) -> String {
 /// 启动一台设备:注册 + 心跳 + 入站应答,后台常驻。状态经 `device_state` 事件推送。
 #[tauri::command]
 async fn start_device(
-    config: DeviceCfg,
+    mut config: DeviceCfg,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
     let mut guard = state.device.lock().await;
     if guard.is_some() {
         return Err("已有设备在运行,请先停止".into());
+    }
+
+    if config.transport.eq_ignore_ascii_case("TCP") {
+        return Err("当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into());
+    }
+    if config.server_port == 0
+        || format!("{}:{}", config.server_host, config.server_port)
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+    {
+        return Err("平台地址必须是有效的 IP:端口（当前不支持域名）".into());
+    }
+    if config.password.is_empty() {
+        return Err("SIP 认证密码不能为空".into());
+    }
+    if let Some(source) = config.video_source.take() {
+        let source = source.trim().to_string();
+        if source.is_empty() {
+            config.video_source = None;
+        } else {
+            if source.starts_with("live:") {
+                let spec = media_rtp::LiveSourceSpec::parse(&source)
+                    .map_err(|error| format!("实时媒体源配置无效: {error}"))?;
+                let catalog = tokio::task::spawn_blocking(media_rtp::list_live_sources)
+                    .await
+                    .map_err(|error| format!("实时设备枚举任务异常: {error}"))?
+                    .map_err(|error| format!("实时设备枚举失败: {error}"))?;
+                let requested_audio_codec = match &spec {
+                    media_rtp::LiveSourceSpec::Camera {
+                        audio_index: Some(_),
+                        audio_codec,
+                        ..
+                    } => Some(*audio_codec),
+                    media_rtp::LiveSourceSpec::Screen {
+                        audio, audio_codec, ..
+                    } if audio.is_enabled() => Some(*audio_codec),
+                    _ => None,
+                };
+                match requested_audio_codec {
+                    Some(media_rtp::LiveAudioCodec::Aac) if !catalog.aac_available => {
+                        return Err("当前内嵌 FFmpeg 不支持 AAC 编码，请改用 G.711A/G.711U".into());
+                    }
+                    Some(media_rtp::LiveAudioCodec::Opus) if !catalog.opus_available => {
+                        return Err(
+                            "当前内嵌 FFmpeg 不支持 libopus 编码，请改用 G.711A/G.711U".into()
+                        );
+                    }
+                    _ => {}
+                }
+                match spec {
+                    media_rtp::LiveSourceSpec::Camera { video_index, .. }
+                        if !catalog
+                            .cameras
+                            .iter()
+                            .any(|camera| camera.index == video_index) =>
+                    {
+                        return Err(catalog.avfoundation_error.unwrap_or_else(|| {
+                            format!("未找到 AVFoundation 摄像头索引 {video_index}")
+                        }));
+                    }
+                    media_rtp::LiveSourceSpec::Camera {
+                        audio_index: Some(index),
+                        ..
+                    } if !catalog
+                        .microphones
+                        .iter()
+                        .any(|microphone| microphone.index == index) =>
+                    {
+                        return Err(catalog
+                            .avfoundation_error
+                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                    }
+                    media_rtp::LiveSourceSpec::Screen {
+                        audio: media_rtp::LiveAudioSource::Microphone(index),
+                        ..
+                    } if !catalog
+                        .microphones
+                        .iter()
+                        .any(|microphone| microphone.index == index) =>
+                    {
+                        return Err(catalog
+                            .avfoundation_error
+                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                    }
+                    media_rtp::LiveSourceSpec::Screen { display_id, .. }
+                        if display_id != 0
+                            && !catalog
+                                .screens
+                                .iter()
+                                .any(|screen| screen.display_id == display_id) =>
+                    {
+                        return Err(catalog.screen_error.unwrap_or_else(|| {
+                            format!("未找到 ScreenCaptureKit 显示器 {display_id}")
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            config.video_source = Some(source);
+        }
     }
 
     let device_id = DeviceId::new(config.device_id.clone()).map_err(|e| e.to_string())?;
@@ -407,11 +656,7 @@ async fn start_device(
     } else {
         GbVersion::V2022
     };
-    let transport = if config.transport.eq_ignore_ascii_case("TCP") {
-        Transport::Tcp
-    } else {
-        Transport::Udp
-    };
+    let transport = Transport::Udp;
     let channel_name = if config.channel_name.is_empty() {
         "Camera-1".to_string()
     } else {
@@ -448,8 +693,9 @@ async fn start_device(
     // 预热视频源:容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会阻塞
     // 200 OK 与首包推流,导致平台收流超时。这里在设备上线前先转好、缓存,
     // INVITE 时命中缓存瞬时加载。ffmpeg 是阻塞调用,放 spawn_blocking。
+    // 实时采集(live:)无文件可预热,跳过;仅对文件源(C 档容器)做转封装预热。
     if let Some(ref vs) = config.video_source {
-        if !vs.trim().is_empty() {
+        if !vs.trim().is_empty() && !vs.trim().starts_with("live:") {
             let vs = vs.clone();
             let prepared =
                 tokio::task::spawn_blocking(move || gb28181_simulator::prepare_video_source(&vs))
@@ -751,6 +997,8 @@ pub fn run() {
             stop_stress,
             get_metrics,
             export_report,
+            list_live_sources,
+            probe_live_source,
             start_device,
             stop_device,
             fire_alarm,

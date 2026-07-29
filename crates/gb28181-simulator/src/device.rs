@@ -249,6 +249,8 @@ impl Default for ControlState {
 
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
 struct PushSession {
+    /// 唯一会话标记，防止已结束的旧任务清理后续新会话。
+    marker: Arc<()>,
     /// push_stream 任务。
     _task: tokio::task::JoinHandle<()>,
     /// 停止信号发送端(drop 或 send 均可触发停流)。
@@ -1936,7 +1938,7 @@ impl DeviceSimulator {
 
     /// 处理 INVITE:解析平台 SDP,启动推流,回 200 OK(带本端 SDP)。
     async fn handle_invite(
-        &self,
+        self: &Arc<Self>,
         transport: &Arc<UdpTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
@@ -1970,8 +1972,15 @@ impl DeviceSimulator {
         // 启动推流任务(若配置了视频源)。
         let mut sess_guard = self.session.lock().await;
         if sess_guard.is_some() {
-            return Err(Error::Gb28181("已有活跃会话".into()));
+            let busy =
+                sip_core::SipMessage::Response(builder::response_status(req, 486, "Busy Here"));
+            transport.send_to(&busy, from).await?;
+            return Ok(true);
         }
+        // 实时设备启动可能涉及 TCC 授权和最多 5 秒首帧等待，先发 100 防止
+        // 平台在准备期间把事务误判为无响应。
+        let trying = sip_core::SipMessage::Response(builder::response_status(req, 100, "Trying"));
+        transport.send_to(&trying, from).await?;
 
         // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 TCP-ACTIVE(RFC 4571)。
         let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
@@ -1980,19 +1989,34 @@ impl DeviceSimulator {
         let fps = self.config.video_fps;
         let source: Option<Box<dyn media_rtp::VideoSource>> =
             if let Some(ref path) = self.config.video_source {
-                if let Some(input) = path.strip_prefix("live:") {
-                    // 实时采集摄像头/屏幕(把电脑当真实 IPC)。live:0 采集视频设备 0。
-                    let input = if input.is_empty() { "0" } else { input };
-                    Some(Box::new(
-                        media_rtp::LiveSource::capture(input, fps)
-                            .map_err(|e| Error::Media(format!("实时采集失败: {e}")))?,
-                    ))
+                let built: Result<Box<dyn media_rtp::VideoSource>> = if path.starts_with("live:") {
+                    // 实时源由 LiveSource 严格解析完整 URI;legacy live:0 明确映射主屏幕。
+                    media_rtp::LiveSource::capture(path, fps)
+                        .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
+                        .map_err(|e| Error::Media(format!("实时采集失败: {e}")))
                 } else {
                     // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
-                    Some(Box::new(
-                        media_rtp::FileSource::from_path_av(path, fps)
-                            .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))?,
-                    ))
+                    media_rtp::FileSource::from_path_av(path, fps)
+                        .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
+                        .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))
+                };
+                match built {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // 采集/加载失败发生在点播(INVITE)这条异步流程里,不经 start_device
+                        // 返回值。必须推 RuntimeError 事件,否则前端一片安静、只见收流超时。
+                        self.observer.on_event(common::DeviceEvent::RuntimeError {
+                            scope: "capture".into(),
+                            message: e.to_string(),
+                        });
+                        let unavailable = sip_core::SipMessage::Response(builder::response_status(
+                            req,
+                            480,
+                            "Temporarily Unavailable",
+                        ));
+                        transport.send_to(&unavailable, from).await?;
+                        return Ok(true);
+                    }
                 }
             } else {
                 self.config
@@ -2027,6 +2051,7 @@ impl DeviceSimulator {
         // 带回放控制:回放时平台可经会话内 INFO 调整倍速/暂停,直播则保持 1.0x。
         if let Some(source) = source {
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
             let control = media_rtp::PlaybackControl::new();
             // 录像下载会话(s=Download + a=downloadspeed:N):按 N 倍速推流。
             if platform_sdp.is_download() {
@@ -2036,11 +2061,18 @@ impl DeviceSimulator {
                 }
             }
             let control_task = Arc::clone(&control);
+            let simulator = Arc::clone(self);
+            let marker = Arc::new(());
+            let task_marker = Arc::clone(&marker);
             let task = tokio::spawn(async move {
+                // 确保 PushSession 已写入槽位后再允许任务结束并清理，避免启动失败竞态。
+                if start_rx.await.is_err() {
+                    return;
+                }
                 if use_tcp {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                if let Err(e) = media_rtp::push_stream_controlled(
+                let result = media_rtp::push_stream_controlled(
                     source,
                     rtp_dst,
                     ssrc,
@@ -2051,17 +2083,37 @@ impl DeviceSimulator {
                         let _ = stop_rx.await;
                     },
                 )
-                .await
-                {
-                    tracing::warn!(error=%e, "推流结束(错误)");
+                .await;
+                if let Err(error) = &result {
+                    tracing::warn!(%error, "推流结束(错误)");
+                    simulator
+                        .observer
+                        .on_event(common::DeviceEvent::RuntimeError {
+                            scope: "stream".into(),
+                            message: error.to_string(),
+                        });
+                }
+                let mut session = simulator.session.lock().await;
+                let owns_slot = session
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(&active.marker, &task_marker));
+                if owns_slot {
+                    *session = None;
+                }
+                drop(session);
+                if owns_slot {
+                    simulator.observer.on_event(common::DeviceEvent::StreamStop);
                 }
             });
             *sess_guard = Some(PushSession {
+                marker,
                 _task: task,
                 stop_tx,
                 control,
                 is_history: platform_sdp.is_playback() || platform_sdp.is_download(),
             });
+            self.observer.on_event(common::DeviceEvent::StreamStart);
+            let _ = start_tx.send(());
         }
         drop(sess_guard);
         let mode = if platform_sdp.is_download() {
@@ -2088,10 +2140,16 @@ impl DeviceSimulator {
     ) -> Result<bool> {
         let mut sess_guard = self.session.lock().await;
         let was_history = sess_guard.as_ref().map(|s| s.is_history).unwrap_or(false);
-        if let Some(session) = sess_guard.take() {
+        let had_session = if let Some(session) = sess_guard.take() {
             let _ = session.stop_tx.send(()); // 触发停流
-        }
+            true
+        } else {
+            false
+        };
         drop(sess_guard);
+        if had_session {
+            self.observer.on_event(common::DeviceEvent::StreamStop);
+        }
 
         let resp = sip_core::SipMessage::Response(builder::response_ok(req));
         transport.send_to(&resp, from).await?;
@@ -2949,6 +3007,7 @@ mod tests {
             let _ = stop_rx.await;
         });
         *sim.session.lock().await = Some(PushSession {
+            marker: Arc::new(()),
             _task: task,
             stop_tx,
             control: control.clone(),

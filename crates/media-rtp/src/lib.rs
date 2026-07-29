@@ -17,7 +17,9 @@ pub use ps::{AudioCodec, PsMuxer, VideoCodec};
 pub use pusher::{push_stream, push_stream_controlled, PlaybackControl};
 pub use rtp::{build_rtcp_sr, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
-    prepare_video_source, FileSource, Frame, LightSource, LiveSource, NoneSource, VideoSource,
+    list_live_sources, prepare_video_source, FileSource, Frame, LightSource, LiveAudioCodec,
+    LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource, LiveSourceCatalog, LiveSourceSpec,
+    LiveVideoCodec, LiveVideoProfile, NoneSource, VideoSource,
 };
 
 /// RTP 发送模式。

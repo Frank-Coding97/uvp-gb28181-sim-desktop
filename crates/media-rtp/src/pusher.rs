@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use common::Result;
+use common::{Error, Result};
 
 use crate::ps::PsMuxer;
 use crate::rtp::{RtpSender, CLOCK_HZ};
@@ -130,15 +130,33 @@ pub async fn push_stream_controlled(
     } else {
         RtpSender::new(dst, ssrc).await?
     };
-    // PSM 视频 stream_type 跟随源编码(H.264=0x1B / H.265=0x24)。
-    let mux = PsMuxer::with_video(source.codec());
+    tracing::info!(%dst, ssrc = format!("{ssrc:#x}"), use_tcp, fps, live = source.is_live(), "推流开始:已建立发送通道");
+    // PSM stream_type 跟随源编码,并按源能力稳定声明音频 ES。
+    let audio_codec = source.audio_codec();
+    let audio_frame_duration = audio_codec.frame_duration_90k();
+    let mux = if source.has_audio() {
+        PsMuxer::with_codecs(source.codec(), audio_codec)
+    } else {
+        PsMuxer::with_video(source.codec())
+    };
     let fps = fps.max(1);
     let ts_step = CLOCK_HZ / fps;
     let base_interval_us = 1_000_000f32 / fps as f32;
-    let mut timestamp: u32 = 0;
+    let mut timestamp: u32 = 0; // RTP timestamp wraps at 32 bits.
+    let mut ps_timestamp: u64 = 0; // MPEG-PS SCR/PTS uses a 33-bit clock.
+    const PS_CLOCK_MASK: u64 = 0x1_FFFF_FFFF;
+    // 实时音频使用独立 33-bit/90kHz 时钟；每个访问单元按真实帧时长推进。
+    let mut audio_timestamp: Option<u64> = None;
+
+    // 诊断计数:发出的帧数 / 关键帧数 / 字节数,退出时汇报,定位"断在第几帧"。
+    let mut frames_sent: u64 = 0;
+    let mut keyframes_sent: u64 = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut first_frame = true;
+    let mut empty_polls: u64 = 0;
 
     tokio::pin!(stop);
-    loop {
+    let result = loop {
         // 按当前倍速动态计算取帧间隔(倍速越高间隔越短);暂停时用固定轮询间隔。
         let sleep_us = if control.is_paused() {
             50_000 // 暂停:50ms 轮询等待恢复,不发送。
@@ -147,8 +165,15 @@ pub async fn push_stream_controlled(
         };
         let sleep = tokio::time::sleep(std::time::Duration::from_micros(sleep_us));
         tokio::select! {
-            _ = &mut stop => break,
+            _ = &mut stop => {
+                tracing::info!(frames_sent, keyframes_sent, bytes_sent, "推流正常停止(收到 stop/BYE)");
+                break Ok(());
+            }
             _ = sleep => {
+                if let Some(error) = source.take_error() {
+                    tracing::warn!(%error, frames_sent, "推流:实时采集后端异常停止");
+                    break Err(Error::Media(error));
+                }
                 // 处理待定拖动请求(§9.8 回放 Range 定位):跳转源游标到目标位置。
                 if let Some(permille) = control.take_seek() {
                     source.seek(permille);
@@ -157,25 +182,90 @@ pub async fn push_stream_controlled(
                     continue; // 暂停中,不取帧。
                 }
                 if let Some(frame) = source.next_frame() {
-                    // 音视频复合流:取该帧时间窗的音频包,与视频一起封进 PS。
+                    // 音视频复合流：取该视频时间窗内的完整编码音频访问单元。
                     let audio = source.next_audio();
-                    let ps = mux.mux_frame_av(&frame.data, timestamp, frame.key_frame, &audio);
-                    sender.send_frame(&ps, timestamp).await?;
+                    let audio_start_pts = audio_timestamp.map_or(ps_timestamp, |candidate| {
+                        // 33-bit PS 时钟上的模运算：恢复时若音频落后视频超过 100ms，
+                        // 重新对齐当前视频 PTS，避免静音/设备切换造成持续过期音频。
+                        let lag = ps_timestamp.wrapping_sub(candidate) & PS_CLOCK_MASK;
+                        if lag < (1_u64 << 32) && lag > u64::from(CLOCK_HZ / 10) {
+                            ps_timestamp
+                        } else {
+                            candidate
+                        }
+                    });
+                    let ps = mux.mux_frame_av_with_audio_pts(
+                        &frame.data,
+                        ps_timestamp,
+                        frame.key_frame,
+                        &audio,
+                        audio_start_pts,
+                    );
+                    if !audio.is_empty() {
+                        audio_timestamp = Some(
+                            audio_start_pts.wrapping_add(
+                                (audio.len() as u64).wrapping_mul(u64::from(audio_frame_duration)),
+                            ) & PS_CLOCK_MASK,
+                        );
+                    }
+                    if first_frame {
+                        tracing::info!(
+                            ps_bytes = ps.len(), key_frame = frame.key_frame, au_bytes = frame.data.len(),
+                            "推流:准备发送首帧"
+                        );
+                    }
+                    if let Err(e) = sender.send_frame(&ps, timestamp).await {
+                        // 关键诊断:断在发送时,报告已发多少帧——区分"一帧没发出"vs"发了一阵才断"。
+                        tracing::warn!(
+                            error = %e, frames_sent, keyframes_sent, bytes_sent,
+                            first_frame, ps_bytes = ps.len(),
+                            "推流:发送失败(TCP 对端关闭/网络错误)"
+                        );
+                        break Err(e);
+                    }
+                    if first_frame {
+                        tracing::info!("推流:首帧已成功发出");
+                        first_frame = false;
+                    }
+                    frames_sent += 1;
+                    if frame.key_frame {
+                        keyframes_sent += 1;
+                    }
+                    bytes_sent += ps.len() as u64;
+                    // 每 100 帧汇报一次心跳(约 4s@25fps),确认还在推。
+                    if frames_sent % 100 == 0 {
+                        tracing::debug!(frames_sent, keyframes_sent, bytes_sent, "推流进行中");
+                    }
                     timestamp = timestamp.wrapping_add(ts_step);
+                    ps_timestamp =
+                        ps_timestamp.wrapping_add(u64::from(ts_step)) & PS_CLOCK_MASK;
+                } else if source.is_live() {
+                    // 实时源暂时无视频帧时仍消费并丢弃音频，防止有界通道保留旧包、
+                    // 恢复画面后永久落后。下一有效帧会把音频时钟重新对齐视频 PTS。
+                    let _ = source.next_audio();
+                    audio_timestamp = None;
+                    // 采集刚启动还没攒够第一帧或发生瞬时空档时不能停流。
+                    // 时间戳不推进，下一有效帧续上。
+                    empty_polls += 1;
+                    if empty_polls % 50 == 0 {
+                        tracing::debug!(empty_polls, frames_sent, "推流:实时源暂无帧,等待采集…");
+                    }
+                    continue;
                 } else {
                     // 有限源耗尽,停流。
-                    break;
+                    tracing::info!(frames_sent, keyframes_sent, bytes_sent, "推流:有限源耗尽,正常停止");
+                    break Ok(());
                 }
             }
         }
-    }
-    Ok(())
+    };
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::FileSource;
+    use crate::source::{FileSource, Frame};
     use tokio::net::UdpSocket;
 
     fn sample_h264() -> Vec<u8> {
@@ -210,6 +300,61 @@ mod tests {
             .unwrap();
         assert!(n >= 12);
         assert_eq!(buf[0], 0x80); // RTP V=2
+
+        let _ = tx_stop.send(());
+        handle.await.unwrap().unwrap();
+    }
+
+    /// 模拟实时源:前 N 次 next_frame 返回 None(采集尚未就绪),之后持续产帧。
+    /// 用于验证 pusher 不会因实时源启动初期暂空而提前停流(live 播不出的根因)。
+    struct SlowLive {
+        warmup: u32,
+        calls: u32,
+    }
+    impl VideoSource for SlowLive {
+        fn is_live(&self) -> bool {
+            true
+        }
+        fn next_frame(&mut self) -> Option<Frame> {
+            self.calls += 1;
+            if self.calls <= self.warmup {
+                None // 采集线程还没攒够第一帧
+            } else {
+                Some(Frame {
+                    data: vec![0, 0, 0, 1, 0x65, 0x11],
+                    key_frame: true,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn 实时源启动初期暂空_不提前停流() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+
+        // 前 5 拍无帧(模拟 ffmpeg 采集预热),之后才产帧。
+        let source = Box::new(SlowLive {
+            warmup: 5,
+            calls: 0,
+        });
+        let (tx_stop, rx_stop) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            push_stream(source, rx_addr, 0x4455, 50, false, async {
+                let _ = rx_stop.await;
+            })
+            .await
+        });
+
+        // 若旧逻辑(None 即 break)仍在,warmup 期第一拍就停流,这里必超时。
+        // 修复后应在预热结束后持续收到 RTP 包。
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv(&mut buf))
+            .await
+            .expect("超时:实时源预热期被误判耗尽而停流")
+            .unwrap();
+        assert!(n >= 12);
+        assert_eq!(buf[0], 0x80);
 
         let _ = tx_stop.send(());
         handle.await.unwrap().unwrap();
