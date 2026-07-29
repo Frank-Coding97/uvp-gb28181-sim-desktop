@@ -184,7 +184,16 @@ pub fn message_xml(
 /// 为入站请求构造 200 OK 响应。按 SIP 规则回显 Via/From/To/Call-ID/CSeq
 /// (若 To 无 tag 则补一个随机 tag),用于应答平台的 OPTIONS / 简单 MESSAGE。
 pub fn response_ok(request: &sip_core::Request) -> sip_core::Response {
-    response_ok_tagged(request, &rand_token(""))
+    response_status(request, 200, "OK")
+}
+
+/// 为入站请求构造任意状态响应，并回显事务标识头。
+pub fn response_status(
+    request: &sip_core::Request,
+    status: u16,
+    reason: &str,
+) -> sip_core::Response {
+    response_status_tagged(request, status, reason, &rand_token(""))
 }
 
 /// 同 [`response_ok`],但当 To 无 tag 时用指定 `to_tag` 补(UAS 生成)。
@@ -192,6 +201,15 @@ pub fn response_ok(request: &sip_core::Request) -> sip_core::Response {
 /// 订阅场景需要:200 里的 To-tag 必须与后续对话内 NOTIFY 的 From-tag 一致,
 /// 才能与平台的订阅对话匹配,故由调用方指定同一个 tag。
 pub fn response_ok_tagged(request: &sip_core::Request, to_tag: &str) -> sip_core::Response {
+    response_status_tagged(request, 200, "OK", to_tag)
+}
+
+fn response_status_tagged(
+    request: &sip_core::Request,
+    status: u16,
+    reason: &str,
+    to_tag: &str,
+) -> sip_core::Response {
     let mut headers = Headers::new();
     for via in request.headers.get_all("Via") {
         headers.append("Via", via.to_string());
@@ -213,8 +231,8 @@ pub fn response_ok_tagged(request: &sip_core::Request, to_tag: &str) -> sip_core
         headers.append("CSeq", cseq.to_string());
     }
     sip_core::Response {
-        status: 200,
-        reason: "OK".into(),
+        status,
+        reason: reason.into(),
         headers,
         body: Vec::new(),
     }

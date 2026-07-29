@@ -48,6 +48,24 @@ pub fn ffmpeg_bin() -> Option<String> {
             .map(|o| o.status.success())
             .unwrap_or(false)
     };
+    // 0) app 包内 ffmpeg(macOS)。**关键**:Homebrew ffmpeg 在包外、不属任何 .app,
+    // 采集时被 TCC SIGABRT 崩溃。把 ffmpeg 放进主 app 的 Contents/MacOS/(与主二进制
+    // 同目录、同属 com.uvp.gb28181.desktop 这个 bundle),签名 identifier 也设成主 app,
+    // 则:摄像头 TCC 认主 app Info.plist 的 NSCameraUsageDescription;屏幕录制 TCC
+    // 按主 app 主体判定授权(用户在系统设置里勾选的正是主 app)。与主进程同主体是关键。
+    // current_exe = …/Contents/MacOS/uvp-desktop,同目录取 ffmpeg。
+    #[cfg(target_os = "macos")]
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("ffmpeg");
+            if bundled.exists() {
+                let s = bundled.to_string_lossy().into_owned();
+                if probe(&s) {
+                    return Some(s);
+                }
+            }
+        }
+    }
     // 1) PATH(终端启动 / 已配置环境)。
     if probe("ffmpeg") {
         return Some("ffmpeg".into());
@@ -206,9 +224,8 @@ pub trait VideoSource: Send {
     /// 取下一帧;返回 `None` 表示无更多帧(有限源)。循环源永不返回 None。
     fn next_frame(&mut self) -> Option<Frame>;
 
-    /// 取与"下一帧视频"同时间窗的音频包(G.711A,每包 20ms/160B)。
-    /// 默认无音频(纯视频源);含音频轨的源(FileSource)覆盖此方法。
-    /// 每次 `next_frame` 后调用一次,返回该帧期间应发送的音频分包(可为空)。
+    /// 取与当前视频帧同时间窗的完整编码音频访问单元。
+    /// 不同编码的帧大小和时长不同；实现方不得按固定字节数拆分 AAC/Opus。
     fn next_audio(&mut self) -> Vec<Vec<u8>> {
         Vec::new()
     }
@@ -216,6 +233,11 @@ pub trait VideoSource: Send {
     /// 本源是否带音频轨(决定 PS 是否声明音频 ES)。
     fn has_audio(&self) -> bool {
         false
+    }
+
+    /// 本源音频编码(决定 PSM stream_type)。默认 G.711A。
+    fn audio_codec(&self) -> crate::ps::AudioCodec {
+        crate::ps::AudioCodec::G711A
     }
 
     /// 视频编码(决定 PSM stream_type)。默认 H.264;H.265 源覆盖。
@@ -226,6 +248,23 @@ pub trait VideoSource: Send {
     /// 拖动(seek)到流的千分比位置(0..=1000)。回放 Range 定位用(§9.8)。
     /// 默认忽略(不支持定位的源如空媒体/循环灯);FileSource 覆盖为跳转帧游标。
     fn seek(&mut self, _permille: u32) {}
+
+    /// 是否为实时采集源(持续产帧,无"结束"概念)。
+    ///
+    /// **关键**:pusher 用 `next_frame()` 返回 `None` 表示"有限源已耗尽"→停流。
+    /// 但实时源(摄像头/屏幕)刚启动时,后台采集线程可能还没攒够一整帧,
+    /// 此时 `next_frame()` 也返回 `None`——若按有限源语义直接 break,会导致
+    /// "第一拍就停流、平台收流超时、又无报错"。故实时源覆盖此方法返回 true,
+    /// pusher 遇 `None` 时跳过当前拍继续等待,而非终止会话。
+    fn is_live(&self) -> bool {
+        false
+    }
+
+    /// 取出实时采集后端的终止错误。默认源没有异步后端错误。
+    /// pusher 每拍检查一次；返回错误后结束媒体会话并让上层更新状态。
+    fn take_error(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// 空媒体源:永不产帧(A 档,只维持信令)。
@@ -505,127 +544,388 @@ fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Fr
 ///
 /// ffmpeg 进程 stdout 输出 Annex B 裸流,后台线程按起始码切帧塞入队列,
 /// `next_frame()` 从队列取;队列空(采集慢于消费)时返回上一关键帧维持画面。
-pub struct LiveSource {
-    /// 帧队列接收端(后台采集线程 → 消费)。
-    rx: std::sync::mpsc::Receiver<Frame>,
-    /// ffmpeg 子进程句柄(drop 时 kill,停止采集)。
-    child: std::process::Child,
-    /// 最近一个关键帧(队列空时重复发送,避免花屏/断流)。
-    last_key: Option<Frame>,
-}
+#[path = "source_live.rs"]
+mod live;
+pub use live::{
+    list_live_sources, LiveAudioCodec, LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource,
+    LiveSourceCatalog, LiveSourceSpec, LiveVideoCodec, LiveVideoProfile,
+};
 
-impl LiveSource {
-    /// 采集指定输入设备。`input` 为平台相关设备标识:
-    /// macOS avfoundation 用 `"0"`(视频设备序号)或 `"0:0"`(视频:音频);
-    /// 屏幕用列出的 "Capture screen" 序号。`fps` 目标帧率。
+// Superseded implementation retained disabled so the surrounding user changes remain reviewable
+// while canonical live URIs use the implementation in source_live.rs.
+#[cfg(any())]
+mod obsolete_live {
+    use super::*;
+
+    /// 实时采集视频源后端模式。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LiveBackend {
+        /// 方案 B:Native 原生模式(内置 openh264 硬件/软编码 + 原生 xcap 屏幕抓取/动态渲染器,零外部 CLI 依赖)
+        Native,
+        /// 方案 A:FFmpeg 命令行子进程模式(依赖系统路径包含 ffmpeg 可执行文件)
+        FfmpegCmd,
+    }
+
+    /// 实时采集视频源。
     ///
-    /// 仅视频(音频采集/对讲另行处理)。缺 ffmpeg 返回错误。
-    pub fn capture(input: &str, fps: u32) -> Result<Self> {
-        use std::io::Read;
-        use std::process::{Command, Stdio};
+    /// 方案 B 默认激活:使用内置 `openh264` 编码器 + `xcap` 原生屏幕/摄像头捕获,
+    /// 无需在系统安装 ffmpeg 命令行工具。
+    ///
+    /// 方案 A 完整保留在 [`LiveSource::capture_ffmpeg`]:可通过 `live:ffmpeg:...` 或
+    /// 环境变量 `UVP_LIVE_BACKEND=ffmpeg` 随时切换回方案 A 对比效果。
+    pub struct LiveSource {
+        /// 帧队列接收端(后台采集线程 → 消费)。
+        rx: std::sync::mpsc::Receiver<Frame>,
+        /// 本地帧缓冲(FIFO,保持解码顺序;堆积时快进到最近关键帧)。
+        buf: std::collections::VecDeque<Frame>,
+        /// 目标帧率(用于计算缓冲上界和 last_key 重复上限)。
+        fps: u32,
+        /// 方案 A 时使用的 ffmpeg 子进程(drop 时 kill)。
+        child: Option<std::process::Child>,
+        /// 方案 B 后台采集/编码线程停止标志。
+        stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// 最近一个关键帧(队列空时短暂兜底,避免瞬时花屏)。
+        last_key: Option<Frame>,
+        /// 连续队列空的拍数计数。超过阈值后停止返回 last_key,改返回 None。
+        consecutive_empty: u32,
+    }
 
-        let ffmpeg = ffmpeg_bin()
-            .ok_or_else(|| Error::Media("实时采集需要 ffmpeg,但未找到;请安装 ffmpeg".into()))?;
+    impl LiveSource {
+        /// 采集指定输入设备。默认采用方案 B(Native openh264 + 原生捕获)。
+        /// 若 `input` 包含 `ffmpeg` 或指定环境变量 `UVP_LIVE_BACKEND=ffmpeg`,则走方案 A。
+        pub fn capture(input: &str, fps: u32) -> Result<Self> {
+            let use_ffmpeg_a = input.contains("ffmpeg")
+                || std::env::var("UVP_LIVE_BACKEND")
+                    .map(|v| v.eq_ignore_ascii_case("ffmpeg"))
+                    .unwrap_or(false);
 
-        // 平台采集输入格式。
-        let fmt = if cfg!(target_os = "macos") {
-            "avfoundation"
-        } else if cfg!(target_os = "windows") {
-            "dshow"
-        } else {
-            "v4l2"
-        };
-        let fps_s = fps.max(1).to_string();
+            if use_ffmpeg_a {
+                tracing::info!(input, "【方案 A 激活】使用外置 FFmpeg 子进程实时采集");
+                Self::capture_ffmpeg(input, fps)
+            } else {
+                tracing::info!(
+                    input,
+                    "【方案 B 激活】使用内置 Native (openh264 + 原生抓屏) 实时采集"
+                );
+                Self::capture_native(input, fps)
+            }
+        }
 
-        // 采集 → H.264 Annex B(baseline,低延迟,周期 IDR 便于点播随时进流)。
-        let mut child = Command::new(&ffmpeg)
-            .args([
-                "-f",
-                fmt,
-                "-framerate",
-                &fps_s,
-                "-i",
-                input,
-                "-an", // 仅视频
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-pix_fmt",
-                "yuv420p",
-                "-g",
-                &fps_s, // 每秒一个 IDR
-                "-f",
-                "h264",
-                "-",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| Error::Media(format!("启动 ffmpeg 采集失败: {e}")))?;
+        /// 方案 B:Native 原生模式(openh264 编码 + 原生屏幕抓取/动态视效)。
+        /// 完全零外部依赖,免安装 ffmpeg 二进制文件。
+        pub fn capture_native(input: &str, fps: u32) -> Result<Self> {
+            use openh264::encoder::Encoder;
+            use openh264::formats::{RgbSliceU8, YUVBuffer};
+            use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Media("无法获取 ffmpeg stdout".into()))?;
+            let width = 1280usize;
+            let height = 720usize;
+            let fps = fps.max(1);
 
-        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        // 后台线程:持续读 stdout,按 Annex B 起始码累积成帧后塞队列。
-        std::thread::spawn(move || {
-            let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
-            let mut chunk = [0u8; 32 * 1024];
-            loop {
-                match stdout.read(&mut chunk) {
-                    Ok(0) => break, // ffmpeg 退出
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        // 从 buf 切出完整帧(保留最后一个不完整帧)。
-                        drain_frames(&mut buf, &tx);
+            let mut encoder = Encoder::new()
+                .map_err(|e| Error::Media(format!("方案 B 初始化 openh264 编码器失败: {e}")))?;
+
+            let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+            let stop_flag = std::sync::Arc::new(AtomicBool::new(false));
+            let sf = stop_flag.clone();
+
+            // 尝试解析屏幕设备序号
+            let monitor_idx: usize = input
+                .trim_start_matches("live:")
+                .trim_start_matches("native:")
+                .parse()
+                .unwrap_or(0);
+
+            std::thread::spawn(move || {
+                let interval = std::time::Duration::from_millis(1000 / fps as u64);
+                let mut rgb_buf = vec![0u8; width * height * 3];
+                let mut frame_seq: u64 = 0;
+
+                while !sf.load(Ordering::Relaxed) {
+                    let start_time = std::time::Instant::now();
+                    frame_seq += 1;
+
+                    // 尝试用 xcap 抓取原生屏幕图像
+                    let captured = xcap::Monitor::all().ok().and_then(|monitors| {
+                        let m = monitors.get(monitor_idx).or_else(|| monitors.first())?;
+                        let img = m.capture_image().ok()?;
+                        // 将捕获图片转换并调整分辨率至 1280x720
+                        let resized = image::imageops::resize(
+                            &img,
+                            width as u32,
+                            height as u32,
+                            image::imageops::FilterType::Triangle,
+                        );
+                        Some(resized.into_raw()) // RGBA 字节流 (width * height * 4)
+                    });
+
+                    if let Some(rgba_raw) = captured {
+                        // RGBA -> RGB24
+                        for i in 0..(width * height) {
+                            rgb_buf[i * 3] = rgba_raw[i * 4];
+                            rgb_buf[i * 3 + 1] = rgba_raw[i * 4 + 1];
+                            rgb_buf[i * 3 + 2] = rgba_raw[i * 4 + 2];
+                        }
+                    } else {
+                        // 屏幕不可用或受限时:绘制原生动态时钟/实时高清画面(保证流100%不间断)
+                        let now_str = chrono_str();
+                        render_dynamic_testcard(&mut rgb_buf, width, height, frame_seq, &now_str);
                     }
-                    Err(_) => break,
+
+                    // openh264 编码:RGB24 -> YUVBuffer -> Bitstream
+                    let yuv =
+                        YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb_buf, (width, height)));
+                    if let Ok(bitstream) = encoder.encode(&yuv) {
+                        let frame_bytes = bitstream.to_vec();
+                        if !frame_bytes.is_empty() {
+                            let is_key = frame_bytes.windows(4).any(|w| w == [0, 0, 0, 1])
+                                && frame_bytes.iter().any(|&b| (b & 0x1f) == 5);
+                            let _ = tx.send(Frame {
+                                data: frame_bytes,
+                                key_frame: is_key,
+                            });
+                        }
+                    }
+
+                    let elapsed = start_time.elapsed();
+                    if elapsed < interval {
+                        std::thread::sleep(interval - elapsed);
+                    }
+                }
+            });
+
+            Ok(LiveSource {
+                rx,
+                buf: std::collections::VecDeque::new(),
+                fps,
+                child: None,
+                stop_flag,
+                last_key: None,
+                consecutive_empty: 0,
+            })
+        }
+
+        /// 方案 A:FFmpeg 命令行子进程模式(依赖系统 ffmpeg 二进制文件)。
+        /// 完整保留原有代码逻辑,方便切换对比。
+        pub fn capture_ffmpeg(input: &str, fps: u32) -> Result<Self> {
+            use std::io::Read;
+            use std::process::{Command, Stdio};
+
+            let ffmpeg = ffmpeg_bin().ok_or_else(|| {
+                Error::Media(
+                    "实时采集[方案 A]需要系统 ffmpeg 命令,但未找到;请安装 ffmpeg 或使用默认方案 B"
+                        .into(),
+                )
+            })?;
+
+            let fmt = if cfg!(target_os = "macos") {
+                "avfoundation"
+            } else if cfg!(target_os = "windows") {
+                "dshow"
+            } else {
+                "v4l2"
+            };
+            let fps_s = fps.max(1).to_string();
+            let clean_input = input
+                .trim_start_matches("live:")
+                .trim_start_matches("ffmpeg:");
+            let input_arg = if clean_input.is_empty() {
+                "0"
+            } else {
+                clean_input
+            };
+
+            let vf_scale = "scale=min(1280\\,iw):min(720\\,ih):force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2";
+            let mut child = Command::new(&ffmpeg)
+                .args([
+                    "-f",
+                    fmt,
+                    "-framerate",
+                    &fps_s,
+                    "-i",
+                    input_arg,
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-x264-params",
+                    "slices=1:sliced-threads=0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-vf",
+                    vf_scale,
+                    "-crf",
+                    "28",
+                    "-g",
+                    &fps_s,
+                    "-f",
+                    "h264",
+                    "-",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| Error::Media(format!("方案 A 启动 ffmpeg 采集失败: {e}")))?;
+
+            let mut stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::Media("无法获取 ffmpeg stdout".into()))?;
+
+            let err_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let err_handle = child.stderr.take().map(|mut se| {
+                let eb = err_buf.clone();
+                std::thread::spawn(move || {
+                    let mut s = String::new();
+                    let _ = se.read_to_string(&mut s);
+                    if let Ok(mut g) = eb.lock() {
+                        *g = s;
+                    }
+                })
+            });
+
+            let got_data = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+            let gd = got_data.clone();
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+                let mut chunk = [0u8; 32 * 1024];
+                loop {
+                    match stdout.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            gd.store(true, Ordering::Relaxed);
+                            buf.extend_from_slice(&chunk[..n]);
+                            drain_frames(&mut buf, &tx);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let take_err = |handle: Option<std::thread::JoinHandle<()>>| -> String {
+                if let Some(h) = handle {
+                    let _ = h.join();
+                }
+                let raw = err_buf.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                let tail: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+                tail.iter()
+                    .rev()
+                    .take(3)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !got_data.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|e| Error::Media(format!("等待 ffmpeg 采集失败: {e}")))?
+                {
+                    return Err(Error::Media(format!(
+                        "方案 A 实时采集启动失败(ffmpeg 退出:{status}):{}",
+                        take_err(err_handle)
+                    )));
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err(Error::Media(format!(
+                        "方案 A 实时采集 5s 内无数据(检查权限或设备 '{clean_input}'):{}",
+                        take_err(err_handle)
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            Ok(LiveSource {
+                rx,
+                buf: std::collections::VecDeque::new(),
+                fps,
+                child: Some(child),
+                stop_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_key: None,
+                consecutive_empty: 0,
+            })
+        }
+    }
+
+    impl Drop for LiveSource {
+        fn drop(&mut self) {
+            self.stop_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill(); // 停止方案 A 子进程
+            }
+        }
+    }
+
+    impl VideoSource for LiveSource {
+        fn is_live(&self) -> bool {
+            true
+        }
+
+        fn next_frame(&mut self) -> Option<Frame> {
+            // 先把采集线程新产的帧全部收进本地缓冲(FIFO,保持解码顺序)。
+            while let Ok(f) = self.rx.try_recv() {
+                self.buf.push_back(f);
+            }
+            // 有界快进:缓冲堆积过多(采集短暂快于推流)时,丢到最近一个关键帧起点,
+            // 既降延迟又保证从 IDR 续帧、绝不把关键帧连同 SPS/PPS 一起丢掉(否则平台解不出图)。
+            let cap = (self.fps.max(1) * 3) as usize;
+            if self.buf.len() > cap {
+                if let Some(idx) = self.buf.iter().rposition(|f| f.key_frame) {
+                    self.buf.drain(..idx);
                 }
             }
-        });
-
-        Ok(LiveSource {
-            rx,
-            child,
-            last_key: None,
-        })
-    }
-}
-
-impl Drop for LiveSource {
-    fn drop(&mut self) {
-        let _ = self.child.kill(); // 停止采集,释放摄像头
-    }
-}
-
-impl VideoSource for LiveSource {
-    fn next_frame(&mut self) -> Option<Frame> {
-        // 取队列里最新可用帧;为避免积压延迟,尽量取到最近一帧。
-        let mut frame = None;
-        while let Ok(f) = self.rx.try_recv() {
-            frame = Some(f);
-        }
-        if let Some(f) = frame {
-            if f.key_frame {
-                self.last_key = Some(f.clone());
+            if let Some(f) = self.buf.pop_front() {
+                self.consecutive_empty = 0; // 有新帧,重置空计数
+                if f.key_frame {
+                    self.last_key = Some(f.clone());
+                }
+                Some(f)
+            } else {
+                self.consecutive_empty += 1;
+                // 队列暂空:最多允许 last_key 兜底 2 拍(≈80ms@25fps),
+                // 超过后返回 None 让 pusher 跳过本拍。
+                // 目的:避免采集慢于推流时无限重复同一帧,导致平台判定流异常关连接。
+                let max_repeat = (self.fps.max(1) / 12).max(2);
+                if self.consecutive_empty <= max_repeat {
+                    self.last_key.clone()
+                } else {
+                    None
+                }
             }
-            Some(f)
-        } else {
-            // 队列暂空:重复最近关键帧维持画面(实时源不循环文件)。
-            self.last_key.clone()
         }
+    }
+}
+
+trait FrameSender {
+    fn send_frame(&self, frame: Frame);
+}
+
+impl FrameSender for std::sync::mpsc::Sender<Frame> {
+    fn send_frame(&self, frame: Frame) {
+        let _ = self.send(frame);
+    }
+}
+
+impl FrameSender for std::sync::mpsc::SyncSender<Frame> {
+    fn send_frame(&self, frame: Frame) {
+        let _ = self.try_send(frame);
     }
 }
 
 /// 从缓冲区切出完整 H.264 访问单元并发送;保留尾部不完整数据。
-/// 以"下一个 SPS(type 7)或非连续 IDR 起点"作帧边界的简化实现:
-/// 每遇到一个 AUD/SPS 或新的 VCL 起点就切一帧。
-fn drain_frames(buf: &mut Vec<u8>, tx: &std::sync::mpsc::Sender<Frame>) {
+/// 关键修复:只有包含 VCL NAL(type 1/5)的访问单元才发出,
+/// 纯 SPS+PPS 片段（等待 IDR 的前缀）保留在缓冲区,不提前发出。
+/// 否则缓冲末尾恰好以 IDR 起始码结束时,SPS+PPS 会被单独发出为"关键帧",
+/// 导致平台收到 332/332 全是无效的纯头部碎片而关闭连接。
+fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
     // 找所有起始码位置。
     let mut starts = Vec::new();
     let mut i = 0;
@@ -640,29 +940,33 @@ fn drain_frames(buf: &mut Vec<u8>, tx: &std::sync::mpsc::Sender<Frame>) {
     if starts.len() < 2 {
         return; // 不足两个起始码,等更多数据
     }
-    // 按 VCL slice(type 1/5)为帧边界:遇到含 VCL 的 NAL 后,下一个 VCL 起点切帧。
-    // 简化:把 [start[k], start[k+1]) 作为一个 NAL,累积到遇到新 VCL 且已有 VCL。
+
+    let last = *starts.last().unwrap();
+    let complete = &buf[..last];
+    let mut positions: Vec<usize> = starts.iter().copied().filter(|&p| p < last).collect();
+    positions.push(last);
+
     let mut cur: Vec<u8> = Vec::new();
     let mut cur_key = false;
     let mut has_vcl = false;
-    // 保留最后一个起始码之后的数据(可能不完整)。
-    let last = *starts.last().unwrap();
-    let complete = &buf[..last];
-    // 重新在 complete 上切 NAL。
-    let mut positions: Vec<usize> = starts.iter().copied().filter(|&p| p < last).collect();
-    positions.push(last);
+    // 记录最后一次成功发送帧之后的 buf 位置,只 drain 到这里。
+    let mut drained_to: usize = 0;
+
     for w in positions.windows(2) {
         let nal = &complete[w[0]..w[1]];
         let hdr_off = if nal.len() >= 4 && nal[2] == 0 { 4 } else { 3 };
         let nal_type = nal.get(hdr_off).map(|b| b & 0x1f).unwrap_or(0);
         let is_vcl = nal_type == 1 || nal_type == 5;
         if is_vcl && has_vcl {
-            let _ = tx.send(Frame {
+            // 当前积累的 AU 含 VCL,可以安全发出。
+            tx.send_frame(Frame {
                 data: std::mem::take(&mut cur),
                 key_frame: cur_key,
             });
             cur_key = false;
             has_vcl = false;
+            // 已发送到 w[0](下一 NAL 的起始位置)之前的所有数据。
+            drained_to = w[0];
         }
         if nal_type == 5 || nal_type == 7 || nal_type == 8 {
             cur_key = true;
@@ -672,14 +976,20 @@ fn drain_frames(buf: &mut Vec<u8>, tx: &std::sync::mpsc::Sender<Frame>) {
         }
         cur.extend_from_slice(nal);
     }
-    if !cur.is_empty() {
-        let _ = tx.send(Frame {
+
+    // 只有 cur 包含 VCL 才发尾部帧;纯 SPS+PPS（等待 IDR）保留在 buf 中。
+    if has_vcl && !cur.is_empty() {
+        tx.send_frame(Frame {
             data: cur,
             key_frame: cur_key,
         });
+        drained_to = last;
     }
-    // 丢弃已处理部分,保留尾部不完整帧。
-    buf.drain(..last);
+
+    // 只 drain 已确实发出的部分,未发出的 SPS+PPS 保留供下次拼接。
+    if drained_to > 0 {
+        buf.drain(..drained_to);
+    }
 }
 
 #[cfg(test)]
@@ -820,5 +1130,71 @@ mod tests {
         let mut s = LightSource::new(1, 25); // 极低码率 → 命中 64 字节下限
         let f = s.next_frame().unwrap();
         assert_eq!(f.data.len(), 64 + 5);
+    }
+
+    /// 回归测试:缓冲区末尾以 IDR 起始码结束时,SPS+PPS 不得被单独发出。
+    /// 旧实现会把 SPS+PPS 作为"关键帧"提前发出,导致平台收到 332/332 无效头部碎片关连接。
+    #[test]
+    fn drain_frames_缓冲末尾为_idr_起始码时_sps_pps_不单独发出() {
+        use std::sync::mpsc;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00]); // SPS(7)
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce]); // PPS(8)
+        buf.extend_from_slice(&[0, 0, 0, 1]); // IDR 起始码(数据未到)
+        let (tx, rx) = mpsc::channel::<Frame>();
+        drain_frames(&mut buf, &tx);
+        drop(tx);
+        let frames: Vec<Frame> = rx.into_iter().collect();
+        assert_eq!(
+            frames.len(),
+            0,
+            "SPS+PPS 不构成完整 AU,不应发出,实际发出 {} 帧",
+            frames.len()
+        );
+        assert!(!buf.is_empty(), "SPS+PPS+IDR起始码应保留在 buf");
+    }
+}
+
+#[cfg(any())]
+#[allow(clippy::items_after_test_module)]
+fn chrono_str() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let hours = (secs / 3600 % 24) + 8; // UTC+8
+    let mins = secs / 60 % 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours % 24, mins, s)
+}
+
+/// 绘制高画质动态测试卡与物理运动画面(用于受限/无界面环境下稳定输出 H.264 视频流)
+#[cfg(any())]
+#[allow(clippy::items_after_test_module)]
+fn render_dynamic_testcard(buf: &mut [u8], width: usize, height: usize, seq: u64, _now_str: &str) {
+    let t = seq as f64 * 0.05;
+    let cx = (width as f64 * 0.5 + (t * 2.0).cos() * (width as f64 * 0.35)) as usize;
+    let cy = (height as f64 * 0.5 + (t * 1.5).sin() * (height as f64 * 0.35)) as usize;
+    let radius = 60usize;
+
+    for y in 0..height {
+        let r_val = ((y as f64 / height as f64 + (t * 0.3).sin()) * 128.0 + 64.0) as u8;
+        for x in 0..width {
+            let g_val = ((x as f64 / width as f64 + (t * 0.5).cos()) * 128.0 + 64.0) as u8;
+            let b_val = (((x + y) as f64 / (width + height) as f64) * 200.0) as u8;
+
+            let idx = (y * width + x) * 3;
+            let dx = x.abs_diff(cx);
+            let dy = y.abs_diff(cy);
+            if dx * dx + dy * dy <= radius * radius {
+                buf[idx] = 255;
+                buf[idx + 1] = 230;
+                buf[idx + 2] = 50;
+            } else {
+                buf[idx] = r_val;
+                buf[idx + 1] = g_val;
+                buf[idx + 2] = b_val;
+            }
+        }
     }
 }

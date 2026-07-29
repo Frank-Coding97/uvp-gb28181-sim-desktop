@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 单设备联调控制台(UC-1),高保真对齐参考原型 frost-blue:
 // 顶部 4 指标卡 + 双栏配置卡(SIP 服务器 / 设备身份)。
-import { ref, onMounted, onUnmounted, onActivated, computed, inject, type Ref } from "vue";
+import { ref, onMounted, onUnmounted, onActivated, computed } from "vue";
 import { NButton, useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -19,7 +19,11 @@ async function pickVideoSource() {
         { name: "视频", extensions: ["h264", "264", "h265", "hevc", "mp4", "flv", "mkv", "mov"] },
       ],
     });
-    if (typeof picked === "string") form.value.video_source = picked;
+    if (typeof picked === "string") {
+      mediaMode.value = "file";
+      form.value.video_source = picked;
+      probeState.value = null;
+    }
   } catch (e) {
     message.error("选择文件失败:" + String(e));
   }
@@ -28,24 +32,295 @@ async function pickVideoSource() {
 // 平台连接参数(server_host/port/domain/password/transport)来自顶栏全局平台档案,
 // 本页只管设备自身参数(设备 ID/版本/通道/视频源/模板)。
 import { usePlatform } from "../platform";
+import { useDevice } from "../device";
 const { active: activePlatform } = usePlatform();
 
-const form = ref({
-  device_id: "35020000001310000001",
-  gb_version: "2022",
-  channel_name: "Camera-1",
-  video_source: "",
-  catalog_template: "",
+// 设备配置/状态/注册逻辑来自共享 store(与顶栏共用同一份)。
+const {
+  form, startDisabled, stopDisabled, canReport,
+  startDevice: storeStart, stopDevice: storeStop, reconcile,
+} = useDevice();
+
+type MediaMode = "none" | "file" | "camera" | "screen";
+type ScreenCodec = "h264" | "h265";
+type AudioCodec = "g711a" | "g711u" | "aac" | "opus";
+function isAudioCodec(value: string): value is AudioCodec {
+  return value === "g711a" || value === "g711u" || value === "aac" || value === "opus";
+}
+type ScreenAudioSource = "none" | "system" | `microphone:${number}`;
+const SCREEN_RESOLUTIONS = [
+  { value: "640x360", label: "640 × 360（360p）" },
+  { value: "640x480", label: "640 × 480（标清 4:3）" },
+  { value: "1280x720", label: "1280 × 720（720p）" },
+  { value: "1920x1080", label: "1920 × 1080（1080p）" },
+  { value: "2560x1440", label: "2560 × 1440（2K）" },
+  { value: "3840x2160", label: "3840 × 2160（4K）" },
+] as const;
+const DEFAULT_SCREEN_PROFILE = {
+  width: 1280,
+  height: 720,
+  bitrateKbps: 2500,
+  codec: "h264" as const,
+};
+const MIN_SCREEN_DIMENSION = 160;
+const MAX_SCREEN_LONG_SIDE = 3840;
+const MAX_SCREEN_SHORT_SIDE = 2160;
+const MIN_SCREEN_BITRATE_KBPS = 128;
+const MAX_SCREEN_BITRATE_KBPS = 20_000;
+
+interface LiveAvDevice { index: number; name: string; }
+interface LiveScreenDevice {
+  display_id: number; width: number; height: number; name: string; uri: string;
+}
+interface LiveSourceCatalog {
+  ffmpeg_available: boolean;
+  aac_available: boolean;
+  opus_available: boolean;
+  screens: LiveScreenDevice[];
+  cameras: LiveAvDevice[];
+  microphones: LiveAvDevice[];
+  screen_error: string | null;
+  avfoundation_error: string | null;
+}
+interface LiveProbeResult {
+  uri: string;
+  video_ready: boolean;
+  audio_requested: boolean;
+  audio_ready: boolean | null;
+  message: string;
+}
+type ProbeState = { kind: "loading" | "success" | "warning" | "error"; message: string };
+
+interface ParsedCameraSource {
+  videoIndex: number;
+  audio: string;
+  audioCodec: AudioCodec;
+}
+interface ParsedScreenSource {
+  displayId: number;
+  audio: ScreenAudioSource;
+  audioCodec: AudioCodec;
+  width: number;
+  height: number;
+  bitrateKbps: number;
+  codec: ScreenCodec;
+}
+
+function parseCameraSource(source: string): ParsedCameraSource | null {
+  const match = source.match(/^live:camera:(\d+)\?(.+)$/);
+  if (!match) return null;
+  const videoIndex = Number(match[1]);
+  const params = new URLSearchParams(match[2]);
+  const audio = params.get("audio");
+  const audioCodec = params.get("audio_codec") ?? "g711a";
+  if (!Number.isSafeInteger(videoIndex) || videoIndex < 0 ||
+      (audio !== "none" && !/^\d+$/.test(audio ?? "")) ||
+      !isAudioCodec(audioCodec)) return null;
+  return { videoIndex, audio: audio!, audioCodec };
+}
+
+function parseScreenNumber(value: string | null, fallback: number): number {
+  if (value === null) return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseScreenSource(source: string): ParsedScreenSource | null {
+  const match = source.match(/^live:screen:(\d+)\?(.+)$/);
+  if (!match) return null;
+  const displayId = Number(match[1]);
+  if (!Number.isSafeInteger(displayId) || displayId <= 0) return null;
+  const params = new URLSearchParams(match[2]);
+  const audio = params.get("audio");
+  const audioCodec = params.get("audio_codec") ?? "g711a";
+  const codec = params.get("codec");
+  const validAudio = audio === "system" || audio === "none" || /^microphone:\d+$/.test(audio ?? "");
+  if (!validAudio ||
+      !isAudioCodec(audioCodec) ||
+      (codec !== null && codec !== "h264" && codec !== "h265")) return null;
+  return {
+    displayId,
+    audio: audio as ScreenAudioSource,
+    audioCodec,
+    width: parseScreenNumber(params.get("width"), DEFAULT_SCREEN_PROFILE.width),
+    height: parseScreenNumber(params.get("height"), DEFAULT_SCREEN_PROFILE.height),
+    bitrateKbps: parseScreenNumber(params.get("bitrate"), DEFAULT_SCREEN_PROFILE.bitrateKbps),
+    codec: codec === "h265" ? "h265" : "h264",
+  };
+}
+
+const initialSource = form.value.video_source.trim();
+const cameraSource = parseCameraSource(initialSource);
+const screenSource = parseScreenSource(initialSource);
+const mediaMode = ref<MediaMode>(
+  cameraSource ? "camera"
+    : screenSource || initialSource === "live:0" || initialSource === "live:ffmpeg:0" ? "screen"
+      : initialSource ? "file" : "none"
+);
+const selectedCameraIndex = ref<number | null>(cameraSource?.videoIndex ?? null);
+const selectedMicrophone = ref(cameraSource?.audio ?? "none");
+const selectedCameraAudioCodec = ref<AudioCodec>(cameraSource?.audioCodec ?? "g711a");
+const selectedDisplayId = ref<number | null>(screenSource?.displayId ?? null);
+const selectedScreenAudio = ref<ScreenAudioSource>(screenSource?.audio ?? "none");
+const selectedScreenAudioCodec = ref<AudioCodec>(screenSource?.audioCodec ?? "g711a");
+const selectedScreenWidth = ref(screenSource?.width ?? DEFAULT_SCREEN_PROFILE.width);
+const selectedScreenHeight = ref(screenSource?.height ?? DEFAULT_SCREEN_PROFILE.height);
+const selectedScreenResolution = ref(`${selectedScreenWidth.value}x${selectedScreenHeight.value}`);
+const selectedScreenBitrate = ref(screenSource?.bitrateKbps ?? DEFAULT_SCREEN_PROFILE.bitrateKbps);
+const selectedScreenCodec = ref<ScreenCodec>(screenSource?.codec ?? DEFAULT_SCREEN_PROFILE.codec);
+const liveCatalog = ref<LiveSourceCatalog>({
+  ffmpeg_available: false,
+  aac_available: false,
+  opus_available: false,
+  screens: [],
+  cameras: [],
+  microphones: [],
+  screen_error: null,
+  avfoundation_error: null,
+});
+const sourceLoading = ref(false);
+const probeState = ref<ProbeState | null>(null);
+
+function audioCodecAvailable(codec: AudioCodec): boolean {
+  if (codec === "aac") return liveCatalog.value.aac_available;
+  if (codec === "opus") return liveCatalog.value.opus_available;
+  return true;
+}
+
+const selectedLiveAudioCodecAvailable = computed(() => {
+  if (mediaMode.value === "camera") {
+    return selectedMicrophone.value === "none" ||
+      audioCodecAvailable(selectedCameraAudioCodec.value);
+  }
+  if (mediaMode.value === "screen") {
+    return selectedScreenAudio.value === "none" ||
+      audioCodecAvailable(selectedScreenAudioCodec.value);
+  }
+  return true;
+});
+const registrationDisabled = computed(() =>
+  startDisabled.value ||
+  ((mediaMode.value === "camera" || mediaMode.value === "screen") &&
+    !selectedLiveAudioCodecAvailable.value)
+);
+
+const screenResolutionOptions = computed(() => {
+  const current = selectedScreenResolution.value;
+  if (SCREEN_RESOLUTIONS.some((item) => item.value === current)) return SCREEN_RESOLUTIONS;
+  return [{ value: current, label: `${selectedScreenWidth.value} × ${selectedScreenHeight.value}（已有配置）` }, ...SCREEN_RESOLUTIONS];
 });
 
-// 设备状态由常驻的 App.vue 统一维护并 provide,这里 inject 共享同一份,
-// 避免路由切换导致本页状态与顶栏胶囊分叉(注册后离开再回来两处状态不一致)。
-type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
-const deviceState = inject<Ref<DState>>("deviceState", ref<DState>("Disconnected"));
-const startedAt = inject<Ref<number | null>>("deviceStartedAt", ref<number | null>(null));
-const uptime = ref("--:--:--");
-let timer: number | null = null;
+function applyScreenResolution() {
+  const [width, height] = selectedScreenResolution.value.split("x").map(Number);
+  selectedScreenWidth.value = width;
+  selectedScreenHeight.value = height;
+  syncLiveSourceUri();
+}
 
+const screenProfileValidationError = computed(() => {
+  const width = selectedScreenWidth.value;
+  const height = selectedScreenHeight.value;
+  const bitrateKbps = selectedScreenBitrate.value;
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height)) {
+    return "分辨率必须是整数";
+  }
+  if (width % 2 !== 0 || height % 2 !== 0) {
+    return "分辨率宽高必须为偶数";
+  }
+  if (width < MIN_SCREEN_DIMENSION || height < MIN_SCREEN_DIMENSION) {
+    return `分辨率单边不能小于 ${MIN_SCREEN_DIMENSION}`;
+  }
+  if (Math.max(width, height) > MAX_SCREEN_LONG_SIDE || Math.min(width, height) > MAX_SCREEN_SHORT_SIDE) {
+    return "分辨率超过 OpenH264 支持的 3840×2160 边界";
+  }
+  if (!Number.isSafeInteger(bitrateKbps) || bitrateKbps < MIN_SCREEN_BITRATE_KBPS || bitrateKbps > MAX_SCREEN_BITRATE_KBPS) {
+    return `码率必须在 ${MIN_SCREEN_BITRATE_KBPS}–${MAX_SCREEN_BITRATE_KBPS} kbps 之间`;
+  }
+  if (selectedScreenCodec.value !== "h264" && selectedScreenCodec.value !== "h265") {
+    return "编码格式必须为 H.264 或 H.265";
+  }
+  return null;
+});
+const screenProfileValid = computed(() => screenProfileValidationError.value === null);
+
+function syncLiveSourceUri() {
+  probeState.value = null;
+  if (mediaMode.value === "camera") {
+    form.value.video_source = selectedCameraIndex.value === null
+      ? ""
+      : `live:camera:${selectedCameraIndex.value}?audio=${selectedMicrophone.value}&audio_codec=${selectedCameraAudioCodec.value}`;
+  } else if (mediaMode.value === "screen") {
+    form.value.video_source = selectedDisplayId.value === null || !screenProfileValid.value
+      ? ""
+      : `live:screen:${selectedDisplayId.value}?audio=${selectedScreenAudio.value}&audio_codec=${selectedScreenAudioCodec.value}&width=${selectedScreenWidth.value}&height=${selectedScreenHeight.value}&bitrate=${selectedScreenBitrate.value}&codec=${selectedScreenCodec.value}`;
+  }
+}
+
+function setMediaMode(mode: MediaMode) {
+  mediaMode.value = mode;
+  probeState.value = null;
+  if (mode === "none") {
+    form.value.video_source = "";
+  } else if (mode === "file") {
+    if (form.value.video_source.startsWith("live:")) form.value.video_source = "";
+  } else {
+    syncLiveSourceUri();
+  }
+}
+
+async function refreshLiveSources(notify = true) {
+  sourceLoading.value = true;
+  probeState.value = null;
+  try {
+    const catalog = await invoke<LiveSourceCatalog>("list_live_sources");
+    liveCatalog.value = catalog;
+    if (selectedCameraIndex.value === null) {
+      selectedCameraIndex.value = catalog.cameras[0]?.index ?? null;
+    }
+    if (selectedDisplayId.value === null) {
+      selectedDisplayId.value = catalog.screens[0]?.display_id ?? null;
+    }
+    if (mediaMode.value === "camera" || mediaMode.value === "screen") syncLiveSourceUri();
+    if (notify) message.success("采集设备列表已刷新");
+  } catch (e) {
+    probeState.value = { kind: "error", message: `设备枚举失败：${String(e)}` };
+  } finally {
+    sourceLoading.value = false;
+  }
+}
+
+const canProbeSource = computed(() =>
+  !sourceLoading.value && !startDisabled.value && selectedLiveAudioCodecAvailable.value &&
+  (mediaMode.value === "camera" || mediaMode.value === "screen") &&
+  (mediaMode.value !== "screen" || screenProfileValid.value) &&
+  form.value.video_source.startsWith("live:")
+);
+
+const sourceSummary = computed(() => {
+  if (mediaMode.value === "none") return "不发送媒体，只进行 SIP 信令联调";
+  if (mediaMode.value === "file") return form.value.video_source || "尚未选择视频文件";
+  if (mediaMode.value === "screen" && screenProfileValidationError.value) {
+    return `屏幕参数无效：${screenProfileValidationError.value}`;
+  }
+  return form.value.video_source || "尚未选择可用设备";
+});
+
+async function probeLiveSource() {
+  if (!canProbeSource.value) return;
+  probeState.value = { kind: "loading", message: "正在启动采集并等待音视频数据…" };
+  try {
+    const result = await invoke<LiveProbeResult>("probe_live_source", {
+      uri: form.value.video_source,
+    });
+    const ready = result.video_ready && (!result.audio_requested || result.audio_ready === true);
+    probeState.value = {
+      kind: ready ? "success" : "warning",
+      message: result.message,
+    };
+  } catch (e) {
+    probeState.value = { kind: "error", message: `采集测试失败：${String(e)}` };
+  }
+}
 
 // OSD 配置状态:反映**平台下发的 OSD 配置命令**(国标 A.2.3.2.11),设备已按其设置。
 // 非本地随意填写——osd_config 事件由后端在收到平台 DeviceConfig+OSDConfig 时推来。
@@ -56,64 +331,19 @@ const now = ref(new Date().toLocaleString("zh-CN", { hour12: false }));
 let osdTimer: number | null = null;
 let unlistenOsd: (() => void) | null = null;
 
-const stateMeta = computed(() => {
-  switch (deviceState.value) {
-    case "Registering": return { text: "注册中", color: "var(--warning)" };
-    case "Registered":  return { text: "已注册", color: "var(--success)" };
-    case "InCall":      return { text: "推流中", color: "var(--accent)" };
-    case "Failed":      return { text: "注册失败", color: "var(--error)" };
-    default:            return { text: "未连接", color: "var(--text-tertiary)" };
-  }
-});
-// 引擎里是否存在设备实例(与状态灯解耦):只要设备后台在跑(哪怕在重试注册),
-// 就应允许"注销"停止它。启动成功即置 true,stop/引擎对账为空时置 false。
-const deviceLive = ref(false);
-// "注册上线"禁用:设备实例存在时禁用(避免重复启动)。
-const startDisabled = computed(() => deviceLive.value);
-// "注销"禁用:设备实例不存在时禁用。注册失败/重试中设备仍在跑,注销可点。
-const stopDisabled = computed(() => !deviceLive.value);
-const canReport = computed(() => deviceState.value === "Registered" || deviceState.value === "InCall");
-
-function fmtUptime() {
-  if (!startedAt.value) { uptime.value = "--:--:--"; return; }
-  const s = Math.floor((Date.now() - startedAt.value) / 1000);
-  const h = String(Math.floor(s / 3600)).padStart(2, "0");
-  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-  const ss = String(s % 60).padStart(2, "0");
-  uptime.value = `${h}:${m}:${ss}`;
-}
-
+// 页面内注册/注销:走 store,结果用本页 message 提示(顶栏也可操作同一台设备)。
 async function startDevice() {
-  try {
-    const p = activePlatform.value;
-    if (!p) { message.error("请先在顶栏配置目标平台"); return; }
-    // 合并全局平台参数 + 本页设备参数。
-    const config = {
-      server_host: p.server_host, server_port: p.server_port,
-      server_domain: p.server_domain, password: p.password, transport: p.transport,
-      signaling_encoding: p.signaling_encoding ?? "GB18030",
-      ...form.value,
-      video_source: form.value.video_source.trim() || null,
-    };
-    const msg = await invoke<string>("start_device", { config });
-    // 设备实例已在后台运行(可能仍在注册/重试),允许注销。
-    deviceLive.value = true;
-    message.success(msg);
-  } catch (e) {
-    // 启动本身失败(如配置非法):后端未留下实例,保持可重新启动。
-    message.error(String(e));
-    deviceLive.value = false;
-    deviceState.value = "Failed";
+  if (!selectedLiveAudioCodecAvailable.value &&
+      (mediaMode.value === "camera" || mediaMode.value === "screen")) {
+    message.error("当前内嵌 FFmpeg 不支持所选音频编码，请改用 G.711A/G.711U");
+    return;
   }
+  const r = await storeStart(activePlatform.value);
+  if (r.ok) message.success(r.msg); else message.error(r.msg);
 }
 async function stopDevice() {
-  try {
-    await invoke<string>("stop_device");
-    deviceLive.value = false;
-    deviceState.value = "Disconnected";
-    startedAt.value = null;
-    message.info("设备已停止");
-  } catch (e) { message.error(String(e)); }
+  const r = await storeStop();
+  if (r.ok) message.info(r.msg); else message.error(r.msg);
 }
 async function fireAlarm() {
   try { message.success(await invoke<string>("fire_alarm", { description: "移动侦测报警" })); }
@@ -321,7 +551,6 @@ onMounted(async () => {
     // 展开态锚在原条目上:新条目插到头部后,展开索引下移一位。
     if (expandedTrace.value !== null) expandedTrace.value += 1;
   });
-  timer = window.setInterval(fmtUptime, 1000);
   poseTimer = window.setInterval(poseTick, 60);
   osdTimer = window.setInterval(() => { now.value = new Date().toLocaleString("zh-CN", { hour12: false }); }, 1000);
   // 订阅平台下发的 OSD 配置命令(国标 A.2.3.2.11)。
@@ -350,6 +579,7 @@ onMounted(async () => {
       progHideTimer = window.setTimeout(() => { progress.value = null; }, 3000);
     }
   });
+  await refreshLiveSources(false);
 });
 onUnmounted(() => {
   unlistenTrace?.();
@@ -360,37 +590,15 @@ onUnmounted(() => {
   if (progHideTimer) clearTimeout(progHideTimer);
   unlistenPreset?.();
   unlistenOsd?.();
-  if (timer) clearInterval(timer);
   if (poseTimer) clearInterval(poseTimer);
   if (osdTimer) clearInterval(osdTimer);
   if (ptzStopTimer) clearTimeout(ptzStopTimer);
 });
 
-// keep-alive 激活时与引擎对账:以引擎真实状态为准同步 deviceLive(避免切页后按钮态错乱)。
-onActivated(async () => {
-  try {
-    const st = await invoke<{ running: boolean }>("get_device_status");
-    deviceLive.value = st.running;
-    if (!st.running && deviceState.value !== "Disconnected") {
-      deviceState.value = "Disconnected";
-      startedAt.value = null;
-    }
-  } catch { /* 忽略 */ }
-});
-// 首次挂载也对账一次(app 重启后仍能反映后台是否在跑)。
-onMounted(async () => {
-  try {
-    const st = await invoke<{ running: boolean }>("get_device_status");
-    deviceLive.value = st.running;
-  } catch { /* 忽略 */ }
-});
+// keep-alive 激活时与引擎对账(store 内统一实现),避免切页后按钮态错乱。
+onActivated(reconcile);
 
-const metrics = computed(() => [
-  { label: "注册状态", value: stateMeta.value.text, color: stateMeta.value.color, dot: true },
-  { label: "在线时长", value: uptime.value, mono: true },
-  { label: "国标版本", value: "GB/T " + form.value.gb_version },
-  { label: "传输协议", value: activePlatform.value?.transport ?? "—" },
-]);
+// 注册状态/在线时长/传输模式已上移到全局顶栏(App.vue),所有菜单页可见,本页不再重复展示。
 </script>
 
 <template>
@@ -398,45 +606,20 @@ const metrics = computed(() => [
     <div class="page-header">
       <div class="page-title">单设备联调</div>
       <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
-    </div>
-
-    <!-- 状态徽标条:置顶,一行四项,一眼看清注册/时长/版本/传输 -->
-    <div class="glass-card panel status-strip">
-      <div v-for="m in metrics" :key="m.label" class="ss-item">
-        <div class="ss-label">{{ m.label }}</div>
-        <div class="ss-value" :class="{ mono: m.mono }" :style="{ color: m.color }">
-          <span v-if="m.dot" class="mdot" :style="{ background: m.color }" />{{ m.value }}
         </div>
-      </div>
-    </div>
 
-    <!-- 工作区:左=配置,右=实时监控。两列等分,填满宽屏、不再一长条空荡 -->
-    <div class="workspace">
-      <!-- ── 左列:配置 ── -->
-      <div class="ws-col">
-        <div class="glass-card panel">
-          <div class="panel-title">目标平台</div>
-          <div class="plat-readonly" v-if="activePlatform">
-            <div class="pr-name">{{ activePlatform.name }}</div>
-            <div class="pr-grid">
-              <div class="pr-row"><span>地址</span><b>{{ activePlatform.server_host }}:{{ activePlatform.server_port }}</b></div>
-              <div class="pr-row"><span>平台域</span><b>{{ activePlatform.server_domain }}</b></div>
-              <div class="pr-row"><span>传输</span><b>{{ activePlatform.transport }}</b></div>
-              <div class="pr-row"><span>编码</span><b>{{ activePlatform.signaling_encoding ?? 'GB18030' }}</b></div>
-            </div>
-          </div>
-          <div class="fg" style="margin-top: 14px">
+
+    <!-- 设备身份与媒体源占满整行，避免窄列挤压复杂配置。 -->
+    <div class="glass-card panel identity-panel">
+          <div class="panel-title">设备身份</div>
+          <div class="identity-grid">
+          <div class="fg">
             <label>国标版本</label>
             <div class="seg">
               <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">GB/T 2022</button>
               <button :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">GB/T 2016</button>
             </div>
           </div>
-          <div class="fg-hint">平台参数在顶栏"目标平台"切换/编辑,单设备与压测共用。</div>
-        </div>
-
-        <div class="glass-card panel">
-          <div class="panel-title">设备身份</div>
           <div class="fg">
             <label>设备编号</label>
             <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
@@ -454,18 +637,170 @@ const metrics = computed(() => [
               <option value="large-16ch">16 通道大型监控</option>
             </select>
           </div>
-          <div class="fg">
-            <label>视频源(可选)</label>
-            <div class="file-row">
-              <input v-model="form.video_source" class="inp" placeholder="H.264/MP4 文件,或 live:0 摄像头" />
-              <button class="file-btn" @click="pickVideoSource">选择文件</button>
+          </div>
+          <div class="fg media-source-field">
+            <div class="source-heading">
+              <label>媒体源(可选)</label>
+              <span class="source-lock" v-if="startDisabled">设备运行中，配置已锁定</span>
             </div>
-            <div class="src-quick">
-              <button class="chip-btn" @click="form.video_source = 'live:0'">📷 摄像头</button>
-              <button class="chip-btn" @click="form.video_source = 'live:2'">🖥 屏幕</button>
-              <button class="chip-btn" v-if="form.video_source" @click="form.video_source = ''">清除</button>
+            <div class="source-modes" role="radiogroup" aria-label="媒体源类型">
+              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'none' }" @click="setMediaMode('none')">
+                <b>无媒体</b><span>仅信令联调</span>
+              </button>
+              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'file' }" @click="setMediaMode('file')">
+                <b>视频文件</b><span>循环推送本地文件</span>
+              </button>
+              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'camera' }" @click="setMediaMode('camera')">
+                <b>电脑摄像头</b><span>含 iPhone 连续互通</span>
+              </button>
+              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'screen' }" @click="setMediaMode('screen')">
+                <b>电脑屏幕实时画面</b><span>系统声音或电脑麦克风</span>
+              </button>
             </div>
-            <div class="fg-hint">留空只做信令联调;文件需 H.264/MP4(容器需装 ffmpeg);live:N 实时采集摄像头/屏幕(把电脑当真实 IPC,需 ffmpeg)。</div>
+
+            <div v-if="mediaMode === 'file'" class="source-config">
+              <div class="file-row">
+                <input v-model="form.video_source" :disabled="startDisabled" class="inp" placeholder="选择 H.264/H.265 裸流或 MP4、MOV 等视频文件" />
+                <button type="button" class="file-btn" :disabled="startDisabled" @click="pickVideoSource">选择文件</button>
+              </div>
+              <div class="fg-hint">容器文件会在设备启动前转封装；有音频轨时自动转为 G.711A 后与视频复用。</div>
+            </div>
+
+            <div v-else-if="mediaMode === 'camera'" class="source-config">
+              <div class="source-capability">
+                <span class="cap-badge" :class="liveCatalog.ffmpeg_available ? 'ok' : 'warn'">
+                  FFmpeg {{ liveCatalog.ffmpeg_available ? '可用' : '未找到' }}
+                </span>
+                <span>AVFoundation 摄像头采集</span>
+              </div>
+              <div class="source-grid camera-source-grid">
+                <div>
+                  <label>视频设备</label>
+                  <select v-model.number="selectedCameraIndex" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option v-if="!liveCatalog.cameras.length && selectedCameraIndex === null" :value="null" disabled>未发现摄像头</option>
+                    <option v-if="selectedCameraIndex !== null && !liveCatalog.cameras.some(item => item.index === selectedCameraIndex)" :value="selectedCameraIndex" disabled>
+                      [{{ selectedCameraIndex }}] 当前摄像头不可用
+                    </option>
+                    <option v-for="camera in liveCatalog.cameras" :key="camera.index" :value="camera.index">
+                      [{{ camera.index }}] {{ camera.name }}
+                    </option>
+                  </select>
+                </div>
+                <div>
+                  <label>音频设备</label>
+                  <select v-model="selectedMicrophone" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+.chip-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(56,132,255,0.08); }
+                    <option value="none">不采集音频（画面将没有声音）</option>
+                    <option v-if="selectedMicrophone !== 'none' && !liveCatalog.microphones.some(item => String(item.index) === selectedMicrophone)" :value="selectedMicrophone" disabled>
+                      [{{ selectedMicrophone }}] 当前音频设备不可用
+                    </option>
+                    <option v-for="mic in liveCatalog.microphones" :key="mic.index" :value="String(mic.index)">
+                      [{{ mic.index }}] {{ mic.name }}
+                    </option>
+                  </select>
+                </div>
+                <div>
+                  <label>音频编码</label>
+                  <select v-model="selectedCameraAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option value="g711a">G.711A / PCMA · 8 kHz</option>
+                    <option value="g711u">G.711U / PCMU · 8 kHz</option>
+                    <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz{{ liveCatalog.aac_available ? '' : '（编码器不可用）' }}</option>
+                    <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz · 20 ms（扩展{{ liveCatalog.opus_available ? '' : '，编码器不可用' }}）</option>
+                  </select>
+                </div>
+              </div>
+              <div v-if="liveCatalog.avfoundation_error" class="source-notice error">{{ liveCatalog.avfoundation_error }}</div>
+              <div v-else class="fg-hint">iPhone 的“相机”和“桌上视角”是两个真实视频视角，不是屏幕镜像。选择麦克风后，视频与音频在同一个 AVFoundation 会话中采集，避免连续互通设备被两个进程争用。首次采集必须允许麦克风权限；如仍无声，请前往“系统设置 → 隐私与安全性 → 麦克风”确认本应用已开启。</div>
+            </div>
+
+            <div v-else-if="mediaMode === 'screen'" class="source-config">
+              <div class="source-capability">
+                <span class="cap-badge ok">ScreenCaptureKit</span>
+                <span>原生屏幕与系统音频采集</span>
+              </div>
+              <div class="source-grid">
+                <div>
+                  <label>显示器</label>
+                  <select v-model.number="selectedDisplayId" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option v-if="!liveCatalog.screens.length && selectedDisplayId === null" :value="null" disabled>未发现可用显示器</option>
+                    <option v-if="selectedDisplayId !== null && !liveCatalog.screens.some(item => item.display_id === selectedDisplayId)" :value="selectedDisplayId" disabled>
+                      Display {{ selectedDisplayId }}（当前不可用）
+                    </option>
+                    <option v-for="screen in liveCatalog.screens" :key="screen.display_id" :value="screen.display_id">
+                      {{ screen.name }}
+                    </option>
+                  </select>
+                </div>
+                <div>
+                  <label>声音</label>
+                  <select v-model="selectedScreenAudio" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option value="system">系统播放声音</option>
+                    <option v-if="selectedScreenAudio.startsWith('microphone:') && !liveCatalog.microphones.some(item => `microphone:${item.index}` === selectedScreenAudio)" :value="selectedScreenAudio" disabled>
+                      麦克风 {{ selectedScreenAudio.slice('microphone:'.length) }}（当前不可用）
+                    </option>
+                    <option v-for="mic in liveCatalog.microphones" :key="`screen-mic-${mic.index}`" :value="`microphone:${mic.index}`">
+                      麦克风 · [{{ mic.index }}] {{ mic.name }}
+                    </option>
+                    <option value="none">不采集声音</option>
+                  </select>
+                </div>
+              </div>
+              <div class="screen-profile-grid">
+                <div>
+                  <label>输出分辨率</label>
+                  <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
+                    <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
+                      {{ resolution.label }}
+                    </option>
+                  </select>
+                </div>
+                <div>
+                  <label>视频码率</label>
+                  <div class="screen-bitrate-input">
+                    <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
+                    <span>kbps</span>
+                  </div>
+                </div>
+                <div>
+                  <label>编码格式</label>
+                  <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option value="h264">H.264 / AVC（兼容性优先）</option>
+                    <option value="h265">H.265 / HEVC（更低带宽）</option>
+                  </select>
+                </div>
+                <div>
+                  <label>音频格式</label>
+                  <select v-model="selectedScreenAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" aria-label="实时音频格式" @change="syncLiveSourceUri">
+                    <option value="g711a">G.711A / PCMA · 8 kHz · 单声道</option>
+                    <option value="g711u">G.711U / PCMU · 8 kHz · 单声道</option>
+                    <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz · 单声道{{ liveCatalog.aac_available ? '' : '（编码器不可用）' }}</option>
+                    <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz · 20 ms（扩展{{ liveCatalog.opus_available ? '' : '，编码器不可用' }}）</option>
+                  </select>
+                </div>
+              </div>
+              <div v-if="screenProfileValidationError" class="source-notice error">{{ screenProfileValidationError }}</div>
+              <div v-if="liveCatalog.screen_error" class="source-notice error">
+                {{ liveCatalog.screen_error }}
+                <span>请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许本应用。</span>
+              </div>
+              <div v-else class="fg-hint">声音可选择系统播放或任意 AVFoundation 麦克风。G.711A/U 兼容性最高；AAC-LC / ADTS 是 FLV 最常用的标准音频格式；Opus 使用私有 PS 扩展，只有明确支持 Opus 的平台才能播放。麦克风无声时请检查“系统设置 → 隐私与安全性 → 麦克风”。</div>
+            </div>
+
+            <div v-if="mediaMode !== 'none'" class="source-footer">
+              <div class="source-uri">
+                <span>{{ mediaMode === 'file' ? '当前文件' : '规范实时源 URI' }}</span>
+                <code>{{ sourceSummary }}</code>
+              </div>
+              <div v-if="mediaMode === 'camera' || mediaMode === 'screen'" class="source-actions">
+                <button type="button" class="file-btn compact" :disabled="startDisabled || sourceLoading" @click="refreshLiveSources()">
+                  {{ sourceLoading ? '刷新中…' : '刷新设备' }}
+                </button>
+                <button type="button" class="file-btn compact primary" :disabled="!canProbeSource || probeState?.kind === 'loading'" @click="probeLiveSource">
+                  {{ probeState?.kind === 'loading' ? '测试中…' : '测试采集' }}
+                </button>
+              </div>
+            </div>
+            <div v-if="probeState" class="probe-result" :class="probeState.kind">{{ probeState.message }}</div>
           </div>
           <div class="action-row">
             <n-button type="primary" :disabled="startDisabled" @click="startDevice">注册上线</n-button>
@@ -473,7 +808,7 @@ const metrics = computed(() => [
             <n-button :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
             <n-button :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
           </div>
-        </div>
+    </div>
 
         <div class="glass-card panel ptz-panel">
           <div class="panel-title">云台控制</div>
@@ -591,39 +926,32 @@ const metrics = computed(() => [
 </template>
 
 <style scoped>
-.page { max-width: 1320px; }
-.page-header { margin-bottom: 20px; }
-.plat-readonly { font-size: 13px; }
-.pr-name { font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
-.pr-row { display: flex; gap: 10px; padding: 3px 0; color: var(--text-secondary); }
-.pr-row span { width: 56px; }
-.pr-row b { color: var(--text-primary); font-weight: 500; }
-.page-title { font-size: 24px; font-weight: 700; color: var(--text-primary); }
+.page { max-width: 1480px; padding-bottom: 28px; }
+.page-header { margin-bottom: 20px; padding: 4px 2px; }
+.page-title { font-size: 24px; font-weight: 750; color: var(--text-primary); letter-spacing: -.3px; }
 .page-sub { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; }
 
-.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
-.metric { padding: 16px 18px; }
-.metric-label { font-size: 12px; color: var(--text-tertiary); }
-.metric-value {
-  font-size: 20px; font-weight: 700; margin-top: 8px; color: var(--text-primary);
-  display: flex; align-items: center; gap: 8px;
+/* 所有功能卡片按阅读顺序全宽单列排列，避免复杂信息被窄栏压缩。 */
+.identity-panel { margin-bottom: 18px; }
+.identity-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.identity-grid .fg { margin-bottom: 0; }
+.workspace { display: flex; flex-direction: column; gap: 18px; }
+.ws-col { display: contents; }
+.workspace > .ws-col > .panel { width: 100%; box-sizing: border-box; }
+.panel {
+  position: relative; overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-default) 82%, white);
+  box-shadow: 0 12px 34px rgba(32, 51, 79, .07), inset 0 1px 0 rgba(255,255,255,.65);
 }
-.metric-value.mono { font-family: "SF Mono", Menlo, monospace; letter-spacing: 1px; }
-.mdot { width: 8px; height: 8px; border-radius: 50%; }
-
-/* 配置区自适应:宽屏 3 列、中屏 2 列、窄屏 1 列,避免面板挤成一坨 */
-.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; align-items: start; }
-/* 工作区两列:左配置 / 右监控。窄屏(<1080)自动堆叠为一列 */
-.workspace { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(420px, 1.15fr); gap: 18px; align-items: start; }
-.ws-col { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
-@media (max-width: 1080px) { .workspace { grid-template-columns: 1fr; } }
-
-/* 状态徽标条:紧凑一行四项,替代原 4 大卡 */
-.status-strip { display: flex; gap: 8px; padding: 14px 18px; }
-.ss-item { flex: 1; min-width: 0; }
-.ss-label { font-size: 11px; color: var(--text-tertiary); margin-bottom: 4px; }
-.ss-value { font-size: 15px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 6px; white-space: nowrap; }
-.ss-value.mono { font-family: "SF Mono", Menlo, monospace; font-size: 13px; letter-spacing: .5px; }
+.panel::before {
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+  background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 25%, transparent));
+  opacity: .68;
+}
+@media (max-width: 1080px) {
+  .identity-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) { .identity-grid { grid-template-columns: 1fr; } }
 
 /* 实时状态分块 */
 .rt-block { padding: 10px 0; border-top: 1px solid rgba(120,120,120,0.08); }
@@ -689,7 +1017,6 @@ const metrics = computed(() => [
   background: rgba(120,130,150,0.08); border: 1px solid var(--border-default);
   color: var(--text-secondary); transition: all 0.15s;
 }
-.chip-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(56,132,255,0.08); }
 
 /* 云台控制可视化 */
 .ptz-panel { margin-top: 0; }

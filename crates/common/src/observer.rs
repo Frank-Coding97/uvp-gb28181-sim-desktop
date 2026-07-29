@@ -72,6 +72,15 @@ pub enum DeviceEvent {
         /// 百分比(0-100)。
         percent: u32,
     },
+    /// 运行时错误(供 UI 全局错误条):设备上线后异步流程里的失败,
+    /// 如点播(INVITE)时视频源采集失败——这类错误发生在后台任务中,
+    /// 不经 start_device 的返回值,必须靠事件推给前端,否则用户界面一片安静。
+    RuntimeError {
+        /// 错误场景(如 invite/stream/capture),供 UI 分类/图标。
+        scope: String,
+        /// 人类可读的错误详情。
+        message: String,
+    },
 }
 
 /// 失败归因(与 docs/20-architecture/data-model.md#4 对齐)。

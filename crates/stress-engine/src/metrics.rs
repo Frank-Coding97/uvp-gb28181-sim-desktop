@@ -157,13 +157,14 @@ impl DeviceObserver for Metrics {
             DeviceEvent::HeartbeatFail => self.on_heartbeat_failure(),
             DeviceEvent::StreamStart => self.on_stream_start(),
             DeviceEvent::StreamStop => self.on_stream_stop(),
-            // 压测不关心云台动作/OSD/命令时间线/订阅/进度(均 UI 展示用),忽略。
+            // 压测不关心云台动作/OSD/命令时间线/订阅/进度/运行时错误(均 UI 展示用),忽略。
             DeviceEvent::Ptz { .. }
             | DeviceEvent::PtzPresetCall { .. }
             | DeviceEvent::OsdConfig { .. }
             | DeviceEvent::PlatformCommand { .. }
             | DeviceEvent::SubscriptionChanged { .. }
-            | DeviceEvent::Progress { .. } => {}
+            | DeviceEvent::Progress { .. }
+            | DeviceEvent::RuntimeError { .. } => {}
         }
     }
 }

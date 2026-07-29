@@ -20,12 +20,14 @@ stress-engine     = { path = "../../../crates/stress-engine" }
 scenario          = { path = "../../../crates/scenario" }
 gb28181-simulator = { path = "../../../crates/gb28181-simulator" }
 gb28181-protocol  = { path = "../../../crates/gb28181-protocol" }
+media-rtp          = { path = "../../../crates/media-rtp" }
 sip-core          = { path = "../../../crates/sip-core" }
 encoding_rs       = { workspace = true }
 common            = { path = "../../../crates/common" }
 tauri = { version = "=2.11.5", features = [] }
 serde.workspace = true
 serde_json.workspace = true
+toml = "=0.8.2"
 tokio.workspace = true
 tracing.workspace = true
 tauri-plugin-dialog = "=2.7.1"

@@ -11,8 +11,8 @@ const STREAM_ID_AUDIO: u8 = 0xC0;
 
 /// 把 90kHz 时间戳编码为 PES 里的 5 字节 PTS/DTS 结构。
 /// `marker_bits` 为高 4 位标志(PTS-only=0b0010,PTS+DTS 时 PTS=0b0011)。
-fn encode_pts(ts: u32, marker_bits: u8) -> [u8; 5] {
-    let ts = ts as u64;
+fn encode_pts(ts: u64, marker_bits: u8) -> [u8; 5] {
+    let ts = ts & 0x1_FFFF_FFFF;
     let mut b = [0u8; 5];
     // '0010'/'0011' + PTS[32..30] + marker
     b[0] = (marker_bits << 4) | ((((ts >> 30) & 0x07) as u8) << 1) | 0x01;
@@ -89,19 +89,42 @@ impl VideoCodec {
 /// 音频编码,决定 PSM 的 stream_type。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AudioCodec {
-    /// G.711 A-law,stream_type 0x90。
+    /// G.711 A-law / PCMA,stream_type 0x90。
     #[default]
     G711A,
-    /// AAC(ADTS),stream_type 0x0F。
+    /// G.711 μ-law / PCMU,stream_type 0x91。
+    G711U,
+    /// AAC-LC with ADTS headers,stream_type 0x0F。
     Aac,
+    /// Opus uses private-data stream_type 0x06 with an `Opus` registration descriptor.
+    /// This is an extension rather than a codec mandated by GB/T 28181.
+    Opus,
 }
 
 impl AudioCodec {
     /// PSM 中的 stream_type。
-    pub fn stream_type(&self) -> u8 {
+    pub const fn stream_type(self) -> u8 {
         match self {
-            AudioCodec::G711A => 0x90,
-            AudioCodec::Aac => 0x0F,
+            Self::G711A => 0x90,
+            Self::G711U => 0x91,
+            Self::Aac => 0x0F,
+            Self::Opus => 0x06,
+        }
+    }
+
+    /// 每个编码访问单元在 90 kHz PS 时钟中的持续时间。
+    pub const fn frame_duration_90k(self) -> u32 {
+        match self {
+            Self::Aac => 1_920,                              // 1024 samples / 48 kHz
+            Self::G711A | Self::G711U | Self::Opus => 1_800, // 20 ms
+        }
+    }
+
+    /// PSM elementary_stream_info descriptor。Opus 通过注册描述符标识私有流。
+    const fn descriptor(self) -> &'static [u8] {
+        match self {
+            Self::Opus => &[0x05, 0x04, b'O', b'p', b'u', b's'],
+            _ => &[],
         }
     }
 }
@@ -136,38 +159,36 @@ fn write_psm(out: &mut Vec<u8>, video: VideoCodec) {
 /// 写入含音频的 PSM:声明视频(按 `video`)+ 音频(按 `audio`)两条 ES。
 fn write_psm_av(out: &mut Vec<u8>, video: VideoCodec, audio: AudioCodec) {
     out.extend_from_slice(&[0x00, 0x00, 0x01, 0xBC]);
-    // elementary_stream_map_length = 8(两条 ES 映射,各 4 字节)。
-    let body: [u8; 16] = [
-        0xE1,
-        0xFF, // marker/version
-        0x00,
-        0x00, // program_stream_info_length = 0
-        0x00,
-        0x08, // elementary_stream_map_length = 8
+    let descriptor = audio.descriptor();
+    let elementary_map_len = 8 + descriptor.len();
+    let mut body = Vec::with_capacity(12 + elementary_map_len);
+    body.extend_from_slice(&[
+        0xE1, 0xFF, // marker/version
+        0x00, 0x00, // program_stream_info_length = 0
+    ]);
+    body.extend_from_slice(&(elementary_map_len as u16).to_be_bytes());
+    body.extend_from_slice(&[
         video.stream_type(),
-        0xE0,
+        STREAM_ID_VIDEO,
         0x00,
-        0x00, // ES map: 视频(0xE0)
+        0x00, // 视频 ES 无描述符
         audio.stream_type(),
-        0xC0,
-        0x00,
-        0x00, // ES map: 音频(0xC0)
-        0x00,
-        0x00, // CRC32 前 2 字节占位
-    ];
-    let psm_len = (body.len() + 2) as u16;
-    out.extend_from_slice(&psm_len.to_be_bytes());
+        STREAM_ID_AUDIO,
+    ]);
+    body.extend_from_slice(&(descriptor.len() as u16).to_be_bytes());
+    body.extend_from_slice(descriptor);
+    body.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // CRC32 占位
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(&body);
-    out.extend_from_slice(&[0x00, 0x00]); // CRC32 后 2 字节占位
 }
 
 /// 写入一个视频 PES 包(stream_id 0xE0),承载 `data`(可能是一帧的一部分)。
-fn write_pes(out: &mut Vec<u8>, data: &[u8], pts: u32, with_pts: bool) {
+fn write_pes(out: &mut Vec<u8>, data: &[u8], pts: u64, with_pts: bool) {
     write_pes_stream(out, STREAM_ID_VIDEO, data, pts, with_pts);
 }
 
 /// 写入一个 PES 包,指定 stream_id(视频 0xE0 / 音频 0xC0)。
-fn write_pes_stream(out: &mut Vec<u8>, stream_id: u8, data: &[u8], pts: u32, with_pts: bool) {
+fn write_pes_stream(out: &mut Vec<u8>, stream_id: u8, data: &[u8], pts: u64, with_pts: bool) {
     out.extend_from_slice(&[0x00, 0x00, 0x01, stream_id]);
     let header = if with_pts {
         encode_pts(pts, 0b0010)
@@ -196,6 +217,8 @@ pub struct PsMuxer {
     video: VideoCodec,
     /// 音频编码(决定 PSM stream_type)。
     audio: AudioCodec,
+    /// 即使当前视频帧暂时没有音频包,关键帧 PSM 也声明音频 ES。
+    declare_audio: bool,
 }
 
 impl Default for PsMuxer {
@@ -204,6 +227,7 @@ impl Default for PsMuxer {
             pes_max: 60_000,
             video: VideoCodec::default(),
             audio: AudioCodec::default(),
+            declare_audio: false,
         }
     }
 }
@@ -222,21 +246,31 @@ impl PsMuxer {
         }
     }
 
+    /// 指定视频编码及是否声明音频 ES。
+    pub fn with_video_and_audio(video: VideoCodec, has_audio: bool) -> Self {
+        PsMuxer {
+            video,
+            declare_audio: has_audio,
+            ..Self::default()
+        }
+    }
+
     /// 指定视频与音频编码新建。
     pub fn with_codecs(video: VideoCodec, audio: AudioCodec) -> Self {
         PsMuxer {
             pes_max: 60_000,
             video,
             audio,
+            declare_audio: true,
         }
     }
 
     /// 封装一帧 H.264 访问单元(Annex B,含起始码)。
     /// `key_frame` 为真时前置 System Header + PSM(便于平台快速出图)。
     /// 返回可直接交给 RTP 分片发送的 PS 字节。
-    pub fn mux_frame(&self, au: &[u8], pts: u32, key_frame: bool) -> Vec<u8> {
+    pub fn mux_frame(&self, au: &[u8], pts: u64, key_frame: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(au.len() + 64);
-        write_pack_header(&mut out, pts as u64);
+        write_pack_header(&mut out, pts);
         if key_frame {
             write_system_header(&mut out);
             write_psm(&mut out, self.video);
@@ -250,13 +284,25 @@ impl PsMuxer {
         out
     }
 
-    /// 封装一帧视频 + 其后紧随的音频包(G.711A 音视频复合流)。
-    /// `audio` 为该帧时间窗内的若干 G.711A 分包(每包一个音频 PES);为空则等价于 [`mux_frame`]。
-    /// 关键帧处 PSM 声明音视频两条 ES。
-    pub fn mux_frame_av(&self, au: &[u8], pts: u32, key_frame: bool, audio: &[Vec<u8>]) -> Vec<u8> {
-        let has_audio = !audio.is_empty();
+    /// 封装一帧视频及同一时间窗内的完整编码音频访问单元。
+    /// 每个音频元素独立写入一个 PES；关键帧处 PSM 声明音视频两条 ES。
+    pub fn mux_frame_av(&self, au: &[u8], pts: u64, key_frame: bool, audio: &[Vec<u8>]) -> Vec<u8> {
+        self.mux_frame_av_with_audio_pts(au, pts, key_frame, audio, pts)
+    }
+
+    /// 封装视频和音频,并允许音频从独立的 90kHz 时钟起点开始。
+    /// 音频访问单元的 PTS 按编码帧时长递增：G.711/Opus 为 20ms，AAC-LC 为 1024/48kHz。
+    pub fn mux_frame_av_with_audio_pts(
+        &self,
+        au: &[u8],
+        pts: u64,
+        key_frame: bool,
+        audio: &[Vec<u8>],
+        audio_start_pts: u64,
+    ) -> Vec<u8> {
+        let has_audio = self.declare_audio || !audio.is_empty();
         let mut out = Vec::with_capacity(au.len() + 128);
-        write_pack_header(&mut out, pts as u64);
+        write_pack_header(&mut out, pts);
         if key_frame {
             write_system_header(&mut out);
             if has_audio {
@@ -271,9 +317,12 @@ impl PsMuxer {
             write_pes(&mut out, chunk, pts, first);
             first = false;
         }
-        // 音频 PES(stream_id 0xC0),各带 PTS,紧随视频后。
-        for a in audio {
-            write_pes_stream(&mut out, STREAM_ID_AUDIO, a, pts, true);
+        // 每个编码访问单元单独封装音频 PES，并按真实编码帧时长递增 PTS。
+        let frame_duration = self.audio.frame_duration_90k();
+        for (index, packet) in audio.iter().enumerate() {
+            let audio_pts = audio_start_pts
+                .wrapping_add((index as u64).wrapping_mul(u64::from(frame_duration)));
+            write_pes_stream(&mut out, STREAM_ID_AUDIO, packet, audio_pts, true);
         }
         out
     }
