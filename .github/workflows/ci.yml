@@ -63,7 +63,17 @@ jobs:
       - name: 安装前端依赖
         working-directory: apps/desktop
         run: npm ci
-      - name: 构建桌面安装包
+      - name: 安装 macOS FFmpeg 运行时
+        if: matrix.os == 'macos-latest'
+        run: brew install ffmpeg
+      - name: 构建 macOS 完整 DMG（Swift runtime + FFmpeg）
+        if: matrix.os == 'macos-latest'
+        working-directory: apps/desktop
+        env:
+          BUNDLE_FFMPEG: "1"
+        run: ./build-macos-dmg.sh
+      - name: 构建 Linux / Windows 安装包
+        if: matrix.os != 'macos-latest'
         working-directory: apps/desktop
         run: npm run tauri build -- --target ${{ matrix.target }}
       - name: 上传产物
@@ -71,6 +81,7 @@ jobs:
         with:
           name: desktop-${{ matrix.os }}
           path: |
+            target/release/bundle/dmg/*.dmg
             target/${{ matrix.target }}/release/bundle/**/*.dmg
             target/${{ matrix.target }}/release/bundle/**/*.deb
             target/${{ matrix.target }}/release/bundle/**/*.AppImage

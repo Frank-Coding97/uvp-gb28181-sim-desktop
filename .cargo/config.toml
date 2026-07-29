@@ -1,0 +1,10 @@
+# ScreenCaptureKit 8.x links a small Swift bridge. Ensure Rust executables can
+# resolve Swift Concurrency both in local test environments and from a bundled
+# macOS application's Frameworks directory.
+[target.'cfg(target_os = "macos")']
+rustflags = [
+  "-L", "native=/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx",
+  "-C", "link-arg=-Wl,-rpath,@executable_path/../Frameworks",
+  "-C", "link-arg=-Wl,-rpath,/usr/lib/swift",
+  "-C", "link-arg=-Wl,-rpath,/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx",
+]
