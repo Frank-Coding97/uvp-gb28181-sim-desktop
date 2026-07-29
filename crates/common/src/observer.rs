@@ -34,8 +34,8 @@ pub enum DeviceEvent {
         tilt_speed: u8,
         zoom_speed: u8,
     },
-    /// 平台调用预置位(转到某预置位),供 UI 演示摄像头转到目标角度。
-    PtzPresetCall { preset: u8 },
+    /// 平台调用预置位(转到某预置位),携带设备当前登记的国标 PresetName。
+    PtzPresetCall { preset: u8, name: String },
     /// 平台下发 OSD 配置命令(DeviceConfig + OSDConfig),设备已应用。
     /// 供 UI 展示"平台设置了 OSD、设备已按其设置"(国标 A.2.3.2.11)。
     OsdConfig {

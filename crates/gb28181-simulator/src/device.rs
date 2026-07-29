@@ -15,12 +15,18 @@ use sip_core::{authorization, Challenge, UdpTransport};
 
 use crate::builder::{self, DialogIds};
 
-/// 设备初始内置的两个预置位(可被平台的预置位设置/删除命令修改)。
+/// 设备初始内置的五个具名预置位(可被平台的预置位设置/删除命令修改)。
 fn default_presets() -> std::collections::BTreeMap<u8, String> {
-    let mut m = std::collections::BTreeMap::new();
-    m.insert(1, "预置位1".to_string());
-    m.insert(2, "预置位2".to_string());
-    m
+    [
+        (1, "大门入口"),
+        (2, "停车场"),
+        (3, "接待大厅"),
+        (4, "东侧通道"),
+        (5, "西侧通道"),
+    ]
+    .into_iter()
+    .map(|(id, name)| (id, name.to_string()))
+    .collect()
 }
 
 /// 最小 HTTP PUT 上传 JPEG(抓拍上传用)。仅支持 http://(https 需 TLS,本工具不引入重依赖)。
@@ -1560,10 +1566,18 @@ impl DeviceSimulator {
             use gb28181_protocol::manscdp::PresetAction;
             match ctrl.preset_op() {
                 Some((PresetAction::Set, idx)) => {
+                    let name = ctrl
+                        .ptz_cmd_params
+                        .as_ref()
+                        .and_then(|params| params.preset_name.as_deref())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("预置位{idx}"));
                     if let Ok(mut p) = self.presets.lock() {
-                        p.insert(idx, format!("预置位{idx}"));
+                        p.insert(idx, name.clone());
                     }
-                    tracing::info!(preset = idx, "预置位设置");
+                    tracing::info!(preset = idx, preset_name = %name, "预置位设置");
                 }
                 Some((PresetAction::Delete, idx)) => {
                     if let Ok(mut p) = self.presets.lock() {
@@ -1572,9 +1586,15 @@ impl DeviceSimulator {
                     tracing::info!(preset = idx, "预置位删除");
                 }
                 Some((PresetAction::Call, idx)) => {
-                    tracing::info!(preset = idx, "预置位调用(转到)");
+                    let name = self
+                        .presets
+                        .lock()
+                        .ok()
+                        .and_then(|presets| presets.get(&idx).cloned())
+                        .unwrap_or_else(|| format!("预置位{idx}"));
+                    tracing::info!(preset = idx, preset_name = %name, "预置位调用(转到)");
                     self.observer
-                        .on_event(common::DeviceEvent::PtzPresetCall { preset: idx });
+                        .on_event(common::DeviceEvent::PtzPresetCall { preset: idx, name });
                 }
                 None => {
                     // 优先级:巡航/辅助(0x8x)→ FI 光圈聚焦(0x4x)→ 方向/变倍运动。
