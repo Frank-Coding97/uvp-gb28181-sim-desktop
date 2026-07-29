@@ -3,28 +3,41 @@
 //! 按 docs/20-architecture/api-contract.md 注册 IPC 命令。
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use serde::{Deserialize, Serialize};
 use sip_core::UdpTransport;
 use stress_engine::{Metrics, Orchestrator};
-use tauri::{AppHandle, Emitter}; // Tauri 2 emit 需要 Emitter trait
+use tauri::{AppHandle, Emitter, Manager}; // Tauri 2 emit/state 需要对应 trait
 use tokio::sync::{broadcast, Mutex};
 
 /// 应用全局状态（托管在 Tauri managed state）。
 struct AppState {
-    /// 当前压测的停止发射端；None 表示空闲。
-    stop_tx: Mutex<Option<broadcast::Sender<()>>>,
-    /// 当前压测的实时指标；None 表示空闲。
+    /// 当前压测句柄；任务完全退出前始终占用槽位。
+    stress: Mutex<Option<StressHandle>>,
+    /// 分配单调递增的压测 ID,防止旧任务事件污染新任务状态。
+    next_stress_id: AtomicU64,
+    /// 当前压测的实时指标；None 表示任务已完全退出。
     metrics: Mutex<Option<Arc<Metrics>>>,
-    /// 最近一次压测的指标快照(停止后保留,供导出报告)。
+    /// 最近一次压测的最终指标快照(停止后保留,供导出报告)。
     last_metrics: Mutex<Option<stress_engine::MetricsSnapshot>>,
-    /// 最近一次启动使用的场景 TOML 与设备数（报告导出用）。
+    /// 最近一次启动使用的脱敏场景 TOML 与设备数（报告导出用）。
     last_scenario: Mutex<Option<(String, usize)>>,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
+}
+
+/// 压测运行句柄。收到停止请求后仅标记 `stopping`，由后台任务退出时释放。
+struct StressHandle {
+    run_id: u64,
+    stop_tx: broadcast::Sender<()>,
+    stopping: bool,
+    device_count: usize,
 }
 
 /// 单设备运行句柄。
@@ -39,7 +52,8 @@ struct DeviceHandle {
 impl AppState {
     fn new() -> Self {
         AppState {
-            stop_tx: Mutex::new(None),
+            stress: Mutex::new(None),
+            next_stress_id: AtomicU64::new(1),
             metrics: Mutex::new(None),
             last_metrics: Mutex::new(None),
             last_scenario: Mutex::new(None),
@@ -215,10 +229,12 @@ fn engine_version() -> String {
     format!("stress-engine v{} 就绪", env!("CARGO_PKG_VERSION"))
 }
 
-/// 校验场景 YAML/TOML 并返回摘要，不启动压测。
+/// 校验场景 TOML 并返回摘要，不启动压测。
 #[tauri::command]
 async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
     let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
+    // 生成一台设备可触发所有语义校验,避免“语法正确、启动才失败”。
+    Orchestrator::new(&sc, 1).map_err(|e| e.to_string())?;
     Ok(ScenarioSummary {
         name: sc.device_info.device_name.clone(),
         device_count: 0, // 由前端传 count 参数
@@ -227,8 +243,15 @@ async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
     })
 }
 
+/// 报告中保留可复现场景,但基于解析后的结构体覆盖密码后再序列化，
+/// 避免 quoted key、多行字符串等 TOML 语法绕过文本脱敏。
+fn serialize_redacted_scenario(mut scenario: scenario::LinearScenario) -> Result<String, String> {
+    scenario.password = "***".into();
+    toml::to_string(&scenario).map_err(|e| format!("脱敏场景序列化失败: {e}"))
+}
+
 /// 启动压测。`toml` 为场景内容，`count` 为设备数。
-/// 成功后每秒向前端发送 `metrics_tick` 事件。
+/// 成功后每秒向前端发送带 `run_id` 的 `metrics_tick` 事件。
 #[tauri::command]
 async fn start_stress(
     toml: String,
@@ -238,62 +261,154 @@ async fn start_stress(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    let mut stop_guard = state.stop_tx.lock().await;
-    if stop_guard.is_some() {
-        return Err("已有压测在运行，请先停止".into());
+    if position_interval > 86_400 || alarm_interval > 86_400 {
+        return Err("主动上报间隔不能超过 86400 秒".into());
     }
 
     let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
+    let redacted_scenario = serialize_redacted_scenario(sc.clone())?;
     let orch = Orchestrator::new(&sc, count).map_err(|e| e.to_string())?;
 
+    let mut stress_guard = state.stress.lock().await;
+    if stress_guard.is_some() {
+        return Err("已有压测正在运行或停止中，请等待任务完全退出".into());
+    }
+
+    let run_id = state.next_stress_id.fetch_add(1, Ordering::Relaxed);
     let (tx, _) = broadcast::channel::<()>(1);
-    *stop_guard = Some(tx.clone());
+    // 必须在向前端暴露运行态前创建接收器，确保“启动后立即停止”不会丢信号。
+    let run_stop = tx.subscribe();
+    let tick_stop = tx.subscribe();
+    *stress_guard = Some(StressHandle {
+        run_id,
+        stop_tx: tx.clone(),
+        stopping: false,
+        device_count: count,
+    });
 
     let metrics = Arc::clone(&orch.metrics);
     *state.metrics.lock().await = Some(Arc::clone(&metrics));
-    *state.last_scenario.lock().await = Some((toml.clone(), count));
-    drop(stop_guard);
+    *state.last_metrics.lock().await = None;
+    *state.last_scenario.lock().await = Some((redacted_scenario, count));
 
-    // 压测任务(含批量主动上报:0=关闭)。
-    let tx2 = tx.clone();
-    tokio::spawn(async move {
-        let _ = orch.run(tx2, position_interval, alarm_interval).await;
-    });
+    // 先发布运行事件再启动后台任务，避免初始化瞬时失败时“最终事件”被旧启动事件覆盖。
+    let _ = app.emit(
+        "stress_state",
+        serde_json::json!({
+            "run_id": run_id,
+            "running": true,
+            "stopping": false,
+            "device_count": count,
+        }),
+    );
+    drop(stress_guard);
 
-    // 每秒推送指标快照给前端。
-    let app2 = app.clone();
-    let m2 = Arc::clone(&metrics);
-    let mut tick_stop = tx.subscribe();
+    // 每秒推送带运行 ID 的指标快照，前端据此隔离迟到事件。
+    let app_for_tick = app.clone();
+    let metrics_for_tick = Arc::clone(&metrics);
     tokio::spawn(async move {
+        let mut tick_stop = tick_stop;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = tick_stop.recv() => break,
                 _ = interval.tick() => {
-                    let snap = m2.snapshot();
-                    if let Ok(json) = serde_json::to_string(&snap) {
-                        let _ = app2.emit("metrics_tick", json);
-                    }
+                    let _ = app_for_tick.emit(
+                        "metrics_tick",
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "metrics": metrics_for_tick.snapshot(),
+                        }),
+                    );
                 }
             }
         }
     });
 
+    // 压测任务结束后保存最终快照并回收槽位；停止请求不会提前释放运行权。
+    let app_for_run = app.clone();
+    let metrics_for_run = Arc::clone(&metrics);
+    let tx_for_run = tx.clone();
+    tokio::spawn(async move {
+        let result = orch
+            .run_with_stop_receiver(
+                tx_for_run.clone(),
+                run_stop,
+                position_interval,
+                alarm_interval,
+            )
+            .await;
+        // 初始化失败时也要关闭指标推送任务。
+        let _ = tx_for_run.send(());
+
+        let state = app_for_run.state::<AppState>();
+        let final_metrics = metrics_for_run.snapshot();
+        let mut current = state.stress.lock().await;
+        let owns_state = current
+            .as_ref()
+            .is_some_and(|handle| handle.run_id == run_id);
+        if !owns_state {
+            return;
+        }
+        let was_stopping = current.as_ref().is_some_and(|handle| handle.stopping);
+
+        // 在仍持有本轮生命周期所有权时提交全部共享状态，最后才释放运行槽位。
+        // last_metrics 先写、metrics 后清，确保报告能力不会出现瞬时空窗。
+        *state.last_metrics.lock().await = Some(final_metrics.clone());
+        state.metrics.lock().await.take();
+        current.take();
+        drop(current);
+
+        let payload = match result {
+            Ok(()) => serde_json::json!({
+                "run_id": run_id,
+                "running": false,
+                "stopping": false,
+                "reason": if was_stopping { "stopped" } else { "completed" },
+                "device_count": count,
+                "metrics": final_metrics,
+            }),
+            Err(error) => {
+                tracing::error!(%error, run_id, "压测任务异常结束");
+                serde_json::json!({
+                    "run_id": run_id,
+                    "running": false,
+                    "stopping": false,
+                    "reason": "failed",
+                    "error": error.to_string(),
+                    "device_count": count,
+                    "metrics": final_metrics,
+                })
+            }
+        };
+        let _ = app_for_run.emit("stress_state", payload);
+    });
+
     Ok(format!("已启动 {count} 台设备压测"))
 }
 
-/// 停止当前压测。
+/// 停止当前压测。只发送信号并进入 stopping 状态，运行槽位由后台任务退出时释放。
 #[tauri::command]
-async fn stop_stress(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let mut stop_guard = state.stop_tx.lock().await;
-    match stop_guard.take() {
-        Some(tx) => {
-            let _ = tx.send(());
-            // 停止前保留最后指标快照(供停止后导出报告)。
-            if let Some(m) = state.metrics.lock().await.take() {
-                *state.last_metrics.lock().await = Some(m.snapshot());
-            }
-            Ok("压测已停止".into())
+async fn stop_stress(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+    let mut stress_guard = state.stress.lock().await;
+    match stress_guard.as_mut() {
+        Some(handle) if handle.stopping => Ok("压测正在停止，请稍候".into()),
+        Some(handle) => {
+            handle.stopping = true;
+            let _ = handle.stop_tx.send(());
+            // 在持有生命周期锁时发布，保证后台最终事件一定排在 stopping 事件之后。
+            let _ = app.emit(
+                "stress_state",
+                serde_json::json!({
+                    "run_id": handle.run_id,
+                    "running": true,
+                    "stopping": true,
+                    "reason": "stopping",
+                    "device_count": handle.device_count,
+                }),
+            );
+            Ok("压测停止信号已发送，正在等待设备任务退出".into())
         }
         None => Err("没有正在运行的压测".into()),
     }
@@ -308,19 +423,39 @@ async fn get_metrics(state: tauri::State<'_, AppState>) -> Result<String, String
     }
 }
 
-/// 查询压测运行状态(供 UI 页面切换后与引擎真实状态对账,消除组件重建导致的状态丢失)。
-/// running=是否有压测在跑;device_count=当前场景设备数(无则 0)。
+/// 查询压测状态，供 UI 页面切换或 IPC 返回后与引擎真实状态对账。
 #[tauri::command]
 async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let running = state.stop_tx.lock().await.is_some();
-    let device_count = state
-        .last_scenario
-        .lock()
-        .await
-        .as_ref()
-        .map(|(_, c)| *c)
-        .unwrap_or(0);
-    Ok(serde_json::json!({ "running": running, "device_count": device_count }))
+    // 生命周期变更也持有此锁；在锁内读取关联字段可得到同一运行代际的快照。
+    let stress_guard = state.stress.lock().await;
+    let (running, stopping, run_id, device_count) = match stress_guard.as_ref() {
+        Some(handle) => (
+            true,
+            handle.stopping,
+            Some(handle.run_id),
+            handle.device_count,
+        ),
+        None => {
+            let count = state
+                .last_scenario
+                .lock()
+                .await
+                .as_ref()
+                .map(|(_, count)| *count)
+                .unwrap_or(0);
+            (false, false, None, count)
+        }
+    };
+    let has_report =
+        state.metrics.lock().await.is_some() || state.last_metrics.lock().await.is_some();
+    drop(stress_guard);
+    Ok(serde_json::json!({
+        "running": running,
+        "stopping": stopping,
+        "run_id": run_id,
+        "device_count": device_count,
+        "has_report": has_report,
+    }))
 }
 
 /// 查询单设备运行状态(UI 切页后对账用)。running=设备实例是否存在。
@@ -334,6 +469,8 @@ async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_js
 /// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
 #[tauri::command]
 async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    // 与启动/完成提交共用生命周期锁，避免混合读取不同 run 的场景和指标。
+    let _stress_guard = state.stress.lock().await;
     // 优先取运行中指标,否则取最近一次压测保留的快照。
     let snap = match &*state.metrics.lock().await {
         Some(m) => m.snapshot(),
@@ -351,7 +488,7 @@ async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, Stri
 
     let report = serde_json::json!({
         "generated_at_epoch_secs": ts,
-        "scenario_toml": scenario.as_ref().map(|(t, _)| t),
+        "scenario_toml_redacted": scenario.as_ref().map(|(t, _)| t),
         "device_count": scenario.as_ref().map(|(_, c)| c),
         "metrics": snap,
     });
