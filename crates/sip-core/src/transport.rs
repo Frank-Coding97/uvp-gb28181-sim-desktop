@@ -313,7 +313,7 @@ mod tests {
         let rc = Arc::new(Counter::default());
         sender.set_tracer(Some(sc.clone()));
         receiver.set_tracer(Some(rc.clone()));
-        let _rx = receiver.register("call-trace");
+        let mut rx = receiver.register("call-trace");
 
         let mut h = Headers::new();
         h.set("Call-ID", "call-trace");
@@ -325,7 +325,7 @@ mod tests {
             body: Vec::new(),
         });
         sender.send_to(&req, dst).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
 
         assert_eq!(sc.outs.load(Ordering::Relaxed), 1, "发送侧应记一条 out");
         assert_eq!(sc.ins.load(Ordering::Relaxed), 0);
