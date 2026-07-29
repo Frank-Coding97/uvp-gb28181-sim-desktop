@@ -12,7 +12,7 @@ pub enum Transport {
     /// UDP —— GB28181 最常用,压测默认。
     #[default]
     Udp,
-    /// TCP —— 大码流或跨网时使用。
+    /// TCP —— 预留枚举；当前 SIP 传输层尚未实现,上层会明确拒绝该配置。
     Tcp,
 }
 

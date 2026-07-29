@@ -2,19 +2,22 @@
 // 主应用壳(frost-blue 磨砂风,对齐参考原型):
 // 顶栏右侧状态胶囊 + 磨砂侧边栏 + 内容区路由视图。
 // 必须保留 message/dialog/notification provider,否则子页 useMessage() 抛错致空白。
-import { computed, h, onMounted, onUnmounted, provide, ref } from "vue";
+import { computed, h, onMounted, onUnmounted, provide, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
   NMenu, NIcon, NPopover, NInput, NInputNumber, NButton, NSelect, zhCN, dateZhCN,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
-import {
-  SpeedometerOutline, HardwareChipOutline, ServerOutline,
-  PulseOutline, GitNetworkOutline,
-} from "@vicons/ionicons5";
+import SpeedometerOutline from "@vicons/ionicons5/es/SpeedometerOutline.js";
+import HardwareChipOutline from "@vicons/ionicons5/es/HardwareChipOutline.js";
+import ServerOutline from "@vicons/ionicons5/es/ServerOutline.js";
+import PulseOutline from "@vicons/ionicons5/es/PulseOutline.js";
+import GitNetworkOutline from "@vicons/ionicons5/es/GitNetworkOutline.js";
+import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
+import { useDevice } from "./device";
 
 const route = useRoute();
 const router = useRouter();
@@ -28,6 +31,7 @@ const menuOptions: MenuOption[] = [
   { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
   { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
   { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
+  { label: "系统信息",   key: "/system",    icon: icon(TerminalOutline) },
 ];
 
 // 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
@@ -49,7 +53,9 @@ function addNew() {
     server_domain: "34020000002000000001", password: "change-me", transport: "UDP", signaling_encoding: "GB18030" });
   openEdit();
 }
-const transportOptions = [{ label: "UDP", value: "UDP" }, { label: "TCP", value: "TCP" }];
+const transportOptions = [
+  { label: "UDP（当前支持）", value: "UDP" },
+];
 const encodingOptions = [
   { label: "GB18030(国标默认)", value: "GB18030" },
   { label: "UTF-8", value: "UTF-8" },
@@ -60,26 +66,61 @@ function onMenuSelect(key: string) {
   router.push(key);
 }
 
-// 全局设备状态(顶栏胶囊),订阅 device_state 事件。
+// 全局设备状态 + 注册/注销:来自 device store(顶栏与单设备页共用同一份)。
 type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
-const deviceState = ref<DState>("Disconnected");
-const statusMeta = computed(() => {
-  switch (deviceState.value) {
-    case "Registering": return { text: "注册中", color: "var(--warning)" };
-    case "Registered":  return { text: "已注册", color: "var(--success)" };
-    case "InCall":      return { text: "推流中", color: "var(--accent)" };
-    case "Failed":      return { text: "注册失败", color: "var(--error)" };
-    default:            return { text: "未连接", color: "var(--text-tertiary)" };
+const {
+  deviceState, startedAt, statusMeta, startDisabled, stopDisabled,
+  startDevice, stopDevice, reconcile,
+} = useDevice();
+
+const uptime = ref("--:--:--");
+let uptimeTimer: number | undefined;
+function tickUptime() {
+  if (!startedAt.value) { uptime.value = "--:--:--"; return; }
+  const s = Math.floor((Date.now() - startedAt.value) / 1000);
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  uptime.value = `${h}:${m}:${ss}`;
+}
+
+// 全局顶栏状态芯片:连接状态 + 在线时长 + 传输模式(TCP/UDP)。
+const statusChips = computed(() => [
+  { key: "state", label: "连接状态", value: statusMeta.value.text, color: statusMeta.value.color, dot: true },
+  { key: "uptime", label: "在线时长", value: uptime.value, mono: true },
+  { key: "transport", label: "传输模式", value: active.value?.transport ?? "—", mono: true },
+]);
+
+// 顶栏注册/注销:任意页面可操作同一台设备。成功用 message,失败落全局错误条。
+async function onRegister() {
+  const r = await startDevice(active.value);
+  if (r.ok) topMessage.value = { text: r.msg, ok: true };
+  else lastError.value = { scope: "register", message: r.msg, ts_ms: Date.now() };
+}
+async function onLogout() {
+  const r = await stopDevice();
+  topMessage.value = { text: r.msg, ok: r.ok };
+}
+// 顶栏轻量提示(2.5s 自动消失),避免依赖 message provider(其在本组件树更外层)。
+const topMessage = ref<{ text: string; ok: boolean } | null>(null);
+let topMsgTimer: number | undefined;
+watch(topMessage, (v) => {
+  if (v) {
+    if (topMsgTimer) clearTimeout(topMsgTimer);
+    topMsgTimer = window.setTimeout(() => { topMessage.value = null; }, 2500);
   }
 });
-// 注册起始时刻(在线时长基准)。放在常驻的 App 里,切换路由不丢失。
-const startedAt = ref<number | null>(null);
 
-// 作为唯一状态源下发给子页(Device 页 inject,避免各存一份导致状态分叉)。
-provide("deviceState", deviceState);
-provide("deviceStartedAt", startedAt);
+// 全局错误条:订阅后端运行时错误(如点播采集失败),所有页面可见。
+interface DeviceError { scope: string; message: string; ts_ms: number; }
+const lastError = ref<DeviceError | null>(null);
+function dismissError() { lastError.value = null; }
+const errorScopeLabel: Record<string, string> = {
+  capture: "视频源采集", invite: "点播", stream: "推流", register: "注册",
+};
 
 let unlisten: UnlistenFn | null = null;
+let unlistenErr: UnlistenFn | null = null;
 onMounted(async () => {
   unlisten = await listen<string>("device_state", (e) => {
     const s = e.payload as DState;
@@ -87,8 +128,14 @@ onMounted(async () => {
     if (s === "Registered" && !startedAt.value) startedAt.value = Date.now();
     if (s === "Disconnected" || s === "Failed") startedAt.value = null;
   });
+  unlistenErr = await listen<DeviceError>("device_error", (e) => {
+    lastError.value = e.payload;
+  });
+  uptimeTimer = window.setInterval(tickUptime, 1000);
+  // app 启动/刷新后与引擎对账,反映后台是否已有设备在跑。
+  reconcile();
 });
-onUnmounted(() => unlisten?.());
+onUnmounted(() => { unlisten?.(); unlistenErr?.(); if (uptimeTimer) clearInterval(uptimeTimer); });
 
 const themeOverrides = {
   common: {
@@ -141,7 +188,7 @@ const themeOverrides = {
                     size="small"
                     :value="activeId"
                     :options="profileOptions"
-                    style="width: 280px"
+                    class="plat-select"
                     @update:value="setActive"
                   />
                   <n-popover trigger="click" placement="bottom-start" @update:show="(s: boolean) => s && openEdit()">
@@ -165,11 +212,38 @@ const themeOverrides = {
                     </div>
                   </n-popover>
                 </div>
-                <div class="status-pill">
-                  <span class="pill-dot" :style="{ background: statusMeta.color }" />
-                  <span class="pill-text">{{ statusMeta.text }}</span>
+                <!-- 全局状态芯片 + 注册/注销:所有菜单页可见,任意页面均可注册/注销设备。 -->
+                <div class="status-area">
+                  <div class="status-chips">
+                    <div
+                      v-for="c in statusChips"
+                      :key="c.key"
+                      class="chip"
+                      :title="c.label + '：' + c.value"
+                    >
+                      <span v-if="c.dot" class="chip-dot" :style="{ background: c.color }" />
+                      <span class="chip-val" :class="{ mono: c.mono }" :style="{ color: c.color }">{{ c.value }}</span>
+                    </div>
+                  </div>
+                  <div class="reg-btns">
+                    <n-button size="small" type="primary" :disabled="startDisabled" @click="onRegister">注册</n-button>
+                    <n-button size="small" :disabled="stopDisabled" @click="onLogout">注销</n-button>
+                  </div>
                 </div>
               </header>
+              <!-- 顶栏轻量提示(注册/注销结果),2.5s 自动消失。 -->
+              <transition name="fade">
+                <div v-if="topMessage" class="top-toast" :class="{ ok: topMessage.ok, err: !topMessage.ok }">
+                  {{ topMessage.text }}
+                </div>
+              </transition>
+              <!-- 全局错误条:后端运行时错误(如点播采集失败),所有页面可见,可关闭。 -->
+              <div v-if="lastError" class="error-bar">
+                <span class="eb-icon">⚠</span>
+                <span class="eb-scope">{{ errorScopeLabel[lastError.scope] ?? lastError.scope }}失败</span>
+                <span class="eb-msg" :title="lastError.message">{{ lastError.message }}</span>
+                <button class="eb-close" @click="dismissError" title="关闭">✕</button>
+              </div>
               <section class="content">
                 <!-- keep-alive:切换标签页不销毁组件,保留各页表单/运行/曲线状态。 -->
                 <router-view v-slot="{ Component }">
@@ -215,20 +289,82 @@ const themeOverrides = {
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 24px; gap: 12px;
 }
-.platform-bar { display: inline-flex; align-items: center; gap: 8px; }
+.platform-bar { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.plat-select { width: 280px; min-width: 160px; }
 .plat-icon { color: var(--accent); font-size: 16px; }
 .plat-label { font-size: 12.5px; color: var(--text-secondary); }
 .plat-edit { display: flex; flex-direction: column; gap: 8px; width: 240px; }
 .pe-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .pe-actions { display: flex; gap: 8px; margin-top: 4px; }
-.status-pill {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 5px 14px; border-radius: 999px;
+/* 顶栏右侧:状态芯片 + 注册/注销按钮。 */
+.status-area { display: inline-flex; align-items: center; gap: 12px; min-width: 0; }
+.reg-btns { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+/* 顶栏轻量提示条:居中浮在顶栏下方,不占布局。 */
+.top-toast {
+  position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+  z-index: 50; padding: 7px 18px; border-radius: 999px; font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12); backdrop-filter: var(--blur-light);
+}
+.top-toast.ok { background: color-mix(in srgb, var(--success) 16%, #fff); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
+.top-toast.err { background: color-mix(in srgb, var(--error) 16%, #fff); color: var(--error); border: 1px solid color-mix(in srgb, var(--error) 40%, transparent); }
+.fade-enter-active, .fade-leave-active { transition: opacity .2s; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+/* 全局状态芯片组:一行贴在顶栏右侧,只显示值。内容超长省略,不挤占顶栏。 */
+.status-chips {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-width: 0; overflow: hidden;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; border-radius: 999px;
   background: rgba(255, 255, 255, 0.6);
   border: 1px solid var(--border-subtle);
   backdrop-filter: var(--blur-light);
-  font-size: 12.5px; color: var(--text-secondary);
+  max-width: 200px; min-width: 0;
 }
-.pill-dot { width: 8px; height: 8px; border-radius: 50%; transition: background var(--transition); }
+.chip-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; transition: background var(--transition); }
+.chip-val {
+  font-size: 12.5px; font-weight: 600; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.chip-val.mono { font-family: "SF Mono", Menlo, monospace; font-size: 12px; letter-spacing: .2px; }
+
+/* 全局错误条:顶栏与内容之间,醒目但不遮挡,可手动关闭。 */
+.error-bar {
+  flex-shrink: 0;
+  display: flex; align-items: center; gap: 10px;
+  margin: 4px 24px 0; padding: 9px 14px; border-radius: 10px;
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--error) 40%, transparent);
+  color: var(--error); font-size: 13px;
+}
+.eb-icon { flex: 0 0 auto; font-size: 15px; }
+.eb-scope { flex: 0 0 auto; font-weight: 700; }
+.eb-msg {
+  flex: 1 1 auto; min-width: 0; color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.eb-close {
+  flex: 0 0 auto; background: none; border: none; cursor: pointer;
+  color: var(--error); font-size: 13px; padding: 2px 6px; border-radius: 6px;
+}
+.eb-close:hover { background: color-mix(in srgb, var(--error) 20%, transparent); }
+
 .content { flex: 1; overflow-y: auto; padding: 4px 28px 28px; }
+
+@media (max-width: 1120px) {
+  .topbar { padding: 0 16px; }
+  .plat-select { width: 220px; }
+  .chip:nth-child(2) { display: none; }
+  .status-area { gap: 7px; }
+}
+@media (max-width: 980px) {
+  .sidebar { width: 188px; }
+  .brand { padding-inline: 16px; }
+  .plat-label, .chip:nth-child(3) { display: none; }
+  .content { padding-inline: 20px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fade-enter-active, .fade-leave-active { transition: none; }
+}
 </style>
