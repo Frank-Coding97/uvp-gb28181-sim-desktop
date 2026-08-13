@@ -58,11 +58,9 @@ pub fn decode_xml_body(bytes: &[u8], encoding: common::SignalingEncoding) -> Str
     }
 }
 
-/// 构造一次注册所需的会话标识(同一注册事务内 branch/from-tag/call-id 保持一致)。
+/// 构造一次注册会话所需的标识(同一会话内 from-tag/call-id 保持一致)。
 #[derive(Debug, Clone)]
 pub struct DialogIds {
-    /// Via branch(每个事务唯一,须以 z9hG4bK 开头)。
-    pub branch: String,
     /// From tag。
     pub from_tag: String,
     /// Call-ID。
@@ -73,7 +71,6 @@ impl DialogIds {
     /// 新建一组随机标识。
     pub fn new() -> Self {
         DialogIds {
-            branch: rand_token("z9hG4bK"),
             from_tag: rand_token(""),
             call_id: rand_token(""),
         }
@@ -102,7 +99,8 @@ fn platform_uri(cfg: &DeviceConfig) -> String {
 }
 
 /// 构造 REGISTER 请求。`authorization` 为 None 时是首次(无鉴权)请求;
-/// 为 Some 时是携带 Authorization 的重发。`cseq` 递增,`local` 为本端 host:port。
+/// 为 Some 时是携带 Authorization 的重新请求。每次调用生成新的 Via branch;
+/// `cseq` 递增,`local` 为本端 host:port。
 pub fn register(
     cfg: &DeviceConfig,
     ids: &DialogIds,
@@ -118,7 +116,10 @@ pub fn register(
         "Via",
         format!(
             "SIP/2.0/{} {}:{};rport;branch={}",
-            cfg.transport, local_host, local_port, ids.branch
+            cfg.transport,
+            local_host,
+            local_port,
+            rand_token("z9hG4bK")
         ),
     );
     headers.append("From", format!("<{aor}>;tag={}", ids.from_tag));
@@ -349,10 +350,17 @@ mod tests {
     #[test]
     fn register_带鉴权() {
         let ids = DialogIds::new();
-        let req = register(&cfg(), &ids, 2, "5.6.7.8", 5070, Some("Digest xxx"), 3600);
-        let text = String::from_utf8(req.to_bytes()).unwrap();
+        let first = register(&cfg(), &ids, 1, "5.6.7.8", 5070, None, 3600);
+        let authenticated = register(&cfg(), &ids, 2, "5.6.7.8", 5070, Some("Digest xxx"), 3600);
+        let text = String::from_utf8(authenticated.to_bytes()).unwrap();
         assert!(text.contains("Authorization: Digest xxx"));
         assert!(text.contains("CSeq: 2 REGISTER"));
+        assert_eq!(
+            first.headers.get("Call-ID"),
+            authenticated.headers.get("Call-ID")
+        );
+        assert_eq!(first.headers.get("From"), authenticated.headers.get("From"));
+        assert_ne!(first.headers.get("Via"), authenticated.headers.get("Via"));
     }
 
     #[test]

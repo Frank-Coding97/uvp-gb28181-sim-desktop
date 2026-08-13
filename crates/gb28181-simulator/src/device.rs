@@ -2347,13 +2347,31 @@ mod tests {
     ) {
         let mut prx = platform.register(call_id.clone());
         let mut seen = 0;
+        let mut first_via: Option<String> = None;
+        let mut first_from: Option<String> = None;
+        let mut first_cseq: Option<u32> = None;
         while let Some(inc) = prx.recv().await {
             if let SipMessage::Request(req) = inc.message {
                 let cseq = req.headers.cseq().unwrap_or("1 REGISTER").to_string();
+                let via = req
+                    .headers
+                    .get("Via")
+                    .expect("REGISTER 缺少 Via")
+                    .to_string();
+                let from = req
+                    .headers
+                    .get("From")
+                    .expect("REGISTER 缺少 From")
+                    .to_string();
+                let cseq_number = req.headers.cseq_number().expect("REGISTER 缺少 CSeq");
                 let mut h = Headers::new();
                 h.set("Call-ID", call_id.clone());
                 h.set("CSeq", cseq);
                 let resp = if seen == 0 {
+                    assert!(req.headers.get("Authorization").is_none());
+                    first_via = Some(via);
+                    first_from = Some(from);
+                    first_cseq = Some(cseq_number);
                     h.set(
                         "WWW-Authenticate",
                         r#"Digest realm="3402000000", nonce="abc123""#,
@@ -2365,6 +2383,11 @@ mod tests {
                         body: Vec::new(),
                     }
                 } else {
+                    assert!(req.headers.get("Authorization").is_some());
+                    assert_eq!(req.headers.get("Call-ID"), Some(call_id.as_str()));
+                    assert_eq!(first_from.as_deref(), Some(from.as_str()));
+                    assert_ne!(first_via.as_deref(), Some(via.as_str()));
+                    assert_eq!(Some(cseq_number), first_cseq.map(|value| value + 1));
                     Response {
                         status: 200,
                         reason: "OK".into(),
@@ -2376,6 +2399,9 @@ mod tests {
                 let _ = platform
                     .send_to(&SipMessage::Response(resp), device_addr)
                     .await;
+                if seen == 2 {
+                    return;
+                }
             }
         }
     }
@@ -2388,7 +2414,7 @@ mod tests {
         let device_addr = device_tp.local_addr().unwrap();
 
         let sim = DeviceSimulator::new(test_cfg("127.0.0.1", platform_addr.port()));
-        tokio::spawn(mock_platform_register(
+        let platform_task = tokio::spawn(mock_platform_register(
             platform_tp.clone(),
             device_addr,
             sim.call_id().to_string(),
@@ -2399,6 +2425,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, DeviceState::Registered);
+        platform_task.await.unwrap();
     }
 
     #[tokio::test]
