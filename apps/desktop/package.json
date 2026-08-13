@@ -1,7 +1,7 @@
 {
   "name": "uvp-gb28181-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "description": "UVP GB28181 桌面端模拟器 + 压力测试工具",
   "scripts": {
