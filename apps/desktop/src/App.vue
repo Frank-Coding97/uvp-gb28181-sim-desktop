@@ -6,7 +6,7 @@ import { computed, h, onMounted, onUnmounted, provide, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
-  NMenu, NIcon, NPopover, NInput, NInputNumber, NButton, NSelect, zhCN, dateZhCN,
+  NMenu, NIcon, NModal, NInput, NInputNumber, NButton, NSelect, zhCN, dateZhCN,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
 import SpeedometerOutline from "@vicons/ionicons5/es/SpeedometerOutline.js";
@@ -40,18 +40,34 @@ provide("platform", { profiles, activeId, active, setActive, addProfile, updateP
 const profileOptions = computed(() =>
   profiles.value.map((p) => ({ label: `${p.name}  (${p.server_host}:${p.server_port})`, value: p.id }))
 );
-// 顶栏编辑弹层用的临时表单。
+// 平台档案编辑弹窗(稳定模态框:点击遮罩/ESC 均不关闭,防误触丢失输入)。
+// 表单只在编辑目标切换时重新装载;关闭后重开保留未保存的草稿。
+const editOpen = ref(false);
+let editTargetId: string | null = null;
 const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP", signaling_encoding: "GB18030" });
 function openEdit() {
-  if (active.value) Object.assign(editForm.value, active.value);
+  if (active.value && editTargetId !== activeId.value) {
+    Object.assign(editForm.value, active.value);
+    editTargetId = activeId.value;
+  }
+}
+function openEditModal() {
+  openEdit();
+  editOpen.value = true;
 }
 function saveEdit() {
   updateProfile(activeId.value, { ...editForm.value });
+  editTargetId = activeId.value;
+  editOpen.value = false;
 }
 function addNew() {
   addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
     server_domain: "34020000002000000001", password: "change-me", transport: "UDP", signaling_encoding: "GB18030" });
   openEdit();
+}
+function onDeleteProfile() {
+  removeProfile(activeId.value);
+  openEdit(); // 删除后 activeId 可能切换,重新装载当前档案到表单
 }
 const transportOptions = [
   { label: "UDP（当前支持）", value: "UDP" },
@@ -191,12 +207,17 @@ const themeOverrides = {
                     class="plat-select"
                     @update:value="setActive"
                   />
-                  <n-popover trigger="click" placement="bottom-start" @update:show="(s: boolean) => s && openEdit()">
-                    <template #trigger>
-                      <n-button size="small" tertiary>编辑</n-button>
-                    </template>
+                  <n-button size="small" tertiary @click="openEditModal">编辑</n-button>
+                  <!-- 平台档案编辑:稳定模态框,点击遮罩/ESC 不关闭,误触不丢失输入。 -->
+                  <n-modal
+                    v-model:show="editOpen"
+                    preset="card"
+                    title="平台档案"
+                    :mask-closable="false"
+                    :close-on-esc="false"
+                    style="width: 340px"
+                  >
                     <div class="plat-edit">
-                      <div class="pe-title">平台档案</div>
                       <n-input v-model:value="editForm.name" size="small" placeholder="档案名称" />
                       <n-input v-model:value="editForm.server_host" size="small" placeholder="平台 IP" />
                       <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
@@ -207,10 +228,10 @@ const themeOverrides = {
                       <div class="pe-actions">
                         <n-button size="small" type="primary" @click="saveEdit">保存</n-button>
                         <n-button size="small" @click="addNew">+ 新增</n-button>
-                        <n-button size="small" type="error" :disabled="profiles.length <= 1" @click="removeProfile(activeId)">删除</n-button>
+                        <n-button size="small" type="error" :disabled="profiles.length <= 1" @click="onDeleteProfile">删除</n-button>
                       </div>
                     </div>
-                  </n-popover>
+                  </n-modal>
                 </div>
                 <!-- 全局状态芯片 + 注册/注销:所有菜单页可见,任意页面均可注册/注销设备。 -->
                 <div class="status-area">
@@ -293,8 +314,7 @@ const themeOverrides = {
 .plat-select { width: 280px; min-width: 160px; }
 .plat-icon { color: var(--accent); font-size: 16px; }
 .plat-label { font-size: 12.5px; color: var(--text-secondary); }
-.plat-edit { display: flex; flex-direction: column; gap: 8px; width: 240px; }
-.pe-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.plat-edit { display: flex; flex-direction: column; gap: 8px; width: 100%; }
 .pe-actions { display: flex; gap: 8px; margin-top: 4px; }
 /* 顶栏右侧:状态芯片 + 注册/注销按钮。 */
 .status-area { display: inline-flex; align-items: center; gap: 12px; min-width: 0; }
