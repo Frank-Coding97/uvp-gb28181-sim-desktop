@@ -174,7 +174,7 @@ const themeOverrides = {
                 :indent="18"
                 @update:value="onMenuSelect"
               />
-              <div class="sidebar-footer">v0.1.0 · UVP</div>
+              <div class="sidebar-footer">v0.1.2 · UVP</div>
             </aside>
 
             <!-- 主区 -->

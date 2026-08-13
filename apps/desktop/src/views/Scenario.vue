@@ -166,7 +166,7 @@ function buildToml(): string {
     `device_name = ${tomlString("UVP-Sim")}`,
     `manufacturer = ${tomlString("UVP")}`,
     `model = ${tomlString("Desktop-Sim")}`,
-    `firmware = ${tomlString("0.1.0")}`,
+    `firmware = ${tomlString("0.1.2")}`,
   );
   return lines.join("\n");
 }
