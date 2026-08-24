@@ -9,6 +9,11 @@ export interface PreviewSessionState {
   error: string;
 }
 
+export interface PreviewSessionCallbacks {
+  onState?: (state: PreviewSessionState["state"]) => void;
+  onError?: (error: string) => void;
+}
+
 function decoderFactory(): VideoDecoderFactory | null {
   const ctor = (globalThis as typeof globalThis & { VideoDecoder?: typeof VideoDecoder }).VideoDecoder;
   if (!ctor) return null;
@@ -39,7 +44,7 @@ function parseEnvelope(raw: ArrayBuffer): PreviewPacketMetadata | null {
   };
 }
 
-export function usePreviewSession(canvas: HTMLCanvasElement | null) {
+export function usePreviewSession(canvas: HTMLCanvasElement | null, callbacks: PreviewSessionCallbacks = {}) {
   const state: PreviewSessionState = {
     state: "idle",
     decoder: { state: "idle", path: null, fallbackReason: null, droppedFrames: 0, lastSequence: 0, sessionId: null, firstFrameAt: null },
@@ -60,6 +65,7 @@ export function usePreviewSession(canvas: HTMLCanvasElement | null) {
     }
     frame.close();
     state.state = "playing";
+    callbacks.onState?.("playing");
     state.latencyMs = Math.max(0, Date.now() - packet.captured_at_ms);
     const now = performance.now();
     if (!fpsStart) fpsStart = now;
@@ -87,6 +93,8 @@ export function usePreviewSession(canvas: HTMLCanvasElement | null) {
       if (!packet) {
         state.error = "预览二进制帧格式错误";
         state.state = "error";
+        callbacks.onError?.(state.error);
+        callbacks.onState?.("error");
         return;
       }
       if (packet.codec === "H264") void decoder?.push(packet);
@@ -98,6 +106,8 @@ export function usePreviewSession(canvas: HTMLCanvasElement | null) {
     } catch (error) {
       state.error = String(error);
       state.state = "error";
+      callbacks.onError?.(state.error);
+      callbacks.onState?.("error");
       return false;
     }
   };
@@ -108,6 +118,7 @@ export function usePreviewSession(canvas: HTMLCanvasElement | null) {
     decoder = null;
     channel = null;
     state.state = "stopped";
+    callbacks.onState?.("stopped");
   };
 
   return { state, start, stop, parseEnvelope, annexBNals };

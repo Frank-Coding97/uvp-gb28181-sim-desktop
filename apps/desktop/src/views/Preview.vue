@@ -22,6 +22,7 @@ let binarySession: ReturnType<typeof usePreviewSession> | null = null;
 let unlistenFrame: UnlistenFn | null = null;
 let unlistenState: UnlistenFn | null = null;
 let unlistenError: UnlistenFn | null = null;
+let unlistenTransport: UnlistenFn | null = null;
 
 const source = computed(() => form.value.video_source.trim());
 const stateText = computed(() => ({ idle: "未启动", starting: "启动中", playing: "播放中", stopped: "已停止", error: "异常" }[state.value]));
@@ -36,7 +37,10 @@ const sourceType = computed(() => {
 async function start() {
   error.value = "";
   state.value = "starting";
-  if (!binarySession) binarySession = usePreviewSession(canvasRef.value);
+  if (!binarySession) binarySession = usePreviewSession(canvasRef.value, {
+    onState: (next) => { state.value = next; },
+    onError: (reason) => { error.value = reason; },
+  });
   if (binarySession && await binarySession.start()) {
     binarySessionActive.value = true;
     return;
@@ -88,8 +92,15 @@ onMounted(async () => {
     error.value = event.payload;
     state.value = "error";
   });
+  unlistenTransport = await listen<{ state?: string; timeout_ms?: number }>("preview_transport", (event) => {
+    if (event.payload.state === "stalled") {
+      error.value = `预览通道消费超时（${event.payload.timeout_ms ?? 500}ms）`;
+      state.value = "error";
+      binarySessionActive.value = false;
+    }
+  });
 });
-onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); void binarySession?.stop(); void invoke("stop_preview"); });
+onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); unlistenTransport?.(); void binarySession?.stop(); void invoke("stop_preview"); });
 </script>
 
 <template>

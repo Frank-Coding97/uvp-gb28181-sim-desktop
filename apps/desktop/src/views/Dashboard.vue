@@ -87,6 +87,7 @@ const sourceProbe = ref("");
 let unlistenFrame: UnlistenFn | null = null;
 let unlistenPreviewState: UnlistenFn | null = null;
 let unlistenPreviewError: UnlistenFn | null = null;
+let unlistenPreviewTransport: UnlistenFn | null = null;
 let unlistenCaptureState: UnlistenFn | null = null;
 let unlistenSubscription: UnlistenFn | null = null;
 let fpsWindowStart = 0;
@@ -395,7 +396,10 @@ async function startPreview() {
   if (!isTauri || !deviceLive.value || captureState.value !== "ready" || previewState.value === "playing" || previewState.value === "starting") return;
   previewError.value = "";
   previewState.value = "starting";
-  if (!binarySession) binarySession = usePreviewSession(canvasRef.value);
+  if (!binarySession) binarySession = usePreviewSession(canvasRef.value, {
+    onState: (next) => { previewState.value = next; },
+    onError: (error) => { previewError.value = error; },
+  });
   if (binarySession) {
     const started = await binarySession.start();
     if (started) {
@@ -454,6 +458,13 @@ onMounted(async () => {
     previewState.value = "error";
     previewError.value = event.payload;
   });
+  unlistenPreviewTransport = await listen<{ state?: string; transport?: string; timeout_ms?: number }>("preview_transport", (event) => {
+    if (event.payload.state === "stalled") {
+      previewState.value = "error";
+      previewError.value = `预览通道消费超时（${event.payload.timeout_ms ?? 500}ms），已停止发送`;
+      binarySessionActive.value = false;
+    }
+  });
   unlistenCaptureState = await listen<string>("capture_state", (event) => {
     captureState.value = event.payload as CaptureState;
     if (event.payload === "ready") void startPreview();
@@ -483,6 +494,7 @@ onUnmounted(() => {
   unlistenFrame?.();
   unlistenPreviewState?.();
   unlistenPreviewError?.();
+  unlistenPreviewTransport?.();
   unlistenCaptureState?.();
   unlistenSubscription?.();
 });

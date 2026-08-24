@@ -130,6 +130,7 @@ impl media_rtp::PreviewSink for DesktopPreviewBus {
         // 关闭当前订阅发送端，让预览线程退出并让前端收到 stopped。
         self.subscribers.lock().unwrap().clear();
         self.latest_config_keyframe.lock().unwrap().take();
+        self.store.clear();
     }
 }
 
