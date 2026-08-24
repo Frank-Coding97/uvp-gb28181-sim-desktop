@@ -35,11 +35,12 @@ pub fn prepare_video_source(path: &str) -> Result<std::path::PathBuf> {
 
 /// 定位 ffmpeg 可执行文件。
 ///
-/// **关键**:从 .app 双击启动的 GUI 进程 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`,
-/// 不含 Homebrew 的 `/opt/homebrew/bin`,故仅靠 PATH 找 `ffmpeg` 在打包后会失败
-/// (终端 `cargo run` 有完整 PATH 所以能找到——这是"终端能用、打包不能用"的根因)。
-/// 先试 PATH,再逐个探测常见绝对路径。返回可用的命令名/路径。
+/// **关键**:发布包必须优先使用应用内置的 FFmpeg，不能要求用户安装系统依赖。
+/// 开发阶段才回退到 `UVP_FFMPEG_PATH`、PATH 和常见 Homebrew 路径，方便本地调试。
+/// macOS 的 `.app`、Windows 安装目录和 Linux AppImage/普通安装目录都按可执行文件
+/// 旁的 `ffmpeg`/`ffmpeg.exe` 及 `resources/` 目录探测。
 pub fn ffmpeg_bin() -> Option<String> {
+    use std::path::PathBuf;
     use std::process::Command;
     let probe = |bin: &str| {
         Command::new(bin)
@@ -48,29 +49,42 @@ pub fn ffmpeg_bin() -> Option<String> {
             .map(|o| o.status.success())
             .unwrap_or(false)
     };
-    // 0) app 包内 ffmpeg(macOS)。**关键**:Homebrew ffmpeg 在包外、不属任何 .app,
-    // 采集时被 TCC SIGABRT 崩溃。把 ffmpeg 放进主 app 的 Contents/MacOS/(与主二进制
-    // 同目录、同属 com.uvp.gb28181.desktop 这个 bundle),签名 identifier 也设成主 app,
-    // 则:摄像头 TCC 认主 app Info.plist 的 NSCameraUsageDescription;屏幕录制 TCC
-    // 按主 app 主体判定授权(用户在系统设置里勾选的正是主 app)。与主进程同主体是关键。
-    // current_exe = …/Contents/MacOS/uvp-desktop,同目录取 ffmpeg。
-    #[cfg(target_os = "macos")]
+    let mut bundled = Vec::<PathBuf>::new();
+    if let Ok(path) = std::env::var("UVP_FFMPEG_PATH") {
+        bundled.push(PathBuf::from(path));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let bundled = dir.join("ffmpeg");
-            if bundled.exists() {
-                let s = bundled.to_string_lossy().into_owned();
-                if probe(&s) {
-                    return Some(s);
-                }
+            let names: &[&str] = if cfg!(target_os = "windows") {
+                &["ffmpeg.exe", "ffmpeg"]
+            } else {
+                &["ffmpeg", "ffmpeg.exe"]
+            };
+            for name in names {
+                bundled.push(dir.join(name));
+                bundled.push(dir.join("resources").join(name));
+                bundled.push(dir.join("../resources").join(name));
+                bundled.push(dir.join("../Resources").join(name));
             }
         }
     }
-    // 1) PATH(终端启动 / 已配置环境)。
-    if probe("ffmpeg") {
-        return Some("ffmpeg".into());
+    for path in bundled {
+        let s = path.to_string_lossy().into_owned();
+        if path.is_file() && probe(&s) {
+            return Some(s);
+        }
     }
-    // 2) 常见绝对路径(GUI 启动无 Homebrew PATH 时兜底)。
+    let path_names: &[&str] = if cfg!(target_os = "windows") {
+        &["ffmpeg.exe", "ffmpeg"]
+    } else {
+        &["ffmpeg", "ffmpeg.exe"]
+    };
+    for name in path_names {
+        if probe(name) {
+            return Some((*name).into());
+        }
+    }
+    // 开发环境常见绝对路径兜底；发布包不会依赖这些路径。
     for p in [
         "/opt/homebrew/bin/ffmpeg", // Apple Silicon Homebrew
         "/usr/local/bin/ffmpeg",    // Intel Homebrew
@@ -86,11 +100,11 @@ pub fn ffmpeg_bin() -> Option<String> {
 
 /// 把容器视频文件(MP4/FLV/MKV/MOV 等)转封装为 H.264 Annex B 裸流,返回裸流文件路径。
 ///
-/// 用系统 `ffmpeg`:优先 `-c:v copy -bsf:v h264_mp4toannexb`(无损转封装,快);
+/// 用内置或开发环境解析到的 `ffmpeg`:优先 `-c:v copy -bsf:v h264_mp4toannexb`(无损转封装,快);
 /// 失败则回退重编码(`libx264 -preset ultrafast`,兼容任意输入)。结果按"源路径 + 修改时间"
 /// 缓存到临时目录,同一文件只转一次(压测多设备共用同一文件时只转一次)。
 ///
-/// ffmpeg 为可选外部依赖:仅容器格式需要;缺失时返回明确错误。
+/// 发布包缺少 FFmpeg 时应在打包阶段失败；运行时仍返回明确错误，便于开发环境诊断。
 fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     use std::process::Command;
 
@@ -265,6 +279,228 @@ pub trait VideoSource: Send {
     fn take_error(&mut self) -> Option<String> {
         None
     }
+}
+
+/// 注册期唯一采集源的帧总线。预览和平台点播各自订阅，任何慢消费者都不会阻塞采集。
+pub struct SharedMedia {
+    frames: tokio::sync::broadcast::Sender<SharedFrame>,
+    /// 最近一帧同时包含参数集和关键图像的访问单元。
+    /// 新订阅者必须从它开始，否则延迟加入的 FFmpeg/RTP 解码器只有 IDR、没有 SPS/PPS。
+    latest_config_keyframe: std::sync::Mutex<Option<SharedFrame>>,
+    stop: std::sync::atomic::AtomicBool,
+    alive: std::sync::atomic::AtomicBool,
+    has_audio: bool,
+    audio_codec: crate::ps::AudioCodec,
+    video_codec: crate::ps::VideoCodec,
+    error: std::sync::Mutex<Option<String>>,
+    frames_seen: std::sync::atomic::AtomicU64,
+    seek_permille_plus1: std::sync::atomic::AtomicU32,
+}
+
+#[derive(Clone)]
+struct SharedFrame {
+    frame: Frame,
+    audio: Vec<Vec<u8>>,
+}
+
+/// 从一个源启动唯一采集线程。实时源在设备注册期间持续运行，直到调用 [`SharedMedia::stop`]。
+pub fn start_shared_media(
+    mut source: Box<dyn VideoSource>,
+    fps: u32,
+    preview: Option<std::sync::Arc<dyn crate::pusher::PreviewSink>>,
+) -> std::sync::Arc<SharedMedia> {
+    let fps = fps.max(1);
+    let (frames, _) = tokio::sync::broadcast::channel((fps * 4).max(32) as usize);
+    let media = std::sync::Arc::new(SharedMedia {
+        frames,
+        latest_config_keyframe: std::sync::Mutex::new(None),
+        stop: std::sync::atomic::AtomicBool::new(false),
+        alive: std::sync::atomic::AtomicBool::new(true),
+        has_audio: source.has_audio(),
+        audio_codec: source.audio_codec(),
+        video_codec: source.codec(),
+        error: std::sync::Mutex::new(None),
+        frames_seen: std::sync::atomic::AtomicU64::new(0),
+        seek_permille_plus1: std::sync::atomic::AtomicU32::new(0),
+    });
+    let producer = std::sync::Arc::clone(&media);
+    std::thread::spawn(move || {
+        let interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
+        let mut pts_90k = 0_u64;
+        let pts_step = u64::from(crate::rtp::CLOCK_HZ / fps);
+        while !producer.stop.load(std::sync::atomic::Ordering::Acquire) {
+            let tick = std::time::Instant::now();
+            let seek = producer
+                .seek_permille_plus1
+                .swap(0, std::sync::atomic::Ordering::AcqRel);
+            if seek > 0 {
+                source.seek(seek - 1);
+            }
+            if let Some(error) = source.take_error() {
+                *producer.error.lock().unwrap() = Some(error);
+                break;
+            }
+            if let Some(frame) = source.next_frame() {
+                let audio = source.next_audio();
+                let shared_frame = SharedFrame { frame, audio };
+                producer
+                    .frames_seen
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                if shared_frame.frame.key_frame
+                    && crate::pusher::contains_codec_config(
+                        &shared_frame.frame.data,
+                        producer.video_codec,
+                    )
+                {
+                    *producer.latest_config_keyframe.lock().unwrap() = Some(shared_frame.clone());
+                }
+                if let Some(sink) = &preview {
+                    sink.publish(crate::pusher::PreviewPacket {
+                        data: shared_frame.frame.data.clone(),
+                        key_frame: shared_frame.frame.key_frame,
+                        codec: producer.video_codec,
+                        fps,
+                        pts_90k,
+                        captured_at_ms: now_ms(),
+                    });
+                }
+                let _ = producer.frames.send(shared_frame);
+                pts_90k = pts_90k.wrapping_add(pts_step);
+            } else if !source.is_live() {
+                break;
+            }
+            if let Some(remaining) = interval.checked_sub(tick.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+        }
+        producer
+            .alive
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(sink) = preview {
+            sink.stopped();
+        }
+    });
+    media
+}
+
+impl SharedMedia {
+    /// 为一路 RTP 推流建立独立消费者；发生积压时从下一关键帧恢复。
+    pub fn subscribe(self: &std::sync::Arc<Self>) -> SharedVideoSource {
+        SharedVideoSource {
+            media: std::sync::Arc::clone(self),
+            frames: self.frames.subscribe(),
+            pending_audio: Vec::new(),
+            bootstrap: self.latest_config_keyframe.lock().unwrap().clone(),
+            need_key_frame: true,
+        }
+    }
+
+    /// 设备注销时停止唯一采集线程并释放底层摄像头/屏幕句柄。
+    pub fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 采集线程至少产出过一帧，表示源已经真正启动，而不是仅创建了后台线程。
+    pub fn has_frames(&self) -> bool {
+        self.frames_seen.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// 返回采集线程的异步错误（如果有）。
+    pub fn capture_error(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|error| error.clone())
+    }
+
+    fn seek(&self, permille: u32) {
+        self.seek_permille_plus1
+            .store(permille.min(1000) + 1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for SharedMedia {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// [`SharedMedia`] 的单路 RTP 读取端。
+pub struct SharedVideoSource {
+    media: std::sync::Arc<SharedMedia>,
+    frames: tokio::sync::broadcast::Receiver<SharedFrame>,
+    pending_audio: Vec<Vec<u8>>,
+    bootstrap: Option<SharedFrame>,
+    need_key_frame: bool,
+}
+
+impl VideoSource for SharedVideoSource {
+    fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            if let Some(packet) = self.bootstrap.take() {
+                self.need_key_frame = false;
+                self.pending_audio = packet.audio;
+                return Some(packet.frame);
+            }
+            match self.frames.try_recv() {
+                Ok(packet) => {
+                    if self.need_key_frame && !packet.frame.key_frame {
+                        continue;
+                    }
+                    self.need_key_frame = false;
+                    self.pending_audio = packet.audio;
+                    return Some(packet.frame);
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    self.need_key_frame = true;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return None,
+            }
+        }
+    }
+
+    fn next_audio(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_audio)
+    }
+
+    fn has_audio(&self) -> bool {
+        self.media.has_audio
+    }
+
+    fn audio_codec(&self) -> crate::ps::AudioCodec {
+        self.media.audio_codec
+    }
+
+    fn codec(&self) -> crate::ps::VideoCodec {
+        self.media.video_codec
+    }
+
+    fn seek(&mut self, permille: u32) {
+        self.media.seek(permille);
+        self.bootstrap = None;
+        self.need_key_frame = true;
+    }
+
+    fn is_live(&self) -> bool {
+        self.media.alive.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        self.media
+            .error
+            .lock()
+            .ok()
+            .and_then(|mut error| error.take())
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 空媒体源:永不产帧(A 档,只维持信令)。
@@ -996,6 +1232,75 @@ fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
 mod tests {
     use super::*;
 
+    struct PreviewCollector(std::sync::Mutex<Vec<crate::pusher::PreviewPacket>>);
+
+    impl crate::pusher::PreviewSink for PreviewCollector {
+        fn publish(&self, packet: crate::pusher::PreviewPacket) {
+            self.0.lock().unwrap().push(packet);
+        }
+    }
+
+    struct SyntheticLive {
+        sequence: u8,
+    }
+
+    impl VideoSource for SyntheticLive {
+        fn next_frame(&mut self) -> Option<Frame> {
+            self.sequence = self.sequence.wrapping_add(1);
+            Some(Frame {
+                data: vec![0, 0, 0, 1, 0x65, self.sequence],
+                key_frame: self.sequence % 5 == 1,
+            })
+        }
+
+        fn is_live(&self) -> bool {
+            true
+        }
+    }
+
+    struct ConfigThenFrames {
+        sequence: u8,
+    }
+
+    impl VideoSource for ConfigThenFrames {
+        fn next_frame(&mut self) -> Option<Frame> {
+            self.sequence = self.sequence.wrapping_add(1);
+            let data = if self.sequence == 1 {
+                vec![
+                    0,
+                    0,
+                    0,
+                    1,
+                    0x67,
+                    0x42,
+                    0x00, // SPS
+                    0,
+                    0,
+                    0,
+                    1,
+                    0x68,
+                    0xce, // PPS
+                    0,
+                    0,
+                    0,
+                    1,
+                    0x65,
+                    self.sequence, // IDR
+                ]
+            } else {
+                vec![0, 0, 0, 1, 0x65, self.sequence]
+            };
+            Some(Frame {
+                data,
+                key_frame: true,
+            })
+        }
+
+        fn is_live(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn ffmpeg查找_返回可执行或none不panic() {
         // 不强求装了 ffmpeg;只验证查找逻辑健壮(PATH + 绝对路径探测)不 panic,
@@ -1008,6 +1313,89 @@ mod tests {
                 .unwrap_or(false);
             assert!(ok, "ffmpeg_bin 返回的 {bin} 应可执行");
         }
+    }
+
+    #[test]
+    fn 注册期共享媒体_预览先收到帧_点播订阅仍能收到同一流() {
+        let preview = std::sync::Arc::new(PreviewCollector(std::sync::Mutex::new(Vec::new())));
+        let media = start_shared_media(
+            Box::new(SyntheticLive { sequence: 0 }),
+            100,
+            Some(preview.clone() as std::sync::Arc<dyn crate::pusher::PreviewSink>),
+        );
+        let mut rtp_source = media.subscribe();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut first_rtp = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(frame) = rtp_source.next_frame() {
+                first_rtp = Some(frame);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        media.stop();
+        assert!(first_rtp.is_some(), "点播订阅应能从注册期共享源收到帧");
+        assert!(
+            !preview.0.lock().unwrap().is_empty(),
+            "注册期预览应先收到编码帧"
+        );
+    }
+
+    #[test]
+    fn 延迟点播订阅_首帧使用最近的参数关键帧() {
+        let preview = std::sync::Arc::new(PreviewCollector(std::sync::Mutex::new(Vec::new())));
+        let media = start_shared_media(
+            Box::new(ConfigThenFrames { sequence: 0 }),
+            200,
+            Some(preview.clone() as std::sync::Arc<dyn crate::pusher::PreviewSink>),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while preview.0.lock().unwrap().len() < 5 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut rtp_source = media.subscribe();
+        let first = rtp_source
+            .next_frame()
+            .expect("延迟订阅应立即得到 bootstrap 参数关键帧");
+        let packet = crate::pusher::PreviewPacket {
+            data: first.data,
+            key_frame: first.key_frame,
+            codec: crate::ps::VideoCodec::H264,
+            fps: 200,
+            pts_90k: 0,
+            captured_at_ms: 0,
+        };
+        assert!(
+            crate::pusher::is_config_keyframe(&packet),
+            "延迟订阅的首帧必须包含 SPS/PPS/IDR"
+        );
+        media.stop();
+    }
+
+    #[test]
+    fn 参数集识别_支持_h264_和_h265() {
+        let h264 = crate::pusher::PreviewPacket {
+            data: vec![0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3],
+            key_frame: true,
+            codec: crate::ps::VideoCodec::H264,
+            fps: 25,
+            pts_90k: 0,
+            captured_at_ms: 0,
+        };
+        let h265 = crate::pusher::PreviewPacket {
+            data: vec![
+                0, 0, 1, 0x40, 1, // VPS (type 32)
+                0, 0, 1, 0x42, 1, // SPS (type 33)
+                0, 0, 1, 0x44, 1, // PPS (type 34)
+            ],
+            key_frame: true,
+            codec: crate::ps::VideoCodec::H265,
+            fps: 25,
+            pts_90k: 0,
+            captured_at_ms: 0,
+        };
+        assert!(crate::pusher::is_config_keyframe(&h264));
+        assert!(crate::pusher::is_config_keyframe(&h265));
     }
 
     #[test]

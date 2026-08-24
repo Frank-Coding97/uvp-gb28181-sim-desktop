@@ -23,6 +23,7 @@ gb28181-protocol  = { path = "../../../crates/gb28181-protocol" }
 media-rtp          = { path = "../../../crates/media-rtp" }
 sip-core          = { path = "../../../crates/sip-core" }
 encoding_rs       = { workspace = true }
+base64            = "0.22"
 common            = { path = "../../../crates/common" }
 tauri = { version = "=2.11.5", features = [] }
 serde.workspace = true

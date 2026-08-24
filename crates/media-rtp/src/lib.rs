@@ -14,12 +14,16 @@ pub mod rtp;
 pub mod source;
 
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};
-pub use pusher::{push_stream, push_stream_controlled, PlaybackControl};
+pub use pusher::{
+    contains_codec_config, is_config_keyframe, push_stream, push_stream_controlled,
+    push_stream_controlled_with_preview, PlaybackControl, PreviewPacket, PreviewSink,
+};
 pub use rtp::{build_rtcp_sr, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
-    list_live_sources, prepare_video_source, FileSource, Frame, LightSource, LiveAudioCodec,
-    LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource, LiveSourceCatalog, LiveSourceSpec,
-    LiveVideoCodec, LiveVideoProfile, NoneSource, VideoSource,
+    ffmpeg_bin, list_live_sources, prepare_video_source, start_shared_media, FileSource, Frame,
+    LightSource, LiveAudioCodec, LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource,
+    LiveSourceCatalog, LiveSourceSpec, LiveVideoCodec, LiveVideoProfile, NoneSource, SharedMedia,
+    SharedVideoSource, VideoSource,
 };
 
 /// RTP 发送模式。

@@ -26,6 +26,7 @@ import { usePlatform } from "../platform";
 
 type MediaMode = "none" | "file" | "camera" | "screen";
 type PreviewState = "idle" | "starting" | "playing" | "stopped" | "error";
+type CaptureState = "stopped" | "starting" | "ready" | "error";
 
 interface LiveAvDevice {
   index: number;
@@ -73,6 +74,7 @@ const editing = ref(false);
 const saving = ref(false);
 const sourceLoading = ref(false);
 const previewState = ref<PreviewState>("idle");
+const captureState = ref<CaptureState>("stopped");
 const previewError = ref("");
 const frameUrl = ref("");
 const previewLatency = ref<number | null>(null);
@@ -81,6 +83,7 @@ const sourceProbe = ref("");
 let unlistenFrame: UnlistenFn | null = null;
 let unlistenPreviewState: UnlistenFn | null = null;
 let unlistenPreviewError: UnlistenFn | null = null;
+let unlistenCaptureState: UnlistenFn | null = null;
 let unlistenSubscription: UnlistenFn | null = null;
 let fpsWindowStart = 0;
 let fpsWindowFrames = 0;
@@ -161,6 +164,17 @@ const previewStateText = computed(() => ({
   stopped: "已停止",
   error: "采集异常",
 }[previewState.value]));
+const previewEmptyTitle = computed(() => {
+  if (!deviceLive.value) return "虚拟摄像机未启动";
+  if (captureState.value === "stopped") return "尚未配置视频源";
+  if (captureState.value === "error") return "视频采集启动失败";
+  return "等待采集画面";
+});
+const previewEmptyHint = computed(() => {
+  if (!deviceLive.value) return "选择采集来源并注册设备后显示同帧预览";
+  if (captureState.value === "stopped") return "请选择摄像头、屏幕或视频文件后重新注册设备";
+  return previewError.value || "采集源就绪后会自动订阅并显示首帧";
+});
 const sourceSummary = computed(() => {
   const source = form.value.video_source.trim();
   if (!source) return "当前仅进行 SIP 信令模拟";
@@ -374,7 +388,7 @@ async function fireAlarm() {
 }
 
 async function startPreview() {
-  if (!isTauri || !deviceLive.value || previewState.value === "playing" || previewState.value === "starting") return;
+  if (!isTauri || !deviceLive.value || captureState.value !== "ready" || previewState.value === "playing" || previewState.value === "starting") return;
   previewError.value = "";
   previewState.value = "starting";
   try {
@@ -389,8 +403,8 @@ async function startPreview() {
 }
 
 watch(deviceLive, (running) => {
-  if (running) void startPreview();
-  else {
+  if (!running) {
+    captureState.value = "stopped";
     frameUrl.value = "";
     previewState.value = "idle";
     previewLatency.value = null;
@@ -428,24 +442,35 @@ onMounted(async () => {
     previewState.value = "error";
     previewError.value = event.payload;
   });
+  unlistenCaptureState = await listen<string>("capture_state", (event) => {
+    captureState.value = event.payload as CaptureState;
+    if (event.payload === "ready") void startPreview();
+    if (event.payload === "stopped" || event.payload === "error") {
+      frameUrl.value = "";
+      previewState.value = event.payload === "error" ? "error" : "idle";
+    }
+  });
   unlistenSubscription = await listen<SubscriptionState>("subscription_state", (event) => {
     if (event.payload.kind in subscriptions) {
       subscriptions[event.payload.kind] = event.payload;
     }
   });
-  await Promise.all([reconcile(), refreshSources(false)]);
+  const [runtime] = await Promise.all([reconcile(), refreshSources(false)]);
+  if (runtime) captureState.value = runtime.capture_state as CaptureState;
   await startPreview();
 });
 
-onActivated(() => {
-  void reconcile();
-  void startPreview();
+onActivated(async () => {
+  const runtime = await reconcile();
+  if (runtime) captureState.value = runtime.capture_state as CaptureState;
+  await startPreview();
 });
 
 onUnmounted(() => {
   unlistenFrame?.();
   unlistenPreviewState?.();
   unlistenPreviewError?.();
+  unlistenCaptureState?.();
   unlistenSubscription?.();
 });
 </script>
@@ -477,8 +502,8 @@ onUnmounted(() => {
           <img v-if="frameUrl" :src="frameUrl" alt="设备采集预览" />
           <div v-else class="preview-cover">
             <div class="cover-mark"><n-icon :size="42"><VideocamOutline /></n-icon></div>
-            <strong>{{ deviceLive ? "等待采集画面" : "虚拟摄像机未启动" }}</strong>
-            <span>{{ deviceLive ? (previewError || "编码首帧到达后将在这里显示") : "选择采集来源并注册设备后显示同帧预览" }}</span>
+            <strong>{{ previewEmptyTitle }}</strong>
+            <span>{{ previewEmptyHint }}</span>
           </div>
           <div class="preview-overlay top-left"><i :class="{ on: previewState === 'playing' }" /> UVP-SIM</div>
           <div class="preview-overlay bottom-row">

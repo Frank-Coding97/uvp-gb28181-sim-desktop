@@ -3,11 +3,14 @@
 //! 按 docs/20-architecture/api-contract.md 注册 IPC 命令。
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 
+use base64::Engine;
 use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,9 @@ struct AppState {
     last_scenario: Mutex<Option<(String, usize)>>,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
+    /// 本地预览解码任务；输入来自注册期共享采集总线，不会再打开第二路摄像头。
+    preview: Mutex<Option<PreviewHandle>>,
+    preview_bus: Arc<DesktopPreviewBus>,
 }
 
 /// 压测运行句柄。收到停止请求后仅标记 `stopping`，由后台任务退出时释放。
@@ -49,6 +55,57 @@ struct DeviceHandle {
     stop_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+struct PreviewHandle {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    child: Arc<std::sync::Mutex<Option<Child>>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 推流器到桌面预览的有界同帧总线。慢消费者只丢帧，不阻塞 RTP。
+struct DesktopPreviewBus {
+    subscribers: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<media_rtp::PreviewPacket>>>,
+    latest_config_keyframe: std::sync::Mutex<Option<media_rtp::PreviewPacket>>,
+}
+
+impl DesktopPreviewBus {
+    fn new() -> Self {
+        Self {
+            subscribers: std::sync::Mutex::new(Vec::new()),
+            latest_config_keyframe: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::Receiver<media_rtp::PreviewPacket> {
+        let (tx, rx) = tokio::sync::mpsc::channel(24);
+        if let Some(packet) = self.latest_config_keyframe.lock().unwrap().clone() {
+            // bootstrap 必须先于采集线程后续帧进入队列，避免预览从无 SPS/PPS 的 IDR 开始。
+            let _ = tx.try_send(packet);
+        }
+        self.subscribers.lock().unwrap().push(tx);
+        rx
+    }
+}
+
+impl media_rtp::PreviewSink for DesktopPreviewBus {
+    fn publish(&self, packet: media_rtp::PreviewPacket) {
+        if media_rtp::is_config_keyframe(&packet) {
+            *self.latest_config_keyframe.lock().unwrap() = Some(packet.clone());
+        }
+        let mut subscribers = self.subscribers.lock().unwrap();
+        subscribers.retain(|tx| match tx.try_send(packet.clone()) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        });
+    }
+
+    fn stopped(&self) {
+        // 关闭当前订阅发送端，让预览线程退出并让前端收到 stopped。
+        self.subscribers.lock().unwrap().clear();
+        self.latest_config_keyframe.lock().unwrap().take();
+    }
+}
+
 impl AppState {
     fn new() -> Self {
         AppState {
@@ -58,6 +115,8 @@ impl AppState {
             last_metrics: Mutex::new(None),
             last_scenario: Mutex::new(None),
             device: Mutex::new(None),
+            preview: Mutex::new(None),
+            preview_bus: Arc::new(DesktopPreviewBus::new()),
         }
     }
 }
@@ -73,6 +132,30 @@ impl DeviceObserver for StateEmitter {
             DeviceEvent::RegisterAttempt => "Registering",
             DeviceEvent::RegisterSuccess => "Registered",
             DeviceEvent::RegisterFailure(_) => "Failed",
+            DeviceEvent::CaptureStarting => {
+                let _ = self.app.emit("capture_state", "starting");
+                return;
+            }
+            DeviceEvent::CaptureReady => {
+                let _ = self.app.emit("capture_state", "ready");
+                return;
+            }
+            DeviceEvent::CaptureStopped => {
+                let _ = self.app.emit("capture_state", "stopped");
+                return;
+            }
+            DeviceEvent::CaptureFailure(message) => {
+                let _ = self.app.emit("capture_state", "error");
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = self.app.emit(
+                    "device_error",
+                    serde_json::json!({ "scope": "capture", "message": message, "ts_ms": ts_ms }),
+                );
+                return;
+            }
             DeviceEvent::StreamStart => "InCall",
             DeviceEvent::StreamStop => "Registered",
             // 心跳事件不改变状态灯。
@@ -461,8 +544,15 @@ async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_js
 /// 查询单设备运行状态(UI 切页后对账用)。running=设备实例是否存在。
 #[tauri::command]
 async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let running = state.device.lock().await.is_some();
-    Ok(serde_json::json!({ "running": running }))
+    let device = state.device.lock().await;
+    let (running, capture_state) = match device.as_ref() {
+        Some(handle) => {
+            let ready = handle.sim.capture_ready().await;
+            (true, if ready { "ready" } else { "starting" })
+        }
+        None => (false, "stopped"),
+    };
+    Ok(serde_json::json!({ "running": running, "capture_state": capture_state }))
 }
 
 /// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
@@ -639,6 +729,292 @@ async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
     })
     .await
     .map_err(|error| format!("实时采集探测任务异常: {error}"))?
+}
+
+/// 订阅推流器的同帧预览。source 参数保留用于兼容旧前端，新实现不再重新采集。
+#[tauri::command]
+async fn start_preview(
+    _source: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let mut preview_guard = state.preview.lock().await;
+    if preview_guard.is_some() {
+        let finished = preview_guard.as_ref().is_some_and(|handle| {
+            handle.done.load(Ordering::Relaxed)
+                || handle
+                    .child
+                    .lock()
+                    .ok()
+                    .and_then(|mut child| {
+                        child
+                            .as_mut()
+                            .map(|process| process.try_wait().ok().flatten().is_some())
+                    })
+                    .unwrap_or(false)
+        });
+        if finished {
+            *preview_guard = None;
+        } else {
+            return Err("已有预览正在运行，请先停止当前预览".into());
+        }
+    }
+    let rx = state.preview_bus.subscribe();
+    let child_slot = Arc::new(std::sync::Mutex::new(None));
+    let child_slot_reader = Arc::clone(&child_slot);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_reader = Arc::clone(&stop);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_reader = Arc::clone(&done);
+    let app_reader = app.clone();
+    std::thread::spawn(move || {
+        let mut rx = rx;
+        let _ = app_reader.emit("preview_state", "starting");
+        let first_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let first = loop {
+            if stop_reader.load(Ordering::Relaxed) {
+                done_reader.store(true, Ordering::Relaxed);
+                return;
+            }
+            if std::time::Instant::now() >= first_deadline {
+                let _ = app_reader.emit(
+                    "preview_error",
+                    "预览等待视频参数集超时：采集源没有产生可解码关键帧",
+                );
+                let _ = app_reader.emit("preview_state", "stopped");
+                done_reader.store(true, Ordering::Relaxed);
+                return;
+            }
+            match rx.try_recv() {
+                Ok(packet) if media_rtp::is_config_keyframe(&packet) => break packet,
+                Ok(_) => continue,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    let _ = app_reader.emit("preview_state", "stopped");
+                    done_reader.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        };
+        let ffmpeg = match media_rtp::ffmpeg_bin() {
+            Some(path) => path,
+            None => {
+                let _ = app_reader.emit("preview_error", "未找到内置 FFmpeg，无法解码同帧预览");
+                let _ = app_reader.emit("preview_state", "stopped");
+                done_reader.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let last_captured = Arc::new(AtomicU64::new(first.captured_at_ms));
+        let last_captured_reader = Arc::clone(&last_captured);
+        let input_format = if packet_is_h265(&first) {
+            "hevc"
+        } else {
+            "h264"
+        };
+        // 裸 H.264/HEVC 管道通常没有有效 PTS；仅设置 +genpts 仍可能让 MJPEG
+        // 编码器收到重复时间戳并停止输出。先按源帧率用帧序号生成 PTS，再降到预览帧率。
+        let source_fps = first.fps.max(1);
+        let source_fps_text = source_fps.to_string();
+        let preview_filter = format!("setpts=N/({source_fps}*TB),fps=10,scale=640:-2");
+        let mut command = Command::new(ffmpeg);
+        command.args([
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "warning",
+            "-fflags",
+            "+genpts",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            "5M",
+            "-analyzeduration",
+            "1000000",
+            "-f",
+            input_format,
+            "-framerate",
+            &source_fps_text,
+            "-i",
+            "pipe:0",
+            "-an",
+            "-vf",
+            &preview_filter,
+            "-q:v",
+            "7",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-flush_packets",
+            "1",
+            "pipe:1",
+        ]);
+        let stderr = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let stderr_reader = Arc::clone(&stderr);
+        let mut child = match command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = app_reader.emit(
+                    "preview_error",
+                    format!("启动内置 FFmpeg 解码失败：{error}"),
+                );
+                done_reader.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let mut stdin = child.stdin.take().expect("preview ffmpeg stdin");
+        let mut stdout = child.stdout.take().expect("preview ffmpeg stdout");
+        if let Some(mut child_stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut chunk = [0_u8; 4096];
+                while let Ok(n) = child_stderr.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut output) = stderr_reader.lock() {
+                        output.extend_from_slice(&chunk[..n]);
+                        if output.len() > 16 * 1024 {
+                            let drain = output.len() - 16 * 1024;
+                            output.drain(..drain);
+                        }
+                    }
+                }
+            });
+        }
+        if let Ok(mut slot) = child_slot_reader.lock() {
+            *slot = Some(child);
+        }
+        let app_frames = app_reader.clone();
+        let stop_frames = Arc::clone(&stop_reader);
+        let preview_frames = Arc::new(AtomicU64::new(0));
+        let preview_frames_reader = Arc::clone(&preview_frames);
+        std::thread::spawn(move || {
+            let mut buf = Vec::with_capacity(256 * 1024);
+            let mut chunk = [0_u8; 32 * 1024];
+            loop {
+                if stop_frames.load(Ordering::Relaxed) {
+                    break;
+                }
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        loop {
+                            let Some(start) = buf.windows(2).position(|w| w == [0xff, 0xd8]) else {
+                                break;
+                            };
+                            let Some(end_rel) =
+                                buf[start + 2..].windows(2).position(|w| w == [0xff, 0xd9])
+                            else {
+                                if start > 0 {
+                                    buf.drain(..start);
+                                }
+                                break;
+                            };
+                            let end = start + 2 + end_rel + 2;
+                            let frame = buf[start..end].to_vec();
+                            buf.drain(..end);
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(frame);
+                            let sequence =
+                                preview_frames_reader.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = app_frames.emit(
+                                "preview_frame",
+                                serde_json::json!({
+                                    "data": encoded,
+                                    "captured_at_ms": last_captured_reader.load(Ordering::Relaxed),
+                                    "sequence": sequence,
+                                }),
+                            );
+                            let _ = app_frames.emit("preview_state", "playing");
+                        }
+                    }
+                }
+            }
+        });
+        if stdin.write_all(&first.data).is_err() {
+            done_reader.store(true, Ordering::Relaxed);
+            return;
+        }
+        let mut input_frames = 1_u64;
+        let mut last_output_check = std::time::Instant::now();
+        loop {
+            if stop_reader.load(Ordering::Relaxed) {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(packet) => {
+                    last_captured.store(packet.captured_at_ms, Ordering::Relaxed);
+                    if stdin.write_all(&packet.data).is_err() {
+                        break;
+                    }
+                    input_frames += 1;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+            if last_output_check.elapsed() >= std::time::Duration::from_secs(5) {
+                if input_frames >= 25 && preview_frames.load(Ordering::Relaxed) <= 1 {
+                    let detail = stderr
+                        .lock()
+                        .ok()
+                        .map(|output| String::from_utf8_lossy(&output).trim().to_string())
+                        .unwrap_or_default();
+                    let message = if detail.is_empty() {
+                        format!("预览解码未持续输出画面（已输入 {input_frames} 帧）")
+                    } else {
+                        format!("预览解码未持续输出画面：{detail}")
+                    };
+                    let _ = app_reader.emit("preview_error", message);
+                    break;
+                }
+                last_output_check = std::time::Instant::now();
+            }
+        }
+        drop(stdin);
+        if let Ok(mut slot) = child_slot_reader.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+            }
+        }
+        let _ = app_reader.emit("preview_state", "stopped");
+        done_reader.store(true, Ordering::Relaxed);
+    });
+    *preview_guard = Some(PreviewHandle {
+        stop,
+        child: child_slot,
+        done,
+    });
+    let _ = app.emit("preview_state", "starting");
+    Ok("已订阅同帧预览，等待平台点播".into())
+}
+
+fn packet_is_h265(packet: &media_rtp::PreviewPacket) -> bool {
+    matches!(packet.codec, media_rtp::VideoCodec::H265)
+}
+
+#[tauri::command]
+async fn stop_preview(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+    let mut guard = state.preview.lock().await;
+    if let Some(handle) = guard.take() {
+        handle.stop.store(true, Ordering::Relaxed);
+        if let Ok(mut child) = handle.child.lock() {
+            if let Some(mut process) = child.take() {
+                let _ = process.kill();
+            }
+        }
+        let _ = app.emit("preview_state", "stopped");
+    }
+    Ok("预览已停止".into())
 }
 
 /// 前端传入的单设备配置。
@@ -860,6 +1236,9 @@ async fn start_device(
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
     let sim = Arc::new(DeviceSimulator::with_observer(cfg, observer));
+    sim.set_preview_sink(Some(
+        state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
+    ));
 
     // 若指定了目录模板,在注册前载入(平台注册后会立即同步目录,需在这之前准备好)。
     if !config.catalog_template.is_empty() {
@@ -894,6 +1273,16 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
     let mut guard = state.device.lock().await;
     match guard.take() {
         Some(h) => {
+            h.sim.stop_shared_media().await;
+            if let Some(preview) = state.preview.lock().await.take() {
+                preview.stop.store(true, Ordering::Relaxed);
+                if let Ok(mut child) = preview.child.lock() {
+                    if let Some(mut process) = child.take() {
+                        let _ = process.kill();
+                    }
+                }
+                let _ = app.emit("preview_state", "stopped");
+            }
             let _ = h.stop_tx.send(());
             let _ = app.emit("device_state", "Disconnected");
             Ok("设备已停止".into())
@@ -1171,6 +1560,8 @@ pub fn run() {
             export_report,
             list_live_sources,
             probe_live_source,
+            start_preview,
+            stop_preview,
             start_device,
             stop_device,
             fire_alarm,

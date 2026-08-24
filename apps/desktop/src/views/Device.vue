@@ -12,6 +12,12 @@ const message = useMessage();
 
 // 选择本地 H.264 文件作视频源(FR-8:C 档真实码流)。
 async function pickVideoSource() {
+  // Vite 的 localhost 页面可用于前端调试，但浏览器没有 Tauri IPC，也无法把本机
+  // 文件路径交给 Rust 推流；文件源选择必须在 Tauri 桌面窗口中完成。
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    message.error("当前是浏览器调试页面，请切换到 Tauri 桌面窗口后选择视频文件");
+    return;
+  }
   try {
     const picked = await openDialog({
       multiple: false,

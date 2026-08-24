@@ -145,6 +145,10 @@ impl DeviceObserver for Metrics {
         match event {
             DeviceEvent::RegisterAttempt => self.on_register_attempt(),
             DeviceEvent::RegisterSuccess => self.on_register_success(),
+            DeviceEvent::CaptureStarting
+            | DeviceEvent::CaptureReady
+            | DeviceEvent::CaptureStopped
+            | DeviceEvent::CaptureFailure(_) => {}
             DeviceEvent::RegisterFailure(k) => {
                 let kind = match k {
                     CommonKind::Timeout => FailureKind::Timeout,

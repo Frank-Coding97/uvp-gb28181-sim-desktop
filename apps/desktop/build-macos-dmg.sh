@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# macOS 打包脚本：构建 .app，可选内嵌 FFmpeg，最后生成无 Finder 依赖的 DMG。
+# macOS 打包脚本：构建内嵌 FFmpeg 的 .app，最后生成无 Finder 依赖的 DMG。
 #
 # 用法：在 apps/desktop 目录运行 ./build-macos-dmg.sh
 # 环境变量：
-#   BUNDLE_FFMPEG=auto|1|0   默认 auto；找到 FFmpeg 时自动内嵌
+#   BUNDLE_FFMPEG=auto|1     默认 1；发布包必须内嵌 FFmpeg
 #   FFMPEG_BIN=/path/ffmpeg  指定要内嵌的 FFmpeg
 #   APPLE_SIGNING_IDENTITY   正式签名身份；未设置时使用 ad-hoc 签名“-”
 #   APPLE_NOTARY_PROFILE     可选的 notarytool Keychain profile；设置后提交并装订 DMG
@@ -18,7 +18,7 @@ ARCH="$(uname -m | sed 's/x86_64/x64/;s/arm64/aarch64/')"
 APP_DIR="../../target/release/bundle/macos/UVP GB28181 Desktop.app"
 DMG_DIR="../../target/release/bundle/dmg"
 DMG="$DMG_DIR/UVP-GB28181-Desktop_${VERSION}_${ARCH}.dmg"
-BUNDLE_MODE="${BUNDLE_FFMPEG:-auto}"
+BUNDLE_MODE="${BUNDLE_FFMPEG:-1}"
 BUNDLE_SCRIPT="../../scripts/bundle-ffmpeg-macos.sh"
 SWIFT_BUNDLE_SCRIPT="../../scripts/bundle-swift-runtime-macos.sh"
 SIGN_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
@@ -57,24 +57,21 @@ echo "==> 2/4 内嵌 ScreenCaptureKit 所需 Swift runtime"
 
 echo "==> 3/4 处理 FFmpeg 运行时"
 case "$BUNDLE_MODE" in
-  0|false|no)
-    echo "跳过 FFmpeg 内嵌（BUNDLE_FFMPEG=$BUNDLE_MODE）。摄像头和视频容器功能将依赖目标机器自行安装 FFmpeg。"
-    ;;
   auto|1|true|yes)
     FFMPEG_SOURCE="$(find_ffmpeg || true)"
     if [ -z "$FFMPEG_SOURCE" ]; then
-      if [ "$BUNDLE_MODE" = "auto" ]; then
-        echo "警告：未找到 FFmpeg，继续生成不含 FFmpeg 的 DMG；电脑摄像头功能在目标机器上不可直接使用。" >&2
-      else
-        echo "BUNDLE_FFMPEG=$BUNDLE_MODE，但未找到 FFmpeg；请设置 FFMPEG_BIN。" >&2
-        exit 1
-      fi
+      echo "错误：发布包必须内嵌 FFmpeg，但当前构建机未找到。请安装构建依赖或设置 FFMPEG_BIN。" >&2
+      exit 1
     else
       "$BUNDLE_SCRIPT" "$APP_DIR" "$SIGN_IDENTITY" "$FFMPEG_SOURCE"
     fi
     ;;
+  0|false|no)
+    echo "错误：禁止生成不含 FFmpeg 的用户发布包（BUNDLE_FFMPEG=$BUNDLE_MODE）。" >&2
+    exit 1
+    ;;
   *)
-    echo "无效的 BUNDLE_FFMPEG=$BUNDLE_MODE；允许值为 auto、1 或 0。" >&2
+    echo "无效的 BUNDLE_FFMPEG=$BUNDLE_MODE；允许值为 auto 或 1。" >&2
     exit 1
     ;;
 esac

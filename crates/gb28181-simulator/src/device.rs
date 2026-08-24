@@ -196,6 +196,10 @@ pub enum DeviceState {
 /// 设备仿真运行时状态机。持有配置 + 会话标识 + CSeq 计数 + 会话状态 + 事件观察者。
 pub struct DeviceSimulator {
     config: DeviceConfig,
+    /// 桌面端可选的同帧预览接收器。
+    preview_sink: std::sync::Mutex<Option<Arc<dyn media_rtp::PreviewSink>>>,
+    /// 注册后启动的唯一采集源；平台点播只订阅它，不再重复打开摄像头/文件。
+    shared_media: tokio::sync::Mutex<Option<Arc<media_rtp::SharedMedia>>>,
     ids: DialogIds,
     cseq: AtomicU32,
     /// 当前活跃的推流会话(INVITE → 推流中,BYE → 停止)。
@@ -281,6 +285,8 @@ impl DeviceSimulator {
     pub fn new(config: DeviceConfig) -> Self {
         Self {
             config,
+            preview_sink: std::sync::Mutex::new(None),
+            shared_media: tokio::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
@@ -303,6 +309,8 @@ impl DeviceSimulator {
     pub fn with_observer(config: DeviceConfig, observer: Arc<dyn common::DeviceObserver>) -> Self {
         Self {
             config,
+            preview_sink: std::sync::Mutex::new(None),
+            shared_media: tokio::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
@@ -337,6 +345,98 @@ impl DeviceSimulator {
     /// 只读访问配置。
     pub fn config(&self) -> &DeviceConfig {
         &self.config
+    }
+
+    /// 设置桌面端预览接收器。必须在启动设备前调用。
+    pub fn set_preview_sink(&self, sink: Option<Arc<dyn media_rtp::PreviewSink>>) {
+        *self.preview_sink.lock().unwrap() = sink;
+    }
+
+    /// 注册成功后启动唯一媒体采集源。采集失败不影响 SIP 注册，但会通过观察者上报。
+    async fn start_shared_media(&self) -> Result<bool> {
+        {
+            let mut active = self.shared_media.lock().await;
+            if active.as_ref().is_some_and(|media| media.is_alive()) {
+                return Ok(true);
+            }
+            if let Some(stale) = active.take() {
+                stale.stop();
+            }
+        }
+        let Some(path) = self.config.video_source.clone() else {
+            let Some(kbps) = self.config.light_bitrate_kbps else {
+                return Ok(false);
+            };
+            let source = Box::new(media_rtp::LightSource::new(kbps, self.config.video_fps))
+                as Box<dyn media_rtp::VideoSource>;
+            let preview = self.preview_sink.lock().unwrap().clone();
+            let media = media_rtp::start_shared_media(source, self.config.video_fps, preview);
+            *self.shared_media.lock().await = Some(media);
+            return self.wait_for_media_ready().await;
+        };
+        let fps = self.config.video_fps;
+        let source = tokio::task::spawn_blocking(move || {
+            if path.starts_with("live:") {
+                media_rtp::LiveSource::capture(&path, fps)
+                    .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
+                    .map_err(|error| Error::Media(format!("实时采集失败: {error}")))
+            } else {
+                media_rtp::FileSource::from_path_av(&path, fps)
+                    .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
+                    .map_err(|error| Error::Media(format!("加载视频源失败: {error}")))
+            }
+        })
+        .await
+        .map_err(|error| Error::Media(format!("媒体源启动任务异常: {error}")))??;
+        let preview = self.preview_sink.lock().unwrap().clone();
+        let media = media_rtp::start_shared_media(source, fps, preview);
+        *self.shared_media.lock().await = Some(media);
+        self.wait_for_media_ready().await
+    }
+
+    async fn wait_for_media_ready(&self) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = {
+                let media = self.shared_media.lock().await;
+                media.as_ref().map(|media| {
+                    if media.has_frames() {
+                        Some(Ok(true))
+                    } else if let Some(error) = media.capture_error() {
+                        Some(Err(Error::Media(error)))
+                    } else if !media.is_alive() {
+                        Some(Ok(false))
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(result) = status.flatten() {
+                return result;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Media(
+                    "视频采集启动超时：10 秒内没有产生编码帧".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 停止注册期唯一采集源，释放摄像头/屏幕和编码器。
+    pub async fn stop_shared_media(&self) {
+        if let Some(media) = self.shared_media.lock().await.take() {
+            media.stop();
+        }
+    }
+
+    /// 查询采集源是否已经真正产出过编码帧，供桌面端刷新页面后恢复状态。
+    pub async fn capture_ready(&self) -> bool {
+        self.shared_media
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|media| media.has_frames())
     }
 
     /// 设置本端信令地址(仅供测试/非 run 场景手动注入应答用;run() 会自动设置)。
@@ -433,7 +533,25 @@ impl DeviceSimulator {
         self.observer.on_event(DeviceEvent::RegisterAttempt);
         let result = self.register_inner(transport, local_host, local_port).await;
         match &result {
-            Ok(_) => self.observer.on_event(DeviceEvent::RegisterSuccess),
+            Ok(_) => {
+                self.observer.on_event(DeviceEvent::RegisterSuccess);
+                self.observer.on_event(DeviceEvent::CaptureStarting);
+                match self.start_shared_media().await {
+                    Ok(true) => self.observer.on_event(DeviceEvent::CaptureReady),
+                    Ok(false) => self.observer.on_event(DeviceEvent::CaptureStopped),
+                    Err(error) => {
+                        // 初始化失败不能留下一个“活着但不可用”的采集源，否则下一次重注册
+                        // 会误判为 ready，页面也会永远订阅到坏总线。
+                        self.stop_shared_media().await;
+                        self.observer
+                            .on_event(DeviceEvent::CaptureFailure(error.to_string()));
+                        self.observer.on_event(DeviceEvent::RuntimeError {
+                            scope: "capture".into(),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
             Err(e) => {
                 // 按错误信息归因:超时 → Timeout,含状态码拒绝 → Rejected,其余 Other。
                 let kind = match e {
@@ -2007,44 +2125,27 @@ impl DeviceSimulator {
         // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 TCP-ACTIVE(RFC 4571)。
         let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
 
-        // 按配置选择视频源:实时采集(live:) > 文件(C档) > 轻量伪流(B档) > 不推流(A档)。
+        // 媒体源在注册成功后已启动；点播这里只创建一个独立读取端。
         let fps = self.config.video_fps;
-        let source: Option<Box<dyn media_rtp::VideoSource>> =
-            if let Some(ref path) = self.config.video_source {
-                let built: Result<Box<dyn media_rtp::VideoSource>> = if path.starts_with("live:") {
-                    // 实时源由 LiveSource 严格解析完整 URI;legacy live:0 明确映射主屏幕。
-                    media_rtp::LiveSource::capture(path, fps)
-                        .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
-                        .map_err(|e| Error::Media(format!("实时采集失败: {e}")))
-                } else {
-                    // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
-                    media_rtp::FileSource::from_path_av(path, fps)
-                        .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
-                        .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))
-                };
-                match built {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        // 采集/加载失败发生在点播(INVITE)这条异步流程里,不经 start_device
-                        // 返回值。必须推 RuntimeError 事件,否则前端一片安静、只见收流超时。
-                        self.observer.on_event(common::DeviceEvent::RuntimeError {
-                            scope: "capture".into(),
-                            message: e.to_string(),
-                        });
-                        let unavailable = sip_core::SipMessage::Response(builder::response_status(
-                            req,
-                            480,
-                            "Temporarily Unavailable",
-                        ));
-                        transport.send_to(&unavailable, from).await?;
-                        return Ok(true);
-                    }
-                }
-            } else {
-                self.config
-                    .light_bitrate_kbps
-                    .map(|kbps| Box::new(media_rtp::LightSource::new(kbps, fps)) as _)
-            };
+        let source = match self.shared_media.lock().await.as_ref() {
+            Some(media) => Some(Box::new(media.subscribe()) as Box<dyn media_rtp::VideoSource>),
+            None => None,
+        };
+        if source.is_none()
+            && (self.config.video_source.is_some() || self.config.light_bitrate_kbps.is_some())
+        {
+            self.observer.on_event(common::DeviceEvent::RuntimeError {
+                scope: "capture".into(),
+                message: "平台点播时共享媒体源尚未就绪".into(),
+            });
+            let unavailable = sip_core::SipMessage::Response(builder::response_status(
+                req,
+                480,
+                "Temporarily Unavailable",
+            ));
+            transport.send_to(&unavailable, from).await?;
+            return Ok(true);
+        }
 
         // 先构造并发送 200 OK(带本端 SDP,SSRC 回显平台值)。
         // TCP-PASSIVE 下平台收到 200 后才开始监听,故推流必须在 200 之后再连接。
@@ -2094,13 +2195,14 @@ impl DeviceSimulator {
                 if use_tcp {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                let result = media_rtp::push_stream_controlled(
+                let result = media_rtp::push_stream_controlled_with_preview(
                     source,
                     rtp_dst,
                     ssrc,
                     fps,
                     use_tcp,
                     control_task,
+                    None,
                     async {
                         let _ = stop_rx.await;
                     },
@@ -2299,6 +2401,7 @@ impl DeviceSimulator {
         }
         inbound_task.abort();
         self.stop_subscriptions().await;
+        self.stop_shared_media().await;
         // 主动向平台注销(REGISTER Expires=0,§9.1.2.2):平台立即置离线,不等心跳超时。
         if let Err(e) = self.unregister(&transport, &local_host, local_port).await {
             tracing::warn!(device=%self.config.device_id, error=%e, "注销失败(下线仍继续)");
@@ -2425,6 +2528,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, DeviceState::Registered);
+        assert!(!sim.capture_ready().await, "未配置视频源时不应伪造采集就绪");
+        platform_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 注册成功后_先启动采集并等待首帧再报告就绪() {
+        use common::{DeviceEvent, DeviceObserver};
+        use std::sync::Mutex;
+
+        struct Cap(Mutex<Vec<&'static str>>);
+        impl DeviceObserver for Cap {
+            fn on_event(&self, event: DeviceEvent) {
+                let name = match event {
+                    DeviceEvent::RegisterSuccess => "registered",
+                    DeviceEvent::CaptureStarting => "capture-starting",
+                    DeviceEvent::CaptureReady => "capture-ready",
+                    _ => return,
+                };
+                self.0.lock().unwrap().push(name);
+            }
+        }
+
+        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+        let mut cfg = test_cfg("127.0.0.1", platform_addr.port());
+        cfg.light_bitrate_kbps = Some(128);
+        let events = Arc::new(Cap(Mutex::new(Vec::new())));
+        let sim = DeviceSimulator::with_observer(cfg, events.clone());
+        let platform_task = tokio::spawn(mock_platform_register(
+            platform_tp,
+            device_addr,
+            sim.call_id().to_string(),
+        ));
+
+        assert_eq!(
+            sim.register(&device_tp, "127.0.0.1", device_addr.port())
+                .await
+                .unwrap(),
+            DeviceState::Registered
+        );
+        assert!(sim.capture_ready().await);
+        assert_eq!(
+            events.0.lock().unwrap().as_slice(),
+            &["registered", "capture-starting", "capture-ready"]
+        );
+        sim.stop_shared_media().await;
         platform_task.await.unwrap();
     }
 

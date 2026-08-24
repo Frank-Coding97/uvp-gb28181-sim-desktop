@@ -10,6 +10,7 @@ import Device from "./views/Device.vue";
 import Channels from "./views/Channels.vue";
 import Scenario from "./views/Scenario.vue";
 import System from "./views/System.vue";
+import Preview from "./views/Preview.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -17,6 +18,7 @@ const router = createRouter({
     { path: "/", redirect: "/dashboard" },
     { path: "/dashboard", component: Dashboard },
     { path: "/device",    component: Device },
+    { path: "/preview",   component: Preview },
     { path: "/channels",  component: Channels },
     // 压力测试(场景编排 + 实时监控已合并到一页)。
     { path: "/scenario",  component: Scenario },

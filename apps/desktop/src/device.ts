@@ -106,16 +106,18 @@ export function useDevice() {
   }
 
   // 与引擎对账:以引擎真实状态为准同步 deviceLive(切页/重启后仍准确)。
-  async function reconcile() {
+  async function reconcile(): Promise<{ running: boolean; capture_state: string } | null> {
     try {
-      const st = await invoke<{ running: boolean }>("get_device_status");
+      const st = await invoke<{ running: boolean; capture_state: string }>("get_device_status");
       deviceLive.value = st.running;
       if (!st.running && deviceState.value !== "Disconnected") {
         deviceState.value = "Disconnected";
         startedAt.value = null;
       }
+      return st;
     } catch {
       // 忽略
+      return null;
     }
   }
 

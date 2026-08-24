@@ -11,6 +11,14 @@ pub enum DeviceEvent {
     RegisterAttempt,
     /// 注册成功。
     RegisterSuccess,
+    /// 已通过 SIP 注册，开始初始化视频采集源。
+    CaptureStarting,
+    /// 视频采集源已启动并持续产出编码帧。
+    CaptureReady,
+    /// 视频采集源已停止或未配置采集源。
+    CaptureStopped,
+    /// 视频采集源初始化失败。
+    CaptureFailure(String),
     /// 注册失败(带归因)。
     RegisterFailure(FailureKind),
     /// 心跳成功。

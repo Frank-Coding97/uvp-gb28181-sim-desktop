@@ -7,9 +7,11 @@
 ## 容器格式支持(FileSource)
 
 引擎推流只吃 **H.264/H.265 Annex B 裸流**(按起始码切帧)。为支持常见容器(MP4/FLV/MKV/MOV):
-`FileSource::from_path` 检测文件非 Annex B 时,调用系统 **ffmpeg** 转封装为 Annex B 裸流
+`FileSource::from_path` 检测文件非 Annex B 时,调用 FFmpeg 转封装为 Annex B 裸流。用户发布包使用应用内置 FFmpeg；开发环境允许通过 `UVP_FFMPEG_PATH`、PATH 或常见系统路径覆盖。
 (`-c:v copy -bsf:v h264_mp4toannexb`,失败回退重编码),结果按"源路径+修改时间"缓存到临时目录复用。
-ffmpeg 为**可选**外部依赖:仅容器格式需要;裸流(.h264/.h265)不依赖它。ffmpeg 缺失时对容器文件报明确错误。
+FFmpeg 是用户发布包的内置运行时：容器格式、摄像头采集和预览不要求用户另行安装。构建机必须准备对应平台的 FFmpeg 二进制，发布脚本找不到时应直接失败。
+
+桌面单设备模式的实时源由 `SharedMedia` 在注册成功后唯一持有；本地预览与平台点播分别订阅其有界帧总线。BYE 仅结束 RTP 订阅，注销设备才停止采集，避免第二次打开摄像头并保证预览与平台使用同一批编码帧。
 
 ## 职责
 

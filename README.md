@@ -27,7 +27,7 @@
 | 前端 UI | Vue 3 + TypeScript + Naive UI + ECharts |
 | 核心引擎 | Rust + Tokio |
 | UI↔引擎 | Tauri IPC 命令 + 事件流 |
-| 媒体转封装 | 系统 ffmpeg(仅 MP4 等容器源 / 音频抽取时需要) |
+| 媒体转封装 | 发布包内置 FFmpeg(开发环境可用 PATH/`FFMPEG_BIN` 覆盖) |
 
 > 压测报告当前导出为最终指标快照 JSON;时序指标落 SQLite 为规划中(见 `docs/20-architecture/data-model.md`)。
 
@@ -60,8 +60,7 @@ uvp-gb28181-desktop/
 
 ## 快速开始
 
-> 前置：Rust（stable）、Node.js 20+、pnpm/npm。
-> 可选：**ffmpeg**（仅当视频源用 MP4/FLV/MKV 容器或需推送音频时;纯 .h264/.h265 裸流不需要）。
+> 用户运行已发布安装包无需单独安装 FFmpeg。只有构建桌面安装包的构建机需要准备对应平台的 FFmpeg 二进制。
 
 ```bash
 # 前端依赖
@@ -70,10 +69,15 @@ cd apps/desktop && npm install
 # 开发模式（起 Tauri + Vite 热更新）
 npm run tauri dev
 
-# 打当前平台安装包
-npm run tauri build
+# macOS 发布包（自动内嵌 FFmpeg + Swift runtime）
+./build-macos-dmg.sh
+
+# Windows 发布包（PowerShell，自动把 ffmpeg.exe 作为资源内嵌）
+./build-windows.ps1
 ```
 
+> **发布包必须使用平台脚本**，不能把裸 `npm run tauri build` 当作最终交付；平台脚本会先校验并内嵌 FFmpeg，避免用户安装后再补运行时依赖。
+>
 > **macOS 打包**:用脚本 `apps/desktop/build-macos-dmg.sh` 打包,产出 `.app`(双击即运行)
 > 和 `.dmg`(分发用,挂载后把 app 拖进「应用程序」即安装)。
 >
