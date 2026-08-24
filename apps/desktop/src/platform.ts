@@ -2,14 +2,20 @@
 // 存 localStorage,provide/inject 下发给各页,取代原先各页硬编码 + 独立平台配置页。
 import { ref, computed } from "vue";
 
+export type SignalingTransport = "UDP" | "TCP";
+export type AudioTransport = "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE";
+
 export interface PlatformProfile {
   id: string;
   name: string;
   server_host: string;
   server_port: number;
+  server_id: string;
   server_domain: string;
+  device_id: string;
   password: string;
-  transport: string; // "UDP" | "TCP"
+  transport: SignalingTransport;
+  audio_transport: AudioTransport;
   signaling_encoding?: string; // "GB18030"(默认) | "UTF-8"
 }
 
@@ -23,11 +29,44 @@ function defaultProfiles(): PlatformProfile[] {
     name: "本地示例",
     server_host: "127.0.0.1",
     server_port: 5060,
-    server_domain: "34020000002000000001",
+    server_id: "34020000002000000001",
+    server_domain: "3402000000",
+    device_id: "35020000001310000001",
     password: "change-me",
     transport: "UDP",
+    audio_transport: "TCP_ACTIVE",
     signaling_encoding: "GB18030",
   }];
+}
+
+function normalizeProfile(raw: Partial<PlatformProfile> & Record<string, unknown>, index: number): PlatformProfile {
+  const legacyDomain = typeof raw.server_domain === "string" ? raw.server_domain : "";
+  const serverId = typeof raw.server_id === "string" && raw.server_id
+    ? raw.server_id
+    : legacyDomain.length === 20
+      ? legacyDomain
+      : "34020000002000000001";
+  const serverDomain = typeof raw.server_id === "string" && raw.server_id
+    ? legacyDomain
+    : serverId.slice(0, 10);
+  const transport: SignalingTransport = raw.transport === "TCP" ? "TCP" : "UDP";
+  const audioTransport: AudioTransport = ["UDP", "TCP_ACTIVE", "TCP_PASSIVE"].includes(String(raw.audio_transport))
+    ? raw.audio_transport as AudioTransport
+    : "TCP_ACTIVE";
+
+  return {
+    id: typeof raw.id === "string" && raw.id ? raw.id : `profile-${index + 1}`,
+    name: typeof raw.name === "string" && raw.name ? raw.name : `平台 ${index + 1}`,
+    server_host: typeof raw.server_host === "string" ? raw.server_host : "",
+    server_port: typeof raw.server_port === "number" ? raw.server_port : 5060,
+    server_id: serverId,
+    server_domain: serverDomain,
+    device_id: typeof raw.device_id === "string" ? raw.device_id : "",
+    password: typeof raw.password === "string" ? raw.password : "",
+    transport,
+    audio_transport: audioTransport,
+    signaling_encoding: raw.signaling_encoding === "UTF-8" ? "UTF-8" : "GB18030",
+  };
 }
 
 // 单例响应式状态(整个应用共享一份)。
@@ -38,8 +77,8 @@ function load(): PlatformProfile[] {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) {
-      const arr = JSON.parse(raw) as PlatformProfile[];
-      if (Array.isArray(arr) && arr.length) return arr;
+      const arr = JSON.parse(raw) as Array<Partial<PlatformProfile> & Record<string, unknown>>;
+      if (Array.isArray(arr) && arr.length) return arr.map(normalizeProfile);
     }
   } catch {
     // 忽略损坏数据,回退默认

@@ -9,7 +9,7 @@ import {
   NMenu, NIcon, NPopover, NInput, NInputNumber, NButton, NSelect, zhCN, dateZhCN,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
-import SpeedometerOutline from "@vicons/ionicons5/es/SpeedometerOutline.js";
+import HomeOutline from "@vicons/ionicons5/es/HomeOutline.js";
 import HardwareChipOutline from "@vicons/ionicons5/es/HardwareChipOutline.js";
 import ServerOutline from "@vicons/ionicons5/es/ServerOutline.js";
 import PulseOutline from "@vicons/ionicons5/es/PulseOutline.js";
@@ -20,6 +20,7 @@ import { usePlatform } from "./platform";
 import { useDevice } from "./device";
 
 const route = useRoute();
+const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const router = useRouter();
 
 function icon(comp: any) {
@@ -27,7 +28,7 @@ function icon(comp: any) {
 }
 
 const menuOptions: MenuOption[] = [
-  { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
+  { label: "首页",        key: "/dashboard", icon: icon(HomeOutline) },
   { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
   { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
   { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
@@ -41,7 +42,18 @@ const profileOptions = computed(() =>
   profiles.value.map((p) => ({ label: `${p.name}  (${p.server_host}:${p.server_port})`, value: p.id }))
 );
 // 顶栏编辑弹层用的临时表单。
-const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP", signaling_encoding: "GB18030" });
+const editForm = ref({
+  name: "",
+  server_host: "",
+  server_port: 5060,
+  server_id: "",
+  server_domain: "",
+  device_id: "",
+  password: "",
+  transport: "UDP" as "UDP" | "TCP",
+  audio_transport: "TCP_ACTIVE" as "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE",
+  signaling_encoding: "GB18030",
+});
 function openEdit() {
   if (active.value) Object.assign(editForm.value, active.value);
 }
@@ -50,11 +62,19 @@ function saveEdit() {
 }
 function addNew() {
   addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
-    server_domain: "34020000002000000001", password: "change-me", transport: "UDP", signaling_encoding: "GB18030" });
+    server_id: "34020000002000000001", server_domain: "3402000000",
+    device_id: "35020000001310000001", password: "change-me",
+    transport: "UDP", audio_transport: "TCP_ACTIVE", signaling_encoding: "GB18030" });
   openEdit();
 }
 const transportOptions = [
   { label: "UDP（当前支持）", value: "UDP" },
+  { label: "TCP（待信令层支持）", value: "TCP" },
+];
+const audioTransportOptions = [
+  { label: "UDP", value: "UDP" },
+  { label: "TCP 主动", value: "TCP_ACTIVE" },
+  { label: "TCP 被动", value: "TCP_PASSIVE" },
 ];
 const encodingOptions = [
   { label: "GB18030(国标默认)", value: "GB18030" },
@@ -62,6 +82,7 @@ const encodingOptions = [
 ];
 
 const activeKey = computed(() => route.path);
+const showTopbar = computed(() => route.path !== "/dashboard");
 function onMenuSelect(key: string) {
   router.push(key);
 }
@@ -122,6 +143,10 @@ const errorScopeLabel: Record<string, string> = {
 let unlisten: UnlistenFn | null = null;
 let unlistenErr: UnlistenFn | null = null;
 onMounted(async () => {
+  if (!isTauri) {
+    uptimeTimer = window.setInterval(tickUptime, 1000);
+    return;
+  }
   unlisten = await listen<string>("device_state", (e) => {
     const s = e.payload as DState;
     deviceState.value = s;
@@ -179,7 +204,7 @@ const themeOverrides = {
 
             <!-- 主区 -->
             <main class="main">
-              <header class="topbar">
+              <header v-if="showTopbar" class="topbar">
                 <!-- 全局目标平台:单设备/压测共用,下拉切换 + 编辑 -->
                 <div class="platform-bar">
                   <n-icon :component="ServerOutline" class="plat-icon" />
@@ -200,9 +225,12 @@ const themeOverrides = {
                       <n-input v-model:value="editForm.name" size="small" placeholder="档案名称" />
                       <n-input v-model:value="editForm.server_host" size="small" placeholder="平台 IP" />
                       <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
-                      <n-input v-model:value="editForm.server_domain" size="small" placeholder="平台域 ID" />
+                      <n-input v-model:value="editForm.server_id" size="small" maxlength="20" placeholder="服务器 ID（20 位）" />
+                      <n-input v-model:value="editForm.server_domain" size="small" maxlength="10" placeholder="服务器域（10 位）" />
+                      <n-input v-model:value="editForm.device_id" size="small" maxlength="20" placeholder="设备 ID（20 位）" />
                       <n-input v-model:value="editForm.password" size="small" type="password" show-password-on="click" placeholder="SIP 密码" />
                       <n-select v-model:value="editForm.transport" size="small" :options="transportOptions" />
+                      <n-select v-model:value="editForm.audio_transport" size="small" :options="audioTransportOptions" />
                       <n-select v-model:value="editForm.signaling_encoding" size="small" :options="encodingOptions" />
                       <div class="pe-actions">
                         <n-button size="small" type="primary" @click="saveEdit">保存</n-button>

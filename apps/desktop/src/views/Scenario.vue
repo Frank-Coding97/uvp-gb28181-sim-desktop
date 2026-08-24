@@ -147,7 +147,7 @@ function buildToml(): string {
     `password = ${tomlString(p.password)}`,
     `server_host = ${tomlString(p.server_host.trim())}`,
     `server_port = ${p.server_port}`,
-    `server_domain = ${tomlString(p.server_domain.trim())}`,
+    `server_domain = ${tomlString(p.server_id.trim())}`,
     `transport = ${tomlString(p.transport.toUpperCase())}`,
     `heartbeat_interval_secs = ${form.value.heartbeat_interval}`,
     `channels_per_device = ${form.value.channels_per_device}`,
@@ -172,6 +172,10 @@ function buildToml(): string {
 }
 
 async function pickVideoSource() {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    message.error("当前是浏览器调试页面，请切换到 Tauri 桌面窗口后选择视频文件");
+    return;
+  }
   try {
     const picked = await openDialog({
       multiple: false,

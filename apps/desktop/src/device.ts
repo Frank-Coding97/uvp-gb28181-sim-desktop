@@ -75,7 +75,8 @@ export function useDevice() {
     try {
       const config = {
         server_host: platform.server_host, server_port: platform.server_port,
-        server_domain: platform.server_domain, password: platform.password,
+        // Rust 注册链当前字段名仍为 server_domain，实际承载 20 位服务器 ID。
+        server_domain: platform.server_id, password: platform.password,
         transport: platform.transport,
         signaling_encoding: platform.signaling_encoding ?? "GB18030",
         ...form.value,

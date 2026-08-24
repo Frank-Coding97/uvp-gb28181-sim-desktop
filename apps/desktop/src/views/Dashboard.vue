@@ -1,210 +1,864 @@
 <script setup lang="ts">
-// 首页总览：引擎健康、当前目标与核心工作流入口。
-import { computed, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
-import { NButton, NIcon } from "naive-ui";
-import GitNetworkOutline from "@vicons/ionicons5/es/GitNetworkOutline.js";
-import HardwareChipOutline from "@vicons/ionicons5/es/HardwareChipOutline.js";
-import LayersOutline from "@vicons/ionicons5/es/LayersOutline.js";
-import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
+import { computed, onActivated, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { useDevice } from "../device";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { NButton, NIcon, NInput, NInputNumber, NPopconfirm, NSelect, useMessage } from "naive-ui";
+import {
+  AddOutline,
+  AlertCircleOutline,
+  CameraOutline,
+  CheckmarkCircleOutline,
+  DesktopOutline,
+  DocumentOutline,
+  FolderOpenOutline,
+  LocationOutline,
+  OptionsOutline,
+  RadioOutline,
+  RefreshOutline,
+  SaveOutline,
+  TrashOutline,
+  VideocamOutline,
+  WarningOutline,
+} from "@vicons/ionicons5";
+import { persistForm, useDevice } from "../device";
 import { usePlatform } from "../platform";
 
-const router = useRouter();
-const engineInfo = ref("正在检查引擎");
-const online = ref(false);
-const { active } = usePlatform();
-const { statusMeta, deviceLive } = useDevice();
+type MediaMode = "none" | "file" | "camera" | "screen";
+type PreviewState = "idle" | "starting" | "playing" | "stopped" | "error";
 
-const platformEndpoint = computed(() =>
-  active.value ? `${active.value.server_host}:${active.value.server_port}` : "未配置",
+interface LiveAvDevice {
+  index: number;
+  name: string;
+}
+
+interface LiveScreenDevice {
+  display_id: number;
+  width: number;
+  height: number;
+  name: string;
+}
+
+interface LiveSourceCatalog {
+  ffmpeg_available: boolean;
+  cameras: LiveAvDevice[];
+  microphones: LiveAvDevice[];
+  screens: LiveScreenDevice[];
+  screen_error: string | null;
+  avfoundation_error: string | null;
+}
+
+type SubscriptionKind = "MobilePosition" | "Catalog" | "Alarm" | "PTZPosition";
+
+interface SubscriptionState {
+  kind: SubscriptionKind;
+  active: boolean;
+  notify_count: number;
+}
+
+const message = useMessage();
+const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile } = usePlatform();
+const {
+  form,
+  deviceLive,
+  statusMeta,
+  startDisabled,
+  canReport,
+  startDevice,
+  reconcile,
+} = useDevice();
+
+const editing = ref(false);
+const saving = ref(false);
+const sourceLoading = ref(false);
+const previewState = ref<PreviewState>("idle");
+const previewError = ref("");
+const frameUrl = ref("");
+const previewLatency = ref<number | null>(null);
+const previewFps = ref(0);
+const sourceProbe = ref("");
+let unlistenFrame: UnlistenFn | null = null;
+let unlistenPreviewState: UnlistenFn | null = null;
+let unlistenPreviewError: UnlistenFn | null = null;
+let unlistenSubscription: UnlistenFn | null = null;
+let fpsWindowStart = 0;
+let fpsWindowFrames = 0;
+
+const subscriptions = reactive<Record<SubscriptionKind, SubscriptionState>>({
+  MobilePosition: { kind: "MobilePosition", active: false, notify_count: 0 },
+  Catalog: { kind: "Catalog", active: false, notify_count: 0 },
+  Alarm: { kind: "Alarm", active: false, notify_count: 0 },
+  PTZPosition: { kind: "PTZPosition", active: false, notify_count: 0 },
+});
+
+const draft = reactive({
+  name: "",
+  server_host: "",
+  server_port: 5060 as number | null,
+  server_id: "",
+  server_domain: "",
+  password: "",
+  device_id: "",
+  transport: "UDP" as "UDP" | "TCP",
+  audio_transport: "TCP_ACTIVE" as "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE",
+});
+const serverDomainManuallyEdited = ref(false);
+
+const catalog = ref<LiveSourceCatalog>({
+  ffmpeg_available: false,
+  cameras: [],
+  microphones: [],
+  screens: [],
+  screen_error: null,
+  avfoundation_error: null,
+});
+
+function detectMediaMode(source: string): MediaMode {
+  if (source.startsWith("live:camera:")) return "camera";
+  if (source.startsWith("live:screen:")) return "screen";
+  if (source) return "file";
+  return "none";
+}
+
+const mediaMode = ref<MediaMode>(detectMediaMode(form.value.video_source.trim()));
+const selectedCamera = ref<number | null>(null);
+const selectedScreen = ref<number | null>(null);
+
+const mediaModes = [
+  { value: "none", label: "仅信令", icon: RadioOutline },
+  { value: "camera", label: "摄像头", icon: CameraOutline },
+  { value: "screen", label: "屏幕", icon: DesktopOutline },
+  { value: "file", label: "视频文件", icon: DocumentOutline },
+] as const;
+const signalingTransportOptions = [
+  { label: "UDP", value: "UDP" },
+  { label: "TCP", value: "TCP" },
+];
+const audioTransportOptions = [
+  { label: "UDP", value: "UDP" },
+  { label: "TCP 主动", value: "TCP_ACTIVE" },
+  { label: "TCP 被动", value: "TCP_PASSIVE" },
+];
+const sipProfileOptions = computed(() =>
+  profiles.value.map((profile) => ({ label: profile.name, value: profile.id })),
 );
 
-onMounted(async () => {
+const cameraOptions = computed(() =>
+  catalog.value.cameras.map((item) => ({ label: `[${item.index}] ${item.name}`, value: item.index })),
+);
+const screenOptions = computed(() =>
+  catalog.value.screens.map((item) => ({
+    label: `${item.name} · ${item.width}x${item.height}`,
+    value: item.display_id,
+  })),
+);
+const mediaModeLabel = computed(() => mediaModes.find((item) => item.value === mediaMode.value)?.label ?? "未配置");
+const previewStateText = computed(() => ({
+  idle: "等待启动",
+  starting: "等待画面",
+  playing: "采集中",
+  stopped: "已停止",
+  error: "采集异常",
+}[previewState.value]));
+const sourceSummary = computed(() => {
+  const source = form.value.video_source.trim();
+  if (!source) return "当前仅进行 SIP 信令模拟";
+  if (source.startsWith("live:camera:")) return `电脑摄像头 ${source.match(/^live:camera:(\d+)/)?.[1] ?? ""}`;
+  if (source.startsWith("live:screen:")) return `电脑屏幕 ${source.match(/^live:screen:(\d+)/)?.[1] ?? ""}`;
+  return source.split(/[\\/]/).pop() || source;
+});
+const deviceIdValid = computed(() => /^\d{20}$/.test(draft.device_id));
+const platformValid = computed(() =>
+  draft.name.trim().length > 0 &&
+  draft.server_host.trim().length > 0 &&
+  (draft.server_port === null || draft.server_port > 0) &&
+  /^\d{20}$/.test(draft.server_id) &&
+  (draft.server_domain === "" || /^\d{10}$/.test(draft.server_domain)),
+);
+const canSave = computed(() => editing.value && deviceIdValid.value && platformValid.value && !deviceLive.value);
+
+function resetDraft() {
+  if (active.value) {
+    draft.name = active.value.name;
+    draft.server_host = active.value.server_host;
+    draft.server_port = active.value.server_port;
+    draft.server_id = active.value.server_id;
+    draft.server_domain = active.value.server_domain;
+    draft.password = active.value.password;
+    draft.transport = active.value.transport;
+    draft.audio_transport = active.value.audio_transport;
+  }
+  draft.device_id = active.value?.device_id || form.value.device_id;
+  serverDomainManuallyEdited.value = false;
+}
+
+function syncDeviceIdFromProfile() {
+  if (!active.value?.device_id) return;
+  form.value.device_id = active.value.device_id;
+  persistForm();
+}
+
+function switchSipProfile(id: string) {
+  if (deviceLive.value || id === activeId.value) return;
+  editing.value = false;
+  setActive(id);
+  syncDeviceIdFromProfile();
+  resetDraft();
+}
+
+function addSipProfile() {
+  if (deviceLive.value) return;
+  const source = active.value;
+  addProfile({
+    name: `SIP 配置 ${profiles.value.length + 1}`,
+    server_host: source?.server_host ?? "",
+    server_port: source?.server_port ?? 5060,
+    server_id: source?.server_id ?? "",
+    server_domain: source?.server_domain ?? "",
+    device_id: source?.device_id || form.value.device_id,
+    password: source?.password ?? "",
+    transport: source?.transport ?? "UDP",
+    audio_transport: source?.audio_transport ?? "TCP_ACTIVE",
+    signaling_encoding: source?.signaling_encoding ?? "GB18030",
+  });
+  resetDraft();
+  editing.value = true;
+}
+
+function deleteSipProfile() {
+  if (deviceLive.value || profiles.value.length <= 1) return;
+  editing.value = false;
+  removeProfile(activeId.value);
+  syncDeviceIdFromProfile();
+  resetDraft();
+}
+
+function updateServerId(value: string) {
+  draft.server_id = value.replace(/\D/g, "").slice(0, 20);
+  if (!serverDomainManuallyEdited.value) draft.server_domain = draft.server_id.slice(0, 10);
+}
+
+function updateServerDomain(value: string) {
+  draft.server_domain = value.replace(/\D/g, "").slice(0, 10);
+  serverDomainManuallyEdited.value = true;
+}
+
+function updateDeviceId(value: string) {
+  draft.device_id = value.replace(/\D/g, "").slice(0, 20);
+}
+
+function clearDraft() {
+  draft.server_host = "";
+  draft.server_port = null;
+  draft.server_id = "";
+  draft.server_domain = "";
+  draft.password = "";
+  draft.device_id = "";
+  serverDomainManuallyEdited.value = false;
+}
+
+function saveConfig() {
+  if (!canSave.value || !active.value) return;
+  saving.value = true;
+  updateProfile(active.value.id, {
+    name: draft.name.trim(),
+    server_host: draft.server_host.trim(),
+    server_port: draft.server_port ?? 5060,
+    server_id: draft.server_id.trim(),
+    server_domain: draft.server_domain.trim(),
+    device_id: draft.device_id.trim(),
+    password: draft.password,
+    transport: draft.transport,
+    audio_transport: draft.audio_transport,
+  });
+  form.value.device_id = draft.device_id.trim();
+  persistForm();
+  editing.value = false;
+  saving.value = false;
+  message.success("首页配置已保存");
+}
+
+function cancelEdit() {
+  resetDraft();
+  editing.value = false;
+}
+
+function syncLiveSource() {
+  sourceProbe.value = "";
+  if (mediaMode.value === "none") {
+    form.value.video_source = "";
+  } else if (mediaMode.value === "camera" && selectedCamera.value !== null) {
+    form.value.video_source = `live:camera:${selectedCamera.value}?audio=none&audio_codec=g711a`;
+  } else if (mediaMode.value === "screen" && selectedScreen.value !== null) {
+    form.value.video_source = `live:screen:${selectedScreen.value}?audio=none&audio_codec=g711a&width=1280&height=720&bitrate=2500&codec=h264`;
+  }
+  persistForm();
+}
+
+async function setMediaMode(mode: MediaMode) {
+  if (deviceLive.value) return;
+  mediaMode.value = mode;
+  if (mode === "file") {
+    await pickVideoFile();
+    return;
+  }
+  if (mode === "camera" && selectedCamera.value === null) {
+    selectedCamera.value = catalog.value.cameras[0]?.index ?? null;
+  }
+  if (mode === "screen" && selectedScreen.value === null) {
+    selectedScreen.value = catalog.value.screens[0]?.display_id ?? null;
+  }
+  syncLiveSource();
+}
+
+async function pickVideoFile() {
+  if (!isTauri) {
+    message.info("浏览器预览不能读取本机文件，请在桌面应用中选择");
+    return;
+  }
+  const picked = await openDialog({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "视频", extensions: ["h264", "264", "h265", "hevc", "mp4", "flv", "mkv", "mov"] }],
+  });
+  if (typeof picked === "string") {
+    form.value.video_source = picked;
+    mediaMode.value = "file";
+    persistForm();
+  } else if (!form.value.video_source) {
+    mediaMode.value = "none";
+  }
+}
+
+async function refreshSources(showFeedback = true) {
+  if (!isTauri) return;
+  sourceLoading.value = true;
   try {
-    engineInfo.value = await invoke<string>("engine_version");
-    online.value = true;
+    catalog.value = await invoke<LiveSourceCatalog>("list_live_sources");
+    const cameraMatch = form.value.video_source.match(/^live:camera:(\d+)/);
+    const screenMatch = form.value.video_source.match(/^live:screen:(\d+)/);
+    selectedCamera.value = cameraMatch ? Number(cameraMatch[1]) : catalog.value.cameras[0]?.index ?? null;
+    selectedScreen.value = screenMatch ? Number(screenMatch[1]) : catalog.value.screens[0]?.display_id ?? null;
+    if (showFeedback) message.success("采集设备已刷新");
   } catch (error) {
-    engineInfo.value = `引擎不可用：${String(error)}`;
+    sourceProbe.value = `设备枚举失败：${String(error)}`;
+  } finally {
+    sourceLoading.value = false;
+  }
+}
+
+async function probeSource() {
+  if (!isTauri || !form.value.video_source.startsWith("live:")) return;
+  sourceProbe.value = "正在测试采集…";
+  try {
+    const result = await invoke<{ message: string }>("probe_live_source", { uri: form.value.video_source });
+    sourceProbe.value = result.message;
+  } catch (error) {
+    sourceProbe.value = `采集测试失败：${String(error)}`;
+  }
+}
+
+async function registerDevice() {
+  const result = await startDevice(active.value);
+  if (result.ok) message.success(result.msg);
+  else message.error(result.msg);
+}
+
+async function fireAlarm() {
+  try {
+    message.success(await invoke<string>("fire_alarm", { description: "移动侦测报警" }));
+  } catch (error) {
+    message.error(String(error));
+  }
+}
+
+async function startPreview() {
+  if (!isTauri || !deviceLive.value || previewState.value === "playing" || previewState.value === "starting") return;
+  previewError.value = "";
+  previewState.value = "starting";
+  try {
+    await invoke<string>("start_preview", { source: form.value.video_source });
+  } catch (error) {
+    const text = String(error);
+    if (!text.includes("已有预览正在运行")) {
+      previewState.value = "error";
+      previewError.value = text;
+    }
+  }
+}
+
+watch(deviceLive, (running) => {
+  if (running) void startPreview();
+  else {
+    frameUrl.value = "";
+    previewState.value = "idle";
+    previewLatency.value = null;
   }
 });
 
-const features = [
-  {
-    key: "/device",
-    icon: HardwareChipOutline,
-    color: "#3884ff",
-    step: "01",
-    title: "单设备联调",
-    desc: "验证注册、鉴权、目录、点播、PTZ 与主动上报，实时查看 SIP 原始报文。",
-  },
-  {
-    key: "/channels",
-    icon: GitNetworkOutline,
-    color: "#00a6c8",
-    step: "02",
-    title: "多通道目录",
-    desc: "构造 NVR、行政区划与业务分组目录，观察增量 Catalog NOTIFY。",
-  },
-  {
-    key: "/scenario",
-    icon: LayersOutline,
-    color: "#715df2",
-    step: "03",
-    title: "压力测试",
-    desc: "批量设备爬坡注册、心跳和媒体推流，实时统计成功率与失败归因。",
-    highlight: true,
-  },
-  {
-    key: "/system",
-    icon: TerminalOutline,
-    color: "#08a77e",
-    step: "04",
-    title: "系统日志",
-    desc: "动态调整日志级别，按模块、等级与关键字检查协议和媒体运行细节。",
-  },
-];
+watch(active, () => {
+  syncDeviceIdFromProfile();
+  if (!editing.value) resetDraft();
+});
 
-const capabilities = [
-  ["信令", "REGISTER / MESSAGE / SUBSCRIBE"],
-  ["协议", "GB/T 28181-2016 / 2022"],
-  ["媒体", "PS over RTP · UDP / TCP 媒体"],
-  ["规模", "单机最多 10,000 虚拟设备"],
-];
+onMounted(async () => {
+  syncDeviceIdFromProfile();
+  resetDraft();
+  if (!isTauri) return;
+  unlistenFrame = await listen<{ data: string; captured_at_ms: number }>("preview_frame", (event) => {
+    frameUrl.value = `data:image/jpeg;base64,${event.payload.data}`;
+    previewLatency.value = Math.max(0, Date.now() - event.payload.captured_at_ms);
+    const now = performance.now();
+    if (!fpsWindowStart) fpsWindowStart = now;
+    fpsWindowFrames += 1;
+    if (now - fpsWindowStart >= 1000) {
+      previewFps.value = Math.round(fpsWindowFrames * 1000 / (now - fpsWindowStart));
+      fpsWindowFrames = 0;
+      fpsWindowStart = now;
+    }
+    previewState.value = "playing";
+  });
+  unlistenPreviewState = await listen<string>("preview_state", (event) => {
+    if (["starting", "playing", "stopped"].includes(event.payload)) {
+      previewState.value = event.payload as PreviewState;
+    }
+  });
+  unlistenPreviewError = await listen<string>("preview_error", (event) => {
+    previewState.value = "error";
+    previewError.value = event.payload;
+  });
+  unlistenSubscription = await listen<SubscriptionState>("subscription_state", (event) => {
+    if (event.payload.kind in subscriptions) {
+      subscriptions[event.payload.kind] = event.payload;
+    }
+  });
+  await Promise.all([reconcile(), refreshSources(false)]);
+  await startPreview();
+});
+
+onActivated(() => {
+  void reconcile();
+  void startPreview();
+});
+
+onUnmounted(() => {
+  unlistenFrame?.();
+  unlistenPreviewState?.();
+  unlistenPreviewError?.();
+  unlistenSubscription?.();
+});
 </script>
 
 <template>
-  <div class="page">
-    <section class="hero">
-      <div class="hero-copy">
-        <div class="eyebrow">GB28181 DEVICE LAB</div>
-        <h1>把一台电脑，变成完整的国标设备实验室</h1>
-        <p>面向平台联调、协议验证与容量评估。无需真实摄像机，即可复现设备注册、控制、点播和并发压力。</p>
-        <div class="hero-actions">
-          <n-button type="primary" size="large" @click="router.push('/device')">开始单设备联调</n-button>
-          <n-button secondary size="large" @click="router.push('/scenario')">创建压力场景</n-button>
-        </div>
+  <div class="home-page">
+    <section class="state-strip">
+      <div class="device-state">
+        <span class="state-dot" :style="{ background: statusMeta.color }" />
+        <div><small>设备状态</small><b :style="{ color: statusMeta.color }">{{ statusMeta.text }}</b></div>
       </div>
-      <div class="hero-visual" aria-hidden="true">
-        <div class="radar-ring ring-1" />
-        <div class="radar-ring ring-2" />
-        <div class="radar-ring ring-3" />
-        <div class="radar-core">SIP</div>
-        <span class="node n1" />
-        <span class="node n2" />
-        <span class="node n3" />
-        <span class="node n4" />
-      </div>
+      <div class="state-item"><small>设备 ID</small><b class="mono">{{ form.device_id }}</b></div>
+      <div class="state-item"><small>目标平台</small><b>{{ active?.name ?? "未配置" }}</b></div>
+      <div class="state-item"><small>协议版本</small><b>GB/T 28181-{{ form.gb_version }}</b></div>
+      <div class="state-item"><small>采集来源</small><b>{{ mediaModeLabel }}</b></div>
     </section>
 
-    <section class="status-grid">
-      <div class="glass-card status-card">
-        <span class="status-label">核心引擎</span>
-        <div class="status-value"><i :class="{ online }" />{{ online ? "运行正常" : "离线" }}</div>
-        <small>{{ engineInfo }}</small>
-      </div>
-      <div class="glass-card status-card">
-        <span class="status-label">目标平台</span>
-        <div class="status-value mono">{{ platformEndpoint }}</div>
-        <small>{{ active?.name ?? "请在顶栏创建平台档案" }} · {{ active?.transport ?? "—" }}</small>
-      </div>
-      <div class="glass-card status-card">
-        <span class="status-label">单设备状态</span>
-        <div class="status-value" :style="{ color: statusMeta.color }">{{ statusMeta.text }}</div>
-        <small>{{ deviceLive ? "后台设备实例正在运行" : "尚未启动设备实例" }}</small>
-      </div>
-    </section>
-
-    <section class="section-head">
-      <div>
-        <h2>推荐工作流</h2>
-        <p>先验证单设备协议，再扩展目录结构，最后进行可控爬坡压测。</p>
-      </div>
-      <span>4 个工作区</span>
-    </section>
-
-    <section class="feature-grid">
-      <button
-        v-for="feature in features"
-        :key="feature.key"
-        type="button"
-        class="glass-card feature"
-        :class="{ highlight: feature.highlight }"
-        @click="router.push(feature.key)"
-      >
-        <div class="feature-top">
-          <div class="feature-icon" :style="{ background: `${feature.color}14`, color: feature.color }">
-            <n-icon :size="25"><component :is="feature.icon" /></n-icon>
+    <main class="home-workspace">
+      <section class="preview-panel">
+        <div class="panel-head">
+          <div>
+            <span class="panel-kicker">VIDEO CAPTURE</span>
+            <h2>视频采集预览</h2>
           </div>
-          <span>{{ feature.step }}</span>
+          <div class="preview-status" :class="previewState"><i />{{ previewStateText }}</div>
         </div>
-        <h3>{{ feature.title }}<em v-if="feature.highlight">核心</em></h3>
-        <p>{{ feature.desc }}</p>
-        <div class="feature-link">进入工作区 <span>→</span></div>
-      </button>
-    </section>
 
-    <section class="glass-card capability-bar">
-      <div v-for="item in capabilities" :key="item[0]">
-        <span>{{ item[0] }}</span>
-        <b>{{ item[1] }}</b>
-      </div>
-    </section>
+        <div class="preview-stage">
+          <img v-if="frameUrl" :src="frameUrl" alt="设备采集预览" />
+          <div v-else class="preview-cover">
+            <div class="cover-mark"><n-icon :size="42"><VideocamOutline /></n-icon></div>
+            <strong>{{ deviceLive ? "等待采集画面" : "虚拟摄像机未启动" }}</strong>
+            <span>{{ deviceLive ? (previewError || "编码首帧到达后将在这里显示") : "选择采集来源并注册设备后显示同帧预览" }}</span>
+          </div>
+          <div class="preview-overlay top-left"><i :class="{ on: previewState === 'playing' }" /> UVP-SIM</div>
+          <div class="preview-overlay bottom-row">
+            <span>{{ sourceSummary }}</span>
+            <span v-if="previewLatency !== null">{{ previewFps }} FPS · {{ previewLatency }} ms</span>
+            <span v-else>1280x720 · H.264</span>
+          </div>
+        </div>
+
+        <div class="source-bar">
+          <div class="source-modes" aria-label="媒体来源">
+            <button
+              v-for="item in mediaModes"
+              :key="item.value"
+              type="button"
+              :class="{ active: mediaMode === item.value }"
+              :disabled="deviceLive"
+              @click="setMediaMode(item.value)"
+            >
+              <n-icon :component="item.icon" />
+              {{ item.label }}
+            </button>
+          </div>
+          <div class="source-picker">
+            <n-select
+              v-if="mediaMode === 'camera'"
+              v-model:value="selectedCamera"
+              size="small"
+              :options="cameraOptions"
+              :loading="sourceLoading"
+              :disabled="deviceLive"
+              placeholder="选择摄像头"
+              @update:value="syncLiveSource"
+            />
+            <n-select
+              v-else-if="mediaMode === 'screen'"
+              v-model:value="selectedScreen"
+              size="small"
+              :options="screenOptions"
+              :loading="sourceLoading"
+              :disabled="deviceLive"
+              placeholder="选择屏幕"
+              @update:value="syncLiveSource"
+            />
+            <button v-else-if="mediaMode === 'file'" type="button" class="file-source" :disabled="deviceLive" @click="pickVideoFile">
+              {{ sourceSummary }}
+            </button>
+            <span v-else class="source-empty">不发送媒体流</span>
+          </div>
+          <n-button quaternary circle size="small" :loading="sourceLoading" :disabled="deviceLive" title="刷新采集设备" @click="refreshSources()">
+            <template #icon><n-icon><RefreshOutline /></n-icon></template>
+          </n-button>
+          <n-button size="small" secondary :disabled="deviceLive || !form.video_source.startsWith('live:')" @click="probeSource">测试采集</n-button>
+        </div>
+        <div v-if="sourceProbe" class="source-feedback">{{ sourceProbe }}</div>
+      </section>
+
+      <aside class="config-panel">
+        <div class="panel-head compact">
+          <div>
+            <span class="panel-kicker">SIP CONNECTION</span>
+            <h2>SIP 配置</h2>
+          </div>
+          <div class="config-actions">
+            <n-button v-if="!editing" size="small" type="primary" secondary :disabled="deviceLive" @click="editing = true">编辑</n-button>
+            <template v-else>
+              <n-button size="small" quaternary @click="clearDraft">重置</n-button>
+              <n-button size="small" quaternary @click="cancelEdit">取消</n-button>
+              <n-button size="small" type="primary" :loading="saving" :disabled="!canSave" @click="saveConfig">
+                <template #icon><n-icon><SaveOutline /></n-icon></template>
+                完成
+              </n-button>
+            </template>
+          </div>
+        </div>
+
+        <div class="sip-profile-switcher">
+          <n-select
+            size="medium"
+            :value="activeId"
+            :options="sipProfileOptions"
+            :disabled="deviceLive || editing"
+            aria-label="SIP 配置"
+            @update:value="switchSipProfile"
+          />
+          <n-button
+            size="small"
+            type="success"
+            secondary
+            circle
+            :disabled="deviceLive || editing"
+            title="复制新增 SIP 配置"
+            @click="addSipProfile"
+          >
+            <template #icon><n-icon><AddOutline /></n-icon></template>
+          </n-button>
+          <n-popconfirm
+            :disabled="deviceLive || editing || profiles.length <= 1"
+            positive-text="删除"
+            negative-text="取消"
+            @positive-click="deleteSipProfile"
+          >
+            <template #trigger>
+              <n-button
+                size="small"
+                type="error"
+                secondary
+                circle
+                :disabled="deviceLive || editing || profiles.length <= 1"
+                title="删除当前 SIP 配置"
+              >
+                <template #icon><n-icon><TrashOutline /></n-icon></template>
+              </n-button>
+            </template>
+            删除“{{ active?.name }}”配置？
+          </n-popconfirm>
+        </div>
+
+        <div class="config-grid">
+          <label v-if="editing" class="field wide">
+            <span>配置名称</span>
+            <n-input v-model:value="draft.name" size="medium" placeholder="例如 本地平台" />
+          </label>
+          <label class="field wide">
+            <span>服务器</span>
+            <div class="host-port">
+              <n-input v-model:value="draft.server_host" size="medium" :disabled="!editing" placeholder="例如 192.168.1.100" />
+              <n-input-number v-model:value="draft.server_port" size="medium" :disabled="!editing" :min="1" :max="65535" :show-button="false" placeholder="5060" />
+            </div>
+          </label>
+          <label class="field wide">
+            <span>服务器 ID</span>
+            <n-input
+              :value="draft.server_id"
+              size="medium"
+              :disabled="!editing"
+              maxlength="20"
+              placeholder="例如 34020000002000000001"
+              @update:value="updateServerId"
+            />
+          </label>
+          <label class="field">
+            <span>服务器域</span>
+            <n-input
+              :value="draft.server_domain"
+              size="medium"
+              :disabled="!editing"
+              maxlength="10"
+              placeholder="例如 3402000000"
+              @update:value="updateServerDomain"
+            />
+          </label>
+          <label class="field">
+            <span>信令传输</span>
+            <n-select v-model:value="draft.transport" size="medium" :disabled="!editing" :options="signalingTransportOptions" />
+          </label>
+          <label class="field wide">
+            <span>设备 ID</span>
+            <n-input
+              :value="draft.device_id"
+              size="medium"
+              :disabled="!editing"
+              maxlength="20"
+              placeholder="例如 34020000001310000001"
+              @update:value="updateDeviceId"
+            />
+          </label>
+          <label class="field wide">
+            <span>注册密码</span>
+            <n-input v-model:value="draft.password" size="medium" :disabled="!editing" type="password" show-password-on="click" placeholder="上级平台配置的 SIP 密码" />
+          </label>
+          <label class="field wide">
+            <span>对讲传输</span>
+            <n-select v-model:value="draft.audio_transport" size="medium" :disabled="!editing" :options="audioTransportOptions" />
+          </label>
+        </div>
+
+        <div class="primary-actions">
+          <n-button type="primary" size="large" :disabled="startDisabled" @click="registerDevice">
+            <template #icon><n-icon><RadioOutline /></n-icon></template>
+            注册设备
+          </n-button>
+        </div>
+
+        <div class="quick-actions" aria-label="快捷业务">
+          <div class="quick-card unavailable" title="桌面端录像能力尚未接入">
+            <n-icon><VideocamOutline /></n-icon>
+            <strong>录像</strong>
+            <span>未就绪</span>
+          </div>
+          <button
+            type="button"
+            class="quick-card action"
+            :class="{ subscribed: subscriptions.Alarm.active }"
+            :disabled="!canReport"
+            @click="fireAlarm"
+          >
+            <n-icon><WarningOutline /></n-icon>
+            <strong>报警</strong>
+            <span>{{ canReport ? "可触发" : "未就绪" }}</span>
+            <i v-if="subscriptions.Alarm.active" class="subscription-dot" title="报警订阅已建立" />
+          </button>
+          <div class="quick-card subscription" :class="{ active: subscriptions.MobilePosition.active }">
+            <n-icon><LocationOutline /></n-icon>
+            <strong>位置订阅</strong>
+            <span><i />{{ subscriptions.MobilePosition.active ? "已订阅" : "未订阅" }}</span>
+          </div>
+          <div class="quick-card subscription" :class="{ active: subscriptions.Catalog.active }">
+            <n-icon><FolderOpenOutline /></n-icon>
+            <strong>目录订阅</strong>
+            <span><i />{{ subscriptions.Catalog.active ? "已订阅" : "未订阅" }}</span>
+          </div>
+          <div class="quick-card subscription" :class="{ active: subscriptions.PTZPosition.active }">
+            <n-icon><OptionsOutline /></n-icon>
+            <strong class="long-label">PTZ 精准位置订阅</strong>
+            <span><i />{{ subscriptions.PTZPosition.active ? "已订阅" : "未订阅" }}</span>
+          </div>
+        </div>
+
+        <div class="config-foot">
+          <n-icon :component="deviceIdValid && platformValid ? CheckmarkCircleOutline : AlertCircleOutline" />
+          <span>{{ deviceIdValid && platformValid ? "SIP 配置完整，可以启动模拟" : "服务器、服务器 ID、设备 ID 不能为空" }}</span>
+        </div>
+      </aside>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.page { width: min(1200px, 100%); margin: 0 auto; padding-top: 18px; }
-.hero { position: relative; display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); min-height: 275px; overflow: hidden; border: 1px solid rgba(255,255,255,.68); border-radius: 24px; background: linear-gradient(125deg, rgba(255,255,255,.76), rgba(229,239,255,.54)); box-shadow: var(--shadow-card); }
-.hero::before { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 55%, rgba(56,132,255,.07)); pointer-events: none; }
-.hero-copy { position: relative; z-index: 2; padding: 38px 42px; }
-.eyebrow { color: var(--accent); font-size: 10.5px; font-weight: 800; letter-spacing: 2px; }
-h1 { max-width: 720px; margin: 9px 0 0; color: var(--text-primary); font-size: clamp(27px, 3vw, 40px); line-height: 1.18; letter-spacing: -1.1px; }
-.hero-copy p { max-width: 680px; margin: 13px 0 0; color: var(--text-secondary); font-size: 13.5px; line-height: 1.75; }
-.hero-actions { display: flex; gap: 10px; margin-top: 24px; }
-.hero-visual { position: relative; display: grid; place-items: center; min-height: 275px; }
-.radar-ring { position: absolute; border: 1px solid rgba(56,132,255,.18); border-radius: 50%; }
-.ring-1 { width: 210px; height: 210px; }
-.ring-2 { width: 145px; height: 145px; }
-.ring-3 { width: 78px; height: 78px; background: rgba(56,132,255,.05); }
-.radar-ring::before, .radar-ring::after { content: ""; position: absolute; background: rgba(56,132,255,.12); }
-.radar-ring::before { left: 50%; top: 0; width: 1px; height: 100%; }
-.radar-ring::after { top: 50%; left: 0; height: 1px; width: 100%; }
-.radar-core { position: relative; z-index: 2; display: grid; place-items: center; width: 54px; height: 54px; border-radius: 16px; background: linear-gradient(145deg, #4f93ff, #266bdc); color: #fff; font: 800 13px/1 "SF Mono", Menlo, monospace; box-shadow: 0 12px 35px rgba(56,132,255,.35); }
-.node { position: absolute; width: 10px; height: 10px; border: 3px solid rgba(255,255,255,.9); border-radius: 50%; background: var(--cyan); box-shadow: 0 3px 12px rgba(0,185,214,.35); }
-.n1 { transform: translate(-86px, -58px); }.n2 { transform: translate(92px, -34px); }.n3 { transform: translate(-60px, 91px); }.n4 { transform: translate(78px, 72px); background: var(--violet); }
-.status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 16px; }
-.status-card { padding: 17px 19px; }
-.status-label { color: var(--text-tertiary); font-size: 11px; }
-.status-value { display: flex; align-items: center; gap: 8px; min-height: 24px; margin-top: 5px; color: var(--text-primary); font-size: 16px; font-weight: 750; }
-.status-value i { width: 8px; height: 8px; border-radius: 50%; background: var(--text-tertiary); }
-.status-value i.online { background: var(--success); box-shadow: 0 0 0 4px rgba(8,179,136,.11); }
-.status-value.mono { font-family: "SF Mono", Menlo, monospace; font-size: 14px; }
-.status-card small { display: block; overflow: hidden; margin-top: 3px; color: var(--text-tertiary); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
-.section-head { display: flex; align-items: flex-end; justify-content: space-between; margin: 30px 2px 14px; }
-.section-head h2 { margin: 0; color: var(--text-primary); font-size: 18px; }
-.section-head p { margin: 4px 0 0; color: var(--text-tertiary); font-size: 11.5px; }
-.section-head > span { color: var(--text-tertiary); font-size: 11px; }
-.feature-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
-.feature { display: flex; min-width: 0; padding: 18px; border: 1px solid var(--border-subtle); text-align: left; cursor: pointer; flex-direction: column; transition: transform var(--transition), box-shadow var(--transition), border-color var(--transition); }
-.feature:hover { transform: translateY(-3px); border-color: var(--border-accent); box-shadow: var(--shadow-elevated); }
-.feature:focus-visible { outline: 3px solid var(--accent-dim); outline-offset: 2px; }
-.feature.highlight { background: linear-gradient(150deg, rgba(255,255,255,.72), rgba(122,108,255,.09)); border-color: rgba(122,108,255,.3); }
-.feature-top { display: flex; align-items: center; justify-content: space-between; }
-.feature-top > span { color: rgba(76,99,133,.35); font: 700 12px/1 "SF Mono", Menlo, monospace; }
-.feature-icon { display: grid; place-items: center; width: 45px; height: 45px; border-radius: 13px; }
-.feature h3 { display: flex; align-items: center; gap: 7px; margin: 16px 0 0; color: var(--text-primary); font-size: 14.5px; }
-.feature h3 em { padding: 2px 7px; border-radius: 999px; background: var(--violet); color: #fff; font-size: 9.5px; font-style: normal; }
-.feature p { flex: 1; min-height: 58px; margin: 7px 0 0; color: var(--text-tertiary); font-size: 11.5px; line-height: 1.62; }
-.feature-link { margin-top: 13px; color: var(--text-secondary); font-size: 11.5px; font-weight: 650; }
-.feature-link span { margin-left: 3px; color: var(--accent); }
-.capability-bar { display: grid; grid-template-columns: repeat(4, 1fr); margin: 16px 0 24px; padding: 16px 20px; }
-.capability-bar > div { min-width: 0; padding: 0 18px; border-left: 1px solid var(--border-default); }
-.capability-bar > div:first-child { padding-left: 0; border-left: 0; }
-.capability-bar span { display: block; color: var(--text-tertiary); font-size: 10.5px; }
-.capability-bar b { display: block; overflow: hidden; margin-top: 4px; color: var(--text-secondary); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 1100px) { .feature-grid { grid-template-columns: repeat(2, 1fr); } .capability-bar { grid-template-columns: repeat(2, 1fr); row-gap: 18px; } .capability-bar > div:nth-child(3) { padding-left: 0; border-left: 0; } }
-@media (max-width: 780px) { .hero { grid-template-columns: 1fr; } .hero-visual { display: none; } .status-grid { grid-template-columns: 1fr; } }
-@media (max-width: 560px) { .hero-copy { padding: 28px 24px; } .hero-actions { align-items: stretch; flex-direction: column; } .feature-grid, .capability-bar { grid-template-columns: 1fr; } .capability-bar > div { padding: 10px 0; border-top: 1px solid var(--border-default); border-left: 0; } }
+.home-page {
+  width: min(1440px, 100%);
+  height: 100%;
+  min-height: 0;
+  margin: 0 auto;
+  display: grid;
+  grid-template-rows: 62px minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+.preview-status i { width: 7px; height: 7px; border-radius: 50%; background: var(--error); }
+
+.state-strip {
+  display: grid;
+  grid-template-columns: 1.05fr 1.55fr 1.15fr 1.15fr .85fr;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .58);
+}
+.device-state, .state-item { min-width: 0; padding: 0 13px; border-right: 1px solid var(--border-subtle); }
+.device-state { display: flex; align-items: center; gap: 10px; padding-left: 2px; }
+.state-item:last-child { border-right: 0; }
+.state-dot { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; }
+.state-strip small { display: block; color: var(--text-tertiary); font-size: 10px; }
+.state-strip b { display: block; margin-top: 2px; overflow: hidden; color: var(--text-primary); font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.mono { font-family: "SF Mono", Menlo, monospace; }
+
+.home-workspace {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(345px, .8fr);
+  gap: 12px;
+}
+.preview-panel, .config-panel {
+  min-width: 0;
+  min-height: 0;
+  padding: 14px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .62);
+  box-shadow: 0 8px 24px rgba(32, 51, 79, .06);
+}
+.preview-panel { display: grid; grid-template-rows: 42px minmax(0, 1fr) 40px auto; gap: 9px; }
+.config-panel { display: flex; flex-direction: column; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; min-width: 0; }
+.panel-head.compact { min-height: 38px; }
+.panel-kicker { display: block; color: var(--accent); font-size: 9px; font-weight: 750; }
+.panel-head h2 { margin: 1px 0 0; color: var(--text-primary); font-size: 16px; font-weight: 720; }
+.preview-status { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 11px; }
+.preview-status.playing i { background: var(--success); }
+.preview-status.starting i { background: var(--warning); }
+.preview-status.error i { background: var(--error); }
+
+.preview-stage { position: relative; min-height: 260px; overflow: hidden; border-radius: 6px; background: #0a1728; }
+.preview-stage > img { width: 100%; height: 100%; object-fit: contain; }
+.preview-cover { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; color: rgba(218, 230, 248, .68); text-align: center; }
+.preview-cover::before { content: ""; position: absolute; inset: 0; background: linear-gradient(rgba(93, 132, 183, .07) 1px, transparent 1px), linear-gradient(90deg, rgba(93, 132, 183, .07) 1px, transparent 1px); background-size: 42px 42px; mask-image: linear-gradient(to bottom, transparent, #000 24%, #000 76%, transparent); }
+.cover-mark { position: relative; display: grid; place-items: center; width: 72px; height: 72px; border: 1px solid rgba(92, 156, 245, .28); border-radius: 50%; color: #74adff; background: rgba(56, 132, 255, .08); }
+.preview-cover strong, .preview-cover span { position: relative; }
+.preview-cover strong { color: #e4edf9; font-size: 14px; }
+.preview-cover span { max-width: 420px; font-size: 11px; }
+.preview-overlay { position: absolute; z-index: 2; color: rgba(229, 238, 251, .78); font-family: "SF Mono", Menlo, monospace; font-size: 10px; }
+.top-left { top: 11px; left: 12px; display: inline-flex; align-items: center; gap: 6px; }
+.top-left i { width: 6px; height: 6px; border-radius: 50%; background: rgba(229, 238, 251, .35); }
+.top-left i.on { background: #43d59d; }
+.bottom-row { right: 0; bottom: 0; left: 0; display: flex; justify-content: space-between; gap: 12px; padding: 9px 12px; background: linear-gradient(transparent, rgba(3, 10, 20, .78)); }
+.bottom-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.source-bar { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto auto; align-items: center; gap: 7px; min-width: 0; }
+.source-modes { display: inline-flex; gap: 3px; padding: 3px; border-radius: 6px; background: var(--bg-hover); }
+.source-modes button { height: 27px; display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; border: 0; border-radius: 4px; color: var(--text-tertiary); background: transparent; cursor: pointer; font-size: 10.5px; }
+.source-modes button.active { color: var(--accent); background: #fff; box-shadow: 0 1px 4px rgba(31, 55, 88, .1); }
+.source-modes button:disabled { cursor: not-allowed; opacity: .55; }
+.source-picker { min-width: 0; }
+.file-source { width: 100%; height: 30px; overflow: hidden; padding: 0 9px; border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-secondary); background: #fff; cursor: pointer; font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.source-empty { display: block; color: var(--text-tertiary); font-size: 11px; }
+.source-feedback { overflow: hidden; color: var(--text-secondary); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+
+.config-actions { display: flex; gap: 4px; }
+.sip-profile-switcher { display: grid; grid-template-columns: minmax(0, 1fr) 28px 28px; align-items: center; gap: 6px; margin-top: 8px; }
+.config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.config-panel :deep(.n-input--disabled) {
+  --n-text-color-disabled: var(--text-secondary) !important;
+  --n-color-disabled: rgba(248, 250, 253, .9) !important;
+  --n-icon-color-disabled: var(--text-tertiary) !important;
+}
+.config-panel :deep(.n-base-selection--disabled) {
+  --n-text-color-disabled: var(--text-secondary) !important;
+  --n-color-disabled: rgba(248, 250, 253, .9) !important;
+  --n-arrow-color-disabled: var(--text-tertiary) !important;
+}
+.field { display: grid; gap: 3px; min-width: 0; }
+.field.wide { grid-column: 1 / -1; }
+.field > span { color: var(--text-tertiary); font-size: 10px; }
+.host-port { display: grid; grid-template-columns: minmax(0, 1fr) 78px; gap: 6px; }
+.primary-actions { display: grid; grid-template-columns: minmax(0, 1fr); margin-top: 10px; }
+.quick-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; margin-top: 7px; }
+.quick-card {
+  position: relative;
+  min-width: 0;
+  height: 74px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 5px 2px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  color: var(--text-tertiary);
+  background: rgba(255, 255, 255, .7);
+  font-family: inherit;
+}
+.quick-card > .n-icon { font-size: 19px; }
+.quick-card strong {
+  width: 100%;
+  overflow: hidden;
+  color: currentColor;
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quick-card strong.long-label { min-height: 22px; display: grid; place-items: center; font-size: 8px; line-height: 1.15; white-space: normal; }
+.quick-card > span { display: inline-flex; align-items: center; gap: 3px; font-family: "SF Mono", Menlo, monospace; font-size: 8px; opacity: .72; white-space: nowrap; }
+.quick-card.subscription > span > i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.quick-card.action { color: var(--accent); cursor: pointer; }
+.quick-card.action:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
+.quick-card.action:disabled { cursor: not-allowed; color: var(--text-tertiary); }
+.quick-card.subscription.active { border-color: rgba(24, 160, 88, .38); color: var(--success); background: rgba(24, 160, 88, .07); }
+.subscription-dot { position: absolute; top: 7px; right: 7px; width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
+.config-foot { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--text-tertiary); font-size: 10px; }
+
+@media (max-width: 1080px) {
+  .home-workspace { grid-template-columns: minmax(0, 1fr) 330px; }
+  .state-strip { grid-template-columns: 1fr 1.45fr 1fr 1fr; }
+  .state-item:last-child { display: none; }
+  .source-modes button { padding-inline: 6px; }
+}
+@media (max-height: 680px) {
+  .home-page { grid-template-rows: 54px minmax(0, 1fr); gap: 7px; }
+  .preview-panel, .config-panel { padding: 10px; }
+  .preview-panel { grid-template-rows: 36px minmax(0, 1fr) 36px auto; gap: 6px; }
+  .sip-profile-switcher { margin-top: 5px; }
+  .config-grid { gap: 5px; margin-top: 6px; }
+  .primary-actions { margin-top: 6px; }
+  .quick-actions, .config-foot { margin-top: 5px; }
+}
 </style>
