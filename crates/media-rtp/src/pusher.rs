@@ -21,7 +21,7 @@ pub(crate) fn next_preview_session_id() -> u64 {
 }
 
 /// 推流过程中复制给桌面预览的编码帧。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewPacket {
     pub data: Vec<u8>,
     pub key_frame: bool,

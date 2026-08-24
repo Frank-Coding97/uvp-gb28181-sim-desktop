@@ -19,6 +19,8 @@ use stress_engine::{Metrics, Orchestrator};
 use tauri::{AppHandle, Emitter, Manager}; // Tauri 2 emit/state 需要对应 trait
 use tokio::sync::{broadcast, Mutex};
 
+mod preview_store;
+
 /// 应用全局状态（托管在 Tauri managed state）。
 struct AppState {
     /// 当前压测句柄；任务完全退出前始终占用槽位。
