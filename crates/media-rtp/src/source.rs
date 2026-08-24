@@ -327,6 +327,8 @@ pub fn start_shared_media(
     std::thread::spawn(move || {
         let interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
         let mut pts_90k = 0_u64;
+        let session_id = crate::pusher::next_preview_session_id();
+        let mut sequence = 0_u64;
         let pts_step = u64::from(crate::rtp::CLOCK_HZ / fps);
         while !producer.stop.load(std::sync::atomic::Ordering::Acquire) {
             let tick = std::time::Instant::now();
@@ -355,10 +357,13 @@ pub fn start_shared_media(
                     *producer.latest_config_keyframe.lock().unwrap() = Some(shared_frame.clone());
                 }
                 if let Some(sink) = &preview {
+                    sequence = sequence.saturating_add(1);
                     sink.publish(crate::pusher::PreviewPacket {
                         data: shared_frame.frame.data.clone(),
                         key_frame: shared_frame.frame.key_frame,
                         codec: producer.video_codec,
+                        session_id,
+                        sequence,
                         fps,
                         pts_90k,
                         captured_at_ms: now_ms(),
@@ -1361,6 +1366,8 @@ mod tests {
             data: first.data,
             key_frame: first.key_frame,
             codec: crate::ps::VideoCodec::H264,
+            session_id: 1,
+            sequence: 1,
             fps: 200,
             pts_90k: 0,
             captured_at_ms: 0,
@@ -1378,6 +1385,8 @@ mod tests {
             data: vec![0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3],
             key_frame: true,
             codec: crate::ps::VideoCodec::H264,
+            session_id: 1,
+            sequence: 1,
             fps: 25,
             pts_90k: 0,
             captured_at_ms: 0,
@@ -1390,6 +1399,8 @@ mod tests {
             ],
             key_frame: true,
             codec: crate::ps::VideoCodec::H265,
+            session_id: 1,
+            sequence: 1,
             fps: 25,
             pts_90k: 0,
             captured_at_ms: 0,

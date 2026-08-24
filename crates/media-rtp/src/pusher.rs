@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use common::{Error, Result};
@@ -14,12 +14,22 @@ use crate::ps::PsMuxer;
 use crate::rtp::{RtpSender, CLOCK_HZ};
 use crate::source::VideoSource;
 
+static NEXT_PREVIEW_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_preview_session_id() -> u64 {
+    NEXT_PREVIEW_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// 推流过程中复制给桌面预览的编码帧。
 #[derive(Debug, Clone)]
 pub struct PreviewPacket {
     pub data: Vec<u8>,
     pub key_frame: bool,
     pub codec: crate::ps::VideoCodec,
+    /// 预览会话代际；新会话不会消费旧会话残留帧。
+    pub session_id: u64,
+    /// 会话内单调递增的访问单元序号。
+    pub sequence: u64,
     /// 编码源帧率；预览通过裸 H.264 管道输入时用它补齐帧时间戳。
     pub fps: u32,
     pub pts_90k: u64,
@@ -229,6 +239,7 @@ pub async fn push_stream_controlled_with_preview(
 
     // 诊断计数:发出的帧数 / 关键帧数 / 字节数,退出时汇报,定位"断在第几帧"。
     let mut frames_sent: u64 = 0;
+    let session_id = next_preview_session_id();
     let mut keyframes_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
     let mut first_frame = true;
@@ -266,6 +277,8 @@ pub async fn push_stream_controlled_with_preview(
                         data: frame.data.clone(),
                         key_frame: frame.key_frame,
                         codec: frame_codec,
+                        session_id,
+                        sequence: frames_sent + 1,
                         fps,
                         pts_90k: ps_timestamp,
                         captured_at_ms: now_ms(),
@@ -445,6 +458,11 @@ mod tests {
         assert!(!packets.is_empty());
         assert!(packets[0].key_frame);
         assert_eq!(packets[0].fps, 50);
+        assert!(packets[0].session_id > 0);
+        assert_eq!(packets[0].sequence, 1);
+        assert!(packets.windows(2).all(|pair| {
+            pair[0].session_id == pair[1].session_id && pair[1].sequence == pair[0].sequence + 1
+        }));
         assert!(packets[0].data.windows(2).any(|w| w == [0, 0]));
         assert!(packets[0].data.iter().any(|byte| *byte & 0x1f == 5));
     }

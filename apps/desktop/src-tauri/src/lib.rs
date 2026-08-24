@@ -61,9 +61,17 @@ struct PreviewHandle {
     done: Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct PreviewFramePayload {
+    data: String,
+    captured_at_ms: u64,
+    sequence: u64,
+}
+
 /// 推流器到桌面预览的有界同帧总线。慢消费者只丢帧，不阻塞 RTP。
 struct DesktopPreviewBus {
-    subscribers: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<media_rtp::PreviewPacket>>>,
+    /// 预览是实时画面，不应回放积压帧；watch 通道只保留最新访问单元。
+    subscribers:
+        std::sync::Mutex<Vec<tokio::sync::watch::Sender<Option<media_rtp::PreviewPacket>>>>,
     latest_config_keyframe: std::sync::Mutex<Option<media_rtp::PreviewPacket>>,
 }
 
@@ -75,12 +83,9 @@ impl DesktopPreviewBus {
         }
     }
 
-    fn subscribe(&self) -> tokio::sync::mpsc::Receiver<media_rtp::PreviewPacket> {
-        let (tx, rx) = tokio::sync::mpsc::channel(24);
-        if let Some(packet) = self.latest_config_keyframe.lock().unwrap().clone() {
-            // bootstrap 必须先于采集线程后续帧进入队列，避免预览从无 SPS/PPS 的 IDR 开始。
-            let _ = tx.try_send(packet);
-        }
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<media_rtp::PreviewPacket>> {
+        let initial = self.latest_config_keyframe.lock().unwrap().clone();
+        let (tx, rx) = tokio::sync::watch::channel(initial);
         self.subscribers.lock().unwrap().push(tx);
         rx
     }
@@ -92,11 +97,7 @@ impl media_rtp::PreviewSink for DesktopPreviewBus {
             *self.latest_config_keyframe.lock().unwrap() = Some(packet.clone());
         }
         let mut subscribers = self.subscribers.lock().unwrap();
-        subscribers.retain(|tx| match tx.try_send(packet.clone()) {
-            Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-        });
+        subscribers.retain(|tx| tx.send(Some(packet.clone())).is_ok());
     }
 
     fn stopped(&self) {
@@ -691,7 +692,7 @@ async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
     tokio::task::spawn_blocking(move || {
         use media_rtp::VideoSource;
 
-        let mut source = media_rtp::LiveSource::capture(&canonical_uri, 25)
+        let mut source = media_rtp::LiveSource::capture(&canonical_uri, 30)
             .map_err(|error| error.to_string())?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut video_ready = false;
@@ -785,16 +786,15 @@ async fn start_preview(
                 done_reader.store(true, Ordering::Relaxed);
                 return;
             }
-            match rx.try_recv() {
-                Ok(packet) if media_rtp::is_config_keyframe(&packet) => break packet,
-                Ok(_) => continue,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+            if rx.has_changed().is_err() {
+                let _ = app_reader.emit("preview_state", "stopped");
+                done_reader.store(true, Ordering::Relaxed);
+                return;
+            }
+            match rx.borrow_and_update().clone() {
+                Some(packet) if media_rtp::is_config_keyframe(&packet) => break packet,
+                Some(_) | None => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    let _ = app_reader.emit("preview_state", "stopped");
-                    done_reader.store(true, Ordering::Relaxed);
-                    return;
                 }
             }
         };
@@ -818,7 +818,11 @@ async fn start_preview(
         // 编码器收到重复时间戳并停止输出。先按源帧率用帧序号生成 PTS，再降到预览帧率。
         let source_fps = first.fps.max(1);
         let source_fps_text = source_fps.to_string();
-        let preview_filter = format!("setpts=N/({source_fps}*TB),fps=10,scale=640:-2");
+        let preview_filter = if source_fps <= 30 {
+            format!("setpts=N/({source_fps}*TB),scale=640:-2")
+        } else {
+            format!("setpts=N/({source_fps}*TB),fps=30,scale=640:-2")
+        };
         let mut command = Command::new(ffmpeg);
         command.args([
             "-hide_banner",
@@ -826,13 +830,15 @@ async fn start_preview(
             "-loglevel",
             "warning",
             "-fflags",
-            "+genpts",
+            "nobuffer+genpts",
             "-flags",
             "low_delay",
+            "-avioflags",
+            "direct",
             "-probesize",
-            "5M",
+            "32",
             "-analyzeduration",
-            "1000000",
+            "0",
             "-f",
             input_format,
             "-framerate",
@@ -842,6 +848,8 @@ async fn start_preview(
             "-an",
             "-vf",
             &preview_filter,
+            "-fps_mode",
+            "passthrough",
             "-q:v",
             "7",
             "-f",
@@ -892,10 +900,40 @@ async fn start_preview(
         if let Ok(mut slot) = child_slot_reader.lock() {
             *slot = Some(child);
         }
-        let app_frames = app_reader.clone();
         let stop_frames = Arc::clone(&stop_reader);
+        let latest_frame = Arc::new(std::sync::Mutex::new(None::<PreviewFramePayload>));
+        let latest_frame_writer = Arc::clone(&latest_frame);
+        let frame_reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let frame_reader_done_reader = Arc::clone(&frame_reader_done);
         let preview_frames = Arc::new(AtomicU64::new(0));
         let preview_frames_reader = Arc::clone(&preview_frames);
+        let frame_event_stop = Arc::clone(&stop_reader);
+        let frame_event_slot = Arc::clone(&latest_frame);
+        let frame_event_done = Arc::clone(&frame_reader_done);
+        let frame_event_app = app_reader.clone();
+        std::thread::spawn(move || loop {
+            let payload = frame_event_slot
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            if let Some(payload) = payload {
+                let _ = frame_event_app.emit(
+                    "preview_frame",
+                    serde_json::json!({
+                        "data": payload.data,
+                        "captured_at_ms": payload.captured_at_ms,
+                        "sequence": payload.sequence,
+                    }),
+                );
+                let _ = frame_event_app.emit("preview_state", "playing");
+                continue;
+            }
+            if frame_event_stop.load(Ordering::Relaxed) || frame_event_done.load(Ordering::Acquire)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        });
         std::thread::spawn(move || {
             let mut buf = Vec::with_capacity(256 * 1024);
             let mut chunk = [0_u8; 32 * 1024];
@@ -925,42 +963,60 @@ async fn start_preview(
                             let encoded = base64::engine::general_purpose::STANDARD.encode(frame);
                             let sequence =
                                 preview_frames_reader.fetch_add(1, Ordering::Relaxed) + 1;
-                            let _ = app_frames.emit(
-                                "preview_frame",
-                                serde_json::json!({
-                                    "data": encoded,
-                                    "captured_at_ms": last_captured_reader.load(Ordering::Relaxed),
-                                    "sequence": sequence,
-                                }),
-                            );
-                            let _ = app_frames.emit("preview_state", "playing");
+                            if let Ok(mut slot) = latest_frame_writer.lock() {
+                                *slot = Some(PreviewFramePayload {
+                                    data: encoded,
+                                    captured_at_ms: last_captured_reader.load(Ordering::Relaxed),
+                                    sequence,
+                                });
+                            }
                         }
                     }
                 }
             }
+            frame_reader_done_reader.store(true, Ordering::Release);
         });
         if stdin.write_all(&first.data).is_err() {
             done_reader.store(true, Ordering::Relaxed);
             return;
         }
         let mut input_frames = 1_u64;
+        let pts_step = u64::from(media_rtp::CLOCK_HZ / source_fps);
+        let mut last_input_pts = first.pts_90k;
+        let mut needs_keyframe = false;
         let mut last_output_check = std::time::Instant::now();
         loop {
             if stop_reader.load(Ordering::Relaxed) {
                 break;
             }
-            match rx.try_recv() {
-                Ok(packet) => {
+            match rx.has_changed() {
+                Ok(true) => {
+                    let Some(packet) = rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    // watch 通道只保留最新帧，消费者忙时可能跨过参考帧；跳过普通帧，
+                    // 直到下一个带 SPS/PPS/IDR 的访问单元，避免 FFmpeg 长时间花屏或停解码。
+                    if packet.pts_90k > last_input_pts.saturating_add(pts_step) {
+                        needs_keyframe = true;
+                    }
+                    last_input_pts = packet.pts_90k;
+                    let is_config_keyframe = media_rtp::is_config_keyframe(&packet);
+                    if needs_keyframe && !is_config_keyframe {
+                        continue;
+                    }
+                    if is_config_keyframe {
+                        needs_keyframe = false;
+                    }
                     last_captured.store(packet.captured_at_ms, Ordering::Relaxed);
                     if stdin.write_all(&packet.data).is_err() {
                         break;
                     }
                     input_frames += 1;
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(false) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(_) => break,
             }
             if last_output_check.elapsed() >= std::time::Duration::from_secs(5) {
                 if input_frames >= 25 && preview_frames.load(Ordering::Relaxed) <= 1 {
@@ -1200,7 +1256,7 @@ async fn start_device(
             firmware: "0.1.0".into(),
         },
         video_source: config.video_source.clone(),
-        video_fps: 25,
+        video_fps: 30,
         light_bitrate_kbps: None,
         gb_version,
         signaling_encoding: common::SignalingEncoding::from_str_lenient(&config.signaling_encoding),
@@ -1579,4 +1635,62 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use media_rtp::PreviewSink;
+
+    fn packet(captured_at_ms: u64) -> media_rtp::PreviewPacket {
+        media_rtp::PreviewPacket {
+            data: vec![0, 0, 0, 1, 0x65, captured_at_ms as u8],
+            key_frame: false,
+            codec: media_rtp::VideoCodec::H264,
+            session_id: 1,
+            sequence: captured_at_ms,
+            fps: 25,
+            pts_90k: captured_at_ms,
+            captured_at_ms,
+        }
+    }
+
+    #[test]
+    fn 预览总线只保留最新帧() {
+        let bus = DesktopPreviewBus::new();
+        let mut receiver = bus.subscribe();
+        bus.publish(packet(1));
+        bus.publish(packet(2));
+
+        assert!(receiver.has_changed().expect("预览订阅仍应有效"));
+        assert_eq!(
+            receiver
+                .borrow_and_update()
+                .as_ref()
+                .map(|frame| frame.captured_at_ms),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn 延迟订阅从最近参数关键帧启动() {
+        let bus = DesktopPreviewBus::new();
+        let config = media_rtp::PreviewPacket {
+            data: vec![0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3],
+            key_frame: true,
+            codec: media_rtp::VideoCodec::H264,
+            session_id: 1,
+            sequence: 1,
+            fps: 25,
+            pts_90k: 3,
+            captured_at_ms: 3,
+        };
+        bus.publish(config.clone());
+
+        let receiver = bus.subscribe();
+        assert_eq!(
+            receiver.borrow().as_ref().map(|frame| frame.captured_at_ms),
+            Some(3)
+        );
+    }
 }
