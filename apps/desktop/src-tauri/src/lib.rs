@@ -22,6 +22,8 @@ use tauri::{
 }; // Tauri 2 emit/state 需要对应 trait
 use tokio::sync::{broadcast, Mutex};
 
+#[allow(dead_code)]
+mod preview_ffmpeg;
 mod preview_store;
 use preview_store::{PreviewEnvelope, PreviewFrameStore};
 
