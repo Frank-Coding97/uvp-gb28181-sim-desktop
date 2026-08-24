@@ -23,6 +23,7 @@ import {
 } from "@vicons/ionicons5";
 import { persistForm, useDevice } from "../device";
 import { usePlatform } from "../platform";
+import { usePreviewSession } from "../composables/preview/session";
 
 type MediaMode = "none" | "file" | "camera" | "screen";
 type PreviewState = "idle" | "starting" | "playing" | "stopped" | "error";
@@ -77,6 +78,9 @@ const previewState = ref<PreviewState>("idle");
 const captureState = ref<CaptureState>("stopped");
 const previewError = ref("");
 const frameUrl = ref("");
+const canvasRef = ref<HTMLCanvasElement | null>(null);
+const binarySessionActive = ref(false);
+let binarySession: ReturnType<typeof usePreviewSession> | null = null;
 const previewLatency = ref<number | null>(null);
 const previewFps = ref(0);
 const sourceProbe = ref("");
@@ -391,6 +395,14 @@ async function startPreview() {
   if (!isTauri || !deviceLive.value || captureState.value !== "ready" || previewState.value === "playing" || previewState.value === "starting") return;
   previewError.value = "";
   previewState.value = "starting";
+  if (!binarySession) binarySession = usePreviewSession(canvasRef.value);
+  if (binarySession) {
+    const started = await binarySession.start();
+    if (started) {
+      binarySessionActive.value = true;
+      return;
+    }
+  }
   try {
     await invoke<string>("start_preview", { source: form.value.video_source });
   } catch (error) {
@@ -467,6 +479,7 @@ onActivated(async () => {
 });
 
 onUnmounted(() => {
+  void binarySession?.stop();
   unlistenFrame?.();
   unlistenPreviewState?.();
   unlistenPreviewError?.();
@@ -499,6 +512,7 @@ onUnmounted(() => {
         </div>
 
         <div class="preview-stage">
+          <canvas v-show="binarySessionActive" ref="canvasRef" aria-label="设备采集预览" />
           <img v-if="frameUrl" :src="frameUrl" alt="设备采集预览" />
           <div v-else class="preview-cover">
             <div class="cover-mark"><n-icon :size="42"><VideocamOutline /></n-icon></div>
@@ -790,7 +804,7 @@ onUnmounted(() => {
 .preview-status.error i { background: var(--error); }
 
 .preview-stage { position: relative; min-height: 260px; overflow: hidden; border-radius: 6px; background: #0a1728; }
-.preview-stage > img { width: 100%; height: 100%; object-fit: contain; }
+.preview-stage > img, .preview-stage > canvas { width: 100%; height: 100%; object-fit: contain; }
 .preview-cover { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; color: rgba(218, 230, 248, .68); text-align: center; }
 .preview-cover::before { content: ""; position: absolute; inset: 0; background: linear-gradient(rgba(93, 132, 183, .07) 1px, transparent 1px), linear-gradient(90deg, rgba(93, 132, 183, .07) 1px, transparent 1px); background-size: 42px 42px; mask-image: linear-gradient(to bottom, transparent, #000 24%, #000 76%, transparent); }
 .cover-mark { position: relative; display: grid; place-items: center; width: 72px; height: 72px; border: 1px solid rgba(92, 156, 245, .28); border-radius: 50%; color: #74adff; background: rgba(56, 132, 255, .08); }

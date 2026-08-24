@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { NButton, useMessage } from "naive-ui";
 import { useDevice } from "../device";
+import { usePreviewSession } from "../composables/preview/session";
 
 const message = useMessage();
 const { form, deviceState } = useDevice();
@@ -15,6 +16,9 @@ let fpsWindowStart = 0;
 let fpsWindowFrames = 0;
 const state = ref<"idle" | "starting" | "playing" | "stopped" | "error">("idle");
 const error = ref("");
+const canvasRef = ref<HTMLCanvasElement | null>(null);
+const binarySessionActive = ref(false);
+let binarySession: ReturnType<typeof usePreviewSession> | null = null;
 let unlistenFrame: UnlistenFn | null = null;
 let unlistenState: UnlistenFn | null = null;
 let unlistenError: UnlistenFn | null = null;
@@ -32,6 +36,11 @@ const sourceType = computed(() => {
 async function start() {
   error.value = "";
   state.value = "starting";
+  if (!binarySession) binarySession = usePreviewSession(canvasRef.value);
+  if (binarySession && await binarySession.start()) {
+    binarySessionActive.value = true;
+    return;
+  }
   try {
     message.success(await invoke<string>("start_preview", { source: source.value }));
   } catch (e) {
@@ -42,6 +51,8 @@ async function start() {
 
 async function stop() {
   try {
+    await binarySession?.stop();
+    binarySessionActive.value = false;
     await invoke<string>("stop_preview");
     state.value = "stopped";
     frameUrl.value = "";
@@ -78,7 +89,7 @@ onMounted(async () => {
     state.value = "error";
   });
 });
-onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); void invoke("stop_preview"); });
+onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); void binarySession?.stop(); void invoke("stop_preview"); });
 </script>
 
 <template>
@@ -93,7 +104,10 @@ onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); voi
 
     <div class="preview-grid">
       <section class="glass-card panel preview-stage">
-        <div v-if="frameUrl" class="video-wrap"><img :src="frameUrl" alt="推流预览画面" /></div>
+        <div v-if="frameUrl || binarySessionActive" class="video-wrap">
+          <canvas v-show="binarySessionActive" ref="canvasRef" aria-label="推流预览画面" />
+          <img v-show="!binarySessionActive" :src="frameUrl" alt="推流预览画面" />
+        </div>
         <div v-else class="empty-stage">
           <div class="empty-icon">◉</div>
           <strong>{{ state === 'error' ? '预览无法启动' : '等待预览画面' }}</strong>
@@ -131,7 +145,7 @@ onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); voi
 .panel { position: relative; overflow: hidden; border: 1px solid color-mix(in srgb, var(--border-default) 82%, white); box-shadow: 0 12px 34px rgba(32,51,79,.07); }
 .preview-stage { min-height: 520px; padding: 16px; background: rgba(8,23,44,.86); }
 .video-wrap { display: grid; place-items: center; height: 450px; overflow: hidden; border-radius: 12px; background: #071424; }
-.video-wrap img { width: 100%; height: 100%; object-fit: contain; }
+.video-wrap img, .video-wrap canvas { width: 100%; height: 100%; object-fit: contain; }
 .empty-stage { display: grid; place-items: center; align-content: center; gap: 10px; height: 450px; border: 1px dashed rgba(160,190,230,.28); border-radius: 12px; color: rgba(220,232,250,.75); text-align: center; }
 .empty-stage strong { color: #e6efff; font-size: 16px; }
 .empty-stage span { max-width: 520px; color: rgba(220,232,250,.6); font-size: 12px; }
