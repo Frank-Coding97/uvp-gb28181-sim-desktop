@@ -78,6 +78,8 @@ struct BinaryPreviewHandle {
     done: Arc<std::sync::atomic::AtomicBool>,
 }
 
+const PREVIEW_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 struct PreviewFramePayload {
     data: String,
     captured_at_ms: u64,
@@ -1157,7 +1159,7 @@ async fn start_binary_preview(
                 );
                 break;
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let deadline = std::time::Instant::now() + PREVIEW_ACK_TIMEOUT;
             loop {
                 if stop_reader.load(Ordering::Acquire) {
                     break;
@@ -1174,7 +1176,7 @@ async fn start_binary_preview(
                             "state": "stalled",
                             "session_id": packet.session_id,
                             "sequence": packet.sequence,
-                            "timeout_ms": 500,
+                            "timeout_ms": PREVIEW_ACK_TIMEOUT.as_millis(),
                         }),
                     );
                     stop_reader.store(true, Ordering::Release);

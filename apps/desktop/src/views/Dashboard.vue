@@ -50,6 +50,11 @@ interface LiveSourceCatalog {
   avfoundation_error: string | null;
 }
 
+interface DeviceErrorEvent {
+  scope?: string;
+  message?: string;
+}
+
 type SubscriptionKind = "MobilePosition" | "Catalog" | "Alarm" | "PTZPosition";
 
 interface SubscriptionState {
@@ -89,6 +94,7 @@ let unlistenPreviewState: UnlistenFn | null = null;
 let unlistenPreviewError: UnlistenFn | null = null;
 let unlistenPreviewTransport: UnlistenFn | null = null;
 let unlistenCaptureState: UnlistenFn | null = null;
+let unlistenDeviceError: UnlistenFn | null = null;
 let unlistenSubscription: UnlistenFn | null = null;
 let fpsWindowStart = 0;
 let fpsWindowFrames = 0;
@@ -476,6 +482,11 @@ onMounted(async () => {
       previewState.value = event.payload === "error" ? "error" : "idle";
     }
   });
+  unlistenDeviceError = await listen<DeviceErrorEvent>("device_error", (event) => {
+    if (event.payload.scope === "capture" && event.payload.message) {
+      previewError.value = event.payload.message;
+    }
+  });
   unlistenSubscription = await listen<SubscriptionState>("subscription_state", (event) => {
     if (event.payload.kind in subscriptions) {
       subscriptions[event.payload.kind] = event.payload;
@@ -499,6 +510,7 @@ onUnmounted(() => {
   unlistenPreviewError?.();
   unlistenPreviewTransport?.();
   unlistenCaptureState?.();
+  unlistenDeviceError?.();
   unlistenSubscription?.();
 });
 </script>
