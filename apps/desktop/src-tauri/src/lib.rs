@@ -1096,8 +1096,16 @@ async fn start_binary_preview(
     app: AppHandle,
 ) -> Result<String, String> {
     let mut guard = state.binary_preview.lock().await;
-    if guard.is_some() {
+    if guard
+        .as_ref()
+        .is_some_and(|handle| !handle.done.load(Ordering::Acquire))
+    {
         return Err("已有二进制预览正在运行".into());
+    }
+    if guard.is_some() {
+        // A stalled sender has already stopped its worker; release the old
+        // handle before accepting a new session.
+        *guard = None;
     }
     let mut rx = state.preview_bus.subscribe();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1211,7 +1219,12 @@ async fn stop_binary_preview(
     let mut guard = state.binary_preview.lock().await;
     if let Some(handle) = guard.take() {
         handle.stop.store(true, Ordering::Release);
-        let _ = handle.done.load(Ordering::Acquire);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        while !handle.done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        state.preview_ack_session.store(0, Ordering::Release);
+        state.preview_ack_sequence.store(0, Ordering::Release);
         let _ = app.emit(
             "preview_transport",
             serde_json::json!({ "state": "stopped" }),

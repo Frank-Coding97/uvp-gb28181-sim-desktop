@@ -96,7 +96,10 @@ onMounted(async () => {
     if (event.payload.state === "stalled") {
       error.value = `预览通道消费超时（${event.payload.timeout_ms ?? 500}ms）`;
       state.value = "error";
-      binarySessionActive.value = false;
+      void binarySession?.stop().finally(() => {
+        binarySessionActive.value = false;
+        state.value = "error";
+      });
     }
   });
 });
@@ -115,11 +118,11 @@ onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); unl
 
     <div class="preview-grid">
       <section class="glass-card panel preview-stage">
-        <div v-if="frameUrl || binarySessionActive" class="video-wrap">
+        <div v-show="frameUrl || binarySessionActive" class="video-wrap">
           <canvas v-show="binarySessionActive" ref="canvasRef" aria-label="推流预览画面" />
           <img v-show="!binarySessionActive" :src="frameUrl" alt="推流预览画面" />
         </div>
-        <div v-else class="empty-stage">
+        <div v-if="!frameUrl && !binarySessionActive" class="empty-stage">
           <div class="empty-icon">◉</div>
           <strong>{{ state === 'error' ? '预览无法启动' : '等待预览画面' }}</strong>
           <span>{{ error || '选择媒体源后点击“开始预览”' }}</span>

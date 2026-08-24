@@ -462,7 +462,10 @@ onMounted(async () => {
     if (event.payload.state === "stalled") {
       previewState.value = "error";
       previewError.value = `预览通道消费超时（${event.payload.timeout_ms ?? 500}ms），已停止发送`;
-      binarySessionActive.value = false;
+      void binarySession?.stop().finally(() => {
+        binarySessionActive.value = false;
+        previewState.value = "error";
+      });
     }
   });
   unlistenCaptureState = await listen<string>("capture_state", (event) => {
