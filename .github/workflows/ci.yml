@@ -72,10 +72,19 @@ jobs:
         env:
           BUNDLE_FFMPEG: "1"
         run: ./build-macos-dmg.sh
-      - name: 构建 Linux / Windows 安装包
-        if: matrix.os != 'macos-latest'
+      - name: 构建 Linux 安装包
+        if: matrix.os == 'ubuntu-latest'
         working-directory: apps/desktop
         run: npm run tauri build -- --target ${{ matrix.target }}
+      - name: 安装 Windows FFmpeg 运行时
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+      - name: 构建 Windows 安装包（能力报告 + 内嵌 FFmpeg）
+        if: matrix.os == 'windows-latest'
+        working-directory: apps/desktop
+        shell: pwsh
+        run: ./build-windows.ps1
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:

@@ -20,6 +20,7 @@ DMG_DIR="../../target/release/bundle/dmg"
 DMG="$DMG_DIR/UVP-GB28181-Desktop_${VERSION}_${ARCH}.dmg"
 BUNDLE_MODE="${BUNDLE_FFMPEG:-1}"
 BUNDLE_SCRIPT="../../scripts/bundle-ffmpeg-macos.sh"
+CAPABILITY_SCRIPT="../../scripts/check-ffmpeg-capabilities.sh"
 SWIFT_BUNDLE_SCRIPT="../../scripts/bundle-swift-runtime-macos.sh"
 SIGN_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
 
@@ -63,6 +64,7 @@ case "$BUNDLE_MODE" in
       echo "错误：发布包必须内嵌 FFmpeg，但当前构建机未找到。请安装构建依赖或设置 FFMPEG_BIN。" >&2
       exit 1
     else
+      "$CAPABILITY_SCRIPT" "$FFMPEG_SOURCE" "../../target/release/preview-ffmpeg-capabilities.json" "videotoolbox"
       "$BUNDLE_SCRIPT" "$APP_DIR" "$SIGN_IDENTITY" "$FFMPEG_SOURCE"
     fi
     ;;
