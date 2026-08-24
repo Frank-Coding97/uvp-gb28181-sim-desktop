@@ -204,6 +204,7 @@ pub async fn push_stream_controlled(
 }
 
 /// 带可选同帧预览发布的推流入口。
+#[allow(clippy::too_many_arguments)]
 pub async fn push_stream_controlled_with_preview(
     mut source: Box<dyn VideoSource>,
     dst: SocketAddr,

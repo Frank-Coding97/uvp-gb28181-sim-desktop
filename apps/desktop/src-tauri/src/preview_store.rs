@@ -10,6 +10,7 @@ use media_rtp::{is_config_keyframe, PreviewPacket, VideoCodec};
 const MAGIC: [u8; 4] = *b"UVP1";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 48;
+#[allow(dead_code)] // decode 在 T3/T4 的接收端启用；当前生产发送端只调用 encode。
 const MAX_PAYLOAD_LEN: usize = 32 * 1024 * 1024;
 
 const FLAG_KEYFRAME: u16 = 1;
@@ -56,6 +57,7 @@ impl PreviewEnvelope {
         output
     }
 
+    #[allow(dead_code)]
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() < HEADER_LEN {
             return Err(format!(
@@ -197,6 +199,7 @@ impl PreviewFrameStore {
             .cloned()
     }
 
+    #[allow(dead_code)]
     pub fn stats(&self) -> PreviewStoreStats {
         self.inner
             .lock()
@@ -219,6 +222,7 @@ fn codec_to_byte(codec: VideoCodec) -> u8 {
     }
 }
 
+#[allow(dead_code)]
 fn codec_from_byte(value: u8) -> Result<VideoCodec, String> {
     match value {
         0 => Ok(VideoCodec::H264),
@@ -227,6 +231,7 @@ fn codec_from_byte(value: u8) -> Result<VideoCodec, String> {
     }
 }
 
+#[allow(dead_code)]
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }

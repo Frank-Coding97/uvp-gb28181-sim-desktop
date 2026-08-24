@@ -2127,10 +2127,12 @@ impl DeviceSimulator {
 
         // 媒体源在注册成功后已启动；点播这里只创建一个独立读取端。
         let fps = self.config.video_fps;
-        let source = match self.shared_media.lock().await.as_ref() {
-            Some(media) => Some(Box::new(media.subscribe()) as Box<dyn media_rtp::VideoSource>),
-            None => None,
-        };
+        let source = self
+            .shared_media
+            .lock()
+            .await
+            .as_ref()
+            .map(|media| Box::new(media.subscribe()) as Box<dyn media_rtp::VideoSource>);
         if source.is_none()
             && (self.config.video_source.is_some() || self.config.light_bitrate_kbps.is_some())
         {
@@ -2435,7 +2437,7 @@ mod tests {
                 firmware: "0.1.0".into(),
             },
             video_source: None,
-            video_fps: 25,
+            video_fps: 30,
             light_bitrate_kbps: None,
             gb_version: common::GbVersion::V2022,
             signaling_encoding: common::SignalingEncoding::Gb18030,

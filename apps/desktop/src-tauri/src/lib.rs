@@ -16,10 +16,14 @@ use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator
 use serde::{Deserialize, Serialize};
 use sip_core::UdpTransport;
 use stress_engine::{Metrics, Orchestrator};
-use tauri::{AppHandle, Emitter, Manager}; // Tauri 2 emit/state 需要对应 trait
+use tauri::{
+    ipc::{Channel, InvokeResponseBody},
+    AppHandle, Emitter, Manager,
+}; // Tauri 2 emit/state 需要对应 trait
 use tokio::sync::{broadcast, Mutex};
 
 mod preview_store;
+use preview_store::{PreviewEnvelope, PreviewFrameStore};
 
 /// 应用全局状态（托管在 Tauri managed state）。
 struct AppState {
@@ -37,6 +41,10 @@ struct AppState {
     device: Mutex<Option<DeviceHandle>>,
     /// 本地预览解码任务；输入来自注册期共享采集总线，不会再打开第二路摄像头。
     preview: Mutex<Option<PreviewHandle>>,
+    binary_preview: Mutex<Option<BinaryPreviewHandle>>,
+    preview_store: Arc<PreviewFrameStore>,
+    preview_ack_session: Arc<AtomicU64>,
+    preview_ack_sequence: Arc<AtomicU64>,
     preview_bus: Arc<DesktopPreviewBus>,
 }
 
@@ -63,6 +71,11 @@ struct PreviewHandle {
     done: Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct BinaryPreviewHandle {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct PreviewFramePayload {
     data: String,
     captured_at_ms: u64,
@@ -75,13 +88,21 @@ struct DesktopPreviewBus {
     subscribers:
         std::sync::Mutex<Vec<tokio::sync::watch::Sender<Option<media_rtp::PreviewPacket>>>>,
     latest_config_keyframe: std::sync::Mutex<Option<media_rtp::PreviewPacket>>,
+    store: Arc<PreviewFrameStore>,
 }
 
 impl DesktopPreviewBus {
+    #[allow(dead_code)] // 单元测试直接构造独立总线；生产由 AppState 注入共享 store。
     fn new() -> Self {
+        let store = Arc::new(PreviewFrameStore::new());
+        Self::with_store(store)
+    }
+
+    fn with_store(store: Arc<PreviewFrameStore>) -> Self {
         Self {
             subscribers: std::sync::Mutex::new(Vec::new()),
             latest_config_keyframe: std::sync::Mutex::new(None),
+            store,
         }
     }
 
@@ -95,6 +116,7 @@ impl DesktopPreviewBus {
 
 impl media_rtp::PreviewSink for DesktopPreviewBus {
     fn publish(&self, packet: media_rtp::PreviewPacket) {
+        self.store.publish(packet.clone());
         if media_rtp::is_config_keyframe(&packet) {
             *self.latest_config_keyframe.lock().unwrap() = Some(packet.clone());
         }
@@ -111,6 +133,7 @@ impl media_rtp::PreviewSink for DesktopPreviewBus {
 
 impl AppState {
     fn new() -> Self {
+        let preview_store = Arc::new(PreviewFrameStore::new());
         AppState {
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
@@ -119,7 +142,11 @@ impl AppState {
             last_scenario: Mutex::new(None),
             device: Mutex::new(None),
             preview: Mutex::new(None),
-            preview_bus: Arc::new(DesktopPreviewBus::new()),
+            binary_preview: Mutex::new(None),
+            preview_store: Arc::clone(&preview_store),
+            preview_ack_session: Arc::new(AtomicU64::new(0)),
+            preview_ack_sequence: Arc::new(AtomicU64::new(0)),
+            preview_bus: Arc::new(DesktopPreviewBus::with_store(preview_store)),
         }
     }
 }
@@ -947,10 +974,7 @@ async fn start_preview(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         buf.extend_from_slice(&chunk[..n]);
-                        loop {
-                            let Some(start) = buf.windows(2).position(|w| w == [0xff, 0xd8]) else {
-                                break;
-                            };
+                        while let Some(start) = buf.windows(2).position(|w| w == [0xff, 0xd8]) {
                             let Some(end_rel) =
                                 buf[start + 2..].windows(2).position(|w| w == [0xff, 0xd9])
                             else {
@@ -1058,6 +1082,139 @@ async fn start_preview(
 
 fn packet_is_h265(packet: &media_rtp::PreviewPacket) -> bool {
     matches!(packet.codec, media_rtp::VideoCodec::H265)
+}
+
+/// 预览编码访问单元的二进制传输通道。
+/// 每次最多发送一个未 ACK 的 envelope，避免 Channel 队列无限增长。
+#[tauri::command]
+async fn start_binary_preview(
+    channel: Channel<InvokeResponseBody>,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let mut guard = state.binary_preview.lock().await;
+    if guard.is_some() {
+        return Err("已有二进制预览正在运行".into());
+    }
+    let mut rx = state.preview_bus.subscribe();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_reader = Arc::clone(&stop);
+    let done_reader = Arc::clone(&done);
+    let ack_session = Arc::clone(&state.preview_ack_session);
+    let ack_sequence = Arc::clone(&state.preview_ack_sequence);
+    let app_reader = app.clone();
+    let store = Arc::clone(&state.preview_store);
+    std::thread::spawn(move || {
+        let mut pending = rx.borrow().clone();
+        let _ = app_reader.emit(
+            "preview_transport",
+            serde_json::json!({
+                "state": "starting",
+                "transport": "binary-channel",
+            }),
+        );
+        loop {
+            let packet = if let Some(packet) = pending.take() {
+                packet
+            } else {
+                if stop_reader.load(Ordering::Acquire) || rx.has_changed().is_err() {
+                    break;
+                }
+                let Some(packet) = rx.borrow_and_update().clone() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                packet
+            };
+            let Some(packet) =
+                store.latest_after(packet.session_id, packet.sequence.saturating_sub(1))
+            else {
+                continue;
+            };
+            let envelope = PreviewEnvelope::from_packet(packet.clone()).encode();
+            ack_session.store(0, Ordering::Release);
+            ack_sequence.store(0, Ordering::Release);
+            if channel.send(InvokeResponseBody::Raw(envelope)).is_err() {
+                let _ = app_reader.emit(
+                    "preview_transport",
+                    serde_json::json!({
+                        "state": "send_error",
+                        "session_id": packet.session_id,
+                        "sequence": packet.sequence,
+                    }),
+                );
+                break;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                if stop_reader.load(Ordering::Acquire) {
+                    break;
+                }
+                if ack_session.load(Ordering::Acquire) == packet.session_id
+                    && ack_sequence.load(Ordering::Acquire) == packet.sequence
+                {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = app_reader.emit(
+                        "preview_transport",
+                        serde_json::json!({
+                            "state": "stalled",
+                            "session_id": packet.session_id,
+                            "sequence": packet.sequence,
+                            "timeout_ms": 500,
+                        }),
+                    );
+                    stop_reader.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        let _ = app_reader.emit(
+            "preview_transport",
+            serde_json::json!({
+                "state": "stopped",
+                "transport": "binary-channel",
+            }),
+        );
+        done_reader.store(true, Ordering::Release);
+    });
+    *guard = Some(BinaryPreviewHandle { stop, done });
+    Ok("二进制预览通道已启动".into())
+}
+
+#[tauri::command]
+fn ack_preview_frame(
+    session_id: u64,
+    sequence: u64,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .preview_ack_session
+        .store(session_id, Ordering::Release);
+    state
+        .preview_ack_sequence
+        .store(sequence, Ordering::Release);
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_binary_preview(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let mut guard = state.binary_preview.lock().await;
+    if let Some(handle) = guard.take() {
+        handle.stop.store(true, Ordering::Release);
+        let _ = handle.done.load(Ordering::Acquire);
+        let _ = app.emit(
+            "preview_transport",
+            serde_json::json!({ "state": "stopped" }),
+        );
+    }
+    Ok("二进制预览已停止".into())
 }
 
 #[tauri::command]
@@ -1620,6 +1777,9 @@ pub fn run() {
             probe_live_source,
             start_preview,
             stop_preview,
+            start_binary_preview,
+            ack_preview_frame,
+            stop_binary_preview,
             start_device,
             stop_device,
             fire_alarm,
