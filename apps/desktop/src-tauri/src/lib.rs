@@ -1120,6 +1120,8 @@ async fn start_binary_preview(
     let store = Arc::clone(&state.preview_store);
     std::thread::spawn(move || {
         let mut pending = rx.borrow().clone();
+        let mut last_sent_session = None;
+        let mut last_sent_sequence = 0_u64;
         let _ = app_reader.emit(
             "preview_transport",
             serde_json::json!({
@@ -1128,7 +1130,7 @@ async fn start_binary_preview(
             }),
         );
         loop {
-            let packet = if let Some(packet) = pending.take() {
+            let observed = if let Some(packet) = pending.take() {
                 packet
             } else {
                 if stop_reader.load(Ordering::Acquire) || rx.has_changed().is_err() {
@@ -1140,9 +1142,32 @@ async fn start_binary_preview(
                 };
                 packet
             };
-            let Some(packet) =
-                store.latest_after(packet.session_id, packet.sequence.saturating_sub(1))
-            else {
+
+            let consumer_gap = last_sent_session == Some(observed.session_id)
+                && observed.sequence > last_sent_sequence.saturating_add(1);
+            let packet = if consumer_gap {
+                let config = store.latest_config_after(observed.session_id, last_sent_sequence);
+                if let Some(config) = config {
+                    // The watch receiver may have skipped past this config
+                    // frame. Revisit only its immediately following packet;
+                    // a larger gap still lacks decoder reference frames.
+                    if observed.sequence == config.sequence.saturating_add(1) {
+                        pending = Some(observed.clone());
+                    }
+                    config
+                } else {
+                    // Do not feed a delta frame after a consumer-side gap;
+                    // wait for the next SPS/PPS/IDR access unit.
+                    continue;
+                }
+            } else if let Some(packet) = store.latest_after(
+                observed.session_id,
+                last_sent_session
+                    .filter(|session| *session == observed.session_id)
+                    .map_or(0, |_| last_sent_sequence),
+            ) {
+                packet
+            } else {
                 continue;
             };
             let envelope = PreviewEnvelope::from_packet(packet.clone()).encode();
@@ -1167,6 +1192,8 @@ async fn start_binary_preview(
                 if ack_session.load(Ordering::Acquire) == packet.session_id
                     && ack_sequence.load(Ordering::Acquire) == packet.sequence
                 {
+                    last_sent_session = Some(packet.session_id);
+                    last_sent_sequence = packet.sequence;
                     break;
                 }
                 if std::time::Instant::now() >= deadline {

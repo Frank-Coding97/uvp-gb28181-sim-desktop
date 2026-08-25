@@ -217,6 +217,28 @@ impl PreviewFrameStore {
             .cloned()
     }
 
+    /// 返回当前会话中比 `after_sequence` 更新的配置关键帧。
+    ///
+    /// 预览消费者发生跳帧时不能继续发送普通帧，必须等待新的 SPS/PPS/IDR
+    /// 重新建立解码参考链；旧配置关键帧不能修复已经发生的序列间隔。
+    pub fn latest_config_after(
+        &self,
+        session_id: u64,
+        after_sequence: u64,
+    ) -> Option<PreviewPacket> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        if inner.session_id != Some(session_id) {
+            return None;
+        }
+        inner
+            .latest_config
+            .as_ref()
+            .filter(|packet| packet.sequence > after_sequence)
+            .cloned()
+    }
+
     #[allow(dead_code)]
     pub fn stats(&self) -> PreviewStoreStats {
         self.inner
@@ -349,6 +371,20 @@ mod tests {
         assert_eq!(
             store.latest_after(4, 1).map(|packet| packet.sequence),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn config_after_only_returns_a_fresh_resync_keyframe() {
+        let store = PreviewFrameStore::new();
+        store.publish(config(5, 1));
+        assert!(store.latest_config_after(5, 1).is_none());
+        store.publish(config(5, 4));
+        assert_eq!(
+            store
+                .latest_config_after(5, 1)
+                .map(|packet| packet.sequence),
+            Some(4)
         );
     }
 
