@@ -847,9 +847,9 @@ impl LiveSource {
         let input_fps = camera_input_fps(fps);
         let input_fps_text = input_fps.to_string();
         let output_fps_text = fps.to_string();
-        let video_filter = format!(
-            "fps={fps},scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
-        );
+        let video_filter =
+            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
+                .to_string();
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let input = audio_index.map_or_else(
             || format!("{video_index}:none"),
@@ -865,8 +865,22 @@ impl LiveSource {
             } else {
                 "warning"
             },
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-avioflags",
+            "direct",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
             "-f",
             "avfoundation",
+            "-thread_queue_size",
+            "1",
+            "-pixel_format",
+            "uyvy422",
             "-framerate",
             &input_fps_text,
             "-i",
@@ -880,7 +894,13 @@ impl LiveSource {
             "-tune",
             "zerolatency",
             "-x264-params",
-            "slices=1:sliced-threads=0",
+            &format!(
+                "slices=1:sliced-threads=0:repeat-headers=1:keyint={fps}:min-keyint={fps}:scenecut=0:rc-lookahead=0"
+            ),
+            "-bf",
+            "0",
+            "-refs",
+            "1",
             "-pix_fmt",
             "yuv420p",
             "-vf",
@@ -891,6 +911,8 @@ impl LiveSource {
             "cfr",
             "-f",
             "h264",
+            "-flush_packets",
+            "1",
             "pipe:1",
         ]);
         if audio_index.is_some() {

@@ -12,6 +12,7 @@ export interface PreviewSessionState {
 export interface PreviewSessionCallbacks {
   onState?: (state: PreviewSessionState["state"]) => void;
   onError?: (error: string) => void;
+  onFrame?: (stats: { latencyMs: number; fps: number }) => void;
 }
 
 function decoderFactory(): VideoDecoderFactory | null {
@@ -75,6 +76,7 @@ export function usePreviewSession(canvas: HTMLCanvasElement | null, callbacks: P
       fpsFrames = 0;
       fpsStart = now;
     }
+    callbacks.onFrame?.({ latencyMs: state.latencyMs, fps: state.fps });
   };
 
   const start = async (): Promise<boolean> => {

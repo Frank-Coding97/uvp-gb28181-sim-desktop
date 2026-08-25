@@ -205,6 +205,7 @@ export class WebCodecsH264Decoder {
         codec: config.codec,
         description: config.description,
         hardwareAcceleration: "prefer-hardware",
+        optimizeForLatency: true,
       };
       const support = await this.factory.isConfigSupported(preferred);
       if (support.supported === false) throw new Error("WebCodecs 不支持 H.264 硬件偏好配置");
@@ -264,6 +265,7 @@ export class WebCodecsH264Decoder {
         codec: this.config.codec,
         description: this.config.description,
         hardwareAcceleration: "prefer-software",
+        optimizeForLatency: true,
       };
       const support = await this.factory.isConfigSupported(config);
       if (support.supported === false) throw new Error("WebCodecs 不支持软件 H.264 配置");

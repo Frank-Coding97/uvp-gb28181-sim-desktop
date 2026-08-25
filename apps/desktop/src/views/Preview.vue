@@ -40,6 +40,10 @@ async function start() {
   if (!binarySession) binarySession = usePreviewSession(canvasRef.value, {
     onState: (next) => { state.value = next; },
     onError: (reason) => { error.value = reason; },
+    onFrame: (stats) => {
+      previewLatency.value = stats.latencyMs;
+      previewFps.value = stats.fps;
+    },
   });
   if (binarySession && await binarySession.start()) {
     binarySessionActive.value = true;

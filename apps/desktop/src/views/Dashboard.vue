@@ -405,6 +405,10 @@ async function startPreview() {
   if (!binarySession) binarySession = usePreviewSession(canvasRef.value, {
     onState: (next) => { previewState.value = next; },
     onError: (error) => { previewError.value = error; },
+    onFrame: (stats) => {
+      previewLatency.value = stats.latencyMs;
+      previewFps.value = stats.fps;
+    },
   });
   if (binarySession) {
     const started = await binarySession.start();
