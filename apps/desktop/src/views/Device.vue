@@ -1,9 +1,9 @@
 <script setup lang="ts">
 // 单设备联调控制台(UC-1),高保真对齐参考原型 frost-blue:
 // 顶部 4 指标卡 + 双栏配置卡(SIP 服务器 / 设备身份)。
-import { ref, onMounted, onUnmounted, onActivated, computed } from "vue";
+import { ref, onMounted, onUnmounted, onActivated, computed, watch, nextTick } from "vue";
 import { NButton, useMessage } from "naive-ui";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import ThreePtzCamera from "../components/ThreePtzCamera.vue";
@@ -24,6 +24,7 @@ async function pickVideoSource() {
       mediaMode.value = "file";
       form.value.video_source = picked;
       probeState.value = null;
+      refreshVideoPreview(true);
     }
   } catch (e) {
     message.error("选择文件失败:" + String(e));
@@ -244,6 +245,17 @@ const screenProfileValidationError = computed(() => {
 });
 const screenProfileValid = computed(() => screenProfileValidationError.value === null);
 
+const selectedScreenFps = ref(25);
+const selectedScreenGop = ref(50);
+const selectedAudioSampleRate = ref(8000);
+const selectedAudioChannels = ref(1);
+const selectedAudioBitrate = ref(64);
+const videoFitMode = ref<"contain" | "cover">("contain");
+
+function toggleVideoFitMode() {
+  videoFitMode.value = videoFitMode.value === "contain" ? "cover" : "contain";
+}
+
 function syncLiveSourceUri() {
   probeState.value = null;
   if (mediaMode.value === "camera") {
@@ -262,6 +274,7 @@ function setMediaMode(mode: MediaMode) {
   probeState.value = null;
   if (mode === "none") {
     form.value.video_source = "";
+    stopPreviewStream();
   } else if (mode === "file") {
     if (form.value.video_source.startsWith("live:")) form.value.video_source = "";
   } else {
@@ -322,6 +335,85 @@ async function probeLiveSource() {
     probeState.value = { kind: "error", message: `采集测试失败：${String(e)}` };
   }
 }
+
+
+const videoPreviewEl = ref<HTMLVideoElement | null>(null);
+const previewUrl = ref("");
+const previewState = ref<{ tone: "idle" | "live" | "warn"; text: string }>({ tone: "idle", text: "未选择媒体源" });
+let previewStream: MediaStream | null = null;
+
+const previewTitle = computed(() => {
+  if (mediaMode.value === "file") return "本地文件预览";
+  if (mediaMode.value === "camera") return "摄像头实时预览";
+  if (mediaMode.value === "screen") return "屏幕实时预览";
+  return "媒体预览";
+});
+const previewMeta = computed(() => {
+  if (mediaMode.value === "none") return "当前仅做 SIP 信令联调";
+  if (mediaMode.value === "file") return form.value.video_source ? "预览源文件；平台点播时由引擎转 PS/RTP 推送" : "选择 MP4/MOV 等容器文件可直接预览";
+  if (mediaMode.value === "camera") return "预览使用 WebView 本地媒体流；实际推流使用后端 FFmpeg 采集";
+  return "预览使用屏幕共享授权；实际推流使用后端 ScreenCaptureKit";
+});
+
+function stopPreviewStream() {
+  if (previewStream) {
+    previewStream.getTracks().forEach((track) => track.stop());
+    previewStream = null;
+  }
+  if (videoPreviewEl.value) videoPreviewEl.value.srcObject = null;
+}
+
+function isLikelyPlayableFile(path: string) {
+  return /\.(mp4|m4v|mov|webm|ogg)$/i.test(path);
+}
+
+async function refreshVideoPreview(auto = false) {
+  await nextTick();
+  stopPreviewStream();
+  previewUrl.value = "";
+  const video = videoPreviewEl.value;
+  if (!video) return;
+  if (mediaMode.value === "none") {
+    previewState.value = { tone: "idle", text: "空媒体模式：不会发送视频画面" };
+    return;
+  }
+  if (mediaMode.value === "file") {
+    const path = form.value.video_source.trim();
+    if (!path) {
+      previewState.value = { tone: "idle", text: "请选择一个视频文件" };
+      return;
+    }
+    if (!isLikelyPlayableFile(path)) {
+      previewState.value = { tone: "warn", text: "裸 H.264/H.265 可推流，但浏览器无法直接预览" };
+      return;
+    }
+    previewUrl.value = convertFileSrc(path);
+    previewState.value = { tone: "live", text: "正在预览本地视频文件" };
+    return;
+  }
+  if (!navigator.mediaDevices) {
+    previewState.value = { tone: "warn", text: "当前 WebView 不支持本地媒体预览" };
+    return;
+  }
+  try {
+    previewState.value = { tone: "idle", text: "正在请求本地预览权限…" };
+    if (mediaMode.value === "camera") {
+      previewStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: selectedMicrophone.value !== "none" });
+    } else {
+      previewStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: selectedScreenAudio.value !== "none" });
+    }
+    video.srcObject = previewStream;
+    await video.play().catch(() => undefined);
+    previewState.value = { tone: "live", text: auto ? "实时预览已刷新" : "实时预览中" };
+  } catch (e) {
+    previewState.value = { tone: "warn", text: `预览未开启：${String(e)}` };
+  }
+}
+
+watch(() => [mediaMode.value, form.value.video_source], () => {
+  if (mediaMode.value === "file") refreshVideoPreview(true);
+  else if (mediaMode.value === "none") { stopPreviewStream(); previewState.value = { tone: "idle", text: "空媒体模式：不会发送视频画面" }; previewUrl.value = ""; }
+});
 
 // OSD 配置状态:反映**平台下发的 OSD 配置命令**(国标 A.2.3.2.11),设备已按其设置。
 // 非本地随意填写——osd_config 事件由后端在收到平台 DeviceConfig+OSDConfig 时推来。
@@ -388,8 +480,23 @@ interface TraceEntry {
 }
 const traces = ref<TraceEntry[]>([]);
 const traceOn = ref(true);
+const traceDirectionFilter = ref<"all" | "in" | "out">("all");
+const traceMethodFilter = ref("all");
 const MAX_TRACE = 200;
 const expandedTrace = ref<number | null>(null);
+const traceMethodOptions = computed(() => {
+  const methods = Array.from(new Set(traces.value.map((t) => t.method || "响应"))).sort();
+  return ["all", ...methods];
+});
+const filteredTraces = computed(() => traces.value.filter((t) =>
+  (traceDirectionFilter.value === "all" || t.direction === traceDirectionFilter.value) &&
+  (traceMethodFilter.value === "all" || (t.method || "响应") === traceMethodFilter.value)
+));
+function traceTone(t: TraceEntry) {
+  if (t.status && t.status >= 400 && t.status !== 401) return "error";
+  if (t.status && t.status >= 300) return "warn";
+  return "";
+}
 function toggleTraceRow(i: number) {
   expandedTrace.value = expandedTrace.value === i ? null : i;
 }
@@ -402,7 +509,7 @@ async function toggleTrace() {
     await invoke<string>("set_sip_trace", { enabled: traceOn.value });
   } catch (e) { message.error(String(e)); }
 }
-function clearTraces() { traces.value = []; expandedTrace.value = null; }
+function clearTraces() { traces.value = []; expandedTrace.value = null; traceMethodFilter.value = "all"; traceDirectionFilter.value = "all"; }
 
 // 云台控制可视化:订阅 ptz_action 事件,累积转动角度驱动 3D 球机。
 interface PtzAction {
@@ -639,6 +746,7 @@ onMounted(async () => {
     }
   });
   await refreshLiveSources(false);
+  refreshVideoPreview(true);
 });
 onUnmounted(() => {
   unlistenTrace?.();
@@ -652,6 +760,7 @@ onUnmounted(() => {
   if (poseTimer) clearInterval(poseTimer);
   if (osdTimer) clearInterval(osdTimer);
   if (ptzStopTimer) clearTimeout(ptzStopTimer);
+  stopPreviewStream();
 });
 
 // keep-alive 激活时与引擎对账(store 内统一实现),避免切页后按钮态错乱。
@@ -667,39 +776,71 @@ onActivated(reconcile);
       <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
     </div>
 
+    <section class="device-console-grid">
+      <div class="config-stack">
+        <!-- 设备身份与媒体源：左侧集中配置，占一半宽度。 -->
+        <div class="glass-card panel identity-panel">
+          <div class="panel-head-tight">
+            <div class="panel-title">设备身份与国标参数</div>
+            <span class="param-badge">GB/T 28181</span>
+          </div>
 
-    <!-- 设备身份与媒体源占满整行，避免窄列挤压复杂配置。 -->
-    <div class="glass-card panel identity-panel">
-          <div class="panel-title">设备身份</div>
+          <!-- 国标基础与扩展参数 -->
           <div class="identity-grid">
-          <div class="fg">
-            <label>国标版本</label>
-            <div class="seg">
-              <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">GB/T 2022</button>
-              <button :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">GB/T 2016</button>
+            <div class="fg">
+              <label>国标版本</label>
+              <div class="seg">
+                <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">GB/T 2022</button>
+                <button :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">GB/T 2016</button>
+              </div>
+            </div>
+            <div class="fg">
+              <label>设备国标编号</label>
+              <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
+            </div>
+            <div class="fg">
+              <label>主通道名称</label>
+              <input v-model="form.channel_name" class="inp" placeholder="通道名称" />
+            </div>
+            <div class="fg">
+              <label>目录组织模板</label>
+              <select v-model="form.catalog_template" class="inp">
+                <option value="">单通道(默认)</option>
+                <option value="nvr-8ch">8 通道 NVR</option>
+                <option value="civil-3x2">跨区划(3 区 × 2 通道)</option>
+                <option value="large-16ch">16 通道大型监控</option>
+              </select>
+            </div>
+            <div class="fg">
+              <label>设备厂商 (Manufacturer)</label>
+              <input v-model="form.manufacturer" class="inp" placeholder="厂商名称" />
+            </div>
+            <div class="fg">
+              <label>设备型号 (Model)</label>
+              <input v-model="form.model" class="inp" placeholder="产品型号" />
+            </div>
+            <div class="fg">
+              <label>固件版本 (Firmware)</label>
+              <input v-model="form.firmware" class="inp" placeholder="固件版本号" />
+            </div>
+            <div class="fg">
+              <label>注册有效期 (Expires · 秒)</label>
+              <input v-model.number="form.expires" type="number" min="60" max="86400" step="60" class="inp" placeholder="3600" />
+            </div>
+            <div class="fg">
+              <label>心跳周期 (Interval · 秒)</label>
+              <input v-model.number="form.heartbeat_interval" type="number" min="5" max="300" step="5" class="inp" placeholder="60" />
+            </div>
+            <div class="fg">
+              <label>心跳超时次数 (Max Timeout)</label>
+              <input v-model.number="form.max_heartbeat_timeout" type="number" min="1" max="10" step="1" class="inp" placeholder="3" />
             </div>
           </div>
-          <div class="fg">
-            <label>设备编号</label>
-            <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
-          </div>
-          <div class="fg">
-            <label>通道名称</label>
-            <input v-model="form.channel_name" class="inp" />
-          </div>
-          <div class="fg">
-            <label>目录模板</label>
-            <select v-model="form.catalog_template" class="inp">
-              <option value="">单通道(默认)</option>
-              <option value="nvr-8ch">8 通道 NVR</option>
-              <option value="civil-3x2">跨区划(3 区 × 2 通道)</option>
-              <option value="large-16ch">16 通道大型监控</option>
-            </select>
-          </div>
-          </div>
+
+          <!-- 媒体源类型切换 -->
           <div class="fg media-source-field">
             <div class="source-heading">
-              <label>媒体源(可选)</label>
+              <label>媒体源与音视频编码配置</label>
               <span class="source-lock" v-if="startDisabled">设备运行中，配置已锁定</span>
             </div>
             <div class="source-modes" role="radiogroup" aria-label="媒体源类型">
@@ -717,6 +858,7 @@ onActivated(reconcile);
               </button>
             </div>
 
+            <!-- 文件模式 -->
             <div v-if="mediaMode === 'file'" class="source-config">
               <div class="file-row">
                 <input v-model="form.video_source" :disabled="startDisabled" class="inp" placeholder="选择 H.264/H.265 裸流或 MP4、MOV 等视频文件" />
@@ -725,16 +867,17 @@ onActivated(reconcile);
               <div class="fg-hint">容器文件会在设备启动前转封装；有音频轨时自动转为 G.711A 后与视频复用。</div>
             </div>
 
+            <!-- 摄像头模式 -->
             <div v-else-if="mediaMode === 'camera'" class="source-config">
               <div class="source-capability">
                 <span class="cap-badge" :class="liveCatalog.ffmpeg_available ? 'ok' : 'warn'">
                   FFmpeg {{ liveCatalog.ffmpeg_available ? '可用' : '未找到' }}
                 </span>
-                <span>AVFoundation 摄像头采集</span>
+                <span>AVFoundation 摄像头与音频采集</span>
               </div>
-              <div class="source-grid camera-source-grid">
+              <div class="source-grid">
                 <div>
-                  <label>视频设备</label>
+                  <label>视频采集设备</label>
                   <select v-model.number="selectedCameraIndex" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
                     <option v-if="!liveCatalog.cameras.length && selectedCameraIndex === null" :value="null" disabled>未发现摄像头</option>
                     <option v-if="selectedCameraIndex !== null && !liveCatalog.cameras.some(item => item.index === selectedCameraIndex)" :value="selectedCameraIndex" disabled>
@@ -746,7 +889,7 @@ onActivated(reconcile);
                   </select>
                 </div>
                 <div>
-                  <label>音频设备</label>
+                  <label>音频采集设备</label>
                   <select v-model="selectedMicrophone" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
                     <option value="none">不采集音频（画面将没有声音）</option>
                     <option v-if="selectedMicrophone !== 'none' && !liveCatalog.microphones.some(item => String(item.index) === selectedMicrophone)" :value="selectedMicrophone" disabled>
@@ -757,20 +900,104 @@ onActivated(reconcile);
                     </option>
                   </select>
                 </div>
-                <div>
-                  <label>音频编码</label>
-                  <select v-model="selectedCameraAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                    <option value="g711a">G.711A / PCMA · 8 kHz</option>
-                    <option value="g711u">G.711U / PCMU · 8 kHz</option>
-                    <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz{{ liveCatalog.aac_available ? '' : '（编码器不可用）' }}</option>
-                    <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz · 20 ms（扩展{{ liveCatalog.opus_available ? '' : '，编码器不可用' }}）</option>
-                  </select>
+              </div>
+
+              <!-- 左右分栏：左半列视频参数，右半列音频参数 -->
+              <div class="media-param-columns">
+                <!-- 左半列：视频流参数 -->
+                <div class="param-col">
+                  <div class="col-title">🎥 视频流参数</div>
+                  <div class="fg">
+                    <label>视频编码格式</label>
+                    <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                      <option value="h264">H.264 / AVC（兼容性优先）</option>
+                      <option value="h265">H.265 / HEVC（更高压缩率）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>输出分辨率</label>
+                    <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
+                      <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
+                        {{ resolution.label }}
+                      </option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>视频帧率 (FPS)</label>
+                    <select v-model.number="selectedScreenFps" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="15">15 fps（低开销）</option>
+                      <option :value="25">25 fps（国标推荐）</option>
+                      <option :value="30">30 fps（标准）</option>
+                      <option :value="60">60 fps（高流畅）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>视频码率</label>
+                    <div class="screen-bitrate-input">
+                      <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
+                      <span>kbps</span>
+                    </div>
+                  </div>
+                  <div class="fg">
+                    <label>GOP 关键帧间隔</label>
+                    <select v-model.number="selectedScreenGop" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="25">25 帧 (1秒 GOP)</option>
+                      <option :value="50">50 帧 (2秒 GOP · 推荐)</option>
+                      <option :value="100">100 帧 (4秒 GOP)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <!-- 右半列：音频流参数 -->
+                <div class="param-col">
+                  <div class="col-title">🎙 音频流参数</div>
+                  <div class="fg">
+                    <label>音频编码格式</label>
+                    <select v-model="selectedCameraAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                      <option value="g711a">G.711A / PCMA · 8 kHz</option>
+                      <option value="g711u">G.711U / PCMU · 8 kHz</option>
+                      <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz{{ liveCatalog.aac_available ? '' : '（不可用）' }}</option>
+                      <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz（扩展{{ liveCatalog.opus_available ? '' : '，不可用' }}）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>音频采样率 (Sample Rate)</label>
+                    <select v-model.number="selectedAudioSampleRate" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="8000">8 000 Hz（G.711 标准）</option>
+                      <option :value="16000">16 000 Hz（宽带语音）</option>
+                      <option :value="32000">32 000 Hz</option>
+                      <option :value="44100">44 100 Hz（CD 级）</option>
+                      <option :value="48000">48 000 Hz（专业级 AAC/Opus）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>声道模式 (Channels)</label>
+                    <select v-model.number="selectedAudioChannels" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="1">单声道 (Mono · 默认)</option>
+                      <option :value="2">双声道 (Stereo)</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>音频比特率 (Bitrate)</label>
+                    <select v-model.number="selectedAudioBitrate" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="32">32 kbps</option>
+                      <option :value="64">64 kbps（G.711/AAC 推荐）</option>
+                      <option :value="128">128 kbps（高音质）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>打包周期与采样精度</label>
+                    <select class="inp" disabled>
+                      <option>16-bit 线性量化 · 20 ms 打包</option>
+                    </select>
+                  </div>
                 </div>
               </div>
+
               <div v-if="liveCatalog.avfoundation_error" class="source-notice error">{{ liveCatalog.avfoundation_error }}</div>
-              <div v-else class="fg-hint">iPhone 的“相机”和“桌上视角”是两个真实视频视角，不是屏幕镜像。选择麦克风后，视频与音频在同一个 AVFoundation 会话中采集，避免连续互通设备被两个进程争用。首次采集必须允许麦克风权限；如仍无声，请前往“系统设置 → 隐私与安全性 → 麦克风”确认本应用已开启。</div>
             </div>
 
+            <!-- 屏幕录制模式 -->
             <div v-else-if="mediaMode === 'screen'" class="source-config">
               <div class="source-capability">
                 <span class="cap-badge ok">ScreenCaptureKit</span>
@@ -778,7 +1005,7 @@ onActivated(reconcile);
               </div>
               <div class="source-grid">
                 <div>
-                  <label>显示器</label>
+                  <label>显示器选择</label>
                   <select v-model.number="selectedDisplayId" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
                     <option v-if="!liveCatalog.screens.length && selectedDisplayId === null" :value="null" disabled>未发现可用显示器</option>
                     <option v-if="selectedDisplayId !== null && !liveCatalog.screens.some(item => item.display_id === selectedDisplayId)" :value="selectedDisplayId" disabled>
@@ -790,7 +1017,7 @@ onActivated(reconcile);
                   </select>
                 </div>
                 <div>
-                  <label>声音</label>
+                  <label>声音采集源</label>
                   <select v-model="selectedScreenAudio" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
                     <option value="system">系统播放声音</option>
                     <option v-if="selectedScreenAudio.startsWith('microphone:') && !liveCatalog.microphones.some(item => `microphone:${item.index}` === selectedScreenAudio)" :value="selectedScreenAudio" disabled>
@@ -803,45 +1030,104 @@ onActivated(reconcile);
                   </select>
                 </div>
               </div>
-              <div class="screen-profile-grid">
-                <div>
-                  <label>输出分辨率</label>
-                  <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
-                    <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
-                      {{ resolution.label }}
-                    </option>
-                  </select>
-                </div>
-                <div>
-                  <label>视频码率</label>
-                  <div class="screen-bitrate-input">
-                    <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
-                    <span>kbps</span>
+
+              <!-- 左右分栏：左半列视频参数，右半列音频参数 -->
+              <div class="media-param-columns">
+                <!-- 左半列：视频流参数 -->
+                <div class="param-col">
+                  <div class="col-title">🎥 视频流参数</div>
+                  <div class="fg">
+                    <label>输出分辨率</label>
+                    <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
+                      <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
+                        {{ resolution.label }}
+                      </option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>视频帧率 (FPS)</label>
+                    <select v-model.number="selectedScreenFps" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="15">15 fps（低开销）</option>
+                      <option :value="25">25 fps（国标推荐）</option>
+                      <option :value="30">30 fps（标准）</option>
+                      <option :value="60">60 fps（高流畅）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>视频码率</label>
+                    <div class="screen-bitrate-input">
+                      <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
+                      <span>kbps</span>
+                    </div>
+                  </div>
+                  <div class="fg">
+                    <label>视频编码格式</label>
+                    <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                      <option value="h264">H.264 / AVC（兼容性优先）</option>
+                      <option value="h265">H.265 / HEVC（更低带宽）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>GOP 关键帧间隔</label>
+                    <select v-model.number="selectedScreenGop" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="25">25 帧 (1秒 GOP)</option>
+                      <option :value="50">50 帧 (2秒 GOP · 推荐)</option>
+                      <option :value="100">100 帧 (4秒 GOP)</option>
+                    </select>
                   </div>
                 </div>
-                <div>
-                  <label>编码格式</label>
-                  <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                    <option value="h264">H.264 / AVC（兼容性优先）</option>
-                    <option value="h265">H.265 / HEVC（更低带宽）</option>
-                  </select>
-                </div>
-                <div>
-                  <label>音频格式</label>
-                  <select v-model="selectedScreenAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" aria-label="实时音频格式" @change="syncLiveSourceUri">
-                    <option value="g711a">G.711A / PCMA · 8 kHz · 单声道</option>
-                    <option value="g711u">G.711U / PCMU · 8 kHz · 单声道</option>
-                    <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz · 单声道{{ liveCatalog.aac_available ? '' : '（编码器不可用）' }}</option>
-                    <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz · 20 ms（扩展{{ liveCatalog.opus_available ? '' : '，编码器不可用' }}）</option>
-                  </select>
+
+                <!-- 右半列：音频流参数 -->
+                <div class="param-col">
+                  <div class="col-title">🎙 音频流参数</div>
+                  <div class="fg">
+                    <label>音频编码格式</label>
+                    <select v-model="selectedScreenAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" aria-label="实时音频格式" @change="syncLiveSourceUri">
+                      <option value="g711a">G.711A / PCMA · 8 kHz · 单声道</option>
+                      <option value="g711u">G.711U / PCMU · 8 kHz · 单声道</option>
+                      <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz · 单声道{{ liveCatalog.aac_available ? '' : '（不可用）' }}</option>
+                      <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz · 20 ms（扩展{{ liveCatalog.opus_available ? '' : '，不可用' }}）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>音频采样率 (Sample Rate)</label>
+                    <select v-model.number="selectedAudioSampleRate" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="8000">8 000 Hz（G.711 标准）</option>
+                      <option :value="16000">16 000 Hz（宽带语音）</option>
+                      <option :value="32000">32 000 Hz</option>
+                      <option :value="44100">44 100 Hz（CD 级）</option>
+                      <option :value="48000">48 000 Hz（专业级 AAC/Opus）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>声道模式 (Channels)</label>
+                    <select v-model.number="selectedAudioChannels" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="1">单声道 (Mono · 默认)</option>
+                      <option :value="2">双声道 (Stereo)</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>音频比特率 (Bitrate)</label>
+                    <select v-model.number="selectedAudioBitrate" :disabled="startDisabled || sourceLoading" class="inp">
+                      <option :value="32">32 kbps</option>
+                      <option :value="64">64 kbps（G.711/AAC 推荐）</option>
+                      <option :value="128">128 kbps（高音质）</option>
+                    </select>
+                  </div>
+                  <div class="fg">
+                    <label>打包周期与采样精度</label>
+                    <select class="inp" disabled>
+                      <option>16-bit 线性量化 · 20 ms 打包</option>
+                    </select>
+                  </div>
                 </div>
               </div>
+
               <div v-if="screenProfileValidationError" class="source-notice error">{{ screenProfileValidationError }}</div>
               <div v-if="liveCatalog.screen_error" class="source-notice error">
                 {{ liveCatalog.screen_error }}
                 <span>请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许本应用。</span>
               </div>
-              <div v-else class="fg-hint">声音可选择系统播放或任意 AVFoundation 麦克风。G.711A/U 兼容性最高；AAC-LC / ADTS 是 FLV 最常用的标准音频格式；Opus 使用私有 PS 扩展，只有明确支持 Opus 的平台才能播放。麦克风无声时请检查“系统设置 → 隐私与安全性 → 麦克风”。</div>
             </div>
 
             <div v-if="mediaMode !== 'none'" class="source-footer">
@@ -856,32 +1142,86 @@ onActivated(reconcile);
                 <button type="button" class="file-btn compact primary" :disabled="!canProbeSource || probeState?.kind === 'loading'" @click="probeLiveSource">
                   {{ probeState?.kind === 'loading' ? '测试中…' : '测试采集' }}
                 </button>
+                <button type="button" class="file-btn compact" @click="refreshVideoPreview()">预览画面</button>
               </div>
             </div>
             <div v-if="probeState" class="probe-result" :class="probeState.kind">{{ probeState.message }}</div>
           </div>
-          <div class="action-row">
-            <n-button type="primary" :disabled="registrationDisabled" @click="startDevice">注册上线</n-button>
-            <n-button :disabled="stopDisabled" @click="stopDevice">注销</n-button>
-            <n-button :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
-            <n-button :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
-          </div>
-    </div>
 
-    <!-- 下方工作区：所有卡片全宽单列，按云台、状态、时间线顺序阅读。 -->
-    <div class="workspace">
-      <div class="ws-col">
+          <div class="action-row primary-actions">
+            <n-button type="primary" :disabled="registrationDisabled" @click="startDevice">注册上线</n-button>
+            <n-button secondary type="error" :disabled="stopDisabled" @click="stopDevice">注销</n-button>
+            <n-button tertiary :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
+            <n-button tertiary :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右侧容器：上下平分高度，上部为视频预览，下部为云台控制 -->
+      <div class="preview-ptz-stack">
+        <!-- 上部：视频预览卡片 -->
+        <aside class="glass-card panel preview-panel">
+          <div class="preview-head">
+            <div>
+              <div class="panel-title">视频预览</div>
+              <div class="preview-sub">{{ previewTitle }}</div>
+            </div>
+            <div class="preview-head-right">
+              <button type="button" class="file-btn compact toggle-fit-btn" @click="toggleVideoFitMode" :title="videoFitMode === 'contain' ? '当前：保持比例适应；点击切换为完全铺满' : '当前：铺满裁剪；点击切换为保持比例'">
+                {{ videoFitMode === 'cover' ? '模式：铺满' : '模式：适应' }}
+              </button>
+              <span class="preview-badge" :class="previewState.tone">{{ previewState.tone === 'live' ? 'PREVIEW' : previewState.tone === 'warn' ? 'CHECK' : 'IDLE' }}</span>
+              <div class="preview-actions">
+                <button type="button" class="file-btn compact primary" :disabled="mediaMode === 'none'" @click="refreshVideoPreview()">刷新</button>
+                <button type="button" class="file-btn compact" :disabled="mediaMode !== 'file' || startDisabled" @click="pickVideoSource">选文件</button>
+              </div>
+            </div>
+          </div>
+          <div class="video-frame" :class="[previewState.tone, `fit-${videoFitMode}`]">
+            <video
+              ref="videoPreviewEl"
+              :src="previewUrl || undefined"
+              autoplay
+              muted
+              playsinline
+              controls
+              :class="`video-${videoFitMode}`"
+            />
+            <div v-if="!previewUrl && previewState.tone !== 'live'" class="preview-empty">
+              <div class="scan-mark">GB</div>
+              <strong>{{ previewState.text }}</strong>
+              <span>{{ previewMeta }}</span>
+            </div>
+          </div>
+          <div class="preview-status-line">
+            <div class="preview-status" :class="previewState.tone">
+              <i />
+              <span>{{ previewState.text }}</span>
+            </div>
+            <span class="preview-note">本地预览画面（支持适应/铺满），推送到平台为标准 PS/RTP 流</span>
+          </div>
+        </aside>
+
+        <!-- 下部：云台控制卡片 -->
         <div class="glass-card panel ptz-panel">
-          <div class="panel-title">云台控制</div>
-          <div class="ptz-sub">平台下发 PTZ 时，桌面球机按真实水平转台、球形机芯和光学变倍实时联动</div>
+          <div class="ptz-head">
+            <div class="panel-title">云台控制</div>
+            <div class="ptz-sub">平台下发 PTZ 时机芯与光学变倍实时联动</div>
+          </div>
           <div class="ptz-body">
             <div class="ptz-stage" :class="{ active: ptzActive, seeking }">
               <div class="stage-grid"></div>
+              <!-- 左上角 PTZ LIVE 标识 -->
               <div class="stage-caption">
                 <span class="live-dot"></span>
                 <b>PTZ LIVE</b>
-                <em>{{ statusText }}</em>
               </div>
+              <!-- 右上角 对称呼应的运行状态胶囊 -->
+              <div class="stage-caption stage-caption-right" :class="{ active: ptzActive, seeking }">
+                <span class="motion-dot"></span>
+                <b>{{ statusText }}</b>
+              </div>
+
               <div class="compass-ring" aria-hidden="true">
                 <div class="compass-dial" :style="compassDialStyle">
                   <span class="north">N</span><span class="east">E</span><span class="south">S</span><span class="west">W</span>
@@ -906,24 +1246,24 @@ onActivated(reconcile);
                 :active="ptzActive"
                 :seeking="seeking"
               />
-              <div class="axis-label pan-axis">PAN · 水平 360°</div>
-              <div class="axis-label tilt-axis">TILT · 俯仰 ±90°</div>
+              <div class="axis-label pan-axis">PAN 360°</div>
+              <div class="axis-label tilt-axis">TILT ±90°</div>
             </div>
             <div class="ptz-info">
-              <div class="ptz-stat pose-stat"><span>朝向</span><b class="pose">{{ poseText }}</b></div>
-              <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
-              <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
-              <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
-              <div class="ptz-stat"><span>状态</span><b :class="{ hot: ptzActive || seeking }">{{ statusText }}</b></div>
+              <div class="ptz-stat-grid">
+                <div class="ptz-stat"><span>朝向</span><b class="pose">{{ poseText }}</b></div>
+                <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
+                <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
+                <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
+              </div>
               <div class="ptz-stat action-state">
-                <span>平台按钮实时状态 · {{ lastPtzAt }}</span>
+                <span>平台命令 · {{ lastPtzAt }}</span>
                 <span class="action-chips">
                   <b v-for="button in ptzButtons" :key="button.key" class="action-chip" :class="{ on: button.active, stop: button.key === 'stop' }">{{ button.label }}</b>
                 </span>
-                <em>最近命令：{{ lastPtzAction }}</em>
               </div>
               <div class="ptz-stat presets">
-                <span>预置位 · GB/T 28181 PresetName</span>
+                <span>预置位</span>
                 <span class="preset-chips">
                   <b v-for="id in PRESET_IDS" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">
                     <small>{{ id }}</small>{{ presetNames[id] }}
@@ -932,44 +1272,56 @@ onActivated(reconcile);
               </div>
             </div>
           </div>
-          <section class="ptz-runtime" aria-labelledby="ptz-runtime-title">
-            <div id="ptz-runtime-title" class="ptz-runtime-title">平台实时状态</div>
-            <div class="ptz-runtime-grid">
-              <div class="rt-block">
-                <div class="rt-label">活跃订阅</div>
-                <div v-if="subList.length" class="sub-list">
-                  <div v-for="s in subList" :key="s.kind" class="sub-item">
-                    <span class="sub-dot" /><span class="sub-kind">{{ kindLabel[s.kind] ?? s.kind }}</span>
-                    <span class="sub-count">NOTIFY {{ s.notify_count }}</span>
-                  </div>
-                </div>
-                <div v-else class="rt-idle">无（平台订阅目录、报警或位置后显示）</div>
-              </div>
-              <div class="rt-block">
-                <div class="rt-label">OSD 设置（平台下发）</div>
-                <div v-if="osd.received" class="osd-applied">
-                  <span class="osd-badge" :class="osd.time_show ? 'on' : 'off'">时间 {{ osd.time_show ? '开' : '关' }}</span>
-                  <span class="osd-badge" :class="osd.osd_show ? 'on' : 'off'">信息 {{ osd.osd_show ? '开' : '关' }}</span>
-                  <span class="rt-time">{{ osd.at }}</span>
-                </div>
-                <div v-else class="rt-idle">无（平台下发 OSDConfig 后显示）</div>
-              </div>
-              <div v-if="progress" class="rt-block progress-block">
-                <div class="rt-label">{{ kindLabel[progress.kind] ?? progress.kind }}进度</div>
-                <div class="prog-wrap">
-                  <div class="prog-bar"><div class="prog-fill" :style="{ width: progress.percent + '%' }" /></div>
-                  <div class="prog-txt">{{ progress.current }}/{{ progress.total }} · {{ progress.percent }}%</div>
-                </div>
-              </div>
-            </div>
-          </section>
         </div>
       </div>
+    </section>
 
-      <div class="ws-col">
-        <div class="glass-card panel">
-          <div class="panel-title">平台命令时间线</div>
-          <div v-if="commands.length === 0" class="rt-idle">等待平台下发命令(注册后平台会查目录、下发控制等)…</div>
+    <!-- 下方工作区：平台实时状态与平台命令时间线并排各占 50%，对齐上方；最下方放 SIP 信令追踪 -->
+    <div class="workspace">
+      <div class="runtime-timeline-grid">
+        <!-- 平台实时状态：占左侧 50% 宽度，与上方设备身份卡片等宽对齐 -->
+        <div class="glass-card panel runtime-panel">
+          <div class="panel-head-tight">
+            <div class="panel-title">平台实时状态</div>
+            <span class="param-badge">运行时订阅与 OSD</span>
+          </div>
+          <div class="ptz-runtime-grid">
+            <div class="rt-block">
+              <div class="rt-label">活跃订阅</div>
+              <div v-if="subList.length" class="sub-list">
+                <div v-for="s in subList" :key="s.kind" class="sub-item">
+                  <span class="sub-dot" /><span class="sub-kind">{{ kindLabel[s.kind] ?? s.kind }}</span>
+                  <span class="sub-count">NOTIFY {{ s.notify_count }}</span>
+                </div>
+              </div>
+              <div v-else class="rt-idle">无（平台订阅目录、报警或位置后显示）</div>
+            </div>
+            <div class="rt-block">
+              <div class="rt-label">OSD 设置（平台下发）</div>
+              <div v-if="osd.received" class="osd-applied">
+                <span class="osd-badge" :class="osd.time_show ? 'on' : 'off'">时间 {{ osd.time_show ? '开' : '关' }}</span>
+                <span class="osd-badge" :class="osd.osd_show ? 'on' : 'off'">信息 {{ osd.osd_show ? '开' : '关' }}</span>
+                <span class="rt-time">{{ osd.at }}</span>
+              </div>
+              <div v-else class="rt-idle">无（平台下发 OSDConfig 后显示）</div>
+            </div>
+            <div v-if="progress" class="rt-block progress-block">
+              <div class="rt-label">{{ kindLabel[progress.kind] ?? progress.kind }}进度</div>
+              <div class="prog-wrap">
+                <div class="prog-bar"><div class="prog-fill" :style="{ width: progress.percent + '%' }" /></div>
+                <div class="prog-txt">{{ progress.current }}/{{ progress.total }} · {{ progress.percent }}%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 平台命令时间线：占右侧 50% 宽度，与上方视频/云台卡片等宽对齐 -->
+        <div class="glass-card panel timeline-panel">
+          <div class="panel-head-tight">
+            <div class="panel-title">平台命令时间线</div>
+            <span class="param-badge">交互命令流水</span>
+          </div>
+          <div v-if="commands.length === 0" class="rt-idle empty-timeline">等待平台下发命令(注册后平台会查目录、下发控制等)…</div>
           <div v-else class="cmd-list">
             <div v-for="(c, i) in commands" :key="i" class="cmd-item">
               <span class="cmd-ts">{{ fmtCmdTs(c.ts_ms) }}</span>
@@ -979,106 +1331,349 @@ onActivated(reconcile);
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- SIP 信令实时追踪(FR-43) -->
-    <div class="glass-card panel trace-panel">
-      <div class="trace-head">
-        <div class="panel-title" style="margin: 0">SIP 信令追踪</div>
-        <div class="trace-ctl">
-          <label class="trace-toggle">
-            <input type="checkbox" v-model="traceOn" @change="toggleTrace" /> 追踪
-          </label>
-          <button class="trace-clear" @click="clearTraces">清空</button>
-        </div>
-      </div>
-      <div class="trace-log">
-        <div v-if="!traces.length" class="trace-empty">注册上线后,收发的 SIP 报文将实时显示在这里(新的在最上,点击展开详情)</div>
-        <template v-for="(t, i) in traces" :key="i">
-          <div class="trace-row" :class="[t.direction, { open: expandedTrace === i }]" @click="toggleTraceRow(i)">
-            <span class="trace-caret">{{ expandedTrace === i ? "▾" : "▸" }}</span>
-            <span class="trace-ts">{{ fmtTs(t.ts_ms) }}</span>
-            <span class="trace-dir" :class="t.direction">{{ t.direction === "in" ? "◀ 收" : "▶ 发" }}</span>
-            <span class="trace-sum">{{ t.summary }}</span>
-            <span class="trace-cseq" v-if="t.cseq">{{ t.cseq }}</span>
+      <!-- SIP 信令实时追踪(FR-43) -->
+      <div class="glass-card panel trace-panel">
+        <div class="trace-head">
+          <div class="panel-title" style="margin: 0">SIP 信令追踪</div>
+          <div class="trace-ctl">
+            <label class="trace-toggle">
+              <input type="checkbox" v-model="traceOn" @change="toggleTrace" /> 追踪
+            </label>
+            <select v-model="traceDirectionFilter" class="trace-filter" aria-label="方向过滤">
+              <option value="all">全部方向</option>
+              <option value="in">只看接收</option>
+              <option value="out">只看发送</option>
+            </select>
+            <select v-model="traceMethodFilter" class="trace-filter" aria-label="方法过滤">
+              <option v-for="m in traceMethodOptions" :key="m" :value="m">{{ m === 'all' ? '全部方法' : m }}</option>
+            </select>
+            <button class="trace-clear" @click="clearTraces">清空</button>
           </div>
-          <pre v-if="expandedTrace === i" class="trace-raw">{{ t.raw }}</pre>
-        </template>
+        </div>
+        <div class="trace-log">
+          <div v-if="!traces.length" class="trace-empty">注册上线后,收发的 SIP 报文将实时显示在这里(新的在最上,点击展开详情)</div>
+          <div v-else-if="!filteredTraces.length" class="trace-empty">当前过滤条件下没有匹配的 SIP 报文</div>
+          <template v-for="(t, i) in filteredTraces" :key="`${t.ts_ms}-${i}-${t.cseq ?? ''}`">
+            <div class="trace-row" :class="[t.direction, traceTone(t), { open: expandedTrace === i }]" @click="toggleTraceRow(i)">
+              <span class="trace-caret">{{ expandedTrace === i ? "▾" : "▸" }}</span>
+              <span class="trace-ts">{{ fmtTs(t.ts_ms) }}</span>
+              <span class="trace-dir" :class="t.direction">{{ t.direction === "in" ? "◀ 收" : "▶ 发" }}</span>
+              <span class="trace-sum">{{ t.summary }}</span>
+              <span class="trace-cseq" v-if="t.cseq">{{ t.cseq }}</span>
+            </div>
+            <pre v-if="expandedTrace === i" class="trace-raw">{{ t.raw }}</pre>
+          </template>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.page { max-width: 1480px; padding-bottom: 28px; }
-.page-header { margin-bottom: 20px; padding: 4px 2px; }
-.page-title { font-size: 24px; font-weight: 750; color: var(--text-primary); letter-spacing: -.3px; }
-.page-sub { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; }
+.page { max-width: 1480px; padding-bottom: 16px; }
+.page-header { margin-bottom: 10px; padding: 0 2px; }
+.page-title { font-size: 17px; font-weight: 700; color: var(--text-primary); letter-spacing: -.2px; }
+.page-sub { font-size: 11.5px; color: var(--text-tertiary); margin-top: 2px; }
 
-/* 所有功能卡片按阅读顺序全宽单列排列，避免复杂信息被窄栏压缩。 */
-.identity-panel { margin-bottom: 18px; }
-.identity-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+/* 顶部工作台：左侧设备卡片占一半宽度，右侧视频预览与云台平分高度 */
+.device-console-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px; align-items: stretch; margin-bottom: 10px;
+}
+.config-stack { min-width: 0; display: flex; flex-direction: column; }
+.identity-panel {
+  height: 100%; box-sizing: border-box; display: flex; flex-direction: column;
+}
+.panel-head-tight {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px;
+}
+.param-badge {
+  font-size: 9.5px; color: var(--text-tertiary); background: rgba(255,255,255,0.5);
+  padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border-default); font-weight: 600;
+}
+.identity-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 8px; }
 .identity-grid .fg { margin-bottom: 0; }
-.workspace { display: flex; flex-direction: column; gap: 18px; }
-.ws-col { display: contents; }
-.workspace > .ws-col > .panel { width: 100%; box-sizing: border-box; }
+
 .panel {
-  position: relative; overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--border-default) 82%, white);
-  box-shadow: 0 12px 34px rgba(32, 51, 79, .07), inset 0 1px 0 rgba(255,255,255,.65);
+  position: relative; overflow: hidden; padding: 11px 13px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  box-shadow: 0 4px 16px rgba(32, 51, 79, .04), inset 0 1px 0 rgba(255,255,255,.65);
 }
 .panel::before {
-  content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 2.5px;
   background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 25%, transparent));
-  opacity: .68;
+  opacity: .75;
 }
-@media (max-width: 1080px) {
-  .identity-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 640px) { .identity-grid { grid-template-columns: 1fr; } }
 
-/* 实时状态分块 */
-.rt-block { padding: 10px 0; border-top: 1px solid rgba(120,120,120,0.08); }
+/* 右侧容器：预览与云台垂直堆叠，平分高度 */
+.preview-ptz-stack {
+  min-width: 0; display: flex; flex-direction: column; gap: 10px; height: 100%;
+}
+
+/* 本地视频预览卡片：占右侧 50% 高度 */
+.preview-panel {
+  flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
+}
+.preview-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px; flex: 0 0 auto;
+}
+.preview-head .panel-title { margin-bottom: 1px; }
+.preview-head-right { display: flex; align-items: center; gap: 6px; }
+.preview-sub { color: var(--text-secondary); font-size: 10.5px; }
+.preview-badge {
+  padding: 2px 6px; border-radius: 999px; font: 700 9px/1 "SF Mono", Menlo, monospace; letter-spacing: .5px;
+  color: var(--text-tertiary); background: rgba(255,255,255,.55); border: 1px solid var(--border-default);
+}
+.preview-badge.live { color: var(--success); background: rgba(8,179,136,.1); border-color: rgba(8,179,136,.22); }
+.preview-badge.warn { color: var(--warning); background: rgba(232,147,32,.1); border-color: rgba(232,147,32,.22); }
+
+/* 视频框：自适应填满容器，支持 Cover 与 Contain 切换 */
+.video-frame {
+  position: relative; flex: 1 1 0; min-height: 120px; width: 100%;
+  display: flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 8px; background:
+    radial-gradient(circle at 50% 35%, rgba(56,132,255,.18), transparent 32%),
+    linear-gradient(145deg, #0f1b2e, #14243a 58%, #0d1727);
+  border: 1px solid rgba(255,255,255,.45); box-shadow: inset 0 1px 0 rgba(255,255,255,.15), 0 6px 16px rgba(15,23,42,.08);
+}
+.video-frame::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .18;
+  background-image: linear-gradient(rgba(255,255,255,.12) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.08) 1px, transparent 1px);
+  background-size: 20px 20px; mask-image: linear-gradient(to bottom, #000, transparent 88%);
+}
+.video-frame video {
+  width: 100%; height: 100%; background: #050914; z-index: 1;
+}
+.video-frame video.video-cover { object-fit: cover; }
+.video-frame video.video-contain { object-fit: contain; }
+
+.preview-empty { position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; align-content: center; gap: 4px; padding: 12px; text-align: center; color: rgba(231,241,255,.92); }
+.preview-empty strong { font-size: 11.5px; }
+.preview-empty span { max-width: 240px; color: rgba(210,226,246,.68); font-size: 10px; line-height: 1.4; }
+.scan-mark {
+  display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%;
+  border: 1px solid rgba(122,181,255,.45); color: #9ec8ff; font: 800 11px/1 "SF Mono", Menlo, monospace;
+  box-shadow: 0 0 0 6px rgba(56,132,255,.06), inset 0 0 14px rgba(56,132,255,.14);
+}
+.preview-status-line {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-top: 5px; flex: 0 0 auto;
+}
+.preview-status { display: flex; align-items: center; gap: 5px; color: var(--text-secondary); font-size: 10.5px; line-height: 1.35; }
+.preview-status i { width: 5px; height: 5px; border-radius: 50%; background: var(--text-tertiary); flex: 0 0 auto; }
+.preview-status.live i { background: var(--success); box-shadow: 0 0 0 2px rgba(8,179,136,.12); }
+.preview-status.warn i { background: var(--warning); box-shadow: 0 0 0 2px rgba(232,147,32,.12); }
+.preview-actions { display: flex; gap: 4px; }
+.toggle-fit-btn { background: rgba(56,132,255,0.08); border-color: rgba(56,132,255,0.2); color: var(--accent); }
+.preview-note { color: var(--text-tertiary); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 云台控制卡片：占右侧 50% 高度 */
+.ptz-panel {
+  flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
+}
+.ptz-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px; flex: 0 0 auto;
+}
+.ptz-head .panel-title { margin-bottom: 0; }
+.ptz-sub { font-size: 10.5px; color: var(--text-tertiary); }
+.ptz-body {
+  flex: 1 1 0; min-height: 0; display: flex; gap: 10px; align-items: stretch;
+}
+
+/* 桌面球机 3D 舞台：弹性自动放大，占卡片主要宽度并随窗口舒展 */
+.ptz-stage {
+  position: relative; flex: 1.35 1 280px; height: 100%; min-height: 140px; overflow: hidden;
+  border-radius: var(--radius-sm); perspective: 900px; isolation: isolate;
+  background:
+    radial-gradient(circle at 50% 38%, rgba(78,145,255,.18), transparent 31%),
+    linear-gradient(155deg, rgba(245,250,255,.98), rgba(215,229,245,.78));
+  border: 1px solid rgba(91,126,171,.18);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -16px 32px rgba(57,87,126,.07);
+}
+.stage-grid {
+  position: absolute; inset: 54% -12% -36%; transform: rotateX(65deg); transform-origin: center top;
+  background-image: linear-gradient(rgba(68,111,166,.1) 1px, transparent 1px), linear-gradient(90deg, rgba(68,111,166,.1) 1px, transparent 1px);
+  background-size: 18px 18px; mask-image: linear-gradient(to bottom, #000, transparent 82%);
+}
+.stage-caption {
+  position: absolute; z-index: 9; left: 6px; top: 6px; display: flex; align-items: center; gap: 4px;
+  padding: 2px 6px; border-radius: 5px; color: #527196; background: rgba(255,255,255,.75);
+  border: 1px solid rgba(92,126,168,.14); box-shadow: 0 2px 6px rgba(39,67,103,.05);
+}
+.stage-caption.stage-caption-right {
+  left: auto; right: 6px; color: var(--text-secondary);
+}
+.stage-caption.stage-caption-right.active {
+  color: var(--accent); border-color: rgba(56,132,255,0.3); background: rgba(255,255,255,0.9);
+}
+.stage-caption .live-dot { width: 5px; height: 5px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 5px #22c55e; }
+.stage-caption .motion-dot { width: 5px; height: 5px; border-radius: 50%; background: #64748b; }
+.stage-caption.active .motion-dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.stage-caption b { font: 800 8px/1 "SF Mono", Menlo, monospace; letter-spacing: .5px; }
+
+.ptz-stage.active .stage-caption .live-dot { background: var(--accent); box-shadow: 0 0 7px var(--accent); animation: liveBlink 1s ease-in-out infinite; }
+@keyframes liveBlink { 50% { opacity: .35; } }
+.compass-ring {
+  position: absolute; z-index: 2; left: 50%; top: 64%; width: 170px; height: 58px;
+  margin-left: -85px; border-radius: 50%; transform: rotateX(68deg);
+  border: 1.5px solid rgba(56,132,255,.28); box-shadow: 0 0 0 5px rgba(255,255,255,.25), inset 0 0 14px rgba(56,132,255,.1);
+}
+.compass-dial {
+  position: absolute; inset: 3px; border-radius: 50%; transition: transform .12s linear;
+  background: repeating-conic-gradient(from -1deg, rgba(61,105,158,.58) 0 2deg, transparent 2deg 10deg);
+}
+.compass-dial::after { content: ""; position: absolute; inset: 27%; border-radius: 50%; border: 1px dashed rgba(56,132,255,.24); }
+.compass-dial span { position: absolute; color: #52749e; font-size: 8px; font-weight: 800; text-shadow: 0 1px #fff; }
+.compass-dial .north { left: 50%; top: -2px; transform: translateX(-50%); color: var(--accent); }
+.compass-dial .east { right: 2px; top: 50%; transform: translateY(-50%); }
+.compass-dial .south { left: 50%; bottom: -2px; transform: translateX(-50%); }
+.compass-dial .west { left: 2px; top: 50%; transform: translateY(-50%); }
+.heading-readout {
+  position: absolute; z-index: 2; left: 50%; top: 50%; transform: translate(-50%, -50%) rotateX(-68deg);
+  color: var(--accent); font: 800 9.5px/1 "SF Mono", Menlo, monospace; background: rgba(255,255,255,.9);
+  padding: 2px 5px; border-radius: 5px; box-shadow: 0 2px 5px rgba(43,68,100,.12);
+}
+.direction-hud span {
+  position: absolute; z-index: 10; display: grid; place-items: center; width: 18px; height: 18px;
+  border-radius: 4px; color: #8ba0bb; background: rgba(255,255,255,.6); border: 1px solid rgba(101,129,166,.15);
+  font-size: 11px; transition: .15s ease;
+}
+.direction-hud span.on { color: #fff; background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: scale(1.1); }
+.hud-up { top: 6px; left: calc(50% - 9px); }
+.hud-down { bottom: 6px; left: calc(50% - 9px); }
+.hud-left { left: 6px; top: calc(50% - 9px); }
+.hud-right { right: 6px; top: calc(50% - 9px); }
+.tilt-gauge {
+  position: absolute; z-index: 9; right: 10px; top: 38px; width: 32px; height: 68px;
+  color: #7890ad; font: 700 7px/1 "SF Mono", Menlo, monospace;
+}
+.tilt-gauge > span { position: absolute; right: 0; }
+.tilt-plus { top: 0; } .tilt-zero { top: 32px; } .tilt-minus { bottom: 0; }
+.tilt-track { position: absolute; left: 3px; top: 2px; width: 2px; height: 64px; border-radius: 2px; background: linear-gradient(var(--accent), #a9bdd5); }
+.tilt-track::before, .tilt-track::after { content: ""; position: absolute; left: -2px; width: 5px; height: 1px; background: #7890ad; }
+.tilt-track::before { top: 0; } .tilt-track::after { bottom: 0; }
+.tilt-marker {
+  position: absolute; left: -1px; top: 29px; min-width: 22px; height: 12px; padding-left: 6px; border-radius: 4px;
+  color: #fff; background: var(--accent); font-size: 7px; line-height: 12px; box-shadow: 0 2px 5px var(--accent-glow);
+  transition: transform .12s linear;
+}
+.tilt-marker::before { content: ""; position: absolute; left: -2px; top: 3.5px; border-width: 2.5px 3px 2.5px 0; border-style: solid; border-color: transparent var(--accent) transparent transparent; }
+.axis-label { position: absolute; z-index: 8; color: #7890ad; font: 700 7px/1 "SF Mono", Menlo, monospace; letter-spacing: .3px; }
+.pan-axis { left: 8px; bottom: 8px; } .tilt-axis { right: 8px; bottom: 8px; }
+.ptz-stage.active { box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -16px 32px rgba(57,87,126,.07), 0 0 0 2px rgba(56,132,255,.16); }
+.ptz-stage.seeking { animation: stageSeekPulse 1.15s ease-in-out infinite; }
+@keyframes stageSeekPulse { 50% { box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -16px 32px rgba(57,87,126,.07), 0 0 16px rgba(56,132,255,.28); } }
+
+/* 云台右侧参数信息：弹性紧凑排布 */
+.ptz-info {
+  flex: 1 1 220px; display: flex; flex-direction: column; justify-content: space-between;
+  gap: 5px; min-width: 0; overflow: hidden;
+}
+.ptz-stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+.ptz-stat {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 5px 7px; border-radius: var(--radius-xs);
+  background: linear-gradient(145deg, rgba(255,255,255,.7), rgba(239,245,252,.46));
+  border: 1px solid rgba(105,132,167,.12);
+}
+.ptz-stat span { font-size: 8.5px; color: var(--text-tertiary); width: auto; flex-shrink: 0; text-transform: uppercase; letter-spacing: .2px; }
+.ptz-stat b { font-size: 10.5px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ptz-stat b.hot { color: var(--accent); }
+.ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 10px; }
+.action-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+.action-chip {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 18px; padding: 0 4px;
+  border-radius: 4px; color: var(--text-tertiary); background: rgba(255,255,255,.55);
+  border: 1px solid var(--border-default); font-size: 9.5px; transition: all .15s ease;
+}
+.action-chip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px var(--accent-glow); transform: translateY(-1px); }
+.action-chip.stop.on { background: #64748b; border-color: #64748b; box-shadow: 0 0 6px rgba(100,116,139,.2); }
+.preset-chips { display: flex; gap: 3px; flex-wrap: wrap; }
+.pchip {
+  display: inline-flex; align-items: center; justify-content: center; gap: 3px;
+  min-width: 58px; height: 19px; padding: 0 5px; border-radius: 4px;
+  font-size: 9.5px; font-weight: 600; color: var(--text-secondary);
+  background: rgba(255,255,255,0.5); border: 1px solid var(--border-default); transition: all 0.15s;
+}
+.pchip small {
+  display: inline-grid; place-items: center; width: 12px; height: 12px; border-radius: 3px;
+  color: var(--accent); background: var(--accent-dim); font: 700 8px/1 "SF Mono", Menlo, monospace;
+}
+.pchip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px var(--accent-glow); transform: translateY(-1px); }
+.pchip.on small { color: var(--accent); background: #fff; }
+
+/* 下方工作区：平台实时状态与时间线双列等宽网格(各占 50%，分别对齐左侧与右侧) */
+.workspace { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.runtime-timeline-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px;
+}
+.runtime-panel, .timeline-panel { height: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
+.empty-timeline { padding: 12px 0; font-size: 11px; }
+
+.ptz-runtime-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.ptz-runtime-grid .rt-block {
+  min-width: 0; padding: 7px 9px; border: 1px solid rgba(105,132,167,.1); border-radius: var(--radius-xs);
+  background: rgba(255,255,255,.38);
+}
+.ptz-runtime-grid .progress-block { grid-column: 1 / -1; }
+.rt-block { padding: 6px 0; border-top: 1px solid rgba(120,120,120,0.08); }
 .rt-block:first-of-type { border-top: none; padding-top: 0; }
-.rt-label { font-size: 12px; color: var(--text-secondary); font-weight: 600; margin-bottom: 8px; }
-.rt-idle { font-size: 12.5px; color: var(--text-tertiary); }
-.rt-time { font-size: 11.5px; color: var(--text-tertiary); margin-left: 6px; }
+.rt-label { font-size: 10.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 4px; }
+.rt-idle { font-size: 11px; color: var(--text-tertiary); }
+.rt-time { font-size: 10px; color: var(--text-tertiary); margin-left: 4px; }
+
+/* 活跃订阅面板 */
+.sub-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.sub-item { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px;
+  background: rgba(5,150,105,0.08); border-radius: 4px; font-size: 10.5px; }
+.sub-dot { width: 5px; height: 5px; border-radius: 50%; background: #059669;
+  box-shadow: 0 0 0 2px rgba(5,150,105,0.15); }
+.sub-kind { font-weight: 600; color: var(--text-primary); }
+.sub-count { color: var(--text-tertiary); font-size: 9.5px; }
+
+/* 长任务进度 */
+.prog-wrap { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+.prog-bar { flex: 1; height: 5px; background: rgba(120,120,120,0.15); border-radius: 3px; overflow: hidden; }
+.prog-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.4s; }
+.prog-txt { font-size: 10.5px; color: var(--text-secondary); font-family: monospace; }
 
 /* 目标平台参数网格 + 操作按钮行 */
-.pr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; }
-.action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.pr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 12px; }
+.action-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.primary-actions { padding-top: 10px; border-top: 1px solid rgba(120,130,150,.1); margin-top: auto; }
 
-.panel { padding: 22px 22px 24px; }
 .panel-title {
-  font-size: 12px; font-weight: 600; color: var(--text-tertiary);
-  text-transform: uppercase; letter-spacing: .5px; margin-bottom: 16px;
+  font-size: 11px; font-weight: 650; color: var(--text-tertiary);
+  text-transform: uppercase; letter-spacing: .4px; margin-bottom: 0;
 }
-.fg { margin-bottom: 14px; }
-.fg-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.fg label { display: block; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 6px; }
+.fg { margin-bottom: 6px; }
+.fg-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.fg label { display: block; font-size: 10.5px; color: var(--text-secondary); margin-bottom: 2px; font-weight: 500; }
 .inp {
-  width: 100%; box-sizing: border-box; height: 38px; padding: 0 12px;
-  border: 1px solid var(--border-default); border-radius: var(--radius-sm);
+  width: 100%; box-sizing: border-box; height: 26px; padding: 0 8px;
+  border: 1px solid var(--border-default); border-radius: var(--radius-xs);
   background: rgba(255, 255, 255, 0.7); color: var(--text-primary);
-  font-size: 13px; font-family: "SF Mono", Menlo, monospace;
+  font-size: 11px; font-family: "SF Mono", Menlo, monospace;
   transition: border-color var(--transition), box-shadow var(--transition); outline: none;
 }
-.inp:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+.inp:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 .seg {
-  display: inline-flex; padding: 3px; gap: 3px; border-radius: var(--radius-sm);
+  display: inline-flex; padding: 2px; gap: 2px; border-radius: var(--radius-xs);
   background: rgba(255, 255, 255, 0.5); border: 1px solid var(--border-default);
 }
 .seg button {
-  border: none; background: transparent; padding: 5px 18px; border-radius: 6px;
-  font-size: 13px; color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
+  border: none; background: transparent; padding: 2px 10px; border-radius: 4px;
+  font-size: 10.5px; color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
 }
-.seg button.on { background: var(--accent); color: #fff; box-shadow: 0 2px 6px var(--accent-glow); }
+.seg button.on { background: var(--accent); color: #fff; box-shadow: 0 1px 4px var(--accent-glow); }
 
-/* 密码显示/隐藏:框内右侧眼睛图标(与平台配置页交互一致) */
+/* 密码显示/隐藏:框内右侧眼睛图标 */
 .pwd-wrap { position: relative; }
-.pwd-wrap .inp { width: 100%; padding-right: 40px; }
+.pwd-wrap .inp { width: 100%; padding-right: 32px; }
 .pwd-eye {
-  position: absolute; top: 50%; right: 10px; transform: translateY(-50%);
+  position: absolute; top: 50%; right: 8px; transform: translateY(-50%);
   display: inline-flex; align-items: center; justify-content: center;
   border: none; background: transparent; padding: 2px; cursor: pointer;
   color: var(--text-tertiary);
@@ -1086,15 +1681,15 @@ onActivated(reconcile);
 .pwd-eye:hover { color: var(--accent); }
 
 /* 专业媒体源选择器 */
-.media-source-field { margin-top: 18px; }
-.source-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.source-lock { font-size: 11px; color: var(--warning); }
+.media-source-field { margin-top: 8px; }
+.source-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.source-lock { font-size: 10px; color: var(--warning); }
 .source-modes {
-  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px;
 }
 .source-modes button {
-  min-width: 0; border: 1px solid var(--border-default); border-radius: 10px;
-  background: rgba(255,255,255,0.52); padding: 10px 12px; text-align: left;
+  min-width: 0; border: 1px solid var(--border-default); border-radius: var(--radius-sm);
+  background: rgba(255,255,255,0.52); padding: 5px 7px; text-align: left;
   color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
 }
 .source-modes button:hover:not(:disabled) { border-color: var(--accent); background: rgba(56,132,255,0.06); }
@@ -1103,225 +1698,78 @@ onActivated(reconcile);
   box-shadow: inset 0 0 0 1px rgba(56,132,255,0.12);
 }
 .source-modes button:disabled { cursor: not-allowed; opacity: .62; }
-.source-modes b { display: block; font-size: 12.5px; color: var(--text-primary); margin-bottom: 3px; }
+.source-modes b { display: block; font-size: 10.5px; color: var(--text-primary); margin-bottom: 1px; }
 .source-modes button.on b { color: var(--accent); }
-.source-modes span { display: block; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-modes span { display: block; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); }
 .source-config {
-  margin-top: 10px; padding: 12px; border-radius: 10px;
+  margin-top: 6px; padding: 7px 8px; border-radius: var(--radius-sm);
   border: 1px solid rgba(120,130,150,0.13); background: rgba(255,255,255,0.34);
 }
-.source-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 10px; }
-.camera-source-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, .85fr); }
-.source-grid label, .screen-profile-grid label { display: block; font-size: 11.5px; color: var(--text-secondary); margin-bottom: 5px; }
-.screen-profile-grid {
-  display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, .8fr) minmax(0, 1fr) minmax(0, 1fr);
-  gap: 10px; margin-top: 10px;
+.source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.source-grid label { display: block; font-size: 10px; color: var(--text-secondary); margin-bottom: 2px; }
+
+/* 左右分栏媒体参数网格 */
+.media-param-columns {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px; margin-top: 6px; padding-top: 6px; border-top: 1px dashed rgba(120,130,150,0.18);
 }
-.screen-bitrate-input { display: flex; align-items: center; gap: 6px; }
+.param-col {
+  background: rgba(255,255,255,0.3); padding: 6px 8px; border-radius: 6px;
+  border: 1px solid rgba(120,130,150,0.1);
+}
+.col-title {
+  font-size: 10px; font-weight: 700; color: var(--text-primary); margin-bottom: 5px;
+  padding-bottom: 3px; border-bottom: 1px solid rgba(120,130,150,0.1);
+}
+.param-col .fg { margin-bottom: 5px; }
+.param-col .fg:last-child { margin-bottom: 0; }
+
+.screen-bitrate-input { display: flex; align-items: center; gap: 4px; }
 .screen-bitrate-input .inp { min-width: 0; }
-.screen-bitrate-input span { flex: 0 0 auto; color: var(--text-tertiary); font-size: 12px; }
+.screen-bitrate-input span { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; }
 .screen-bitrate-input .inp { flex: 1 1 auto; }
 .source-capability {
-  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
-  color: var(--text-secondary); font-size: 11.5px;
+  display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
+  color: var(--text-secondary); font-size: 10px;
 }
-.cap-badge { padding: 2px 8px; border-radius: 10px; font-size: 10.5px; font-weight: 650; }
+.cap-badge { padding: 1px 5px; border-radius: 6px; font-size: 9px; font-weight: 650; }
 .cap-badge.ok { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
 .cap-badge.warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
-.file-row { display: flex; gap: 8px; align-items: stretch; }
+.file-row { display: flex; gap: 6px; align-items: stretch; }
 .file-row .inp { flex: 1 1 auto; }
-.fg-hint { font-size: 11.5px; color: var(--text-tertiary); margin-top: 8px; line-height: 1.5; }
+.fg-hint { font-size: 9.5px; color: var(--text-tertiary); margin-top: 4px; line-height: 1.35; }
 .file-btn {
   flex: 0 0 auto; border: 1px solid var(--border-default); background: rgba(255,255,255,0.6);
-  border-radius: var(--radius-sm); padding: 0 14px; font-size: 12px; color: var(--text-secondary);
-  cursor: pointer; white-space: nowrap; min-height: 34px;
+  border-radius: var(--radius-xs); padding: 0 8px; font-size: 10.5px; color: var(--text-secondary);
+  cursor: pointer; white-space: nowrap; min-height: 24px;
 }
 .file-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .file-btn:disabled { cursor: not-allowed; opacity: .55; }
-.file-btn.compact { min-height: 30px; padding: 0 11px; }
+.file-btn.compact { min-height: 22px; padding: 0 6px; font-size: 10px; }
 .file-btn.primary { border-color: var(--accent); color: #fff; background: var(--accent); }
-.source-notice { display: flex; flex-direction: column; gap: 3px; margin-top: 9px; padding: 8px 10px; border-radius: 7px; font-size: 11px; line-height: 1.45; }
+.source-notice { display: flex; flex-direction: column; gap: 2px; margin-top: 5px; padding: 4px 6px; border-radius: 4px; font-size: 9.5px; line-height: 1.3; }
 .source-notice.error { color: var(--error); background: color-mix(in srgb, var(--error) 8%, transparent); }
-.source-footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin-top: 10px; }
+.source-footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 6px; margin-top: 6px; }
 .source-uri { min-width: 0; flex: 1; }
-.source-uri > span { display: block; font-size: 10.5px; color: var(--text-tertiary); margin-bottom: 3px; }
+.source-uri > span { display: block; font-size: 8.5px; color: var(--text-tertiary); margin-bottom: 1px; }
 .source-uri code {
   display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--text-secondary); font-size: 10.5px; font-family: "SF Mono", Menlo, monospace;
+  color: var(--text-secondary); font-size: 8.5px; font-family: "SF Mono", Menlo, monospace;
 }
-.source-actions { display: flex; gap: 7px; flex: 0 0 auto; }
-.probe-result { margin-top: 9px; padding: 8px 10px; border-radius: 7px; font-size: 11.5px; line-height: 1.45; }
+.source-actions { display: flex; gap: 4px; flex: 0 0 auto; }
+.probe-result { margin-top: 5px; padding: 4px 6px; border-radius: 4px; font-size: 9.5px; line-height: 1.3; }
 .probe-result.loading { color: var(--accent); background: rgba(56,132,255,0.08); }
 .probe-result.success { color: var(--success); background: color-mix(in srgb, var(--success) 10%, transparent); }
 .probe-result.warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
 .probe-result.error { color: var(--error); background: color-mix(in srgb, var(--error) 9%, transparent); }
-@media (max-width: 580px) {
-  .source-modes, .source-grid, .screen-profile-grid { grid-template-columns: 1fr; }
-  .source-footer { align-items: stretch; flex-direction: column; }
-}
-
-/* 云台控制可视化 */
-.ptz-panel { margin-top: 0; }
-.ptz-sub { font-size: 12px; color: var(--text-tertiary); margin-bottom: 16px; }
-.ptz-body { display: flex; gap: 28px; align-items: stretch; }
-@media (max-width: 820px) {
-  .ptz-body { flex-direction: column; }
-  .ptz-stage { flex-basis: 300px; min-height: 300px; width: 100%; }
-}
-
-/* 桌面球机：固定底座承载水平转台，U 型支架夹持可俯仰球形机芯。 */
-.ptz-stage {
-  position: relative; flex: 0 0 390px; min-height: 340px; overflow: hidden;
-  border-radius: 20px; perspective: 900px; isolation: isolate;
-  background:
-    radial-gradient(circle at 50% 38%, rgba(78,145,255,.2), transparent 31%),
-    linear-gradient(155deg, rgba(245,250,255,.98), rgba(215,229,245,.78));
-  border: 1px solid rgba(91,126,171,.2);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -28px 60px rgba(57,87,126,.09);
-}
-.stage-grid {
-  position: absolute; inset: 54% -12% -36%; transform: rotateX(65deg); transform-origin: center top;
-  background-image: linear-gradient(rgba(68,111,166,.12) 1px, transparent 1px), linear-gradient(90deg, rgba(68,111,166,.12) 1px, transparent 1px);
-  background-size: 28px 28px; mask-image: linear-gradient(to bottom, #000, transparent 82%);
-}
-.stage-caption {
-  position: absolute; z-index: 9; left: 15px; top: 14px; display: flex; align-items: center; gap: 6px;
-  padding: 5px 9px; border-radius: 9px; color: #527196; background: rgba(255,255,255,.66);
-  border: 1px solid rgba(92,126,168,.14); box-shadow: 0 4px 14px rgba(39,67,103,.08);
-}
-.stage-caption .live-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e; }
-.stage-caption b { font: 800 9px/1 "SF Mono", Menlo, monospace; letter-spacing: .7px; }
-.stage-caption em { padding-left: 6px; border-left: 1px solid rgba(82,113,150,.18); font-size: 9px; font-style: normal; color: var(--text-tertiary); }
-.ptz-stage.active .stage-caption .live-dot { background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: liveBlink 1s ease-in-out infinite; }
-@keyframes liveBlink { 50% { opacity: .35; } }
-.compass-ring {
-  position: absolute; z-index: 2; left: 50%; top: 63%; width: 246px; height: 82px;
-  margin-left: -123px; border-radius: 50%; transform: rotateX(68deg);
-  border: 2px solid rgba(56,132,255,.3); box-shadow: 0 0 0 8px rgba(255,255,255,.3), inset 0 0 24px rgba(56,132,255,.12);
-}
-.compass-dial {
-  position: absolute; inset: 5px; border-radius: 50%; transition: transform .12s linear;
-  background: repeating-conic-gradient(from -1deg, rgba(61,105,158,.58) 0 2deg, transparent 2deg 10deg);
-}
-.compass-dial::after { content: ""; position: absolute; inset: 27%; border-radius: 50%; border: 1px dashed rgba(56,132,255,.24); }
-.compass-dial span { position: absolute; color: #52749e; font-size: 10px; font-weight: 800; text-shadow: 0 1px #fff; }
-.compass-dial .north { left: 50%; top: -2px; transform: translateX(-50%); color: var(--accent); }
-.compass-dial .east { right: 2px; top: 50%; transform: translateY(-50%); }
-.compass-dial .south { left: 50%; bottom: -2px; transform: translateX(-50%); }
-.compass-dial .west { left: 2px; top: 50%; transform: translateY(-50%); }
-.heading-readout {
-  position: absolute; z-index: 2; left: 50%; top: 50%; transform: translate(-50%, -50%) rotateX(-68deg);
-  color: var(--accent); font: 800 11px/1 "SF Mono", Menlo, monospace; background: rgba(255,255,255,.88);
-  padding: 4px 8px; border-radius: 9px; box-shadow: 0 2px 9px rgba(43,68,100,.14);
-}
-.direction-hud span {
-  position: absolute; z-index: 10; display: grid; place-items: center; width: 28px; height: 28px;
-  border-radius: 9px; color: #8ba0bb; background: rgba(255,255,255,.58); border: 1px solid rgba(101,129,166,.17);
-  font-size: 17px; transition: .18s ease;
-}
-.direction-hud span.on { color: #fff; background: var(--accent); box-shadow: 0 0 18px var(--accent-glow); transform: scale(1.13); }
-.hud-up { top: 14px; left: calc(50% - 14px); }
-.hud-down { bottom: 14px; left: calc(50% - 14px); }
-.hud-left { left: 14px; top: calc(50% - 14px); }
-.hud-right { right: 14px; top: calc(50% - 14px); }
-.tilt-gauge {
-  position: absolute; z-index: 9; right: 22px; top: 69px; width: 46px; height: 100px;
-  color: #7890ad; font: 700 8px/1 "SF Mono", Menlo, monospace;
-}
-.tilt-gauge > span { position: absolute; right: 0; }
-.tilt-plus { top: 0; } .tilt-zero { top: 46px; } .tilt-minus { bottom: 0; }
-.tilt-track { position: absolute; left: 5px; top: 4px; width: 2px; height: 92px; border-radius: 2px; background: linear-gradient(var(--accent), #a9bdd5); }
-.tilt-track::before, .tilt-track::after { content: ""; position: absolute; left: -3px; width: 8px; height: 1px; background: #7890ad; }
-.tilt-track::before { top: 0; } .tilt-track::after { bottom: 0; }
-.tilt-marker {
-  position: absolute; left: -1px; top: 43px; min-width: 29px; height: 15px; padding-left: 10px; border-radius: 7px;
-  color: #fff; background: var(--accent); font-size: 8px; line-height: 15px; box-shadow: 0 3px 9px var(--accent-glow);
-  transition: transform .12s linear;
-}
-.tilt-marker::before { content: ""; position: absolute; left: -3px; top: 5px; border-width: 3px 4px 3px 0; border-style: solid; border-color: transparent var(--accent) transparent transparent; }
-.axis-label { position: absolute; z-index: 8; color: #7890ad; font: 700 8px/1 "SF Mono", Menlo, monospace; letter-spacing: .4px; }
-.pan-axis { left: 22px; bottom: 20px; } .tilt-axis { right: 18px; bottom: 20px; }
-.ptz-stage.active { box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -28px 60px rgba(57,87,126,.09), 0 0 0 2px rgba(56,132,255,.18); }
-.ptz-stage.seeking { animation: stageSeekPulse 1.15s ease-in-out infinite; }
-@keyframes stageSeekPulse { 50% { box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -28px 60px rgba(57,87,126,.09), 0 0 26px rgba(56,132,255,.32); } }
-
-.ptz-info { flex: 1 1 auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0; align-content: center; }
-.ptz-stat {
-  display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 13px 14px; border-radius: 12px;
-  background: linear-gradient(145deg, rgba(255,255,255,.7), rgba(239,245,252,.46));
-  border: 1px solid rgba(105,132,167,.14);
-}
-.ptz-stat span { font-size: 11px; color: var(--text-tertiary); width: auto; flex-shrink: 0; text-transform: uppercase; letter-spacing: .4px; }
-.ptz-stat b { font-size: 14px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ptz-stat b.hot { color: var(--accent); }
-.ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 13px; }
-.ptz-stat.pose-stat, .ptz-stat.action-state, .ptz-stat.presets { grid-column: 1 / -1; }
-.action-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.action-chip {
-  display: inline-flex; align-items: center; justify-content: center; min-width: 38px; height: 24px; padding: 0 8px;
-  border-radius: 7px; color: var(--text-tertiary); background: rgba(255,255,255,.55);
-  border: 1px solid var(--border-default); font-size: 11px; transition: all .16s ease;
-}
-.action-chip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 12px var(--accent-glow); transform: translateY(-1px); }
-.action-chip.stop.on { background: #64748b; border-color: #64748b; box-shadow: 0 0 12px rgba(100,116,139,.25); }
-.action-state em { color: var(--text-secondary); font-size: 11px; font-style: normal; }
-.ptz-stat.presets { justify-content: center; }
-.preset-chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.pchip {
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  min-width: 84px; height: 26px; padding: 0 9px; border-radius: 7px;
-  font-size: 11px; font-weight: 600; color: var(--text-secondary);
-  background: rgba(255,255,255,0.5); border: 1px solid var(--border-default); transition: all 0.15s;
-}
-.pchip small {
-  display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 5px;
-  color: var(--accent); background: var(--accent-dim); font: 700 9px/1 "SF Mono", Menlo, monospace;
-}
-.pchip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: translateY(-1px); }
-.pchip.on small { color: var(--accent); background: #fff; }
-
-.ptz-runtime {
-  margin-top: 20px; padding-top: 18px; border-top: 1px solid rgba(105,132,167,.16);
-}
-.ptz-runtime-title {
-  margin-bottom: 11px; color: var(--text-secondary); font-size: 12px; font-weight: 650;
-  letter-spacing: .4px; text-transform: uppercase;
-}
-.ptz-runtime-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.ptz-runtime .rt-block {
-  min-width: 0; padding: 12px 14px; border: 1px solid rgba(105,132,167,.13); border-radius: 11px;
-  background: rgba(255,255,255,.38);
-}
-.ptz-runtime .rt-label { margin-bottom: 7px; }
-.ptz-runtime .sub-list { margin-top: 0; }
-.ptz-runtime .progress-block { grid-column: 1 / -1; }
-@media (max-width: 820px) {
-  .ptz-runtime-grid { grid-template-columns: 1fr; }
-  .ptz-runtime .progress-block { grid-column: auto; }
-}
-
-/* 长任务进度 */
-.prog-wrap { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
-.prog-bar { flex: 1; height: 8px; background: rgba(120,120,120,0.15); border-radius: 4px; overflow: hidden; }
-.prog-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.4s; }
-.prog-txt { font-size: 12.5px; color: var(--text-secondary); font-family: monospace; }
-
-/* 活跃订阅面板 */
-.sub-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
-.sub-item { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
-  background: rgba(5,150,105,0.08); border-radius: 8px; font-size: 13px; }
-.sub-dot { width: 8px; height: 8px; border-radius: 50%; background: #059669;
-  box-shadow: 0 0 0 3px rgba(5,150,105,0.15); }
-.sub-kind { font-weight: 600; color: var(--text-primary); }
-.sub-count { color: var(--text-tertiary); font-size: 12px; }
 
 /* 平台命令时间线 */
-.cmd-empty { color: var(--text-tertiary); font-size: 13px; padding: 12px 0; }
-.cmd-list { margin-top: 8px; max-height: 260px; overflow-y: auto; }
-.cmd-item { display: flex; align-items: center; gap: 10px; padding: 5px 0;
-  border-bottom: 1px solid rgba(120,120,120,0.08); font-size: 12.5px; }
-.cmd-ts { color: var(--text-tertiary); font-family: monospace; font-size: 11.5px; flex-shrink: 0; }
-.cmd-tag { flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 8px;
+.cmd-empty { color: var(--text-tertiary); font-size: 11px; padding: 6px 0; }
+.cmd-list { margin-top: 4px; max-height: 180px; overflow-y: auto; }
+.cmd-item { display: flex; align-items: center; gap: 6px; padding: 3px 0;
+  border-bottom: 1px solid rgba(120,120,120,0.06); font-size: 10.5px; }
+.cmd-ts { color: var(--text-tertiary); font-family: monospace; font-size: 9.5px; flex-shrink: 0; }
+.cmd-tag { flex-shrink: 0; font-size: 9px; font-weight: 600; padding: 1px 5px; border-radius: 4px;
   background: rgba(56,132,255,0.12); color: var(--accent); }
 .cmd-tag.k-control { background: rgba(234,88,12,0.12); color: #ea580c; }
 .cmd-tag.k-invite { background: rgba(5,150,105,0.12); color: #059669; }
@@ -1329,32 +1777,38 @@ onActivated(reconcile);
 .cmd-sum { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* SIP 信令追踪面板 */
-.trace-panel { margin-top: 18px; }
-.trace-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-.trace-ctl { display: inline-flex; align-items: center; gap: 14px; }
-.trace-toggle { font-size: 13px; color: var(--text-secondary); cursor: pointer; user-select: none; }
-.trace-clear {
+.trace-panel { margin-top: 0; }
+.trace-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.trace-ctl { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.trace-toggle { font-size: 10.5px; color: var(--text-secondary); cursor: pointer; user-select: none; }
+.trace-filter, .trace-clear {
   border: 1px solid var(--border-default); background: rgba(255,255,255,0.5);
-  border-radius: 6px; padding: 3px 12px; font-size: 12px; color: var(--text-secondary); cursor: pointer;
+  border-radius: 4px; padding: 1px 6px; font-size: 10px; color: var(--text-secondary); cursor: pointer;
 }
+.trace-filter { height: 22px; outline: none; }
+.trace-filter:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 .trace-log {
-  height: 300px; overflow-y: auto; overflow-x: hidden; border-radius: var(--radius-sm);
+  height: 220px; overflow-y: auto; overflow-x: hidden; border-radius: var(--radius-xs);
   background: rgba(15, 23, 42, 0.03); border: 1px solid var(--border-default);
-  padding: 8px 10px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+  padding: 5px 7px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
 }
-.trace-empty { color: var(--text-secondary); padding: 12px; text-align: center; }
+.trace-empty { color: var(--text-secondary); padding: 8px; text-align: center; font-size: 11px; }
 .trace-row {
-  display: flex; align-items: baseline; gap: 8px; padding: 3px 4px;
-  border-bottom: 1px solid rgba(15,23,42,0.04); white-space: nowrap;
-  cursor: pointer; transition: background 0.12s;
+  display: flex; align-items: baseline; gap: 5px; padding: 2px 4px 2px 5px;
+  border-left: 2px solid transparent; border-bottom: 1px solid rgba(15,23,42,0.03); white-space: nowrap;
+  cursor: pointer; transition: background 0.12s, border-color 0.12s;
 }
+.trace-row.in { border-left-color: #0891b2; }
+.trace-row.out { border-left-color: #7c3aed; }
+.trace-row.warn { background: rgba(232,147,32,.06); }
+.trace-row.error { background: rgba(229,72,92,.08); border-left-color: var(--error); }
 .trace-row:hover { background: rgba(56,132,255,0.05); }
 .trace-row.open { background: rgba(56,132,255,0.08); }
-.trace-caret { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; width: 10px; }
+.trace-caret { flex: 0 0 auto; color: var(--text-tertiary); font-size: 8px; width: 7px; }
 .trace-raw {
-  margin: 0 0 6px 22px; padding: 10px 12px; background: #0f172a; color: #cbd5e1;
-  border-radius: 6px; font-size: 11.5px; line-height: 1.5; white-space: pre-wrap;
-  word-break: break-all; max-height: 300px; overflow-y: auto;
+  margin: 0 0 4px 14px; padding: 6px 8px; background: #0f172a; color: #cbd5e1;
+  border-radius: 4px; font-size: 10px; line-height: 1.4; white-space: pre-wrap;
+  word-break: break-all; max-height: 200px; overflow-y: auto;
 }
 .trace-ts { color: var(--text-secondary); flex: 0 0 auto; }
 .trace-dir { flex: 0 0 auto; font-weight: 600; }
@@ -1364,18 +1818,25 @@ onActivated(reconcile);
 .trace-cseq { flex: 0 0 auto; color: var(--text-secondary); }
 
 /* OSD 设置(平台下发) */
-.osd-panel { margin-top: 18px; }
-.osd-empty { color: var(--text-tertiary); font-size: 13px; padding: 8px 0; }
-.osd-applied { padding: 6px 0; }
-.osd-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; }
-.osd-label { width: 110px; color: var(--text-secondary); font-size: 13px; }
+.osd-empty { color: var(--text-tertiary); font-size: 10.5px; padding: 4px 0; }
+.osd-applied { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
 .osd-badge {
-  font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 10px;
+  font-size: 9.5px; font-weight: 600; padding: 1px 6px; border-radius: 6px;
 }
 .osd-badge.on { color: #059669; background: rgba(5,150,105,0.12); }
 .osd-badge.off { color: var(--text-tertiary); background: rgba(120,120,120,0.12); }
-.osd-sample {
-  font-family: monospace; font-size: 13px; color: var(--text-primary);
-  background: #0f172a; color: #fff; padding: 2px 10px; border-radius: 4px;
+
+@media (max-width: 1080px) {
+  .device-console-grid { grid-template-columns: 1fr; }
+  .runtime-timeline-grid { grid-template-columns: 1fr; }
+  .preview-ptz-stack { height: auto; }
+  .preview-panel { min-height: 240px; }
+  .ptz-panel { min-height: 280px; }
+}
+@media (max-width: 760px) {
+  .identity-grid, .source-grid, .media-param-columns { grid-template-columns: 1fr; }
+  .source-modes { grid-template-columns: 1fr; }
+  .ptz-body { flex-direction: column; }
+  .ptz-stage { flex-basis: 200px; width: 100%; }
 }
 </style>

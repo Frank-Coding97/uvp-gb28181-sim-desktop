@@ -13,6 +13,12 @@ export interface DeviceForm {
   channel_name: string;
   video_source: string;
   catalog_template: string;
+  manufacturer?: string;
+  model?: string;
+  firmware?: string;
+  heartbeat_interval?: number;
+  max_heartbeat_timeout?: number;
+  expires?: number;
 }
 
 const FORM_KEY = "uvp_device_form";
@@ -24,6 +30,12 @@ function defaultForm(): DeviceForm {
     channel_name: "Camera-1",
     video_source: "",
     catalog_template: "",
+    manufacturer: "UVP-Sim",
+    model: "IPC-GB28181",
+    firmware: "V2.4.0-R2026",
+    heartbeat_interval: 60,
+    max_heartbeat_timeout: 3,
+    expires: 3600,
   };
 }
 
