@@ -222,14 +222,14 @@ onActivated(refresh);
 </template>
 
 <style scoped>
-.page { max-width: 980px; }
-.page-header { margin-bottom: 20px; }
-.page-title { font-size: 24px; font-weight: 700; color: var(--text-primary); }
-.page-sub { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; }
-.panel { padding: 24px; }
-.label { color: var(--text-secondary); font-size: 13px; }
-.empty { color: var(--text-tertiary); font-size: 13px; margin-top: 12px; text-align: center; padding: 20px; }
-.chan-summary { font-size: 12.5px; color: var(--text-tertiary); margin-left: auto; }
+.page { max-width: 1200px; }
+.page-header { margin-bottom: 10px; }
+.page-title { font-size: 17px; font-weight: 700; color: var(--text-primary); }
+.page-sub { font-size: 11.5px; color: var(--text-tertiary); margin-top: 2px; }
+.panel { padding: 12px 14px; border-radius: var(--radius-md); }
+.label { color: var(--text-secondary); font-size: 11.5px; }
+.empty { color: var(--text-tertiary); font-size: 11.5px; margin-top: 8px; text-align: center; padding: 14px; }
+.chan-summary { font-size: 11px; color: var(--text-tertiary); margin-left: auto; }
 
 /* 表格半透明质感:去掉 naive-ui 默认白底,融入磨砂卡片 */
 :deep(.n-data-table),
@@ -239,16 +239,19 @@ onActivated(refresh);
 :deep(.n-data-table-base-table) { background-color: transparent !important; }
 :deep(.n-data-table .n-data-table-th) {
   background-color: rgba(120,130,150,0.06) !important;
-  color: var(--text-secondary); font-weight: 600;
+  color: var(--text-secondary); font-weight: 600; font-size: 11.5px;
+  padding: 6px 10px !important;
   border-bottom: 1px solid rgba(120,130,150,0.12) !important;
 }
 :deep(.n-data-table .n-data-table-td) {
+  padding: 5px 10px !important;
+  font-size: 11.5px;
   border-bottom: 1px solid rgba(120,130,150,0.08) !important;
 }
 :deep(.n-data-table .n-data-table-tr:hover .n-data-table-td) {
   background-color: rgba(56,132,255,0.05) !important;
 }
 :deep(.n-data-table .n-data-table-empty) { background-color: transparent !important; }
-.section-title { font-size: 16px; font-weight: 600; color: var(--text-primary); }
-.section-hint { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
+.section-title { font-size: 13.5px; font-weight: 600; color: var(--text-primary); }
+.section-hint { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
 </style>

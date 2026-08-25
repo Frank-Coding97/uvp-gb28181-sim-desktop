@@ -123,6 +123,42 @@ const latest = ref<MetricsSnapshot | null>(null);
 const successRate = computed(() =>
   latest.value ? `${(latest.value.register_success_rate * 100).toFixed(1)}%` : "—",
 );
+const successHealth = computed(() => {
+  if (!latest.value || latest.value.register_attempted === 0) return "等待采样";
+  const rate = latest.value.register_success_rate;
+  if (rate >= 0.98) return "健康";
+  if (rate >= 0.9) return "需观察";
+  return "异常";
+});
+const streamNote = computed(() => {
+  if (!latest.value) return "等待点播";
+  if (latest.value.active_streams > 0) return "平台正在收流";
+  return form.value.media_profile === "A" ? "仅信令场景" : "等待 INVITE 点播";
+});
+const heartbeatNote = computed(() => {
+  const failed = latest.value?.heartbeat_failed ?? 0;
+  return failed > 0 ? "检查网络抖动" : "心跳稳定";
+});
+const reportNote = computed(() => {
+  const total = (latest.value?.position_reported ?? 0) + (latest.value?.alarm_reported ?? 0);
+  return total > 0 ? "主动上报已生效" : "未触发主动上报";
+});
+const failureAdvice = computed(() => {
+  const m = latest.value;
+  if (!m || m.register_failed === 0) return "暂无失败。若平台无设备上线，优先检查平台地址、域 ID 与设备 ID 是否匹配。";
+  if (m.fail_rejected >= m.fail_timeout && m.fail_rejected >= m.fail_other) return "平台拒绝较多：检查设备是否已添加、认证密码、平台域 ID 与设备编号规则。";
+  if (m.fail_timeout >= m.fail_other) return "事务超时较多：检查平台 IP/端口、防火墙、SIP 监听地址和本机网络出口。";
+  return "网络或其它错误较多：查看系统日志页，确认本机 socket 权限、媒体源和运行时依赖。";
+});
+const scenarioSummary = computed(() => {
+  const media = mediaOptions.find((item) => item.value === form.value.media_profile)?.label ?? form.value.media_profile;
+  return [
+    `${form.value.count} 台设备`,
+    form.value.ramp_per_second ? `爬坡 ${form.value.ramp_per_second} 台/秒` : "一次性拉起",
+    `${form.value.channels_per_device} 通道/设备`,
+    media,
+  ].join(" · ");
+});
 
 function tomlString(value: string): string {
   return JSON.stringify(value);
@@ -439,7 +475,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" :class="{ 'is-running': running || starting || stopping || stopPending }">
     <header class="page-header">
       <div>
         <div class="eyebrow">LOAD TESTING</div>
@@ -459,6 +495,7 @@ onUnmounted(() => {
       当前 SIP 信令层仅支持 UDP。请在顶栏将目标平台传输模式改为 UDP 后再启动。
     </n-alert>
 
+    <div class="stress-sections" :class="{ running: running || starting || stopping || stopPending }">
     <section class="glass-card panel config-panel">
       <div class="panel-head">
         <div>
@@ -468,7 +505,12 @@ onUnmounted(() => {
         <n-tag size="small" round :bordered="false" type="info">上限 10,000 台</n-tag>
       </div>
 
-      <n-form :model="form" label-placement="top" :disabled="running || starting">
+      <div v-if="running || starting || stopping || stopPending" class="scenario-summary">
+        <div><span>当前场景</span><b>{{ scenarioSummary }}</b></div>
+        <div><span>目标平台</span><b>{{ platformLabel }}</b></div>
+      </div>
+
+      <n-form v-show="!(running || starting || stopping || stopPending)" :model="form" label-placement="top" :disabled="running || starting">
         <div class="form-grid">
           <n-form-item label="起始设备 ID" class="span-2">
             <n-input v-model:value="form.base_device_id" maxlength="20" placeholder="20 位国标设备编号" />
@@ -546,22 +588,22 @@ onUnmounted(() => {
       <div class="glass-card metric primary">
         <span>注册成功率</span>
         <strong>{{ successRate }}</strong>
-        <small>{{ latest?.register_succeeded ?? 0 }} / {{ latest?.register_attempted ?? 0 }} 次</small>
+        <small>{{ latest?.register_succeeded ?? 0 }} / {{ latest?.register_attempted ?? 0 }} 次 · {{ successHealth }}</small>
       </div>
       <div class="glass-card metric">
         <span>当前活跃流</span>
         <strong>{{ latest?.active_streams ?? 0 }}</strong>
-        <small>实时 RTP 会话</small>
+        <small>{{ streamNote }}</small>
       </div>
       <div class="glass-card metric">
         <span>心跳成功</span>
         <strong>{{ latest?.heartbeat_succeeded ?? 0 }}</strong>
-        <small>失败 {{ latest?.heartbeat_failed ?? 0 }} 次</small>
+        <small>失败 {{ latest?.heartbeat_failed ?? 0 }} 次 · {{ heartbeatNote }}</small>
       </div>
       <div class="glass-card metric">
         <span>主动上报</span>
         <strong>{{ (latest?.position_reported ?? 0) + (latest?.alarm_reported ?? 0) }}</strong>
-        <small>位置 {{ latest?.position_reported ?? 0 }} · 报警 {{ latest?.alarm_reported ?? 0 }}</small>
+        <small>位置 {{ latest?.position_reported ?? 0 }} · 报警 {{ latest?.alarm_reported ?? 0 }} · {{ reportNote }}</small>
       </div>
     </section>
 
@@ -586,67 +628,79 @@ onUnmounted(() => {
           <div><span><i class="rejected" />平台拒绝</span><b>{{ latest?.fail_rejected ?? 0 }}</b></div>
           <div><span><i class="other" />网络或其它</span><b>{{ latest?.fail_other ?? 0 }}</b></div>
         </div>
+        <div class="failure-advice">{{ failureAdvice }}</div>
       </div>
     </section>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .page { width: min(1320px, 100%); margin: 0 auto; }
-.page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin: 18px 0 22px; }
-.eyebrow { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: 1.8px; }
-h1 { margin: 5px 0 0; color: var(--text-primary); font-size: clamp(24px, 2.5vw, 32px); letter-spacing: -0.6px; }
-.page-header p { margin: 8px 0 0; color: var(--text-tertiary); font-size: 13px; line-height: 1.6; }
-.header-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
-.status-chip { display: inline-flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 13px; border: 1px solid var(--border-default); border-radius: 999px; background: rgba(255,255,255,.55); color: var(--text-secondary); font-size: 12px; font-weight: 650; }
-.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); }
+.page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin: 8px 0 12px; }
+.eyebrow { color: var(--accent); font-size: 9.5px; font-weight: 800; letter-spacing: 1.5px; }
+h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22px); letter-spacing: -0.4px; }
+.page-header p { margin: 4px 0 0; color: var(--text-tertiary); font-size: 11.5px; line-height: 1.45; }
+.header-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.status-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; padding: 0 10px; border: 1px solid var(--border-default); border-radius: 999px; background: rgba(255,255,255,.55); color: var(--text-secondary); font-size: 11px; font-weight: 650; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
 .status-chip.running { color: var(--success); border-color: rgba(8,179,136,.25); background: rgba(8,179,136,.08); }
-.status-chip.running .status-dot { background: var(--success); box-shadow: 0 0 0 4px rgba(8,179,136,.12); animation: pulse 1.8s infinite; }
+.status-chip.running .status-dot { background: var(--success); box-shadow: 0 0 0 3px rgba(8,179,136,.12); animation: pulse 1.8s infinite; }
 .status-chip.busy { color: var(--warning); }
 .status-chip.busy .status-dot { background: var(--warning); }
-.notice { margin-bottom: 16px; border-radius: var(--radius-md); }
-.panel { padding: 22px 24px; }
-.config-panel { margin-bottom: 18px; }
-.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
-.panel-head.compact { margin-bottom: 4px; }
-.panel-title { color: var(--text-primary); font-size: 14px; font-weight: 750; }
-.panel-sub { margin-top: 4px; color: var(--text-tertiary); font-size: 11.5px; }
-.form-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); column-gap: 18px; }
+.notice { margin-bottom: 12px; border-radius: var(--radius-md); }
+.stress-sections { display: flex; flex-direction: column; gap: 12px; }
+.stress-sections.running .metric-grid { order: 1; }
+.stress-sections.running .monitor-grid { order: 2; }
+.stress-sections.running .config-panel { order: 3; }
+.panel { padding: 12px 16px; border-radius: var(--radius-md); }
+.config-panel { margin-bottom: 0; transition: opacity var(--transition), transform var(--transition); }
+.stress-sections.running .config-panel { opacity: .86; }
+.scenario-summary { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 8px; margin-bottom: 8px; }
+.scenario-summary div { padding: 8px 10px; border-radius: var(--radius-sm); background: rgba(255,255,255,.38); border: 1px solid var(--border-default); min-width: 0; }
+.scenario-summary span { display: block; color: var(--text-tertiary); font-size: 10px; margin-bottom: 2px; }
+.scenario-summary b { display: block; color: var(--text-primary); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.panel-head.compact { margin-bottom: 2px; }
+.panel-title { color: var(--text-primary); font-size: 12px; font-weight: 700; }
+.panel-sub { margin-top: 2px; color: var(--text-tertiary); font-size: 10.5px; }
+.form-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); column-gap: 12px; row-gap: 0; }
 .span-2 { grid-column: span 2; }
-.section-divider { display: flex; align-items: baseline; gap: 12px; margin: 3px 0 12px; padding-top: 15px; border-top: 1px solid var(--border-default); }
-.section-divider span { color: var(--text-secondary); font-size: 12.5px; font-weight: 700; }
-.section-divider small { color: var(--text-tertiary); font-size: 11.5px; }
-.report-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.report-option { display: grid; grid-template-columns: minmax(120px, 1fr) auto 100px auto; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: rgba(255,255,255,.32); }
-.report-option div { display: flex; flex-direction: column; gap: 2px; }
-.report-option b { color: var(--text-primary); font-size: 12.5px; }
-.report-option span, .report-option em { color: var(--text-tertiary); font-size: 11px; font-style: normal; }
-.action-row { display: flex; align-items: center; gap: 10px; margin-top: 20px; }
-.action-row span { margin-left: auto; color: var(--text-tertiary); font-size: 11.5px; }
-.metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
-.metric { position: relative; overflow: hidden; padding: 18px 20px; }
-.metric::after { content: ""; position: absolute; width: 84px; height: 84px; right: -30px; top: -35px; border-radius: 50%; background: var(--accent-dim); }
+.section-divider { display: flex; align-items: baseline; gap: 8px; margin: 2px 0 8px; padding-top: 10px; border-top: 1px solid var(--border-default); }
+.section-divider span { color: var(--text-secondary); font-size: 11.5px; font-weight: 700; }
+.section-divider small { color: var(--text-tertiary); font-size: 10.5px; }
+.report-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.report-option { display: grid; grid-template-columns: minmax(100px, 1fr) auto 90px auto; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: rgba(255,255,255,.32); }
+.report-option div { display: flex; flex-direction: column; gap: 1px; }
+.report-option b { color: var(--text-primary); font-size: 11.5px; }
+.report-option span, .report-option em { color: var(--text-tertiary); font-size: 10px; font-style: normal; }
+.action-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.action-row span { margin-left: auto; color: var(--text-tertiary); font-size: 10.5px; }
+.metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 0; }
+.metric { position: relative; overflow: hidden; padding: 10px 14px; border-radius: var(--radius-md); }
+.metric::after { content: ""; position: absolute; width: 64px; height: 64px; right: -20px; top: -25px; border-radius: 50%; background: var(--accent-dim); }
 .metric.primary { border-color: rgba(56,132,255,.28); background: linear-gradient(145deg, rgba(255,255,255,.72), rgba(217,231,255,.46)); }
-.metric > span { display: block; color: var(--text-tertiary); font-size: 11.5px; }
-.metric strong { display: block; margin-top: 7px; color: var(--text-primary); font-size: 27px; line-height: 1; font-variant-numeric: tabular-nums; }
+.metric > span { display: block; color: var(--text-tertiary); font-size: 10.5px; }
+.metric strong { display: block; margin-top: 4px; color: var(--text-primary); font-size: 18px; line-height: 1; font-variant-numeric: tabular-nums; }
 .metric.primary strong { color: var(--accent-deep); }
-.metric small { display: block; margin-top: 8px; color: var(--text-tertiary); font-size: 11px; }
-.monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 18px; }
+.metric small { display: block; margin-top: 4px; color: var(--text-tertiary); font-size: 10px; }
+.monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 10px; }
 .chart-panel { min-width: 0; }
-.chart { width: 100%; height: 300px; }
-.live-indicator { padding: 3px 8px; border-radius: 5px; background: rgba(143,161,189,.12); color: var(--text-tertiary); font: 700 10px/1.4 "SF Mono", Menlo, monospace; letter-spacing: .7px; }
+.chart { width: 100%; height: 230px; }
+.live-indicator { padding: 2px 6px; border-radius: 4px; background: rgba(143,161,189,.12); color: var(--text-tertiary); font: 700 9px/1.4 "SF Mono", Menlo, monospace; letter-spacing: .6px; }
 .live-indicator.on { background: rgba(8,179,136,.10); color: var(--success); }
 .failure-panel { display: flex; flex-direction: column; }
-.failure-total { margin-top: 24px; color: var(--text-primary); font-size: 40px; font-weight: 750; line-height: 1; }
-.failure-caption { margin-top: 5px; color: var(--text-tertiary); font-size: 11.5px; }
-.failure-list { display: flex; flex-direction: column; gap: 13px; margin-top: auto; padding-top: 30px; }
-.failure-list > div { display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); font-size: 12px; }
-.failure-list span { display: inline-flex; align-items: center; gap: 8px; }
-.failure-list i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); }
+.failure-total { margin-top: 12px; color: var(--text-primary); font-size: 28px; font-weight: 750; line-height: 1; }
+.failure-caption { margin-top: 3px; color: var(--text-tertiary); font-size: 10.5px; }
+.failure-list { display: flex; flex-direction: column; gap: 8px; margin-top: auto; padding-top: 14px; }
+.failure-list > div { display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); font-size: 11px; }
+.failure-list span { display: inline-flex; align-items: center; gap: 6px; }
+.failure-list i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
 .failure-list i.timeout { background: var(--warning); }
 .failure-list i.rejected { background: var(--error); }
 .failure-list i.other { background: var(--violet); }
 .failure-list b { color: var(--text-primary); font-size: 14px; font-variant-numeric: tabular-nums; }
+.failure-advice { margin-top: 18px; padding: 10px 12px; border-radius: var(--radius-sm); background: rgba(56,132,255,.07); color: var(--text-secondary); font-size: 11.5px; line-height: 1.55; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(8,179,136,0); } }
 @media (max-width: 1120px) {
   .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -655,7 +709,7 @@ h1 { margin: 5px 0 0; color: var(--text-primary); font-size: clamp(24px, 2.5vw, 
 @media (max-width: 820px) {
   .page-header { flex-direction: column; }
   .header-actions { width: 100%; justify-content: space-between; }
-  .report-grid, .monitor-grid { grid-template-columns: 1fr; }
+  .report-grid, .monitor-grid, .scenario-summary { grid-template-columns: 1fr; }
   .failure-list { margin-top: 0; }
 }
 @media (max-width: 620px) {

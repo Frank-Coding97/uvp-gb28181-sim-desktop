@@ -34,3 +34,4 @@ semantic-review/
 assets/media/*.h264
 assets/media/*.ps
 .tokensave
+.omo/
