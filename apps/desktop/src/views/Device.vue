@@ -1567,38 +1567,49 @@ onActivated(reconcile);
 .ptz-stage.seeking { animation: stageSeekPulse 1.15s ease-in-out infinite; }
 @keyframes stageSeekPulse { 50% { box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -16px 32px rgba(57,87,126,.07), 0 0 16px rgba(56,132,255,.28); } }
 
-/* 云台右侧参数信息：弹性紧凑排布 */
+/* 云台右侧参数信息：顶部对齐、2x2 指标卡、下部预置位卡片占满剩余空间 */
 .ptz-info {
-  flex: 1 1 220px; display: flex; flex-direction: column; justify-content: space-between;
-  gap: 5px; min-width: 0; overflow: hidden;
+  flex: 1 1 210px; display: flex; flex-direction: column; justify-content: flex-start;
+  gap: 6px; min-width: 0; overflow: hidden; height: 100%;
 }
-.ptz-stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+.ptz-stat-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; flex: 0 0 auto;
+}
 .ptz-stat {
-  display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 5px 7px; border-radius: var(--radius-xs);
+  display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 5px 8px; border-radius: var(--radius-xs);
   background: linear-gradient(145deg, rgba(255,255,255,.7), rgba(239,245,252,.46));
   border: 1px solid rgba(105,132,167,.12);
 }
 .ptz-stat span { font-size: 8.5px; color: var(--text-tertiary); width: auto; flex-shrink: 0; text-transform: uppercase; letter-spacing: .2px; }
 .ptz-stat b { font-size: 10.5px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ptz-stat b.hot { color: var(--accent); }
-.ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 10px; }
-.action-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+.ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 10.5px; }
+
+.ptz-stat.action-state { flex: 0 0 auto; }
+.action-chips { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
 .action-chip {
-  display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 18px; padding: 0 4px;
+  display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 17px; padding: 0 4px;
   border-radius: 4px; color: var(--text-tertiary); background: rgba(255,255,255,.55);
-  border: 1px solid var(--border-default); font-size: 9.5px; transition: all .15s ease;
+  border: 1px solid var(--border-default); font-size: 9px; transition: all .15s ease;
 }
 .action-chip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px var(--accent-glow); transform: translateY(-1px); }
 .action-chip.stop.on { background: #64748b; border-color: #64748b; box-shadow: 0 0 6px rgba(100,116,139,.2); }
-.preset-chips { display: flex; gap: 3px; flex-wrap: wrap; }
+
+/* 预置位卡片：自适应占满剩余垂直空间 */
+.ptz-stat.presets {
+  flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
+}
+.preset-chips {
+  display: flex; gap: 4px; flex-wrap: wrap; align-content: flex-start; margin-top: 3px; overflow-y: auto;
+}
 .pchip {
   display: inline-flex; align-items: center; justify-content: center; gap: 3px;
-  min-width: 58px; height: 19px; padding: 0 5px; border-radius: 4px;
+  min-width: 58px; height: 20px; padding: 0 5px; border-radius: 4px;
   font-size: 9.5px; font-weight: 600; color: var(--text-secondary);
   background: rgba(255,255,255,0.5); border: 1px solid var(--border-default); transition: all 0.15s;
 }
 .pchip small {
-  display: inline-grid; place-items: center; width: 12px; height: 12px; border-radius: 3px;
+  display: inline-grid; place-items: center; width: 13px; height: 13px; border-radius: 3px;
   color: var(--accent); background: var(--accent-dim); font: 700 8px/1 "SF Mono", Menlo, monospace;
 }
 .pchip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px var(--accent-glow); transform: translateY(-1px); }
