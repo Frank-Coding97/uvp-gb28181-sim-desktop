@@ -189,8 +189,26 @@ impl PreviewFrameStore {
         if inner.session_id != Some(session_id) {
             return None;
         }
+        // A new consumer must start with the parameter-set keyframe even if
+        // ordinary frames have already advanced `latest`.
+        if let Some(config) = inner
+            .latest_config
+            .as_ref()
+            .filter(|packet| packet.sequence > after_sequence)
+        {
+            if after_sequence < config.sequence {
+                return Some(config.clone());
+            }
+        }
         if inner.needs_keyframe {
-            return inner.latest_config.clone();
+            // A config frame from before `after_sequence` cannot repair a
+            // current gap. Returning it would move the decoder sequence
+            // backwards and can produce corruption or an ACK stall.
+            return inner
+                .latest_config
+                .as_ref()
+                .filter(|packet| packet.sequence > after_sequence)
+                .cloned();
         }
         inner
             .latest
@@ -301,16 +319,36 @@ mod tests {
         store.publish(config(2, 1));
         store.publish(packet(2, 3, false, vec![3]));
         assert_eq!(store.stats().sequence_gaps, 1);
-        assert_eq!(
-            store.latest_after(2, 1).map(|frame| frame.sequence),
-            Some(1)
-        );
+        assert!(store.latest_after(2, 1).is_none());
         store.publish(packet(2, 2, false, vec![2]));
         assert_eq!(store.stats().stale_frames, 1);
         store.publish(config(2, 4));
         assert_eq!(
             store.latest_after(2, 1).map(|frame| frame.sequence),
             Some(4)
+        );
+    }
+
+    #[test]
+    fn stale_config_is_not_replayed_after_a_gap() {
+        let store = PreviewFrameStore::new();
+        store.publish(config(3, 1));
+        store.publish(packet(3, 3, false, vec![3]));
+        assert!(store.latest_after(3, 3).is_none());
+    }
+
+    #[test]
+    fn new_consumer_starts_with_config_before_latest_delta() {
+        let store = PreviewFrameStore::new();
+        store.publish(config(4, 1));
+        store.publish(packet(4, 2, false, vec![2]));
+        assert_eq!(
+            store.latest_after(4, 0).map(|packet| packet.sequence),
+            Some(1)
+        );
+        assert_eq!(
+            store.latest_after(4, 1).map(|packet| packet.sequence),
+            Some(2)
         );
     }
 

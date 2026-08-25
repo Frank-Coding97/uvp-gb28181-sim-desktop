@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use common::{Error, Result};
 
-use super::{drain_frames, ffmpeg_bin, Frame, VideoSource, G711_PACKET_BYTES};
+use super::{drain_frames, ffmpeg_bin, Frame, FrameSender, VideoSource, G711_PACKET_BYTES};
 
 const DEFAULT_SCREEN_WIDTH: u32 = 1280;
 const DEFAULT_SCREEN_HEIGHT: u32 = 720;
@@ -730,7 +730,7 @@ fn parse_avfoundation_line(line: &str) -> Option<(u32, String)> {
 
 /// Realtime Annex-B video source with optional codec-aware audio access units.
 pub struct LiveSource {
-    rx: mpsc::Receiver<Frame>,
+    rx: Arc<LatestFrameQueue>,
     buf: VecDeque<Frame>,
     audio_rx: Option<mpsc::Receiver<Vec<u8>>>,
     audio_buf: VecDeque<Vec<u8>>,
@@ -747,6 +747,53 @@ pub struct LiveSource {
     screen_stream: Option<screencapturekit::stream::SCStream>,
     last_key: Option<Frame>,
     consecutive_empty: u32,
+    needs_keyframe: bool,
+}
+
+/// 实时采集队列：宁可丢掉旧帧，也不让采集线程把历史画面排队播放。
+/// `dropped` 让消费端知道需要等下一个关键帧重新同步解码器。
+struct LatestFrameQueue {
+    frames: Mutex<VecDeque<Frame>>,
+    capacity: usize,
+    dropped: AtomicBool,
+}
+
+impl LatestFrameQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            frames: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: capacity.max(1),
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    fn push(&self, frame: Frame) {
+        let Ok(mut frames) = self.frames.lock() else {
+            return;
+        };
+        if frames.len() >= self.capacity {
+            frames.clear();
+            self.dropped.store(true, Ordering::Release);
+        }
+        frames.push_back(frame);
+    }
+
+    fn pop(&self) -> Option<Frame> {
+        self.frames
+            .lock()
+            .ok()
+            .and_then(|mut frames| frames.pop_front())
+    }
+
+    fn take_dropped(&self) -> bool {
+        self.dropped.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl FrameSender for LatestFrameQueue {
+    fn send_frame(&self, frame: Frame) {
+        self.push(frame);
+    }
 }
 
 impl LiveSource {
@@ -799,6 +846,10 @@ impl LiveSource {
         }
         let input_fps = camera_input_fps(fps);
         let input_fps_text = input_fps.to_string();
+        let output_fps_text = fps.to_string();
+        let video_filter = format!(
+            "fps={fps},scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
+        );
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let input = audio_index.map_or_else(
             || format!("{video_index}:none"),
@@ -833,11 +884,11 @@ impl LiveSource {
             "-pix_fmt",
             "yuv420p",
             "-vf",
-            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+            &video_filter,
             "-g",
-            &input_fps_text,
+            &output_fps_text,
             "-fps_mode",
-            "passthrough",
+            "cfr",
             "-f",
             "h264",
             "pipe:1",
@@ -864,7 +915,8 @@ impl LiveSource {
         let producer_alive = Arc::new(AtomicBool::new(true));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::sync_channel((fps * 3) as usize);
+        let tx = Arc::new(LatestFrameQueue::new(2));
+        let rx = Arc::clone(&tx);
         let mut stdout = startup.children[0]
             .stdout
             .take()
@@ -882,7 +934,7 @@ impl LiveSource {
                     Ok(n) => {
                         ready.store(true, Ordering::Release);
                         pending.extend_from_slice(&chunk[..n]);
-                        drain_frames(&mut pending, &tx);
+                        drain_frames(&mut pending, tx.as_ref());
                     }
                 }
             }
@@ -970,6 +1022,7 @@ impl LiveSource {
             screen_stream: None,
             last_key: None,
             consecutive_empty: 0,
+            needs_keyframe: false,
         })
     }
 
@@ -1029,7 +1082,8 @@ impl LiveSource {
             .with_sample_rate(audio_codec.sample_rate())
             .with_channel_count(1);
 
-        let (tx, rx) = mpsc::sync_channel((fps * 3) as usize);
+        let tx = Arc::new(LatestFrameQueue::new(2));
+        let rx = Arc::clone(&tx);
         let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<u8>>(2);
         let video_ready = Arc::new(AtomicBool::new(false));
         let producer_alive = Arc::new(AtomicBool::new(true));
@@ -1074,7 +1128,7 @@ impl LiveSource {
                         let data = bitstream.to_vec();
                         if !data.is_empty() {
                             ready.store(true, Ordering::Release);
-                            let _ = tx.try_send(Frame {
+                            tx.send_frame(Frame {
                                 key_frame: h264_is_keyframe(&data),
                                 data,
                             });
@@ -1167,7 +1221,7 @@ impl LiveSource {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 pending.extend_from_slice(&chunk[..n]);
-                                drain_hevc_frames(&mut pending, &tx);
+                                drain_hevc_frames(&mut pending, tx.as_ref());
                                 ready.store(true, Ordering::Release);
                             }
                         }
@@ -1524,6 +1578,7 @@ impl LiveSource {
             screen_stream: Some(stream),
             last_key: None,
             consecutive_empty: 0,
+            needs_keyframe: false,
         })
     }
 }
@@ -1690,7 +1745,7 @@ fn stderr_tail(stderr: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn drain_hevc_frames(buf: &mut Vec<u8>, tx: &mpsc::SyncSender<Frame>) {
+fn drain_hevc_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
     let mut starts = Vec::new();
     let mut index = 0;
     while index + 3 <= buf.len() {
@@ -1731,7 +1786,7 @@ fn drain_hevc_frames(buf: &mut Vec<u8>, tx: &mpsc::SyncSender<Frame>) {
         // is set; additional slices must remain in the current frame.
         let starts_next_access_unit = first_slice || matches!(nal_type, 32..=35 | 39);
         if has_vcl && starts_next_access_unit {
-            let _ = tx.try_send(Frame {
+            tx.send_frame(Frame {
                 data: buf[frame_start..position].to_vec(),
                 key_frame,
             });
@@ -1965,32 +2020,32 @@ impl Drop for LiveSource {
 
 impl VideoSource for LiveSource {
     fn next_frame(&mut self) -> Option<Frame> {
-        while let Ok(frame) = self.rx.try_recv() {
+        while let Some(frame) = self.rx.pop() {
             self.buf.push_back(frame);
         }
-        let cap = (self.fps * 3) as usize;
-        if self.buf.len() > cap {
-            if let Some(index) = self.buf.iter().rposition(|frame| frame.key_frame) {
-                self.buf.drain(..index);
-            } else {
-                while self.buf.len() > cap {
-                    self.buf.pop_front();
-                }
-            }
+        if self.rx.take_dropped() {
+            self.buf.clear();
+            self.needs_keyframe = true;
         }
-        if let Some(frame) = self.buf.pop_front() {
+        while let Some(frame) = self.buf.pop_front() {
+            if self.needs_keyframe && !frame.key_frame {
+                continue;
+            }
+            self.needs_keyframe = false;
             self.consecutive_empty = 0;
             if frame.key_frame {
                 self.last_key = Some(frame.clone());
             }
-            Some(frame)
-        } else {
-            self.consecutive_empty = self.consecutive_empty.saturating_add(1);
-            let repeat_limit = (self.fps / 12).max(2);
-            (self.consecutive_empty <= repeat_limit)
-                .then(|| self.last_key.clone())
-                .flatten()
+            return Some(frame);
         }
+        self.consecutive_empty = self.consecutive_empty.saturating_add(1);
+        if self.needs_keyframe {
+            return None;
+        }
+        let repeat_limit = (self.fps / 12).max(2);
+        (self.consecutive_empty <= repeat_limit)
+            .then(|| self.last_key.clone())
+            .flatten()
     }
 
     fn next_audio(&mut self) -> Vec<Vec<u8>> {
@@ -2039,5 +2094,29 @@ impl VideoSource for LiveSource {
             .lock()
             .ok()
             .and_then(|mut error| error.take())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(id: u8) -> Frame {
+        Frame {
+            data: vec![id],
+            key_frame: false,
+        }
+    }
+
+    #[test]
+    fn 实时队列满载时只保留最新帧() {
+        let queue = LatestFrameQueue::new(2);
+        queue.push(frame(1));
+        queue.push(frame(2));
+        queue.push(frame(3));
+
+        assert!(queue.take_dropped());
+        assert_eq!(queue.pop().expect("最新帧应存在").data, vec![3]);
+        assert!(queue.pop().is_none());
     }
 }
