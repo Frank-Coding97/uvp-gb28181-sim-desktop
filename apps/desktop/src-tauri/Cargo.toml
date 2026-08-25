@@ -24,7 +24,7 @@ media-rtp          = { path = "../../../crates/media-rtp" }
 sip-core          = { path = "../../../crates/sip-core" }
 encoding_rs       = { workspace = true }
 common            = { path = "../../../crates/common" }
-tauri = { version = "=2.11.5", features = [] }
+tauri = { version = "=2.11.5", features = ["protocol-asset"] }
 serde.workspace = true
 serde_json.workspace = true
 toml = "=0.8.2"
