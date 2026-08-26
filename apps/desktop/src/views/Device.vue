@@ -33,7 +33,7 @@ async function pickVideoSource() {
 
 // 平台连接参数(server_host/port/domain/password/transport)来自顶栏全局平台档案,
 // 本页只管设备自身参数(设备 ID/版本/通道/视频源/模板)。
-import { useDevice } from "../device";
+import { useDevice, persistForm } from "../device";
 
 // 设备配置/状态/注册逻辑来自共享 store(与顶栏共用同一份)。
 const {
@@ -273,6 +273,7 @@ function setMediaMode(mode: MediaMode) {
   } else {
     syncLiveSourceUri();
   }
+  persistForm();
 }
 
 async function refreshLiveSources(notify = true) {
@@ -1339,9 +1340,9 @@ onActivated(reconcile);
   opacity: .75;
 }
 
-/* 本地视频预览卡片：顶部左侧 50% 宽度，增高 1/3 */
+/* 本地视频预览卡片：顶部左侧 50% 宽度 */
 .preview-panel {
-  height: 400px; min-height: 380px; box-sizing: border-box; display: flex; flex-direction: column;
+  box-sizing: border-box; display: flex; flex-direction: column;
 }
 .preview-head {
   display: flex; align-items: flex-start; justify-content: space-between;
@@ -1357,9 +1358,9 @@ onActivated(reconcile);
 .preview-badge.live { color: var(--success); background: rgba(8,179,136,.1); border-color: rgba(8,179,136,.22); }
 .preview-badge.warn { color: var(--warning); background: rgba(232,147,32,.1); border-color: rgba(232,147,32,.22); }
 
-/* 视频框：自适应填满容器，支持 Cover 与 Contain 切换 */
+/* 视频框：严格 16:9 比例展示，支持 Cover 与 Contain 切换 */
 .video-frame {
-  position: relative; flex: 1 1 0; min-height: 160px; width: 100%;
+  position: relative; width: 100%; aspect-ratio: 16 / 9;
   display: flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 8px; background:
     radial-gradient(circle at 50% 35%, rgba(56,132,255,.18), transparent 32%),
     linear-gradient(145deg, #0f1b2e, #14243a 58%, #0d1727);
@@ -1396,9 +1397,9 @@ onActivated(reconcile);
 .toggle-fit-btn { background: rgba(56,132,255,0.08); border-color: rgba(56,132,255,0.2); color: var(--accent); }
 .preview-note { color: var(--text-tertiary); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 云台控制卡片：顶部右侧 50% 宽度，增高 1/3 */
+/* 云台控制卡片：顶部右侧 50% 宽度，与左侧等高 */
 .ptz-panel {
-  height: 400px; min-height: 380px; box-sizing: border-box; display: flex; flex-direction: column;
+  box-sizing: border-box; display: flex; flex-direction: column;
 }
 .ptz-head {
   display: flex; align-items: baseline; justify-content: space-between;

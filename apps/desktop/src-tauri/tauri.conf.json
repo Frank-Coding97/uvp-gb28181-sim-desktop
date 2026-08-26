@@ -14,10 +14,10 @@
       {
         "label": "main",
         "title": "UVP GB28181 Desktop",
-        "width": 1180,
-        "height": 760,
-        "minWidth": 960,
-        "minHeight": 600
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1080,
+        "minHeight": 680
       }
     ],
     "security": {
