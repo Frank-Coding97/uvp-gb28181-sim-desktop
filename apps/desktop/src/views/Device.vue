@@ -308,18 +308,30 @@ const canProbeSource = computed(() =>
 
 async function probeLiveSource() {
   if (!canProbeSource.value) return;
-  probeState.value = { kind: "loading", message: "正在启动采集并等待音视频数据…" };
+  probeState.value = { kind: "loading", message: "正在启动后端采集管道并探测音视频数据…" };
+  const loadingMsg = message.loading("正在探测硬件采集通道与编码器…", { duration: 0 });
   try {
     const result = await invoke<LiveProbeResult>("probe_live_source", {
       uri: form.value.video_source,
     });
+    loadingMsg.destroy();
     const ready = result.video_ready && (!result.audio_requested || result.audio_ready === true);
     probeState.value = {
       kind: ready ? "success" : "warning",
       message: result.message,
     };
+    if (ready) {
+      message.success(result.message);
+      // 联动刷新画面预览
+      refreshVideoPreview(true);
+    } else {
+      message.warning(result.message);
+    }
   } catch (e) {
-    probeState.value = { kind: "error", message: `采集测试失败：${String(e)}` };
+    loadingMsg.destroy();
+    const errMsg = `采集测试失败：${String(e)}`;
+    probeState.value = { kind: "error", message: errMsg };
+    message.error(errMsg);
   }
 }
 
