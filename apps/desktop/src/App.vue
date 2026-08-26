@@ -100,20 +100,6 @@ function tickUptime() {
   uptime.value = `${h}:${m}:${ss}`;
 }
 
-const platformEndpoint = computed(() => {
-  const p = active.value;
-  if (!p) return "未配置平台";
-  return `${p.name} · ${p.server_host}:${p.server_port}`;
-});
-const transportLabel = computed(() => `${active.value?.transport ?? "UDP"} · ${active.value?.signaling_encoding ?? "GB18030"}`);
-const deviceHint = computed(() => {
-  if (deviceState.value === "Disconnected") return "设备未连接";
-  if (deviceState.value === "Registering") return "正在向平台注册";
-  if (deviceState.value === "Registered") return `已在线 ${uptime.value}`;
-  if (deviceState.value === "InCall") return `推流中 ${uptime.value}`;
-  return "注册失败，请查看错误";
-});
-
 // 顶栏注册/注销:任意页面可操作同一台设备。成功用 message,失败落全局错误条。
 async function onRegister() {
   const r = await startDevice(active.value);
@@ -248,16 +234,13 @@ const themeOverrides = {
                     </div>
                   </n-modal>
                 </div>
-                <!-- 全局连接上下文:平台 + 设备状态 + 注册/注销。空间有限,不展示设备编号。 -->
+                <!-- 全局连接状态与注册/注销：单行极简设计，与左侧等高 -->
                 <div class="connection-card">
                   <span class="conn-dot" :style="{ background: statusMeta.color }" />
-                  <div class="conn-copy">
-                    <div class="conn-main">
-                      <b>{{ statusMeta.text }}</b>
-                      <span>{{ platformEndpoint }}</span>
-                    </div>
-                    <div class="conn-sub">{{ deviceHint }} · {{ transportLabel }}</div>
-                  </div>
+                  <span class="conn-status-text">
+                    {{ statusMeta.text }}
+                    <template v-if="deviceState === 'Registered' || deviceState === 'InCall'"> · 在线 {{ uptime }}</template>
+                  </span>
                   <div class="reg-btns">
                     <n-button size="small" type="primary" :disabled="startDisabled" @click="onRegister">注册</n-button>
                     <n-button size="small" secondary type="error" :disabled="stopDisabled" @click="onLogout">注销</n-button>
@@ -329,22 +312,18 @@ const themeOverrides = {
 .plat-label { font-size: 11.5px; color: var(--text-secondary); }
 .plat-edit { display: flex; flex-direction: column; gap: 6px; width: 100%; }
 .pe-actions { display: flex; gap: 6px; margin-top: 4px; }
-/* 顶栏右侧连接上下文:平台、状态、传输与动作合并成一个紧凑卡片。 */
+/* 顶栏右侧连接状态条：单行，与左侧目标平台等高 */
 .connection-card {
-  flex: 0 1 460px; min-width: 280px;
   display: inline-flex; align-items: center; gap: 8px;
-  padding: 4px 6px 4px 10px; border-radius: 10px;
+  padding: 0 4px 0 10px; border-radius: var(--radius-xs);
   background: rgba(255,255,255,.58); border: 1px solid var(--border-subtle);
-  box-shadow: 0 1px 0 rgba(255,255,255,.7) inset, 0 4px 12px rgba(16,46,98,.04);
+  box-shadow: 0 1px 0 rgba(255,255,255,.7) inset, 0 2px 8px rgba(16,46,98,.04);
   backdrop-filter: var(--blur-light); -webkit-backdrop-filter: var(--blur-light);
+  height: 28px; box-sizing: border-box;
 }
 .conn-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px rgba(56,132,255,.1); }
-.conn-copy { min-width: 0; flex: 1 1 auto; }
-.conn-main { display: flex; align-items: center; gap: 6px; min-width: 0; line-height: 1.15; }
-.conn-main b { color: var(--text-primary); font-size: 11.5px; white-space: nowrap; }
-.conn-main span { color: var(--text-secondary); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conn-sub { margin-top: 1px; color: var(--text-tertiary); font: 10px/1.2 "SF Mono", Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.reg-btns { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+.conn-status-text { color: var(--text-primary); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.reg-btns { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; margin-left: 2px; }
 /* 顶栏轻量提示条:居中浮在顶栏下方,不占布局。 */
 .top-toast {
   position: absolute; top: 50px; left: 50%; transform: translateX(-50%);
