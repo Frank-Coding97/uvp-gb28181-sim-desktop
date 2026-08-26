@@ -776,510 +776,508 @@ onActivated(reconcile);
       <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
     </div>
 
-    <section class="device-console-grid">
-      <div class="config-stack">
-        <!-- 设备身份与媒体源：左侧集中配置，占一半宽度。 -->
-        <div class="glass-card panel identity-panel">
-          <div class="panel-head-tight">
-            <div class="panel-title">设备身份与国标参数</div>
-            <span class="param-badge">GB/T 28181</span>
+    <!-- 1. 顶部：视频预览 与 云台控制 左右各占一半 (50% / 50%) -->
+    <section class="top-media-ptz-grid">
+      <!-- 左侧 50%：视频预览卡片 -->
+      <aside class="glass-card panel preview-panel">
+        <div class="preview-head">
+          <div>
+            <div class="panel-title">视频预览</div>
+            <div class="preview-sub">{{ previewTitle }}</div>
           </div>
-
-          <!-- 国标基础与扩展参数 -->
-          <div class="identity-grid">
-            <div class="fg">
-              <label>国标版本</label>
-              <div class="seg">
-                <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">GB/T 2022</button>
-                <button :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">GB/T 2016</button>
-              </div>
+          <div class="preview-head-right">
+            <button type="button" class="file-btn compact toggle-fit-btn" @click="toggleVideoFitMode" :title="videoFitMode === 'contain' ? '当前：保持比例适应；点击切换为完全铺满' : '当前：铺满裁剪；点击切换为保持比例'">
+              {{ videoFitMode === 'cover' ? '模式：铺满' : '模式：适应' }}
+            </button>
+            <span class="preview-badge" :class="previewState.tone">{{ previewState.tone === 'live' ? 'PREVIEW' : previewState.tone === 'warn' ? 'CHECK' : 'IDLE' }}</span>
+            <div class="preview-actions">
+              <button type="button" class="file-btn compact primary" :disabled="mediaMode === 'none'" @click="refreshVideoPreview()">刷新</button>
+              <button type="button" class="file-btn compact" :disabled="mediaMode !== 'file' || startDisabled" @click="pickVideoSource">选文件</button>
             </div>
-            <div class="fg">
-              <label>设备国标编号</label>
-              <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
-            </div>
-            <div class="fg">
-              <label>主通道名称</label>
-              <input v-model="form.channel_name" class="inp" placeholder="通道名称" />
-            </div>
-            <div class="fg">
-              <label>目录组织模板</label>
-              <select v-model="form.catalog_template" class="inp">
-                <option value="">单通道(默认)</option>
-                <option value="nvr-8ch">8 通道 NVR</option>
-                <option value="civil-3x2">跨区划(3 区 × 2 通道)</option>
-                <option value="large-16ch">16 通道大型监控</option>
-              </select>
-            </div>
-            <div class="fg">
-              <label>设备厂商 (Manufacturer)</label>
-              <input v-model="form.manufacturer" class="inp" placeholder="厂商名称" />
-            </div>
-            <div class="fg">
-              <label>设备型号 (Model)</label>
-              <input v-model="form.model" class="inp" placeholder="产品型号" />
-            </div>
-            <div class="fg">
-              <label>固件版本 (Firmware)</label>
-              <input v-model="form.firmware" class="inp" placeholder="固件版本号" />
-            </div>
-            <div class="fg">
-              <label>注册有效期 (Expires · 秒)</label>
-              <input v-model.number="form.expires" type="number" min="60" max="86400" step="60" class="inp" placeholder="3600" />
-            </div>
-            <div class="fg">
-              <label>心跳周期 (Interval · 秒)</label>
-              <input v-model.number="form.heartbeat_interval" type="number" min="5" max="300" step="5" class="inp" placeholder="60" />
-            </div>
-            <div class="fg">
-              <label>心跳超时次数 (Max Timeout)</label>
-              <input v-model.number="form.max_heartbeat_timeout" type="number" min="1" max="10" step="1" class="inp" placeholder="3" />
-            </div>
-          </div>
-
-          <!-- 媒体源类型切换 -->
-          <div class="fg media-source-field">
-            <div class="source-heading">
-              <label>媒体源与音视频编码配置</label>
-              <span class="source-lock" v-if="startDisabled">设备运行中，配置已锁定</span>
-            </div>
-            <div class="source-modes" role="radiogroup" aria-label="媒体源类型">
-              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'none' }" @click="setMediaMode('none')">
-                <b>无媒体</b><span>仅信令联调</span>
-              </button>
-              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'file' }" @click="setMediaMode('file')">
-                <b>视频文件</b><span>循环推送本地文件</span>
-              </button>
-              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'camera' }" @click="setMediaMode('camera')">
-                <b>电脑摄像头</b><span>含 iPhone 连续互通</span>
-              </button>
-              <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'screen' }" @click="setMediaMode('screen')">
-                <b>电脑屏幕实时画面</b><span>系统声音或电脑麦克风</span>
-              </button>
-            </div>
-
-            <!-- 文件模式 -->
-            <div v-if="mediaMode === 'file'" class="source-config">
-              <div class="file-row">
-                <input v-model="form.video_source" :disabled="startDisabled" class="inp" placeholder="选择 H.264/H.265 裸流或 MP4、MOV 等视频文件" />
-                <button type="button" class="file-btn" :disabled="startDisabled" @click="pickVideoSource">选择文件</button>
-              </div>
-              <div class="fg-hint">容器文件会在设备启动前转封装；有音频轨时自动转为 G.711A 后与视频复用。</div>
-            </div>
-
-            <!-- 摄像头模式 -->
-            <div v-else-if="mediaMode === 'camera'" class="source-config">
-              <div class="source-capability">
-                <span class="cap-badge" :class="liveCatalog.ffmpeg_available ? 'ok' : 'warn'">
-                  FFmpeg {{ liveCatalog.ffmpeg_available ? '可用' : '未找到' }}
-                </span>
-                <span>AVFoundation 摄像头与音频采集</span>
-              </div>
-              <div class="source-grid">
-                <div>
-                  <label>视频采集设备</label>
-                  <select v-model.number="selectedCameraIndex" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                    <option v-if="!liveCatalog.cameras.length && selectedCameraIndex === null" :value="null" disabled>未发现摄像头</option>
-                    <option v-if="selectedCameraIndex !== null && !liveCatalog.cameras.some(item => item.index === selectedCameraIndex)" :value="selectedCameraIndex" disabled>
-                      [{{ selectedCameraIndex }}] 当前摄像头不可用
-                    </option>
-                    <option v-for="camera in liveCatalog.cameras" :key="camera.index" :value="camera.index">
-                      [{{ camera.index }}] {{ camera.name }}
-                    </option>
-                  </select>
-                </div>
-                <div>
-                  <label>音频采集设备</label>
-                  <select v-model="selectedMicrophone" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                    <option value="none">不采集音频（画面将没有声音）</option>
-                    <option v-if="selectedMicrophone !== 'none' && !liveCatalog.microphones.some(item => String(item.index) === selectedMicrophone)" :value="selectedMicrophone" disabled>
-                      [{{ selectedMicrophone }}] 当前音频设备不可用
-                    </option>
-                    <option v-for="mic in liveCatalog.microphones" :key="mic.index" :value="String(mic.index)">
-                      [{{ mic.index }}] {{ mic.name }}
-                    </option>
-                  </select>
-                </div>
-              </div>
-
-              <!-- 左右分栏：左半列视频参数，右半列音频参数 -->
-              <div class="media-param-columns">
-                <!-- 左半列：视频流参数 -->
-                <div class="param-col">
-                  <div class="col-title">🎥 视频流参数</div>
-                  <div class="fg">
-                    <label>视频编码格式</label>
-                    <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                      <option value="h264">H.264 / AVC（兼容性优先）</option>
-                      <option value="h265">H.265 / HEVC（更高压缩率）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>输出分辨率</label>
-                    <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
-                      <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
-                        {{ resolution.label }}
-                      </option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>视频帧率 (FPS)</label>
-                    <select v-model.number="selectedScreenFps" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="15">15 fps（低开销）</option>
-                      <option :value="25">25 fps（国标推荐）</option>
-                      <option :value="30">30 fps（标准）</option>
-                      <option :value="60">60 fps（高流畅）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>视频码率</label>
-                    <div class="screen-bitrate-input">
-                      <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
-                      <span>kbps</span>
-                    </div>
-                  </div>
-                  <div class="fg">
-                    <label>GOP 关键帧间隔</label>
-                    <select v-model.number="selectedScreenGop" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="25">25 帧 (1秒 GOP)</option>
-                      <option :value="50">50 帧 (2秒 GOP · 推荐)</option>
-                      <option :value="100">100 帧 (4秒 GOP)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <!-- 右半列：音频流参数 -->
-                <div class="param-col">
-                  <div class="col-title">🎙 音频流参数</div>
-                  <div class="fg">
-                    <label>音频编码格式</label>
-                    <select v-model="selectedCameraAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                      <option value="g711a">G.711A / PCMA · 8 kHz</option>
-                      <option value="g711u">G.711U / PCMU · 8 kHz</option>
-                      <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz{{ liveCatalog.aac_available ? '' : '（不可用）' }}</option>
-                      <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz（扩展{{ liveCatalog.opus_available ? '' : '，不可用' }}）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>音频采样率 (Sample Rate)</label>
-                    <select v-model.number="selectedAudioSampleRate" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="8000">8 000 Hz（G.711 标准）</option>
-                      <option :value="16000">16 000 Hz（宽带语音）</option>
-                      <option :value="32000">32 000 Hz</option>
-                      <option :value="44100">44 100 Hz（CD 级）</option>
-                      <option :value="48000">48 000 Hz（专业级 AAC/Opus）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>声道模式 (Channels)</label>
-                    <select v-model.number="selectedAudioChannels" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="1">单声道 (Mono · 默认)</option>
-                      <option :value="2">双声道 (Stereo)</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>音频比特率 (Bitrate)</label>
-                    <select v-model.number="selectedAudioBitrate" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="32">32 kbps</option>
-                      <option :value="64">64 kbps（G.711/AAC 推荐）</option>
-                      <option :value="128">128 kbps（高音质）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>打包周期与采样精度</label>
-                    <select class="inp" disabled>
-                      <option>16-bit 线性量化 · 20 ms 打包</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-
-              <div v-if="liveCatalog.avfoundation_error" class="source-notice error">{{ liveCatalog.avfoundation_error }}</div>
-            </div>
-
-            <!-- 屏幕录制模式 -->
-            <div v-else-if="mediaMode === 'screen'" class="source-config">
-              <div class="source-capability">
-                <span class="cap-badge ok">ScreenCaptureKit</span>
-                <span>原生屏幕与系统音频采集</span>
-              </div>
-              <div class="source-grid">
-                <div>
-                  <label>显示器选择</label>
-                  <select v-model.number="selectedDisplayId" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                    <option v-if="!liveCatalog.screens.length && selectedDisplayId === null" :value="null" disabled>未发现可用显示器</option>
-                    <option v-if="selectedDisplayId !== null && !liveCatalog.screens.some(item => item.display_id === selectedDisplayId)" :value="selectedDisplayId" disabled>
-                      Display {{ selectedDisplayId }}（当前不可用）
-                    </option>
-                    <option v-for="screen in liveCatalog.screens" :key="screen.display_id" :value="screen.display_id">
-                      {{ screen.name }}
-                    </option>
-                  </select>
-                </div>
-                <div>
-                  <label>声音采集源</label>
-                  <select v-model="selectedScreenAudio" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                    <option value="system">系统播放声音</option>
-                    <option v-if="selectedScreenAudio.startsWith('microphone:') && !liveCatalog.microphones.some(item => `microphone:${item.index}` === selectedScreenAudio)" :value="selectedScreenAudio" disabled>
-                      麦克风 {{ selectedScreenAudio.slice('microphone:'.length) }}（当前不可用）
-                    </option>
-                    <option v-for="mic in liveCatalog.microphones" :key="`screen-mic-${mic.index}`" :value="`microphone:${mic.index}`">
-                      麦克风 · [{{ mic.index }}] {{ mic.name }}
-                    </option>
-                    <option value="none">不采集声音</option>
-                  </select>
-                </div>
-              </div>
-
-              <!-- 左右分栏：左半列视频参数，右半列音频参数 -->
-              <div class="media-param-columns">
-                <!-- 左半列：视频流参数 -->
-                <div class="param-col">
-                  <div class="col-title">🎥 视频流参数</div>
-                  <div class="fg">
-                    <label>输出分辨率</label>
-                    <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
-                      <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
-                        {{ resolution.label }}
-                      </option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>视频帧率 (FPS)</label>
-                    <select v-model.number="selectedScreenFps" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="15">15 fps（低开销）</option>
-                      <option :value="25">25 fps（国标推荐）</option>
-                      <option :value="30">30 fps（标准）</option>
-                      <option :value="60">60 fps（高流畅）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>视频码率</label>
-                    <div class="screen-bitrate-input">
-                      <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
-                      <span>kbps</span>
-                    </div>
-                  </div>
-                  <div class="fg">
-                    <label>视频编码格式</label>
-                    <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
-                      <option value="h264">H.264 / AVC（兼容性优先）</option>
-                      <option value="h265">H.265 / HEVC（更低带宽）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>GOP 关键帧间隔</label>
-                    <select v-model.number="selectedScreenGop" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="25">25 帧 (1秒 GOP)</option>
-                      <option :value="50">50 帧 (2秒 GOP · 推荐)</option>
-                      <option :value="100">100 帧 (4秒 GOP)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <!-- 右半列：音频流参数 -->
-                <div class="param-col">
-                  <div class="col-title">🎙 音频流参数</div>
-                  <div class="fg">
-                    <label>音频编码格式</label>
-                    <select v-model="selectedScreenAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" aria-label="实时音频格式" @change="syncLiveSourceUri">
-                      <option value="g711a">G.711A / PCMA · 8 kHz · 单声道</option>
-                      <option value="g711u">G.711U / PCMU · 8 kHz · 单声道</option>
-                      <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz · 单声道{{ liveCatalog.aac_available ? '' : '（不可用）' }}</option>
-                      <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz · 20 ms（扩展{{ liveCatalog.opus_available ? '' : '，不可用' }}）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>音频采样率 (Sample Rate)</label>
-                    <select v-model.number="selectedAudioSampleRate" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="8000">8 000 Hz（G.711 标准）</option>
-                      <option :value="16000">16 000 Hz（宽带语音）</option>
-                      <option :value="32000">32 000 Hz</option>
-                      <option :value="44100">44 100 Hz（CD 级）</option>
-                      <option :value="48000">48 000 Hz（专业级 AAC/Opus）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>声道模式 (Channels)</label>
-                    <select v-model.number="selectedAudioChannels" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="1">单声道 (Mono · 默认)</option>
-                      <option :value="2">双声道 (Stereo)</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>音频比特率 (Bitrate)</label>
-                    <select v-model.number="selectedAudioBitrate" :disabled="startDisabled || sourceLoading" class="inp">
-                      <option :value="32">32 kbps</option>
-                      <option :value="64">64 kbps（G.711/AAC 推荐）</option>
-                      <option :value="128">128 kbps（高音质）</option>
-                    </select>
-                  </div>
-                  <div class="fg">
-                    <label>打包周期与采样精度</label>
-                    <select class="inp" disabled>
-                      <option>16-bit 线性量化 · 20 ms 打包</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-
-              <div v-if="screenProfileValidationError" class="source-notice error">{{ screenProfileValidationError }}</div>
-              <div v-if="liveCatalog.screen_error" class="source-notice error">
-                {{ liveCatalog.screen_error }}
-                <span>请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许本应用。</span>
-              </div>
-            </div>
-
-            <div v-if="mediaMode !== 'none'" class="source-footer">
-              <div class="source-uri">
-                <span>{{ mediaMode === 'file' ? '当前文件' : '规范实时源 URI' }}</span>
-                <code>{{ sourceSummary }}</code>
-              </div>
-              <div v-if="mediaMode === 'camera' || mediaMode === 'screen'" class="source-actions">
-                <button type="button" class="file-btn compact" :disabled="startDisabled || sourceLoading" @click="refreshLiveSources()">
-                  {{ sourceLoading ? '刷新中…' : '刷新设备' }}
-                </button>
-                <button type="button" class="file-btn compact primary" :disabled="!canProbeSource || probeState?.kind === 'loading'" @click="probeLiveSource">
-                  {{ probeState?.kind === 'loading' ? '测试中…' : '测试采集' }}
-                </button>
-                <button type="button" class="file-btn compact" @click="refreshVideoPreview()">预览画面</button>
-              </div>
-            </div>
-            <div v-if="probeState" class="probe-result" :class="probeState.kind">{{ probeState.message }}</div>
-          </div>
-
-          <div class="action-row primary-actions">
-            <n-button type="primary" :disabled="registrationDisabled" @click="startDevice">注册上线</n-button>
-            <n-button secondary type="error" :disabled="stopDisabled" @click="stopDevice">注销</n-button>
-            <n-button tertiary :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
-            <n-button tertiary :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
           </div>
         </div>
-      </div>
-
-      <!-- 右侧容器：上下平分高度，上部为视频预览，下部为云台控制 -->
-      <div class="preview-ptz-stack">
-        <!-- 上部：视频预览卡片 -->
-        <aside class="glass-card panel preview-panel">
-          <div class="preview-head">
-            <div>
-              <div class="panel-title">视频预览</div>
-              <div class="preview-sub">{{ previewTitle }}</div>
-            </div>
-            <div class="preview-head-right">
-              <button type="button" class="file-btn compact toggle-fit-btn" @click="toggleVideoFitMode" :title="videoFitMode === 'contain' ? '当前：保持比例适应；点击切换为完全铺满' : '当前：铺满裁剪；点击切换为保持比例'">
-                {{ videoFitMode === 'cover' ? '模式：铺满' : '模式：适应' }}
-              </button>
-              <span class="preview-badge" :class="previewState.tone">{{ previewState.tone === 'live' ? 'PREVIEW' : previewState.tone === 'warn' ? 'CHECK' : 'IDLE' }}</span>
-              <div class="preview-actions">
-                <button type="button" class="file-btn compact primary" :disabled="mediaMode === 'none'" @click="refreshVideoPreview()">刷新</button>
-                <button type="button" class="file-btn compact" :disabled="mediaMode !== 'file' || startDisabled" @click="pickVideoSource">选文件</button>
-              </div>
-            </div>
+        <div class="video-frame" :class="[previewState.tone, `fit-${videoFitMode}`]">
+          <video
+            ref="videoPreviewEl"
+            :src="previewUrl || undefined"
+            autoplay
+            muted
+            playsinline
+            controls
+            :class="`video-${videoFitMode}`"
+          />
+          <div v-if="!previewUrl && previewState.tone !== 'live'" class="preview-empty">
+            <div class="scan-mark">GB</div>
+            <strong>{{ previewState.text }}</strong>
+            <span>{{ previewMeta }}</span>
           </div>
-          <div class="video-frame" :class="[previewState.tone, `fit-${videoFitMode}`]">
-            <video
-              ref="videoPreviewEl"
-              :src="previewUrl || undefined"
-              autoplay
-              muted
-              playsinline
-              controls
-              :class="`video-${videoFitMode}`"
+        </div>
+        <div class="preview-status-line">
+          <div class="preview-status" :class="previewState.tone">
+            <i />
+            <span>{{ previewState.text }}</span>
+          </div>
+          <span class="preview-note">本地预览画面（支持适应/铺满），推送到平台为标准 PS/RTP 流</span>
+        </div>
+      </aside>
+
+      <!-- 右侧 50%：云台控制卡片 -->
+      <div class="glass-card panel ptz-panel">
+        <div class="ptz-head">
+          <div class="panel-title">云台控制</div>
+          <div class="ptz-sub">平台下发 PTZ 时机芯与光学变倍实时联动</div>
+        </div>
+        <div class="ptz-body">
+          <div class="ptz-stage" :class="{ active: ptzActive, seeking }">
+            <div class="stage-grid"></div>
+            <!-- 左上角 PTZ LIVE 标识 -->
+            <div class="stage-caption">
+              <span class="live-dot"></span>
+              <b>PTZ LIVE</b>
+            </div>
+            <!-- 右上角 对称呼应的运行状态胶囊 -->
+            <div class="stage-caption stage-caption-right" :class="{ active: ptzActive, seeking }">
+              <span class="motion-dot"></span>
+              <b>{{ statusText }}</b>
+            </div>
+
+            <div class="compass-ring" aria-hidden="true">
+              <div class="compass-dial" :style="compassDialStyle">
+                <span class="north">N</span><span class="east">E</span><span class="south">S</span><span class="west">W</span>
+              </div>
+              <b class="heading-readout">{{ normalizedPan.toFixed(0).padStart(3, "0") }}°</b>
+            </div>
+            <div class="direction-hud" aria-hidden="true">
+              <span class="hud-up" :class="{ on: ptz.up }">↑</span>
+              <span class="hud-down" :class="{ on: ptz.down }">↓</span>
+              <span class="hud-left" :class="{ on: ptz.left }">←</span>
+              <span class="hud-right" :class="{ on: ptz.right }">→</span>
+            </div>
+            <div class="tilt-gauge" aria-hidden="true">
+              <span class="tilt-plus">+90°</span><span class="tilt-zero">0°</span><span class="tilt-minus">−90°</span>
+              <i class="tilt-track"></i>
+              <b class="tilt-marker" :style="tiltMarkerStyle">{{ tilt.toFixed(0) }}°</b>
+            </div>
+            <ThreePtzCamera
+              :pan="pan"
+              :tilt="tilt"
+              :zoom="zoom"
+              :active="ptzActive"
+              :seeking="seeking"
             />
-            <div v-if="!previewUrl && previewState.tone !== 'live'" class="preview-empty">
-              <div class="scan-mark">GB</div>
-              <strong>{{ previewState.text }}</strong>
-              <span>{{ previewMeta }}</span>
-            </div>
+            <div class="axis-label pan-axis">PAN 360°</div>
+            <div class="axis-label tilt-axis">TILT ±90°</div>
           </div>
-          <div class="preview-status-line">
-            <div class="preview-status" :class="previewState.tone">
-              <i />
-              <span>{{ previewState.text }}</span>
+          <div class="ptz-info">
+            <div class="ptz-stat-grid">
+              <div class="ptz-stat"><span>朝向</span><b class="pose">{{ poseText }}</b></div>
+              <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
+              <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
+              <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
             </div>
-            <span class="preview-note">本地预览画面（支持适应/铺满），推送到平台为标准 PS/RTP 流</span>
-          </div>
-        </aside>
-
-        <!-- 下部：云台控制卡片 -->
-        <div class="glass-card panel ptz-panel">
-          <div class="ptz-head">
-            <div class="panel-title">云台控制</div>
-            <div class="ptz-sub">平台下发 PTZ 时机芯与光学变倍实时联动</div>
-          </div>
-          <div class="ptz-body">
-            <div class="ptz-stage" :class="{ active: ptzActive, seeking }">
-              <div class="stage-grid"></div>
-              <!-- 左上角 PTZ LIVE 标识 -->
-              <div class="stage-caption">
-                <span class="live-dot"></span>
-                <b>PTZ LIVE</b>
-              </div>
-              <!-- 右上角 对称呼应的运行状态胶囊 -->
-              <div class="stage-caption stage-caption-right" :class="{ active: ptzActive, seeking }">
-                <span class="motion-dot"></span>
-                <b>{{ statusText }}</b>
-              </div>
-
-              <div class="compass-ring" aria-hidden="true">
-                <div class="compass-dial" :style="compassDialStyle">
-                  <span class="north">N</span><span class="east">E</span><span class="south">S</span><span class="west">W</span>
-                </div>
-                <b class="heading-readout">{{ normalizedPan.toFixed(0).padStart(3, "0") }}°</b>
-              </div>
-              <div class="direction-hud" aria-hidden="true">
-                <span class="hud-up" :class="{ on: ptz.up }">↑</span>
-                <span class="hud-down" :class="{ on: ptz.down }">↓</span>
-                <span class="hud-left" :class="{ on: ptz.left }">←</span>
-                <span class="hud-right" :class="{ on: ptz.right }">→</span>
-              </div>
-              <div class="tilt-gauge" aria-hidden="true">
-                <span class="tilt-plus">+90°</span><span class="tilt-zero">0°</span><span class="tilt-minus">−90°</span>
-                <i class="tilt-track"></i>
-                <b class="tilt-marker" :style="tiltMarkerStyle">{{ tilt.toFixed(0) }}°</b>
-              </div>
-              <ThreePtzCamera
-                :pan="pan"
-                :tilt="tilt"
-                :zoom="zoom"
-                :active="ptzActive"
-                :seeking="seeking"
-              />
-              <div class="axis-label pan-axis">PAN 360°</div>
-              <div class="axis-label tilt-axis">TILT ±90°</div>
+            <div class="ptz-stat action-state">
+              <span>平台命令 · {{ lastPtzAt }}</span>
+              <span class="action-chips">
+                <b v-for="button in ptzButtons" :key="button.key" class="action-chip" :class="{ on: button.active, stop: button.key === 'stop' }">{{ button.label }}</b>
+              </span>
             </div>
-            <div class="ptz-info">
-              <div class="ptz-stat-grid">
-                <div class="ptz-stat"><span>朝向</span><b class="pose">{{ poseText }}</b></div>
-                <div class="ptz-stat"><span>方向</span><b :class="{ hot: seeking || moving }">{{ dirText }}</b></div>
-                <div class="ptz-stat"><span>变倍</span><b :class="{ hot: ptz.zoom_in || ptz.zoom_out }">{{ zoomText }}</b></div>
-                <div class="ptz-stat"><span>速度</span><b :class="{ hot: moving || ptz.zoom_in || ptz.zoom_out }">{{ speedText }}</b></div>
-              </div>
-              <div class="ptz-stat action-state">
-                <span>平台命令 · {{ lastPtzAt }}</span>
-                <span class="action-chips">
-                  <b v-for="button in ptzButtons" :key="button.key" class="action-chip" :class="{ on: button.active, stop: button.key === 'stop' }">{{ button.label }}</b>
-                </span>
-              </div>
-              <div class="ptz-stat presets">
-                <span>预置位</span>
-                <span class="preset-chips">
-                  <b v-for="id in PRESET_IDS" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">
-                    <small>{{ id }}</small>{{ presetNames[id] }}
-                  </b>
-                </span>
-              </div>
+            <div class="ptz-stat presets">
+              <span>预置位</span>
+              <span class="preset-chips">
+                <b v-for="id in PRESET_IDS" :key="id" class="pchip" :class="{ on: activePreset === id && seeking }">
+                  <small>{{ id }}</small>{{ presetNames[id] }}
+                </b>
+              </span>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- 下方工作区：平台实时状态与平台命令时间线并排各占 50%，对齐上方；最下方放 SIP 信令追踪 -->
+    <!-- 2. 中间：设备身份与国标参数 卡片（全宽） -->
+    <section class="device-identity-section">
+      <div class="glass-card panel identity-panel">
+        <div class="panel-head-tight">
+          <div class="panel-title">设备身份与国标参数</div>
+          <span class="param-badge">GB/T 28181</span>
+        </div>
+
+        <!-- 国标基础与扩展参数：4 列网格 -->
+        <div class="identity-grid">
+          <div class="fg">
+            <label>国标版本</label>
+            <div class="seg">
+              <button :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">GB/T 2022</button>
+              <button :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">GB/T 2016</button>
+            </div>
+          </div>
+          <div class="fg">
+            <label>设备国标编号</label>
+            <input v-model="form.device_id" class="inp" placeholder="20 位国标 ID" />
+          </div>
+          <div class="fg">
+            <label>主通道名称</label>
+            <input v-model="form.channel_name" class="inp" placeholder="通道名称" />
+          </div>
+          <div class="fg">
+            <label>目录组织模板</label>
+            <select v-model="form.catalog_template" class="inp">
+              <option value="">单通道(默认)</option>
+              <option value="nvr-8ch">8 通道 NVR</option>
+              <option value="civil-3x2">跨区划(3 区 × 2 通道)</option>
+              <option value="large-16ch">16 通道大型监控</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label>设备厂商 (Manufacturer)</label>
+            <input v-model="form.manufacturer" class="inp" placeholder="厂商名称" />
+          </div>
+          <div class="fg">
+            <label>设备型号 (Model)</label>
+            <input v-model="form.model" class="inp" placeholder="产品型号" />
+          </div>
+          <div class="fg">
+            <label>固件版本 (Firmware)</label>
+            <input v-model="form.firmware" class="inp" placeholder="固件版本号" />
+          </div>
+          <div class="fg">
+            <label>注册有效期 (Expires · 秒)</label>
+            <input v-model.number="form.expires" type="number" min="60" max="86400" step="60" class="inp" placeholder="3600" />
+          </div>
+          <div class="fg">
+            <label>心跳周期 (Interval · 秒)</label>
+            <input v-model.number="form.heartbeat_interval" type="number" min="5" max="300" step="5" class="inp" placeholder="60" />
+          </div>
+          <div class="fg">
+            <label>心跳超时次数 (Max Timeout)</label>
+            <input v-model.number="form.max_heartbeat_timeout" type="number" min="1" max="10" step="1" class="inp" placeholder="3" />
+          </div>
+        </div>
+
+        <!-- 媒体源类型切换 -->
+        <div class="fg media-source-field">
+          <div class="source-heading">
+            <label>媒体源与音视频编码配置</label>
+            <span class="source-lock" v-if="startDisabled">设备运行中，配置已锁定</span>
+          </div>
+          <div class="source-modes" role="radiogroup" aria-label="媒体源类型">
+            <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'none' }" @click="setMediaMode('none')">
+              <b>无媒体</b><span>仅信令联调</span>
+            </button>
+            <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'file' }" @click="setMediaMode('file')">
+              <b>视频文件</b><span>循环推送本地文件</span>
+            </button>
+            <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'camera' }" @click="setMediaMode('camera')">
+              <b>电脑摄像头</b><span>含 iPhone 连续互通</span>
+            </button>
+            <button type="button" :disabled="startDisabled" :class="{ on: mediaMode === 'screen' }" @click="setMediaMode('screen')">
+              <b>电脑屏幕实时画面</b><span>系统声音或电脑麦克风</span>
+            </button>
+          </div>
+
+          <!-- 文件模式 -->
+          <div v-if="mediaMode === 'file'" class="source-config">
+            <div class="file-row">
+              <input v-model="form.video_source" :disabled="startDisabled" class="inp" placeholder="选择 H.264/H.265 裸流或 MP4、MOV 等视频文件" />
+              <button type="button" class="file-btn" :disabled="startDisabled" @click="pickVideoSource">选择文件</button>
+            </div>
+            <div class="fg-hint">容器文件会在设备启动前转封装；有音频轨时自动转为 G.711A 后与视频复用。</div>
+          </div>
+
+          <!-- 摄像头模式 -->
+          <div v-else-if="mediaMode === 'camera'" class="source-config">
+            <div class="source-capability">
+              <span class="cap-badge" :class="liveCatalog.ffmpeg_available ? 'ok' : 'warn'">
+                FFmpeg {{ liveCatalog.ffmpeg_available ? '可用' : '未找到' }}
+              </span>
+              <span>AVFoundation 摄像头与音频采集</span>
+            </div>
+            <div class="source-grid">
+              <div>
+                <label>视频采集设备</label>
+                <select v-model.number="selectedCameraIndex" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                  <option v-if="!liveCatalog.cameras.length && selectedCameraIndex === null" :value="null" disabled>未发现摄像头</option>
+                  <option v-if="selectedCameraIndex !== null && !liveCatalog.cameras.some(item => item.index === selectedCameraIndex)" :value="selectedCameraIndex" disabled>
+                    [{{ selectedCameraIndex }}] 当前摄像头不可用
+                  </option>
+                  <option v-for="camera in liveCatalog.cameras" :key="camera.index" :value="camera.index">
+                    [{{ camera.index }}] {{ camera.name }}
+                  </option>
+                </select>
+              </div>
+              <div>
+                <label>音频采集设备</label>
+                <select v-model="selectedMicrophone" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                  <option value="none">不采集音频（画面将没有声音）</option>
+                  <option v-if="selectedMicrophone !== 'none' && !liveCatalog.microphones.some(item => String(item.index) === selectedMicrophone)" :value="selectedMicrophone" disabled>
+                    [{{ selectedMicrophone }}] 当前音频设备不可用
+                  </option>
+                  <option v-for="mic in liveCatalog.microphones" :key="mic.index" :value="String(mic.index)">
+                    [{{ mic.index }}] {{ mic.name }}
+                  </option>
+                </select>
+              </div>
+            </div>
+
+            <!-- 左右分栏：左半列视频参数，右半列音频参数 -->
+            <div class="media-param-columns">
+              <!-- 左半列：视频流参数 -->
+              <div class="param-col">
+                <div class="col-title">🎥 视频流参数</div>
+                <div class="fg">
+                  <label>视频编码格式</label>
+                  <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option value="h264">H.264 / AVC（兼容性优先）</option>
+                    <option value="h265">H.265 / HEVC（更高压缩率）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>输出分辨率</label>
+                  <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
+                    <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
+                      {{ resolution.label }}
+                    </option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>视频帧率 (FPS)</label>
+                  <select v-model.number="selectedScreenFps" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="15">15 fps（低开销）</option>
+                    <option :value="25">25 fps（国标推荐）</option>
+                    <option :value="30">30 fps（标准）</option>
+                    <option :value="60">60 fps（高流畅）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>视频码率</label>
+                  <div class="screen-bitrate-input">
+                    <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
+                    <span>kbps</span>
+                  </div>
+                </div>
+                <div class="fg">
+                  <label>GOP 关键帧间隔</label>
+                  <select v-model.number="selectedScreenGop" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="25">25 帧 (1秒 GOP)</option>
+                    <option :value="50">50 帧 (2秒 GOP · 推荐)</option>
+                    <option :value="100">100 帧 (4秒 GOP)</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- 右半列：音频流参数 -->
+              <div class="param-col">
+                <div class="col-title">🎙 音频流参数</div>
+                <div class="fg">
+                  <label>音频编码格式</label>
+                  <select v-model="selectedCameraAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option value="g711a">G.711A / PCMA · 8 kHz</option>
+                    <option value="g711u">G.711U / PCMU · 8 kHz</option>
+                    <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz{{ liveCatalog.aac_available ? '' : '（不可用）' }}</option>
+                    <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz（扩展{{ liveCatalog.opus_available ? '' : '，不可用' }}）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>音频采样率 (Sample Rate)</label>
+                  <select v-model.number="selectedAudioSampleRate" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="8000">8 000 Hz（G.711 标准）</option>
+                    <option :value="16000">16 000 Hz（宽带语音）</option>
+                    <option :value="32000">32 000 Hz</option>
+                    <option :value="44100">44 100 Hz（CD 级）</option>
+                    <option :value="48000">48 000 Hz（专业级 AAC/Opus）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>声道模式 (Channels)</label>
+                  <select v-model.number="selectedAudioChannels" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="1">单声道 (Mono · 默认)</option>
+                    <option :value="2">双声道 (Stereo)</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>音频比特率 (Bitrate)</label>
+                  <select v-model.number="selectedAudioBitrate" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="32">32 kbps</option>
+                    <option :value="64">64 kbps（G.711/AAC 推荐）</option>
+                    <option :value="128">128 kbps（高音质）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>打包周期与采样精度</label>
+                  <select class="inp" disabled>
+                    <option>16-bit 线性量化 · 20 ms 打包</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="liveCatalog.avfoundation_error" class="source-notice error">{{ liveCatalog.avfoundation_error }}</div>
+          </div>
+
+          <!-- 屏幕录制模式 -->
+          <div v-else-if="mediaMode === 'screen'" class="source-config">
+            <div class="source-capability">
+              <span class="cap-badge ok">ScreenCaptureKit</span>
+              <span>原生屏幕与系统音频采集</span>
+            </div>
+            <div class="source-grid">
+              <div>
+                <label>显示器选择</label>
+                <select v-model.number="selectedDisplayId" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                  <option v-if="!liveCatalog.screens.length && selectedDisplayId === null" :value="null" disabled>未发现可用显示器</option>
+                  <option v-if="selectedDisplayId !== null && !liveCatalog.screens.some(item => item.display_id === selectedDisplayId)" :value="selectedDisplayId" disabled>
+                    Display {{ selectedDisplayId }}（当前不可用）
+                  </option>
+                  <option v-for="screen in liveCatalog.screens" :key="screen.display_id" :value="screen.display_id">
+                    {{ screen.name }}
+                  </option>
+                </select>
+              </div>
+              <div>
+                <label>声音采集源</label>
+                <select v-model="selectedScreenAudio" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                  <option value="system">系统播放声音</option>
+                  <option v-if="selectedScreenAudio.startsWith('microphone:') && !liveCatalog.microphones.some(item => `microphone:${item.index}` === selectedScreenAudio)" :value="selectedScreenAudio" disabled>
+                    麦克风 {{ selectedScreenAudio.slice('microphone:'.length) }}（当前不可用）
+                  </option>
+                  <option v-for="mic in liveCatalog.microphones" :key="`screen-mic-${mic.index}`" :value="`microphone:${mic.index}`">
+                    麦克风 · [{{ mic.index }}] {{ mic.name }}
+                  </option>
+                  <option value="none">不采集声音</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- 左右分栏：左半列视频参数，右半列音频参数 -->
+            <div class="media-param-columns">
+              <!-- 左半列：视频流参数 -->
+              <div class="param-col">
+                <div class="col-title">🎥 视频流参数</div>
+                <div class="fg">
+                  <label>输出分辨率</label>
+                  <select v-model="selectedScreenResolution" :disabled="startDisabled || sourceLoading" class="inp" @change="applyScreenResolution">
+                    <option v-for="resolution in screenResolutionOptions" :key="resolution.value" :value="resolution.value">
+                      {{ resolution.label }}
+                    </option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>视频帧率 (FPS)</label>
+                  <select v-model.number="selectedScreenFps" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="15">15 fps（低开销）</option>
+                    <option :value="25">25 fps（国标推荐）</option>
+                    <option :value="30">30 fps（标准）</option>
+                    <option :value="60">60 fps（高流畅）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>视频码率</label>
+                  <div class="screen-bitrate-input">
+                    <input v-model.number="selectedScreenBitrate" :disabled="startDisabled || sourceLoading" class="inp" type="number" min="128" max="20000" step="50" aria-label="屏幕视频码率（kbps）" @change="syncLiveSourceUri" />
+                    <span>kbps</span>
+                  </div>
+                </div>
+                <div class="fg">
+                  <label>视频编码格式</label>
+                  <select v-model="selectedScreenCodec" :disabled="startDisabled || sourceLoading" class="inp" @change="syncLiveSourceUri">
+                    <option value="h264">H.264 / AVC（兼容性优先）</option>
+                    <option value="h265">H.265 / HEVC（更低带宽）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>GOP 关键帧间隔</label>
+                  <select v-model.number="selectedScreenGop" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="25">25 帧 (1秒 GOP)</option>
+                    <option :value="50">50 帧 (2秒 GOP · 推荐)</option>
+                    <option :value="100">100 帧 (4秒 GOP)</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- 右半列：音频流参数 -->
+              <div class="param-col">
+                <div class="col-title">🎙 音频流参数</div>
+                <div class="fg">
+                  <label>音频编码格式</label>
+                  <select v-model="selectedScreenAudioCodec" :disabled="startDisabled || sourceLoading" class="inp" aria-label="实时音频格式" @change="syncLiveSourceUri">
+                    <option value="g711a">G.711A / PCMA · 8 kHz · 单声道</option>
+                    <option value="g711u">G.711U / PCMU · 8 kHz · 单声道</option>
+                    <option value="aac" :disabled="!liveCatalog.aac_available">AAC-LC / ADTS · 48 kHz · 单声道{{ liveCatalog.aac_available ? '' : '（不可用）' }}</option>
+                    <option value="opus" :disabled="!liveCatalog.opus_available">Opus · 48 kHz · 20 ms（扩展{{ liveCatalog.opus_available ? '' : '，不可用' }}）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>音频采样率 (Sample Rate)</label>
+                  <select v-model.number="selectedAudioSampleRate" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="8000">8 000 Hz（G.711 标准）</option>
+                    <option :value="16000">16 000 Hz（宽带语音）</option>
+                    <option :value="32000">32 000 Hz</option>
+                    <option :value="44100">44 100 Hz（CD 级）</option>
+                    <option :value="48000">48 000 Hz（专业级 AAC/Opus）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>声道模式 (Channels)</label>
+                  <select v-model.number="selectedAudioChannels" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="1">单声道 (Mono · 默认)</option>
+                    <option :value="2">双声道 (Stereo)</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>音频比特率 (Bitrate)</label>
+                  <select v-model.number="selectedAudioBitrate" :disabled="startDisabled || sourceLoading" class="inp">
+                    <option :value="32">32 kbps</option>
+                    <option :value="64">64 kbps（G.711/AAC 推荐）</option>
+                    <option :value="128">128 kbps（高音质）</option>
+                  </select>
+                </div>
+                <div class="fg">
+                  <label>打包周期与采样精度</label>
+                  <select class="inp" disabled>
+                    <option>16-bit 线性量化 · 20 ms 打包</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="screenProfileValidationError" class="source-notice error">{{ screenProfileValidationError }}</div>
+            <div v-if="liveCatalog.screen_error" class="source-notice error">
+              {{ liveCatalog.screen_error }}
+              <span>请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许本应用。</span>
+            </div>
+          </div>
+
+          <div v-if="mediaMode !== 'none'" class="source-footer">
+            <div class="source-uri">
+              <span>{{ mediaMode === 'file' ? '当前文件' : '规范实时源 URI' }}</span>
+              <code>{{ sourceSummary }}</code>
+            </div>
+            <div v-if="mediaMode === 'camera' || mediaMode === 'screen'" class="source-actions">
+              <button type="button" class="file-btn compact" :disabled="startDisabled || sourceLoading" @click="refreshLiveSources()">
+                {{ sourceLoading ? '刷新中…' : '刷新设备' }}
+              </button>
+              <button type="button" class="file-btn compact primary" :disabled="!canProbeSource || probeState?.kind === 'loading'" @click="probeLiveSource">
+                {{ probeState?.kind === 'loading' ? '测试中…' : '测试采集' }}
+              </button>
+              <button type="button" class="file-btn compact" @click="refreshVideoPreview()">预览画面</button>
+            </div>
+          </div>
+          <div v-if="probeState" class="probe-result" :class="probeState.kind">{{ probeState.message }}</div>
+        </div>
+
+        <div class="action-row primary-actions">
+          <n-button type="primary" :disabled="registrationDisabled" @click="startDevice">注册上线</n-button>
+          <n-button secondary type="error" :disabled="stopDisabled" @click="stopDevice">注销</n-button>
+          <n-button tertiary :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
+          <n-button tertiary :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. 下方工作区：平台实时状态与平台命令时间线并排各占 50%，最下方放 SIP 信令追踪 -->
     <div class="workspace">
       <div class="runtime-timeline-grid">
-        <!-- 平台实时状态：占左侧 50% 宽度，与上方设备身份卡片等宽对齐 -->
+        <!-- 平台实时状态：占左侧 50% 宽度，与上方视频预览等宽对齐 -->
         <div class="glass-card panel runtime-panel">
           <div class="panel-head-tight">
             <div class="panel-title">平台实时状态</div>
@@ -1315,7 +1313,7 @@ onActivated(reconcile);
           </div>
         </div>
 
-        <!-- 平台命令时间线：占右侧 50% 宽度，与上方视频/云台卡片等宽对齐 -->
+        <!-- 平台命令时间线：占右侧 50% 宽度，与上方云台控制卡片等宽对齐 -->
         <div class="glass-card panel timeline-panel">
           <div class="panel-head-tight">
             <div class="panel-title">平台命令时间线</div>
@@ -1376,14 +1374,16 @@ onActivated(reconcile);
 .page-title { font-size: 17px; font-weight: 700; color: var(--text-primary); letter-spacing: -.2px; }
 .page-sub { font-size: 11.5px; color: var(--text-tertiary); margin-top: 2px; }
 
-/* 顶部工作台：左侧设备卡片占一半宽度，右侧视频预览与云台平分高度 */
-.device-console-grid {
+/* 1. 顶部：视频预览与云台控制左右并排各占 50% */
+.top-media-ptz-grid {
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px; align-items: stretch; margin-bottom: 10px;
 }
-.config-stack { min-width: 0; display: flex; flex-direction: column; }
+
+/* 2. 中间：设备身份与国标参数全宽区域 */
+.device-identity-section { margin-bottom: 10px; }
 .identity-panel {
-  height: 100%; box-sizing: border-box; display: flex; flex-direction: column;
+  box-sizing: border-box; display: flex; flex-direction: column;
 }
 .panel-head-tight {
   display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px;
@@ -1392,7 +1392,9 @@ onActivated(reconcile);
   font-size: 9.5px; color: var(--text-tertiary); background: rgba(255,255,255,0.5);
   padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border-default); font-weight: 600;
 }
-.identity-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 8px; }
+.identity-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 6px 10px;
+}
 .identity-grid .fg { margin-bottom: 0; }
 
 .panel {
@@ -1407,14 +1409,9 @@ onActivated(reconcile);
   opacity: .75;
 }
 
-/* 右侧容器：预览与云台垂直堆叠，平分高度 */
-.preview-ptz-stack {
-  min-width: 0; display: flex; flex-direction: column; gap: 10px; height: 100%;
-}
-
-/* 本地视频预览卡片：占右侧 50% 高度 */
+/* 本地视频预览卡片：顶部左侧 50% 宽度 */
 .preview-panel {
-  flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
+  height: 300px; min-height: 280px; box-sizing: border-box; display: flex; flex-direction: column;
 }
 .preview-head {
   display: flex; align-items: flex-start; justify-content: space-between;
@@ -1432,7 +1429,7 @@ onActivated(reconcile);
 
 /* 视频框：自适应填满容器，支持 Cover 与 Contain 切换 */
 .video-frame {
-  position: relative; flex: 1 1 0; min-height: 120px; width: 100%;
+  position: relative; flex: 1 1 0; min-height: 140px; width: 100%;
   display: flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 8px; background:
     radial-gradient(circle at 50% 35%, rgba(56,132,255,.18), transparent 32%),
     linear-gradient(145deg, #0f1b2e, #14243a 58%, #0d1727);
@@ -1469,9 +1466,9 @@ onActivated(reconcile);
 .toggle-fit-btn { background: rgba(56,132,255,0.08); border-color: rgba(56,132,255,0.2); color: var(--accent); }
 .preview-note { color: var(--text-tertiary); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 云台控制卡片：占右侧 50% 高度 */
+/* 云台控制卡片：顶部右侧 50% 宽度，与左侧视频等高 */
 .ptz-panel {
-  flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
+  height: 300px; min-height: 280px; box-sizing: border-box; display: flex; flex-direction: column;
 }
 .ptz-head {
   display: flex; align-items: baseline; justify-content: space-between;
