@@ -12,6 +12,7 @@ mod headers;
 mod parse;
 
 pub use headers::Headers;
+pub use parse::{parse_incremental, ParseOutcome, MAX_HEAD_LEN};
 
 /// SIP 请求方法(GB28181 子集)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,14 @@ pub enum Method {
     Notify,
     /// 会话内控制(回放倍速/暂停/恢复,承载 MANSRTSP 体)。
     Info,
+    /// 可靠临时响应确认(RFC 3262)。设备侧不主动使用,但需能识别以回 405 而非静默丢弃。
+    Prack,
+    /// 会话中更新(RFC 3311)。同上。
+    Update,
+    /// 呼叫转移(RFC 3515)。同上。
+    Refer,
+    /// 事件发布(RFC 3903)。同上。
+    Publish,
 }
 
 impl Method {
@@ -52,8 +61,25 @@ impl Method {
             Method::Subscribe => "SUBSCRIBE",
             Method::Notify => "NOTIFY",
             Method::Info => "INFO",
+            Method::Prack => "PRACK",
+            Method::Update => "UPDATE",
+            Method::Refer => "REFER",
+            Method::Publish => "PUBLISH",
         }
     }
+
+    /// 设备模拟器是否实现了该方法的业务处理。false 的方法应回 405 Method Not Allowed
+    /// 并在 Allow 头里列出支持集,而不是静默丢弃(静默丢弃会让平台一直重传)。
+    pub fn is_handled(&self) -> bool {
+        !matches!(
+            self,
+            Method::Prack | Method::Update | Method::Refer | Method::Publish
+        )
+    }
+
+    /// 设备支持的方法列表,用于 405/OPTIONS 的 `Allow` 头。
+    pub const ALLOW_HEADER: &'static str =
+        "INVITE, ACK, BYE, CANCEL, OPTIONS, MESSAGE, SUBSCRIBE, NOTIFY, INFO, REGISTER";
 
     /// 从方法名解析。
     pub fn parse(s: &str) -> Result<Self> {
@@ -68,6 +94,10 @@ impl Method {
             "SUBSCRIBE" => Method::Subscribe,
             "NOTIFY" => Method::Notify,
             "INFO" => Method::Info,
+            "PRACK" => Method::Prack,
+            "UPDATE" => Method::Update,
+            "REFER" => Method::Refer,
+            "PUBLISH" => Method::Publish,
             other => return Err(Error::Sip(format!("不支持的 SIP 方法: {other}"))),
         })
     }
@@ -168,10 +198,22 @@ mod tests {
             Method::Subscribe,
             Method::Notify,
             Method::Info,
+            Method::Prack,
+            Method::Update,
+            Method::Refer,
+            Method::Publish,
         ] {
             assert_eq!(Method::parse(m.as_str()).unwrap(), m);
         }
-        assert!(Method::parse("PUBLISH").is_err());
+        assert!(Method::parse("NOTAMETHOD").is_err());
+    }
+
+    #[test]
+    fn 未实现的方法应走_405_而非静默丢弃() {
+        assert!(Method::Invite.is_handled());
+        assert!(!Method::Prack.is_handled());
+        assert!(!Method::Publish.is_handled());
+        assert!(Method::ALLOW_HEADER.contains("INVITE"));
     }
 
     #[test]

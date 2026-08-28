@@ -223,9 +223,6 @@ onActivated(refresh);
 
 <style scoped>
 .page { max-width: 1200px; }
-.page-header { margin-bottom: 10px; }
-.page-title { font-size: 17px; font-weight: 700; color: var(--text-primary); }
-.page-sub { font-size: 11.5px; color: var(--text-tertiary); margin-top: 2px; }
 .panel { padding: 12px 14px; border-radius: var(--radius-md); }
 .label { color: var(--text-secondary); font-size: 11.5px; }
 .empty { color: var(--text-tertiary); font-size: 11.5px; margin-top: 8px; text-align: center; padding: 14px; }

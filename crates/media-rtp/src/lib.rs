@@ -14,8 +14,8 @@ pub mod rtp;
 pub mod source;
 
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};
-pub use pusher::{push_stream, push_stream_controlled, PlaybackControl};
-pub use rtp::{build_rtcp_sr, RtpSender, SendStats, CLOCK_HZ, PT_PS};
+pub use pusher::{push_stream, push_stream_controlled, push_stream_prepared, PlaybackControl};
+pub use rtp::{build_rtcp_sr, PreparedMedia, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
     list_live_sources, prepare_video_source, FileSource, Frame, LightSource, LiveAudioCodec,
     LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource, LiveSourceCatalog, LiveSourceSpec,

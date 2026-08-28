@@ -3,6 +3,8 @@
 //! 按 docs/20-architecture/api-contract.md 注册 IPC 命令。
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
+mod secrets;
+
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -11,7 +13,7 @@ use std::sync::{
 use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use serde::{Deserialize, Serialize};
-use sip_core::UdpTransport;
+use sip_core::{SipTransport, TcpTransport, UdpTransport};
 use stress_engine::{Metrics, Orchestrator};
 use tauri::{AppHandle, Emitter, Manager}; // Tauri 2 emit/state 需要对应 trait
 use tokio::sync::{broadcast, Mutex};
@@ -28,6 +30,11 @@ struct AppState {
     last_metrics: Mutex<Option<stress_engine::MetricsSnapshot>>,
     /// 最近一次启动使用的脱敏场景 TOML 与设备数（报告导出用）。
     last_scenario: Mutex<Option<(String, usize)>>,
+    /// 最近一次压测的时序指标 JSONL 文件路径。
+    ///
+    /// 之前时序只活在前端图表内存里,且只保留 60 个点 —— 跑 10 分钟只剩最后一分钟,
+    /// 报告里连时序都没有。现在引擎每秒追加一行,导出报告时一并打包。
+    last_series: Mutex<Option<std::path::PathBuf>>,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
 }
@@ -43,7 +50,7 @@ struct StressHandle {
 /// 单设备运行句柄。
 struct DeviceHandle {
     sim: Arc<DeviceSimulator>,
-    transport: Arc<UdpTransport>,
+    transport: Arc<dyn SipTransport>,
     local_host: String,
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
@@ -57,6 +64,7 @@ impl AppState {
             metrics: Mutex::new(None),
             last_metrics: Mutex::new(None),
             last_scenario: Mutex::new(None),
+            last_series: Mutex::new(None),
             device: Mutex::new(None),
         }
     }
@@ -70,13 +78,15 @@ struct StateEmitter {
 impl DeviceObserver for StateEmitter {
     fn on_event(&self, event: DeviceEvent) {
         let state = match event {
-            DeviceEvent::RegisterAttempt => "Registering",
-            DeviceEvent::RegisterSuccess => "Registered",
+            DeviceEvent::RegisterAttempt { .. } => "Registering",
+            DeviceEvent::RegisterSuccess { .. } => "Registered",
             DeviceEvent::RegisterFailure(_) => "Failed",
             DeviceEvent::StreamStart => "InCall",
             DeviceEvent::StreamStop => "Registered",
-            // 心跳事件不改变状态灯。
-            DeviceEvent::HeartbeatOk | DeviceEvent::HeartbeatFail => return,
+            // 心跳与在线翻转不改变状态灯(状态灯由注册/推流事件驱动)。
+            DeviceEvent::HeartbeatOk { .. }
+            | DeviceEvent::HeartbeatFail
+            | DeviceEvent::OnlineChanged { .. } => return,
             // 云台控制:单独推 ptz_action 事件给前端做云台动画。
             DeviceEvent::Ptz {
                 up,
@@ -243,6 +253,55 @@ async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
     })
 }
 
+/// 压测产物目录:优先 app 数据目录,回退系统临时目录。
+///
+/// 之前报告写在 `std::env::temp_dir()`,可能被 OS 清理 —— 压测报告不该是易失的。
+fn reports_dir(app: &AppHandle) -> std::path::PathBuf {
+    let base = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    base.join("uvp-reports")
+}
+
+/// 追加一行时序指标(JSONL)。失败只告警:时序缺一行不该影响压测本身。
+fn append_series_line(path: &std::path::Path, snapshot: &stress_engine::MetricsSnapshot) {
+    use std::io::Write;
+    let line = match serde_json::to_string(&serde_json::json!({
+        "ts_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        "metrics": snapshot,
+    })) {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::warn!(%error, "时序指标序列化失败");
+            return;
+        }
+    };
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(error) = result {
+        tracing::warn!(%error, path = %path.display(), "时序指标写入失败");
+    }
+}
+
+/// 读取时序 JSONL 为数组(导出报告用)。
+fn read_series(path: &std::path::Path) -> Vec<serde_json::Value> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// 报告中保留可复现场景,但基于解析后的结构体覆盖密码后再序列化，
 /// 避免 quoted key、多行字符串等 TOML 语法绕过文本脱敏。
 fn serialize_redacted_scenario(mut scenario: scenario::LinearScenario) -> Result<String, String> {
@@ -250,12 +309,14 @@ fn serialize_redacted_scenario(mut scenario: scenario::LinearScenario) -> Result
     toml::to_string(&scenario).map_err(|e| format!("脱敏场景序列化失败: {e}"))
 }
 
-/// 启动压测。`toml` 为场景内容，`count` 为设备数。
+/// 启动压测。`toml` 为场景内容,`count` 为设备数。
+/// `profile_id` 用于从 OS 钥匙串取 SIP 密码——前端不再把密码拼进 TOML。
 /// 成功后每秒向前端发送带 `run_id` 的 `metrics_tick` 事件。
 #[tauri::command]
 async fn start_stress(
     toml: String,
     count: usize,
+    profile_id: String,
     position_interval: u64,
     alarm_interval: u64,
     state: tauri::State<'_, AppState>,
@@ -265,7 +326,9 @@ async fn start_stress(
         return Err("主动上报间隔不能超过 86400 秒".into());
     }
 
-    let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
+    let mut sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
+    // 密码只在 Rust 侧存在:场景 TOML 里的字段被钥匙串取值覆盖。
+    sc.password = secrets::get(&profile_id)?;
     let redacted_scenario = serialize_redacted_scenario(sc.clone())?;
     let orch = Orchestrator::new(&sc, count).map_err(|e| e.to_string())?;
 
@@ -291,6 +354,23 @@ async fn start_stress(
     *state.last_metrics.lock().await = None;
     *state.last_scenario.lock().await = Some((redacted_scenario, count));
 
+    // 时序指标落盘:每秒一行 JSONL,导出报告时一并打包。
+    let series_path = {
+        let dir = reports_dir(&app);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir.join(format!("series-run{run_id}-{ts}.jsonl"))),
+            Err(error) => {
+                tracing::warn!(%error, "创建报告目录失败,本轮不落时序");
+                None
+            }
+        }
+    };
+    *state.last_series.lock().await = series_path.clone();
+
     // 先发布运行事件再启动后台任务，避免初始化瞬时失败时“最终事件”被旧启动事件覆盖。
     let _ = app.emit(
         "stress_state",
@@ -305,7 +385,9 @@ async fn start_stress(
 
     // 每秒推送带运行 ID 的指标快照，前端据此隔离迟到事件。
     let app_for_tick = app.clone();
-    let metrics_for_tick = Arc::clone(&metrics);
+    let orch = Arc::new(orch);
+    let orch_for_tick = Arc::clone(&orch);
+    let series_for_tick = series_path.clone();
     tokio::spawn(async move {
         let mut tick_stop = tick_stop;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -314,11 +396,21 @@ async fn start_stress(
             tokio::select! {
                 _ = tick_stop.recv() => break,
                 _ = interval.tick() => {
+                    // 快照带上传输层统计,前端据此判断"结论是否可信"。
+                    let snapshot = orch_for_tick.snapshot();
+                    if let Some(path) = series_for_tick.clone() {
+                        let snap = snapshot.clone();
+                        // 文件 IO 放 blocking 池,不占 runtime 工作线程。
+                        let _ = tokio::task::spawn_blocking(move || {
+                            append_series_line(&path, &snap);
+                        })
+                        .await;
+                    }
                     let _ = app_for_tick.emit(
                         "metrics_tick",
                         serde_json::json!({
                             "run_id": run_id,
-                            "metrics": metrics_for_tick.snapshot(),
+                            "metrics": snapshot,
                         }),
                     );
                 }
@@ -328,10 +420,11 @@ async fn start_stress(
 
     // 压测任务结束后保存最终快照并回收槽位；停止请求不会提前释放运行权。
     let app_for_run = app.clone();
-    let metrics_for_run = Arc::clone(&metrics);
+    let orch_for_run = Arc::clone(&orch);
     let tx_for_run = tx.clone();
+    let series_for_run = series_path.clone();
     tokio::spawn(async move {
-        let result = orch
+        let result = orch_for_run
             .run_with_stop_receiver(
                 tx_for_run.clone(),
                 run_stop,
@@ -343,7 +436,12 @@ async fn start_stress(
         let _ = tx_for_run.send(());
 
         let state = app_for_run.state::<AppState>();
-        let final_metrics = metrics_for_run.snapshot();
+        let final_metrics = orch_for_run.snapshot();
+        // 收尾再写一行,保证时序覆盖到最后一刻。
+        if let Some(path) = series_for_run.clone() {
+            let snap = final_metrics.clone();
+            let _ = tokio::task::spawn_blocking(move || append_series_line(&path, &snap)).await;
+        }
         let mut current = state.stress.lock().await;
         let owns_state = current
             .as_ref()
@@ -468,7 +566,10 @@ async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_js
 /// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
 /// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
 #[tauri::command]
-async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn export_report(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
     // 与启动/完成提交共用生命周期锁，避免混合读取不同 run 的场景和指标。
     let _stress_guard = state.stress.lock().await;
     // 优先取运行中指标,否则取最近一次压测保留的快照。
@@ -480,24 +581,36 @@ async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, Stri
         },
     };
     let scenario = state.last_scenario.lock().await.clone();
+    let series_path = state.last_series.lock().await.clone();
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let dir = reports_dir(&app);
 
-    let report = serde_json::json!({
-        "generated_at_epoch_secs": ts,
-        "scenario_toml_redacted": scenario.as_ref().map(|(t, _)| t),
-        "device_count": scenario.as_ref().map(|(_, c)| c),
-        "metrics": snap,
-    });
-
-    let dir = std::env::temp_dir().join("uvp-reports");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建报告目录失败: {e}"))?;
-    let path = dir.join(format!("report-{ts}.json"));
-    let content = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    std::fs::write(&path, content).map_err(|e| format!("写报告失败: {e}"))?;
+    // 文件 IO 全部放 blocking 池:之前在持有生命周期锁时做同步 IO,
+    // 既阻塞 runtime 工作线程,也把压测启停一起卡住。
+    let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+        let series = series_path.as_deref().map(read_series).unwrap_or_default();
+        let report = serde_json::json!({
+            "generated_at_epoch_secs": ts,
+            "scenario_toml_redacted": scenario.as_ref().map(|(t, _)| t),
+            "device_count": scenario.as_ref().map(|(_, c)| c),
+            "metrics": snap,
+            // 时序指标(每秒一个采样点),不再只有最终快照。
+            "series_sample_count": series.len(),
+            "series": series,
+            "series_file": series_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        });
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建报告目录失败: {e}"))?;
+        let path = dir.join(format!("report-{ts}.json"));
+        let content = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+        std::fs::write(&path, content).map_err(|e| format!("写报告失败: {e}"))?;
+        Ok(path)
+    })
+    .await
+    .map_err(|e| format!("导出任务异常: {e}"))??;
 
     Ok(path.to_string_lossy().to_string())
 }
@@ -642,13 +755,17 @@ async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
 }
 
 /// 前端传入的单设备配置。
+///
+/// 注意:**没有 password 字段**。前端只给 `profile_id`,密码由 Rust 侧从 OS 钥匙串取,
+/// 避免明文经 IPC 往返、也避免落 localStorage。
 #[derive(Deserialize)]
 struct DeviceCfg {
+    /// 平台档案标识,用于从钥匙串取 SIP 密码。
+    profile_id: String,
     server_host: String,
     server_port: u16,
     server_domain: String,
     device_id: String,
-    password: String,
     #[serde(default)]
     transport: String, // "UDP" / "TCP"
     #[serde(default)]
@@ -663,6 +780,22 @@ struct DeviceCfg {
     /// 信令字符集编码(GB18030/UTF-8);空则默认 GB18030。
     #[serde(default)]
     signaling_encoding: String,
+    /// 心跳间隔(秒);缺省 60。
+    #[serde(default)]
+    heartbeat_interval: Option<u64>,
+    /// 注册有效期(秒);缺省 3600。平台可授予更短时长,续约以平台值为准。
+    #[serde(default)]
+    expires: Option<u32>,
+    /// 设备厂商 / 型号 / 固件版本(DeviceInfo 应答字段)。之前前端填了但后端写死。
+    #[serde(default)]
+    manufacturer: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    firmware: Option<String>,
+    /// 输出帧率(1–120);缺省 25。对文件源与实时采集都生效。
+    #[serde(default)]
+    video_fps: Option<u32>,
 }
 
 /// 通过"向平台发起 UDP connect"发现本机对外 IP(不真正发包)。
@@ -673,6 +806,11 @@ fn discover_local_ip(server: &str) -> String {
             Ok(s.local_addr()?.ip().to_string())
         })
         .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// 去掉空白后仍非空则返回,否则 None(用于"前端留空则用默认值")。
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
 }
 
 /// 启动一台设备:注册 + 心跳 + 入站应答,后台常驻。状态经 `device_state` 事件推送。
@@ -687,9 +825,6 @@ async fn start_device(
         return Err("已有设备在运行,请先停止".into());
     }
 
-    if config.transport.eq_ignore_ascii_case("TCP") {
-        return Err("当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into());
-    }
     if config.server_port == 0
         || format!("{}:{}", config.server_host, config.server_port)
             .parse::<std::net::SocketAddr>()
@@ -697,9 +832,8 @@ async fn start_device(
     {
         return Err("平台地址必须是有效的 IP:端口（当前不支持域名）".into());
     }
-    if config.password.is_empty() {
-        return Err("SIP 认证密码不能为空".into());
-    }
+    // 密码从钥匙串取:未配置时给出明确的引导而不是「密码不能为空」。
+    let password = secrets::get(&config.profile_id)?;
     if let Some(source) = config.video_source.take() {
         let source = source.trim().to_string();
         if source.is_empty() {
@@ -787,6 +921,12 @@ async fn start_device(
         }
     }
 
+    // 输出帧率:前端可选 15/25/30/60,这里仍按 1–120 兜底校验(IPC 入参不可信)。
+    let video_fps = config.video_fps.unwrap_or(25);
+    if !(1..=120).contains(&video_fps) {
+        return Err("输出帧率必须在 1–120 之间".into());
+    }
+
     let device_id = DeviceId::new(config.device_id.clone()).map_err(|e| e.to_string())?;
     // 通道 ID:设备 ID 前 17 位 + 132(视频通道类型码)。
     let channel_id_str = format!("{}132", &config.device_id[..17]);
@@ -796,7 +936,12 @@ async fn start_device(
     } else {
         GbVersion::V2022
     };
-    let transport = Transport::Udp;
+    // 传输由用户选择;Via 里的标识由传输对象自己给出,不会与实际发送通道不一致。
+    let transport = if config.transport.eq_ignore_ascii_case("TCP") {
+        Transport::Tcp
+    } else {
+        Transport::Udp
+    };
     let channel_name = if config.channel_name.is_empty() {
         "Camera-1".to_string()
     } else {
@@ -806,25 +951,38 @@ async fn start_device(
     let cfg = DeviceConfig {
         device_id: device_id.clone(),
         username: config.device_id.clone(),
-        password: config.password.clone(),
+        password,
         server_host: config.server_host.clone(),
         server_port: config.server_port,
         server_domain: config.server_domain.clone(),
         transport,
-        heartbeat_interval_secs: 60,
+        heartbeat_interval_secs: config.heartbeat_interval.unwrap_or(60).max(1),
+        register_expires_secs: config.expires.unwrap_or(3600).max(1),
+        // §9.1.1 c):注册重试间隔不应短于 60s(单设备联调遵守标准)。
+        register_retry_max_secs: gb28181_simulator::DEFAULT_REGISTER_RETRY_MAX_SECS,
         channels: vec![ChannelConfig {
             channel_id,
             name: channel_name,
             status: "ON".into(),
         }],
         device_info: DeviceInfo {
-            device_name: "UVP-Sim-Desktop".into(),
-            manufacturer: "UVP".into(),
-            model: "Desktop-Sim".into(),
-            firmware: "0.1.0".into(),
+            device_name: if config.channel_name.is_empty() {
+                "UVP-Sim-Desktop".to_string()
+            } else {
+                config.channel_name.clone()
+            },
+            manufacturer: non_empty(config.manufacturer.as_deref())
+                .unwrap_or("UVP")
+                .into(),
+            model: non_empty(config.model.as_deref())
+                .unwrap_or("Desktop-Sim")
+                .into(),
+            firmware: non_empty(config.firmware.as_deref())
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .into(),
         },
         video_source: config.video_source.clone(),
-        video_fps: 25,
+        video_fps,
         light_bitrate_kbps: None,
         gb_version,
         signaling_encoding: common::SignalingEncoding::from_str_lenient(&config.signaling_encoding),
@@ -847,10 +1005,20 @@ async fn start_device(
         }
     }
 
-    // 共享 UDP 传输 + 本端地址发现。
-    let udp = UdpTransport::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| e.to_string())?;
+    // 共享传输 + 本端地址发现。
+    let udp: Arc<dyn SipTransport> = match transport {
+        Transport::Udp => UdpTransport::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| e.to_string())?,
+        Transport::Tcp => TcpTransport::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+    // 只接受来自该平台的入站报文:不设限时任何主机都能注入 PTZ/DeviceConfig/INVITE,
+    // 而 INVITE 的 c=/m= 决定推流目标 —— 那是可被利用的媒体流量放大。
+    if !udp.trust_only_host(&config.server_host) {
+        tracing::warn!(host = %config.server_host, "平台地址不是字面 IP,来源白名单未启用");
+    }
     let local_port = udp.local_addr().map_err(|e| e.to_string())?.port();
     let local_host = discover_local_ip(&format!("{}:{}", config.server_host, config.server_port));
 
@@ -997,15 +1165,63 @@ fn default_on() -> String {
     "ON".into()
 }
 
-fn node_type_from_str(s: &str) -> gb28181_protocol::id_codec::CatalogNodeType {
+/// 解析节点类型。**未知值报错而不是静默落到 VideoChannel** —— 静默兜底会让
+/// 前端拼错的类型带着错误的 Parental 值被 NOTIFY 给平台。
+fn node_type_from_str(s: &str) -> Result<gb28181_protocol::id_codec::CatalogNodeType, String> {
     use gb28181_protocol::id_codec::CatalogNodeType::*;
-    match s {
+    Ok(match s {
         "BusinessGroup" => BusinessGroup,
         "VirtualOrg" => VirtualOrg,
         "AlarmChannel" => AlarmChannel,
         "Device" => Device,
-        _ => VideoChannel,
+        "VideoChannel" => VideoChannel,
+        other => return Err(format!("未知的目录节点类型: {other}")),
+    })
+}
+
+/// 校验目录节点:ID 必须是合法国标编号,类型必须已知,状态只能 ON/OFF。
+///
+/// 之前 `id`/`parent_id` 是裸 String、完全不过 `DeviceId::new`,非法编号会直接
+/// 进目录树并被 Catalog NOTIFY 发给平台。
+fn validate_channel_node(
+    dto: ChannelNodeDto,
+) -> Result<gb28181_protocol::id_codec::CatalogNode, String> {
+    let id = DeviceId::new(dto.id.trim().to_string()).map_err(|e| format!("通道 ID 非法: {e}"))?;
+    let parent = dto.parent_id.trim();
+    if parent.is_empty() {
+        return Err("父节点 ID 不能为空".into());
     }
+    DeviceId::new(parent.to_string()).map_err(|e| format!("父节点 ID 非法: {e}"))?;
+    let node_type = node_type_from_str(dto.node_type.trim())?;
+    let name = dto.name.trim();
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err("通道名称长度必须在 1..=64 个字符之间".into());
+    }
+    let status = dto.status.trim().to_uppercase();
+    if status != "ON" && status != "OFF" {
+        return Err("通道状态只能是 ON 或 OFF".into());
+    }
+    if let Some(code) = dto.civil_code.as_deref() {
+        let code = code.trim();
+        let looks_valid =
+            code.is_empty() || (code.len() <= 8 && code.bytes().all(|b| b.is_ascii_digit()));
+        if !looks_valid {
+            return Err("行政区划编码必须是 1..=8 位数字".into());
+        }
+    }
+
+    let mut node = gb28181_protocol::id_codec::CatalogNode::new(
+        id.as_str().to_string(),
+        node_type,
+        name.to_string(),
+        parent.to_string(),
+    );
+    node.civil_code = dto
+        .civil_code
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    node.status = status;
+    Ok(node)
 }
 
 fn node_type_to_str(t: gb28181_protocol::id_codec::CatalogNodeType) -> &'static str {
@@ -1032,26 +1248,19 @@ impl From<&gb28181_protocol::id_codec::CatalogNode> for ChannelNodeDto {
     }
 }
 
-impl From<ChannelNodeDto> for gb28181_protocol::id_codec::CatalogNode {
-    fn from(d: ChannelNodeDto) -> Self {
-        let mut node = gb28181_protocol::id_codec::CatalogNode::new(
-            d.id,
-            node_type_from_str(&d.node_type),
-            d.name,
-            d.parent_id,
-        );
-        node.civil_code = d.civil_code;
-        node.status = d.status;
-        node
-    }
-}
-
 /// 载入内置目录模板(single/nvr-8ch/civil-3x2/large-16ch),返回加载后的节点列表(FR-34)。
 #[tauri::command]
 async fn load_catalog_template(
     template: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ChannelNodeDto>, String> {
+    const TEMPLATES: [&str; 4] = ["single", "nvr-8ch", "civil-3x2", "large-16ch"];
+    if !TEMPLATES.contains(&template.as_str()) {
+        return Err(format!(
+            "未知的目录模板 {template},可选:{}",
+            TEMPLATES.join(" / ")
+        ));
+    }
     let guard = state.device.lock().await;
     let h = guard.as_ref().ok_or("设备未启动,请先在单设备页启动设备")?;
     h.sim.load_catalog_template(&template);
@@ -1076,9 +1285,10 @@ async fn upsert_channel(
     node: ChannelNodeDto,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    let node = validate_channel_node(node)?;
     let guard = state.device.lock().await;
     let h = guard.as_ref().ok_or("设备未启动")?;
-    let added = h.sim.upsert_channel(node.into());
+    let added = h.sim.upsert_channel(node);
     spawn_catalog_notify(h);
     Ok(if added {
         "已新增通道".into()
@@ -1146,6 +1356,21 @@ fn get_recent_logs(max: Option<usize>) -> Vec<common::logging::LogLine> {
     common::logging::recent(max.unwrap_or(500))
 }
 
+/// 允许 webview 通过 asset 协议读取用户刚刚**主动选中**的媒体文件。
+///
+/// assetProtocol.scope 已收窄到视频目录与应用自有临时目录;用户从任意路径选的文件
+/// 由这里在运行时逐个放行,而不是把整个文档/桌面/下载目录常开。
+#[tauri::command]
+fn allow_media_preview(path: String, app: AppHandle) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.is_file() {
+        return Err("路径不是一个文件".into());
+    }
+    app.asset_protocol_scope()
+        .allow_file(&p)
+        .map_err(|e| format!("放行媒体预览失败: {e}"))
+}
+
 // ── 应用入口 ──────────────────────────────────────────────
 
 /// 初始化日志、注册命令、启动 Tauri 事件循环。
@@ -1155,10 +1380,47 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .setup(|app| {
-            // 注册实时日志回调:每条日志发 `log_line` 事件给前端日志页。
+            // 实时日志推送:**批量聚合**后再过 IPC。
+            //
+            // 之前是每条日志一个 `log_line` 事件。压测时 10k 设备的 info 日志轻易到
+            // 每秒数千条,每条都要 JSON 序列化 + 跨进程送进 webview——前端裁到 3000 条
+            // 是在代价已经付完之后。现在每 100ms 合并成一个 `log_batch` 事件,
+            // 上限 10 个事件/秒,并统计因队列满被丢弃的条数。
             let handle = app.handle().clone();
+            let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<common::logging::LogLine>(4096);
+            let dropped = Arc::new(AtomicU64::new(0));
+            let dropped_producer = Arc::clone(&dropped);
             common::logging::set_callback(move |line| {
-                let _ = handle.emit("log_line", line);
+                if log_tx.try_send(line.clone()).is_err() {
+                    dropped_producer.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            tauri::async_runtime::spawn(async move {
+                const FLUSH_MS: u64 = 100;
+                const MAX_PER_BATCH: usize = 500;
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(FLUSH_MS));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut batch: Vec<common::logging::LogLine> = Vec::with_capacity(MAX_PER_BATCH);
+                loop {
+                    ticker.tick().await;
+                    batch.clear();
+                    while batch.len() < MAX_PER_BATCH {
+                        match log_rx.try_recv() {
+                            Ok(line) => batch.push(line),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            // 发送端随回调常驻,不会真的断开;断了就退出任务。
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let dropped_now = dropped.swap(0, Ordering::Relaxed);
+                    let _ = handle.emit(
+                        "log_batch",
+                        serde_json::json!({ "lines": &batch, "dropped": dropped_now }),
+                    );
+                }
             });
             Ok(())
         })
@@ -1185,6 +1447,10 @@ pub fn run() {
             set_log_level,
             get_log_level,
             get_recent_logs,
+            allow_media_preview,
+            secrets::save_platform_secret,
+            secrets::delete_platform_secret,
+            secrets::platform_secret_status,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

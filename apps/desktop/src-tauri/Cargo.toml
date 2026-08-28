@@ -31,3 +31,17 @@ toml = "=0.8.2"
 tokio.workspace = true
 tracing.workspace = true
 tauri-plugin-dialog = "=2.7.1"
+
+# 平台凭据存 OS 钥匙串(macOS Keychain / Windows Credential Manager / libsecret),
+# 不再明文落 localStorage。按平台启用原生后端,避免引入不必要的 dbus/openssl 依赖。
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = [
+    "sync-secret-service",
+    "crypto-rust",
+] }

@@ -27,11 +27,8 @@
         "enable": true,
         "scope": [
           "$VIDEO/**",
-          "$DOWNLOAD/**",
-          "$DESKTOP/**",
-          "$DOCUMENT/**",
-          "$TEMP/**",
-          "/tmp/**"
+          "$TEMP/uvp-gb28181/**",
+          "$APPDATA/media/**"
         ]
       }
     }

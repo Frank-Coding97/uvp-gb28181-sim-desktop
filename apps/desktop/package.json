@@ -6,9 +6,11 @@
   "description": "UVP GB28181 桌面端模拟器 + 压力测试工具",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "vue-tsc --noEmit && vitest run && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
@@ -24,8 +26,11 @@
     "@tauri-apps/cli": "2.11.4",
     "@types/three": "0.185.1",
     "@vitejs/plugin-vue": "6.0.8",
+    "@vue/test-utils": "^2.5.0",
+    "jsdom": "^26.1.0",
     "typescript": "5.9.3",
     "vite": "8.1.5",
+    "vitest": "^3.2.7",
     "vue-tsc": "3.3.8"
   }
 }

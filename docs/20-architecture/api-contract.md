@@ -21,11 +21,15 @@
 |---|---|---|---|---|
 | `engine_version` | — | `string` | 引擎版本自检 | M0 ✅ |
 | `validate_scenario` | `{ toml: string }` | `ScenarioSummary` | 校验并预览场景 | ✅ |
-| `start_stress` | `{ toml, count, position_interval, alarm_interval }` | `string` | 启动压测;position/alarm_interval>0 时批量周期主动上报定位/报警(0=关) | ✅ |
+| `start_stress` | `{ toml, count, profile_id, position_interval, alarm_interval }` | `string` | 启动压测。**TOML 里不含密码**,由 `profile_id` 从钥匙串取;position/alarm_interval>0 时批量周期主动上报定位/报警(0=关) | ✅ |
 | `stop_stress` | — | `string` | 停止当前压测(无入参,返回提示文案) | ✅ |
 | `get_metrics` | — | `string`(JSON) | 按需查询当前 `MetricsSnapshot`(实时更新走 `metrics_tick` 事件) | ✅ |
 | `get_stress_status` | — | `{ running: bool, device_count: number }` | 查压测运行态(页面切换后与引擎对账,防组件重建丢状态) | ✅ |
-| `export_report` | — | `string`(文件路径) | 导出报告:把场景 TOML + 设备数 + 最终快照写成 JSON 到系统临时目录,返回路径 | ✅ |
+| `export_report` | — | `string`(文件路径) | 导出报告:脱敏场景 TOML + 设备数 + 最终快照 + **全量时序** 写成 JSON 到 app 数据目录,返回路径 | ✅ |
+| `save_platform_secret` | `{ profileId, password }` | `{ backend, message }` | 把平台密码写入 OS 钥匙串(见 `SECURITY.md`) | ✅ |
+| `delete_platform_secret` | `{ profileId }` | — | 删除钥匙串条目 | ✅ |
+| `platform_secret_status` | `{ profileIds: string[] }` | `Record<string, boolean>` | 批量查询哪些档案已配置密码(**不返回明文**) | ✅ |
+| `allow_media_preview` | `{ path }` | — | 运行时放行用户选中的媒体文件给 webview 预览(asset scope 已收窄) | ✅ |
 | `get_run_status`(规划,未实现) | `{ run_id: string }` | `RunStatus` | 查询某次运行状态 | ⬜ |
 | `list_runs`(规划,未实现) | — | `RunSummary[]` | 历史运行列表 | ⬜ |
 | `save_scenario`(规划,未实现) | `{ name: string, toml: string }` | `{ id: string }` | 保存场景 | ⬜ |
@@ -35,7 +39,7 @@
 
 | 命令 | 入参 | 返回 | 说明 | 里程碑 |
 |---|---|---|---|---|
-| `start_device` | `{ config: DeviceCfg }` | `string` | 启动一台设备(注册+心跳+应答+入站),后台常驻 | ✅ |
+| `start_device` | `{ config: DeviceCfg }` | `string` | 启动一台设备(注册+心跳+应答+入站),后台常驻。`DeviceCfg` **无 password 字段**,只带 `profile_id`;`transport` 支持 UDP / TCP | ✅ |
 | `stop_device` | — | `string` | 停止当前设备 | ✅ |
 | `get_device_status` | — | `{ running: bool }` | 查设备运行态(页面切换后与引擎对账) | ✅ |
 | `fire_alarm` | `{ description: string }` | `string` | 主动上报一条报警 | ✅ |
@@ -60,6 +64,7 @@
 | `sip_trace` | `SipTraceEntry` | 可开关 | 结构化 SIP 报文(大规模默认关) |
 | `ptz_action` | `{ up, down, left, right, zoom_in, zoom_out, pan_speed, tilt_speed, zoom_speed }` | PTZ 控制到达时 | 前端云台动画 |
 | `ptz_preset` | 预置位号(number) | 预置位调用时 | 前端预置位调用演示 |
+| `log_batch` | `{ lines: LogLine[], dropped: number }` | 每 100ms(有日志时) | 日志页。**批量聚合**,取代原来每条一个 `log_line` 事件 |
 | `run_state`(规划,未实现) | `{ run_id, state }` | — | 压测生命周期(当前未发出) |
 | `engine_log`(规划,未实现) | `LogEntry` | — | 引擎日志转发(当前未发出) |
 

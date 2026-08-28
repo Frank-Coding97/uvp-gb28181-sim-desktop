@@ -5,8 +5,24 @@ use std::sync::Arc;
 use common::Result;
 use gb28181_simulator::DeviceSimulator;
 use scenario::Scenario;
+use sip_core::SipTransport;
 
 use crate::metrics::Metrics;
+
+/// 每个共享 UDP socket 承载的设备数上限。
+///
+/// 为什么要分片:原来 10k 设备全挤在**一个** socket + **一个**接收循环上,
+/// 注册风暴时内核接收缓冲一溢出就丢包,而丢包会被上层统计成"事务超时",
+/// 于是本机瓶颈被误读成平台过载 —— 压测结论直接失真。
+/// 分片同时把接收循环并行化,也更接近"很多台设备各有自己五元组"的真实拓扑。
+const DEVICES_PER_SOCKET: usize = 64;
+
+/// 一个传输分片:共享 socket + 本端地址。
+struct TransportShard {
+    transport: Arc<dyn SipTransport>,
+    local_host: String,
+    local_port: u16,
+}
 
 /// 压测编排器:持有场景、批量设备、共享指标。
 pub struct Orchestrator {
@@ -18,6 +34,10 @@ pub struct Orchestrator {
     /// 用于探测本机对平台可达地址的目标端点。
     server_host: String,
     server_port: u16,
+    /// 信令传输方式(UDP / TCP)。决定建哪种共享传输,并据此填 Via。
+    transport_kind: common::Transport,
+    /// 运行中的传输分片统计句柄(供快照聚合本地压力指标)。
+    transport_stats: parking_lot::Mutex<Vec<Arc<sip_core::TransportStats>>>,
 }
 
 impl Orchestrator {
@@ -40,6 +60,7 @@ impl Orchestrator {
             .ok_or_else(|| common::Error::Config("场景未生成任何设备".into()))?;
         let server_host = first.server_host.clone();
         let server_port = first.server_port;
+        let transport_kind = first.transport;
         let ramp_per_second = scenario.ramp_per_second();
         let metrics = Arc::new(Metrics::default());
         let devices: Vec<Arc<DeviceSimulator>> = configs
@@ -60,7 +81,42 @@ impl Orchestrator {
             ramp_per_second,
             server_host,
             server_port,
+            transport_kind,
+            transport_stats: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// 聚合全部传输分片的统计。
+    pub fn transport_stats(&self) -> sip_core::TransportStatsSnapshot {
+        let guard = self.transport_stats.lock();
+        let mut total = sip_core::TransportStatsSnapshot {
+            received: 0,
+            parse_errors: 0,
+            rejected_source: 0,
+            dropped_queue_full: 0,
+            unrouted: 0,
+            sent: 0,
+            send_errors: 0,
+            oversized_sent: 0,
+        };
+        for stats in guard.iter() {
+            let s = stats.snapshot();
+            total.received += s.received;
+            total.parse_errors += s.parse_errors;
+            total.rejected_source += s.rejected_source;
+            total.dropped_queue_full += s.dropped_queue_full;
+            total.unrouted += s.unrouted;
+            total.sent += s.sent;
+            total.send_errors += s.send_errors;
+            total.oversized_sent += s.oversized_sent;
+        }
+        total
+    }
+
+    /// 指标快照(含传输层本地压力,用于判断结论是否可信)。
+    pub fn snapshot(&self) -> crate::metrics::MetricsSnapshot {
+        self.metrics
+            .snapshot_with_transport(Some(self.transport_stats()))
     }
 
     /// 启动所有设备的 run 任务(注册+心跳+入站应答)。
@@ -90,10 +146,6 @@ impl Orchestrator {
         position_secs: u64,
         alarm_secs: u64,
     ) -> Result<()> {
-        // 单个共享 transport(所有设备复用一个 UDP socket)。
-        let transport = sip_core::UdpTransport::bind("0.0.0.0:0").await?;
-        let local_port = transport.local_addr()?.port();
-
         // 不能把 bind 得到的 0.0.0.0 写进 Via/Contact。通过连接目标平台探测
         // 操作系统实际选择的出口地址(UDP connect 不会发送数据)。
         let probe = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -101,24 +153,80 @@ impl Orchestrator {
             .connect((self.server_host.as_str(), self.server_port))
             .await?;
         let local_host = probe.local_addr()?.ip().to_string();
-        tracing::info!(%local_host, local_port, "共享 SIP 传输已绑定");
 
-        // 爬坡:每拉起 ramp_per_second 台后等 1 秒,避免瞬时注册风暴(FR-21)。
-        // ramp=0 表示一次性全拉起。
+        // 按 DEVICES_PER_SOCKET 分片建共享传输,避免单 socket + 单接收循环成为
+        // 隐形瓶颈(见常量注释)。
+        let shard_count = self.devices.len().div_ceil(DEVICES_PER_SOCKET).max(1);
+        let mut shards: Vec<TransportShard> = Vec::with_capacity(shard_count);
+        let mut shard_stats = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            // 传输种类由场景决定;Via 里的标识由传输对象自己给出,不会与实际不一致。
+            let transport: Arc<dyn SipTransport> = match self.transport_kind {
+                common::Transport::Udp => sip_core::UdpTransport::bind("0.0.0.0:0").await?,
+                common::Transport::Tcp => sip_core::TcpTransport::bind("0.0.0.0:0").await?,
+            };
+            // 只接受来自上级平台的报文:不设限时任何主机都能注入 PTZ/INVITE,
+            // 而 INVITE 的 c=/m= 决定推流目标,构成媒体流量放大。
+            if !transport.trust_only_host(&self.server_host) {
+                tracing::warn!(
+                    host = %self.server_host,
+                    "平台地址不是字面 IP,无法启用来源白名单"
+                );
+            }
+            let local_port = transport.local_addr()?.port();
+            shard_stats.push(transport.stats());
+            shards.push(TransportShard {
+                transport,
+                local_host: local_host.clone(),
+                local_port,
+            });
+        }
+        // 锁只在同步区间持有:parking_lot 的 guard 不是 Send,不能跨 await。
+        {
+            let mut stats_guard = self.transport_stats.lock();
+            *stats_guard = shard_stats;
+        }
+        tracing::info!(
+            %local_host,
+            shard_count,
+            devices_per_socket = DEVICES_PER_SOCKET,
+            transport = %self.transport_kind,
+            "共享 SIP 传输已分片绑定"
+        );
+
+        // 爬坡:按 1s/ramp 的**均匀间隔**逐台发放,而不是"攒一批后突发"。
+        // 批量突发会在批内瞬时打满,既不像真实设备上线过程,也容易自己把自己打挂。
         let ramp = self.ramp_per_second;
+        let ramp_gap = (ramp > 0).then(|| {
+            std::time::Duration::from_nanos((1_000_000_000f64 / ramp as f64).max(1.0) as u64)
+        });
+        let mut next_slot = tokio::time::Instant::now();
 
         // 批量启动设备 run 任务。
         let mut handles = Vec::new();
         for (i, dev) in self.devices.iter().enumerate() {
             // 爬坡等待必须可被停止打断,否则停止后仍会继续创建新设备,且晚订阅者
             // 收不到之前已经发送过的 broadcast 信号。
-            if ramp > 0 && i > 0 && (i as u32) % ramp == 0 {
+            if let Some(gap) = ramp_gap {
+                next_slot += gap;
                 tokio::select! {
                     _ = ramp_stop.recv() => {
                         tracing::info!(started = i, "爬坡阶段收到停止信号");
                         break;
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = tokio::time::sleep_until(next_slot) => {}
+                }
+                // 每上线 ramp 台输出一次进度,便于观察"已上线/目标"。
+                if ramp > 0 && (i as u32 + 1) % ramp == 0 {
+                    tracing::info!(
+                        started = i + 1,
+                        target = self.devices.len(),
+                        online = self
+                            .metrics
+                            .devices_online
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        "爬坡进度"
+                    );
                 }
             }
             // 先为本轮所有潜在子任务预建 receiver，再检查全局停止状态：
@@ -133,12 +241,14 @@ impl Orchestrator {
                 }
             }
 
+            let shard = &shards[i / DEVICES_PER_SOCKET];
             let dev_clone = dev.clone();
-            let tp = Arc::clone(&transport);
-            let host = local_host.clone();
+            let tp = Arc::clone(&shard.transport);
+            let host = shard.local_host.clone();
+            let port = shard.local_port;
             handles.push(tokio::spawn(async move {
                 dev_clone
-                    .run(tp, host, local_port, async move {
+                    .run(tp, host, port, async move {
                         let _ = stop_rx.recv().await;
                     })
                     .await;
@@ -147,15 +257,16 @@ impl Orchestrator {
             // 主动上报施压:为该设备挂一个周期任务(定位/报警),随 stop 退出。
             if let Some(mut stop_rep) = stop_rep {
                 let dev_rep = dev.clone();
-                let tp_rep = Arc::clone(&transport);
-                let host_rep = local_host.clone();
+                let tp_rep = Arc::clone(&shard.transport);
+                let host_rep = shard.local_host.clone();
+                let port_rep = shard.local_port;
                 let metrics = Arc::clone(&self.metrics);
                 handles.push(tokio::spawn(async move {
                     Self::report_loop(
                         dev_rep,
                         tp_rep,
                         host_rep,
-                        local_port,
+                        port_rep,
                         position_secs,
                         alarm_secs,
                         metrics,
@@ -182,7 +293,7 @@ impl Orchestrator {
     #[allow(clippy::too_many_arguments)]
     async fn report_loop(
         dev: Arc<DeviceSimulator>,
-        transport: Arc<sip_core::UdpTransport>,
+        transport: Arc<dyn SipTransport>,
         local_host: String,
         local_port: u16,
         position_secs: u64,
@@ -247,6 +358,8 @@ mod tests {
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 3600, // 长心跳避免测试中发送
+            register_expires_secs: 3600,
+            register_retry_max_secs: 10,
             channels_per_device: 1,
             device_info: DeviceInfoTemplate {
                 device_name: "TestDev".into(),

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use common::{DeviceId, Error, Result, Transport};
 use gb28181_protocol::manscdp::Keepalive;
-use sip_core::{authorization, Challenge, UdpTransport};
+use sip_core::{authorization, Challenge, SipTransport};
 
 use crate::builder::{self, DialogIds};
 
@@ -31,7 +31,8 @@ fn default_presets() -> std::collections::BTreeMap<u8, String> {
 
 /// 最小 HTTP PUT 上传 JPEG(抓拍上传用)。仅支持 http://(https 需 TLS,本工具不引入重依赖)。
 ///
-/// 含基本 SSRF 防护:拒绝环回/链路本地/私网/组播地址(测试工具场景下上传目标应为受控采集服务)。
+/// 含 SSRF 防护:**先解析出真实目标 IP 再判定**,并直接连到已校验的地址,
+/// 避免"校验用域名、连接再解析一次"的 DNS rebinding 窗口。
 /// 用裸 TCP 手写请求,避免给压测链路(依赖本 crate)引入 HTTP 客户端。
 async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,7 +52,8 @@ async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
         ),
         None => (authority.to_string(), 80),
     };
-    reject_ssrf(&host)?;
+    // 解析 + 校验:得到一个确定安全的目标地址,后续只用它。
+    let target = resolve_safe_target(&host, port).await?;
 
     let req = format!(
         "PUT {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: image/jpeg\r\n\
@@ -60,7 +62,7 @@ async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
     );
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        tokio::net::TcpStream::connect((host.as_str(), port)),
+        tokio::net::TcpStream::connect(target),
     )
     .await
     .map_err(|_| Error::Gb28181("上传连接超时".into()))?
@@ -99,25 +101,83 @@ async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
     }
 }
 
-/// 拒绝 SSRF 高危目标(环回/链路本地/私网/组播/未指定)。
+/// 把 host(字面 IP 或域名)解析成**已通过 SSRF 校验**的具体地址。
+///
+/// 域名会被真正解析,其**全部**解析结果都必须安全——只要有一条指向内网就整体拒绝,
+/// 否则攻击者可以用一个同时解析到公网与 169.254.169.254 的域名绕过检查。
+async fn resolve_safe_target(host: &str, port: u16) -> Result<SocketAddr> {
+    use std::net::IpAddr;
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        reject_unsafe_ip(ip)?;
+        return Ok(SocketAddr::new(ip, port));
+    }
+
+    let host_owned = host.to_string();
+    let addrs = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (host_owned.as_str(), port)
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| Error::Gb28181(format!("上传目标解析任务异常: {e}")))?
+    .map_err(|e| Error::Gb28181(format!("上传目标 {host} 解析失败: {e}")))?;
+
+    if addrs.is_empty() {
+        return Err(Error::Gb28181(format!("上传目标 {host} 无解析结果")));
+    }
+    for addr in &addrs {
+        reject_unsafe_ip(addr.ip())?;
+    }
+    Ok(addrs[0])
+}
+
+/// 拒绝 SSRF 高危目标(环回/链路本地/私网/组播/未指定/唯一本地/文档段)。
+fn reject_unsafe_ip(ip: std::net::IpAddr) -> Result<()> {
+    use std::net::IpAddr;
+    let bad = match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local() // 含 169.254.169.254 云元数据
+                || v4.is_private()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 100.64.0.0/10 运营商级 NAT
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+                // 0.0.0.0/8 与 240.0.0.0/4 保留段
+                || v4.octets()[0] == 0
+                || v4.octets()[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // fc00::/7 唯一本地地址
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // fe80::/10 链路本地
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // ::ffff:0:0/96 IPv4 映射地址:按其 IPv4 判定
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| reject_unsafe_ip(IpAddr::V4(v4)).is_err())
+        }
+    };
+    if bad {
+        return Err(Error::Gb28181(format!("上传目标 {ip} 属受限地址,已拒绝")));
+    }
+    Ok(())
+}
+
+/// 兼容旧调用点的按 host 判定入口(字面 IP 直接判定,域名交由
+/// [`resolve_safe_target`] 在解析后判定)。
+#[cfg_attr(not(test), allow(dead_code))]
 fn reject_ssrf(host: &str) -> Result<()> {
     use std::net::IpAddr;
-    // 仅对字面 IP 做判定;域名交由 DNS(受控内网场景)。
     if let Ok(ip) = host.parse::<IpAddr>() {
-        let bad = match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_private()
-                    || v4.is_multicast()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast() || v6.is_unspecified(),
-        };
-        if bad {
-            return Err(Error::Gb28181(format!("上传目标 {host} 属受限地址,已拒绝")));
-        }
+        return reject_unsafe_ip(ip);
     }
     Ok(())
 }
@@ -153,10 +213,30 @@ pub struct DeviceConfig {
     pub light_bitrate_kbps: Option<u32>,
     /// GB28181 协议版本(影响 MANSCDP 应答字段集,2022 默认)。
     pub gb_version: common::GbVersion,
+    /// 注册有效期(秒),写入 REGISTER 的 Expires 头。
+    ///
+    /// 注意这只是**请求值**:平台可以在 200 OK 里授予更短的时长,续约必须以
+    /// 平台授予值为准(见 [`DeviceSimulator::granted_expires`])。
+    ///
+    /// GB/T 28181-2022 §9.1.1 d):缺省宜为 86400s,且**不应短于 3600s**。
+    pub register_expires_secs: u32,
+    /// 注册失败后的重试间隔上限(秒)。
+    ///
+    /// §9.1.1 c) 规定"与上一次注册时间间隔应可调,一般情况下不应短于 60s"。
+    /// 单设备联调默认 60s 以符合标准;**压测场景会刻意调小**(否则爬坡毫无意义),
+    /// 这是有意识的偏离,不是漏实现。
+    pub register_retry_max_secs: u64,
     /// 信令字符集编码(§6.10:GB18030 默认;部分平台用 UTF-8)。
     /// 决定 MANSCDP XML 体的字节编码与声明,修复中文乱码。
     pub signaling_encoding: common::SignalingEncoding,
 }
+
+/// 默认注册有效期(秒)。§9.1.1 d) 的下限是 3600s,缺省宜 86400s;
+/// 这里取下限 3600s 以便联调时更快观察到续约行为。
+pub const DEFAULT_REGISTER_EXPIRES: u32 = 3600;
+
+/// 默认注册重试间隔上限(秒),对齐 §9.1.1 c) 的"不应短于 60s"。
+pub const DEFAULT_REGISTER_RETRY_MAX_SECS: u64 = 60;
 
 /// 通道配置(对应目录查询中的一个 Item)。
 #[derive(Debug, Clone)]
@@ -206,23 +286,83 @@ pub struct DeviceSimulator {
     local_addr: std::sync::OnceLock<(String, u16)>,
     /// 当前位置(经度, 纬度)。移动位置订阅的周期 NOTIFY 上报此坐标;
     /// 由 report_position/set_position 更新。默认取一个内置坐标(北京)。
-    position: std::sync::Mutex<(f64, f64)>,
+    position: parking_lot::Mutex<(f64, f64)>,
     /// 活跃订阅表(CmdType → 订阅句柄)。平台 SUBSCRIBE 建立,退订/下线时清理。
     subscriptions: tokio::sync::Mutex<HashMap<String, Subscription>>,
-    /// 报警订阅对话(平台 `SUBSCRIBE + Alarm` 时记录:对话标识 + 平台地址)。
+    /// 报警订阅对话(平台 `SUBSCRIBE + Alarm` 时记录:对话标识 + 平台地址 + 筛选条件)。
     /// 存在时,report_alarm 走对话内 NOTIFY;否则退化为独立 MESSAGE(如手动触发)。
-    alarm_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
+    ///
+    /// 筛选条件来自 A.2.4.6:平台只订阅一级警情时,四级警情不该被推上去。
+    alarm_dialog: tokio::sync::Mutex<Option<AlarmSubscription>>,
     /// 目录订阅对话(平台 `SUBSCRIBE + Catalog` 时记录):CRUD 变更后据此发对话内增量 NOTIFY。
     catalog_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
     /// 预置位表(编号 → 名称)。PTZ 预置位设置/删除命令更新,PresetQuery 返回。
-    presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
+    presets: parking_lot::Mutex<std::collections::BTreeMap<u8, String>>,
     /// 设备控制态(布防/看守位/巡航/精准姿态)。扩展查询与控制命令共同维护(FR-17/18)。
-    control_state: std::sync::Mutex<ControlState>,
+    control_state: parking_lot::Mutex<ControlState>,
     /// 多通道目录树(FR-34)。为空时用 `config.channels` 扁平列表出目录;
     /// 非空时用此树(含业务分组/虚拟组织/报警通道层级)出目录,支持 CRUD + 增量 NOTIFY。
-    catalog_tree: std::sync::Mutex<Vec<gb28181_protocol::id_codec::CatalogNode>>,
+    catalog_tree: parking_lot::Mutex<Vec<gb28181_protocol::id_codec::CatalogNode>>,
     /// 上次推给平台的目录快照(用于计算增量 NOTIFY 的 diff)。
-    catalog_snapshot: std::sync::Mutex<gb28181_protocol::manscdp::CatalogSnapshot>,
+    catalog_snapshot: parking_lot::Mutex<gb28181_protocol::manscdp::CatalogSnapshot>,
+    /// 是否已经发起过一次注册尝试(用于区分首次与重试)。
+    attempted_once: std::sync::atomic::AtomicBool,
+    /// 平台在注册 200 OK 里授予的有效期(秒)。0 = 尚未注册成功。
+    ///
+    /// 续约周期必须以此为准:平台完全可以只给 120s,而请求写的是 3600s。
+    granted_expires: AtomicU32,
+    /// 设备是否处于"平台视角的在线"状态。仅用于在状态**翻转**时上报事件,
+    /// 让聚合方能维护"当前在线设备数"这个 gauge 而无需按设备去重。
+    online: std::sync::atomic::AtomicBool,
+    /// 服务端事务表:入站请求按 (branch, CSeq, method) 去重并缓存最终响应。
+    ///
+    /// 少了这层会出现一个很具体的现场故障:平台 200 OK 丢包后重传 INVITE,
+    /// 设备因"已有会话"回 486 Busy Here,点播直接失败。
+    server_txns: sip_core::ServerTransactions,
+}
+
+/// 从 `Contact` 头值里取出可连接的 `IP:端口`(302 重定向用)。
+///
+/// 形如 `<sip:34020000002000000001@192.168.1.20:5060>` → `192.168.1.20:5060`。
+/// 缺端口按 SIP 默认 5060;域名(非字面 IP)返回 None —— 上层会给出明确报错,
+/// 而不是静默连到一个猜出来的地址。
+fn contact_addr(contact: &str) -> Option<SocketAddr> {
+    let inside = contact
+        .split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(uri, _)| uri)
+        .unwrap_or(contact);
+    let after_scheme = inside
+        .strip_prefix("sip:")
+        .or_else(|| inside.strip_prefix("sips:"))
+        .unwrap_or(inside);
+    // 去掉 userinfo 与 URI 参数。
+    let host_port = after_scheme
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(after_scheme);
+    let host_port = host_port.split([';', '?']).next()?.trim();
+    if let Ok(addr) = host_port.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    // 无端口:补 SIP 默认端口 5060。
+    format!("{host_port}:5060").parse().ok()
+}
+
+/// 单条 MANSCDP body 的安全上限(字节)。
+///
+/// 目标是让"SIP 头 + body"整体落在 1300 字节的安全 MTU 内:SIP 头(Via/From/To/
+/// Call-ID/CSeq/Contact/Content-Type…)通常 300~400 字节,故 body 留 900。
+const MAX_MANSCDP_BODY_BYTES: usize = 900;
+
+/// 由注册有效期推导续约周期:取 80%,并夹在 [10s, 有效期-5s] 之间。
+///
+/// 平台给很短的 Expires(如 30s)时,80% 仍需留出一次事务往返的余量。
+fn renew_interval(expires_secs: u32) -> std::time::Duration {
+    let expires = expires_secs.max(1) as u64;
+    let eighty = (expires * 80 / 100).max(10);
+    let safe_ceiling = expires.saturating_sub(5).max(5);
+    std::time::Duration::from_secs(eighty.min(safe_ceiling).max(5))
 }
 
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
@@ -231,23 +371,46 @@ pub struct DeviceSimulator {
 pub struct ControlState {
     /// 是否处于布防/报警态(AlarmStatus 的 DutyStatus)。
     pub alarming: bool,
+    /// 是否正在录像(DeviceControl/RecordCmd 维护,DeviceStatus 的 Record 字段读回)。
+    pub recording: bool,
     /// 看守位是否启用。
     pub home_enabled: bool,
     /// 是否已设看守位(HomePositionQuery 的 PresetIndex 标志)。
     pub home_set: bool,
     /// 巡航轨迹:轨迹号 → 该轨迹的预置位号列表(增点/删点维护)。
     pub cruise_tracks: std::collections::BTreeMap<u32, Vec<u32>>,
+    /// 巡航参数:轨迹号 → (速度, 停留秒数)。GB/T 28181-2022 表 A.9 的 12 位值。
+    pub cruise_params: std::collections::BTreeMap<u32, (u32, u32)>,
+    /// 自动扫描:扫描组号 → (是否在扫描, 速度, 已设左边界, 已设右边界)。
+    /// GB/T 28181-2022 表 A.10;之前 0x89/0x8A 被误当成辅助开关,扫描完全没实现。
+    pub scan_groups: std::collections::BTreeMap<u32, ScanGroupState>,
     /// 最近一次精准云台姿态(pan 度, tilt 度, zoom 倍)。
     pub precise_pose: (f32, f32, f32),
+}
+
+/// 单个自动扫描组的状态(GB/T 28181-2022 表 A.10)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanGroupState {
+    /// 是否正在自动扫描。
+    pub scanning: bool,
+    /// 扫描速度(12 位)。
+    pub speed: u32,
+    /// 是否已设左边界。
+    pub left_set: bool,
+    /// 是否已设右边界。
+    pub right_set: bool,
 }
 
 impl Default for ControlState {
     fn default() -> Self {
         ControlState {
             alarming: false,
+            recording: false,
             home_enabled: true,
             home_set: false,
             cruise_tracks: std::collections::BTreeMap::new(),
+            cruise_params: std::collections::BTreeMap::new(),
+            scan_groups: std::collections::BTreeMap::new(),
             precise_pose: (0.0, 0.0, 1.0),
         }
     }
@@ -265,6 +428,14 @@ struct PushSession {
     control: Arc<media_rtp::PlaybackControl>,
     /// 是否为回放/下载会话(s=Playback/Download):结束时发 MediaStatus 121。
     is_history: bool,
+}
+
+/// 报警订阅:对话标识 + 平台地址 + 筛选条件(A.2.4.6)。
+#[derive(Debug, Clone)]
+struct AlarmSubscription {
+    dialog: builder::NotifyDialog,
+    peer: SocketAddr,
+    filter: gb28181_protocol::manscdp::AlarmSubscribeFilter,
 }
 
 /// 一条活跃订阅(周期 NOTIFY 任务句柄 + 停止信号)。
@@ -286,16 +457,20 @@ impl DeviceSimulator {
             session: tokio::sync::Mutex::new(None),
             observer: Arc::new(common::NoopObserver),
             local_addr: std::sync::OnceLock::new(),
-            position: std::sync::Mutex::new((116.397_428, 39.909_230)),
+            position: parking_lot::Mutex::new((116.397_428, 39.909_230)),
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
             catalog_dialog: tokio::sync::Mutex::new(None),
-            presets: std::sync::Mutex::new(default_presets()),
-            control_state: std::sync::Mutex::new(ControlState::default()),
-            catalog_tree: std::sync::Mutex::new(Vec::new()),
-            catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
+            presets: parking_lot::Mutex::new(default_presets()),
+            control_state: parking_lot::Mutex::new(ControlState::default()),
+            catalog_tree: parking_lot::Mutex::new(Vec::new()),
+            catalog_snapshot: parking_lot::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
             }),
+            attempted_once: std::sync::atomic::AtomicBool::new(false),
+            granted_expires: AtomicU32::new(0),
+            online: std::sync::atomic::AtomicBool::new(false),
+            server_txns: sip_core::ServerTransactions::default(),
         }
     }
 
@@ -308,16 +483,20 @@ impl DeviceSimulator {
             session: tokio::sync::Mutex::new(None),
             observer,
             local_addr: std::sync::OnceLock::new(),
-            position: std::sync::Mutex::new((116.397_428, 39.909_230)),
+            position: parking_lot::Mutex::new((116.397_428, 39.909_230)),
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
             catalog_dialog: tokio::sync::Mutex::new(None),
-            presets: std::sync::Mutex::new(default_presets()),
-            control_state: std::sync::Mutex::new(ControlState::default()),
-            catalog_tree: std::sync::Mutex::new(Vec::new()),
-            catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
+            presets: parking_lot::Mutex::new(default_presets()),
+            control_state: parking_lot::Mutex::new(ControlState::default()),
+            catalog_tree: parking_lot::Mutex::new(Vec::new()),
+            catalog_snapshot: parking_lot::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
             }),
+            attempted_once: std::sync::atomic::AtomicBool::new(false),
+            granted_expires: AtomicU32::new(0),
+            online: std::sync::atomic::AtomicBool::new(false),
+            server_txns: sip_core::ServerTransactions::default(),
         }
     }
 
@@ -353,22 +532,22 @@ impl DeviceSimulator {
             &self.config.device_info.device_name,
             &self.config.server_domain,
         );
-        *self.catalog_tree.lock().unwrap() = tree;
+        *self.catalog_tree.lock() = tree;
     }
 
     /// 直接设置目录树节点(FR-34)。首节点应为根设备。
     pub fn set_catalog_tree(&self, nodes: Vec<gb28181_protocol::id_codec::CatalogNode>) {
-        *self.catalog_tree.lock().unwrap() = nodes;
+        *self.catalog_tree.lock() = nodes;
     }
 
     /// 当前目录树快照(空表示用 config.channels 扁平列表)。
     pub fn catalog_tree(&self) -> Vec<gb28181_protocol::id_codec::CatalogNode> {
-        self.catalog_tree.lock().unwrap().clone()
+        self.catalog_tree.lock().clone()
     }
 
     /// 新增/更新一个目录通道节点(按 id 覆盖)。返回是否为新增。
     pub fn upsert_channel(&self, node: gb28181_protocol::id_codec::CatalogNode) -> bool {
-        let mut tree = self.catalog_tree.lock().unwrap();
+        let mut tree = self.catalog_tree.lock();
         if let Some(existing) = tree.iter_mut().find(|n| n.id == node.id) {
             *existing = node;
             false
@@ -380,7 +559,7 @@ impl DeviceSimulator {
 
     /// 删除一个目录通道节点(按 id)。返回是否删除了节点。
     pub fn remove_channel(&self, id: &str) -> bool {
-        let mut tree = self.catalog_tree.lock().unwrap();
+        let mut tree = self.catalog_tree.lock();
         let before = tree.len();
         tree.retain(|n| n.id != id);
         tree.len() != before
@@ -389,7 +568,7 @@ impl DeviceSimulator {
     /// 目录节点(树非空时)或扁平通道(树空时)映射为 (id, name, status) 快照三元组,
     /// 供目录应答与增量 diff 复用。根设备节点(parent==self)不作为通道项。
     fn catalog_publishable(&self) -> Vec<(String, String, String)> {
-        let tree = self.catalog_tree.lock().unwrap();
+        let tree = self.catalog_tree.lock();
         if tree.is_empty() {
             self.config
                 .channels
@@ -425,18 +604,41 @@ impl DeviceSimulator {
     /// 成功返回 [`DeviceState::Registered`],鉴权/拒绝失败返回 [`DeviceState::Failed`] 对应错误。
     pub async fn register(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<DeviceState> {
+        // 首次尝试与重试分开计:把重试算进"尝试"会让成功率变成尝试维度,
+        // 长跑后被稀释到看不出真实上线比例。
+        let retry = self.attempted_once.swap(true, Ordering::Relaxed);
+        self.register_with_retry_flag(transport, local_host, local_port, retry)
+            .await
+    }
+
+    async fn register_with_retry_flag(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        local_host: &str,
+        local_port: u16,
+        retry: bool,
+    ) -> Result<DeviceState> {
         use common::{DeviceEvent, FailureKind};
-        self.observer.on_event(DeviceEvent::RegisterAttempt);
+        self.observer
+            .on_event(DeviceEvent::RegisterAttempt { retry });
+        let started = std::time::Instant::now();
         let result = self.register_inner(transport, local_host, local_port).await;
         match &result {
-            Ok(_) => self.observer.on_event(DeviceEvent::RegisterSuccess),
+            Ok(_) => {
+                self.observer.on_event(DeviceEvent::RegisterSuccess {
+                    rtt_ms: started.elapsed().as_millis() as u64,
+                });
+                self.set_online(true);
+            }
             Err(e) => {
-                // 按错误信息归因:超时 → Timeout,含状态码拒绝 → Rejected,其余 Other。
+                // 按错误信息归因。**本地发送失败单独一类**:本机 ENOBUFS/socket 错误
+                // 绝不能算成"平台承载不住",否则压测结论直接失真。
                 let kind = match e {
+                    Error::Io(_) => FailureKind::Local,
                     Error::Sip(msg) if msg.contains("超时") => FailureKind::Timeout,
                     Error::Sip(msg) if msg.contains("被拒") => FailureKind::Rejected,
                     _ => FailureKind::Other,
@@ -447,23 +649,31 @@ impl DeviceSimulator {
         result
     }
 
+    /// 翻转在线状态并在**真的变化时**上报事件。
+    fn set_online(&self, online: bool) {
+        let previous = self.online.swap(online, Ordering::Relaxed);
+        if previous != online {
+            self.observer
+                .on_event(common::DeviceEvent::OnlineChanged { online });
+        }
+    }
+
     /// 注册核心逻辑(不含事件上报)。
+    ///
+    /// 相对最初实现补齐了两处:
+    /// - **尊重平台授予的 Expires**:请求写配置值,但续约周期以 200 OK 里平台给的为准。
+    ///   之前硬编码 3600 并按 2880s 续约,平台只给 120s 时会被判掉线。
+    /// - **stale nonce 重试**:平台回 `stale=true` 时用新 nonce 再算一次,而不是当成密码错。
     async fn register_inner(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<DeviceState> {
-        let dst: SocketAddr = format!("{}:{}", self.config.server_host, self.config.server_port)
-            .parse()
-            .map_err(|_| {
-                Error::Config(format!(
-                    "平台地址非法: {}:{}",
-                    self.config.server_host, self.config.server_port
-                ))
-            })?;
-        let mut rx = transport.register(self.ids.call_id.clone());
+        let dst = self.platform_addr()?;
+        let mut rx = transport.register(&self.ids.call_id);
         let timing = sip_core::Timing::default();
+        let want_expires = self.config.register_expires_secs.max(1);
 
         // 首发 REGISTER(无鉴权)。
         let cseq1 = self.next_cseq();
@@ -474,55 +684,248 @@ impl DeviceSimulator {
             local_host,
             local_port,
             None,
-            3600,
+            want_expires,
+            transport.protocol(),
         );
-        let resp = sip_core::client_transact(transport, dst, &req1, &mut rx, timing).await?;
+        let resp =
+            sip_core::client_transact(transport.as_ref(), dst, &req1, &mut rx, timing).await?;
 
         match resp.status {
-            200 => Ok(DeviceState::Registered),
+            200 => {
+                self.accept_registration(&resp, want_expires);
+                Ok(DeviceState::Registered)
+            }
+            // 重定向服务器也可能不鉴权直接回 302。
+            302 => {
+                let target = resp
+                    .headers
+                    .get("Contact")
+                    .and_then(contact_addr)
+                    .ok_or_else(|| Error::Sip("302 重定向缺少可用的 Contact 地址".into()))?;
+                tracing::info!(%target, "注册被重定向(302),改向新服务器注册");
+                self.register_redirected(transport, local_host, local_port, target)
+                    .await
+            }
             401 => {
-                // 解析挑战,带 Authorization 重发。
-                let wa = resp
+                // 解析挑战,带 Authorization 重发。最多重试两轮(第二轮用于 stale nonce)。
+                let mut challenge_header = resp
                     .headers
                     .get("WWW-Authenticate")
-                    .ok_or_else(|| Error::Sip("401 缺少 WWW-Authenticate".into()))?;
-                let challenge = Challenge::parse(wa)?;
-                let auth = authorization(
-                    &challenge,
-                    &self.config.username,
-                    &self.config.password,
-                    "REGISTER",
-                    &req1.uri,
-                );
-                let cseq2 = self.next_cseq();
-                let req2 = builder::register(
-                    &self.config,
-                    &self.ids,
-                    cseq2,
-                    local_host,
-                    local_port,
-                    Some(&auth),
-                    3600,
-                );
-                let resp2 =
-                    sip_core::client_transact(transport, dst, &req2, &mut rx, timing).await?;
-                if resp2.status == 200 {
-                    // 网络校时:用平台 200 OK 的 Date 头校准本地时钟偏移(FR)。
-                    if let Some(date) = resp2.headers.get("Date") {
-                        if let Some(off) = common::clock::sync_from_date_header(date) {
-                            tracing::info!(platform_date = %date, offset_secs = off, "网络校时完成");
+                    .ok_or_else(|| Error::Sip("401 缺少 WWW-Authenticate".into()))?
+                    .to_string();
+                for attempt in 0..2 {
+                    let challenge = Challenge::parse(&challenge_header)?;
+                    let auth = authorization(
+                        &challenge,
+                        &self.config.username,
+                        &self.config.password,
+                        "REGISTER",
+                        &req1.uri,
+                    );
+                    let cseq = self.next_cseq();
+                    let req = builder::register(
+                        &self.config,
+                        &self.ids,
+                        cseq,
+                        local_host,
+                        local_port,
+                        Some(&auth),
+                        want_expires,
+                        transport.protocol(),
+                    );
+                    let resp2 =
+                        sip_core::client_transact(transport.as_ref(), dst, &req, &mut rx, timing)
+                            .await?;
+                    match resp2.status {
+                        200 => {
+                            // 网络校时:用平台 200 OK 的 Date 头校准本地时钟偏移(FR)。
+                            if let Some(date) = resp2.headers.get("Date") {
+                                if let Some(off) = common::clock::sync_from_date_header(date) {
+                                    tracing::info!(platform_date = %date, offset_secs = off, "网络校时完成");
+                                }
+                            }
+                            self.accept_registration(&resp2, want_expires);
+                            return Ok(DeviceState::Registered);
+                        }
+                        401 if attempt == 0 => {
+                            // 平台可能因 nonce 过期(stale)再挑战一次:换新 nonce 重算。
+                            let next = resp2
+                                .headers
+                                .get("WWW-Authenticate")
+                                .ok_or_else(|| {
+                                    Error::Sip("注册被拒: 401 重挑战但缺少 WWW-Authenticate".into())
+                                })?
+                                .to_string();
+                            let stale = Challenge::parse(&next).map(|c| c.stale).unwrap_or(false);
+                            if !stale && next == challenge_header {
+                                return Err(Error::Sip(
+                                    "鉴权后注册被拒: 401(nonce 未更新,通常是密码或用户名错)".into(),
+                                ));
+                            }
+                            tracing::info!(stale, "平台再次挑战,用新 nonce 重算鉴权");
+                            challenge_header = next;
+                        }
+                        // §9.1.2.3 注册重定向:重定向服务器在鉴权后回 302,
+                        // Contact 里给出真正的 SIP 服务器地址,设备应改向它注册。
+                        // 之前 302 被当成"注册被拒",接重定向服务器的平台永远注册不上。
+                        302 => {
+                            let target = resp2
+                                .headers
+                                .get("Contact")
+                                .and_then(contact_addr)
+                                .ok_or_else(|| {
+                                    Error::Sip("302 重定向缺少可用的 Contact 地址".into())
+                                })?;
+                            tracing::info!(%target, "注册被重定向(302),改向新服务器注册");
+                            return self
+                                .register_redirected(transport, local_host, local_port, target)
+                                .await;
+                        }
+                        other => {
+                            return Err(Error::Sip(format!(
+                                "鉴权后注册被拒: {} {}",
+                                other, resp2.reason
+                            )))
                         }
                     }
-                    Ok(DeviceState::Registered)
-                } else {
-                    Err(Error::Sip(format!(
-                        "鉴权后注册被拒: {} {}",
-                        resp2.status, resp2.reason
-                    )))
                 }
+                Err(Error::Sip("鉴权后注册被拒: 反复 401".into()))
             }
             other => Err(Error::Sip(format!("注册被拒: {} {}", other, resp.reason))),
         }
+    }
+
+    /// 按 302 重定向给出的新地址重新注册一轮(§9.1.2.3)。
+    ///
+    /// 只重定向一次:再收到 302 视为重定向环路并报错,避免无限跳转。
+    async fn register_redirected(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        local_host: &str,
+        local_port: u16,
+        target: SocketAddr,
+    ) -> Result<DeviceState> {
+        let want_expires = self.config.register_expires_secs.max(1);
+        // 重定向后的注册用独立 Call-ID,避免与原事务路由冲突。
+        let ids = DialogIds::new();
+        let mut rx = transport.register(&ids.call_id);
+        let timing = sip_core::Timing::default();
+        let result = async {
+            let cseq = self.next_cseq();
+            let req = builder::register(
+                &self.config,
+                &ids,
+                cseq,
+                local_host,
+                local_port,
+                None,
+                want_expires,
+                transport.protocol(),
+            );
+            let resp = sip_core::client_transact(transport.as_ref(), target, &req, &mut rx, timing)
+                .await?;
+            match resp.status {
+                200 => {
+                    self.accept_registration(&resp, want_expires);
+                    Ok(DeviceState::Registered)
+                }
+                401 => {
+                    let wa = resp
+                        .headers
+                        .get("WWW-Authenticate")
+                        .ok_or_else(|| Error::Sip("重定向后 401 缺少 WWW-Authenticate".into()))?;
+                    let challenge = Challenge::parse(wa)?;
+                    let auth = authorization(
+                        &challenge,
+                        &self.config.username,
+                        &self.config.password,
+                        "REGISTER",
+                        &req.uri,
+                    );
+                    let cseq2 = self.next_cseq();
+                    let req2 = builder::register(
+                        &self.config,
+                        &ids,
+                        cseq2,
+                        local_host,
+                        local_port,
+                        Some(&auth),
+                        want_expires,
+                        transport.protocol(),
+                    );
+                    let resp2 = sip_core::client_transact(
+                        transport.as_ref(),
+                        target,
+                        &req2,
+                        &mut rx,
+                        timing,
+                    )
+                    .await?;
+                    if resp2.status == 200 {
+                        if let Some(date) = resp2.headers.get("Date") {
+                            if let Some(off) = common::clock::sync_from_date_header(date) {
+                                tracing::info!(offset_secs = off, "网络校时完成(重定向后)");
+                            }
+                        }
+                        self.accept_registration(&resp2, want_expires);
+                        Ok(DeviceState::Registered)
+                    } else {
+                        Err(Error::Sip(format!(
+                            "重定向后鉴权注册被拒: {} {}",
+                            resp2.status, resp2.reason
+                        )))
+                    }
+                }
+                302 => Err(Error::Sip("注册重定向环路(连续两次 302),放弃".into())),
+                other => Err(Error::Sip(format!(
+                    "重定向后注册被拒: {} {}",
+                    other, resp.reason
+                ))),
+            }
+        }
+        .await;
+        transport.unregister(&ids.call_id);
+        result
+    }
+
+    /// 记录平台在 200 OK 里授予的注册有效期。
+    ///
+    /// 优先取 Expires 头,其次取 Contact 的 `expires` 参数,都没有才退回请求值
+    /// (RFC 3261 §10.2.4:服务端未回 Expires 时视为接受请求值)。
+    fn accept_registration(&self, resp: &sip_core::Response, requested: u32) {
+        let granted = resp
+            .headers
+            .expires()
+            .or_else(|| resp.headers.contact_expires())
+            .map(|v| v.min(u32::MAX as u64) as u32)
+            .filter(|v| *v > 0)
+            .unwrap_or(requested);
+        let previous = self.granted_expires.swap(granted, Ordering::Relaxed);
+        if previous != granted {
+            tracing::info!(requested, granted, "平台授予注册有效期(续约周期以此为准)");
+        }
+    }
+
+    /// 平台当前授予的注册有效期(秒)。未注册成功前为配置的请求值。
+    pub fn granted_expires(&self) -> u32 {
+        let v = self.granted_expires.load(Ordering::Relaxed);
+        if v == 0 {
+            self.config.register_expires_secs.max(1)
+        } else {
+            v
+        }
+    }
+
+    /// 解析平台信令地址。
+    fn platform_addr(&self) -> Result<SocketAddr> {
+        format!("{}:{}", self.config.server_host, self.config.server_port)
+            .parse()
+            .map_err(|_| {
+                Error::Config(format!(
+                    "平台地址非法: {}:{}",
+                    self.config.server_host, self.config.server_port
+                ))
+            })
     }
 
     /// 向平台注销(GB28181-2022 §9.1.2.2):发 REGISTER Expires=0。
@@ -531,7 +934,7 @@ impl DeviceSimulator {
     /// 尽力而为:失败仅记录警告(下线流程不因注销失败而阻塞)。
     pub async fn unregister(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<()> {
@@ -540,14 +943,24 @@ impl DeviceSimulator {
             .map_err(|_| Error::Config("平台地址非法".into()))?;
         // 用独立 Call-ID,避免与运行中的注册路由冲突。
         let ids = DialogIds::new();
-        let mut rx = transport.register(ids.call_id.clone());
+        let mut rx = transport.register(&ids.call_id);
         let timing = sip_core::Timing::default();
 
         // 首发 REGISTER Expires=0(无鉴权)。
         let cseq1 = self.next_cseq();
-        let req1 = builder::register(&self.config, &ids, cseq1, local_host, local_port, None, 0);
+        let req1 = builder::register(
+            &self.config,
+            &ids,
+            cseq1,
+            local_host,
+            local_port,
+            None,
+            0,
+            transport.protocol(),
+        );
         let result = async {
-            let resp = sip_core::client_transact(transport, dst, &req1, &mut rx, timing).await?;
+            let resp =
+                sip_core::client_transact(transport.as_ref(), dst, &req1, &mut rx, timing).await?;
             match resp.status {
                 200 => Ok(()),
                 401 => {
@@ -572,9 +985,11 @@ impl DeviceSimulator {
                         local_port,
                         Some(&auth),
                         0,
+                        transport.protocol(),
                     );
                     let resp2 =
-                        sip_core::client_transact(transport, dst, &req2, &mut rx, timing).await?;
+                        sip_core::client_transact(transport.as_ref(), dst, &req2, &mut rx, timing)
+                            .await?;
                     if resp2.status == 200 {
                         Ok(())
                     } else {
@@ -597,7 +1012,7 @@ impl DeviceSimulator {
     /// 事务结束即注销路由。
     async fn send_message_xml(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
         xml: &str,
@@ -607,11 +1022,24 @@ impl DeviceSimulator {
             .map_err(|_| Error::Config("平台地址非法".into()))?;
         let ids = DialogIds::new();
         let cseq = self.next_cseq();
-        let req = builder::message_xml(&self.config, &ids, cseq, local_host, local_port, xml);
-        let mut rx = transport.register(ids.call_id.clone());
-        let result =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await;
+        let req = builder::message_xml(
+            &self.config,
+            &ids,
+            cseq,
+            local_host,
+            local_port,
+            xml,
+            transport.protocol(),
+        );
+        let mut rx = transport.register(&ids.call_id);
+        let result = sip_core::client_transact(
+            transport.as_ref(),
+            dst,
+            &req,
+            &mut rx,
+            sip_core::Timing::default(),
+        )
+        .await;
         transport.unregister(&ids.call_id);
         Ok(result?.status)
     }
@@ -622,7 +1050,7 @@ impl DeviceSimulator {
     /// 不支持该 CmdType 直接丢弃)。发出即返回,不因平台不响应而阻塞重传。
     async fn send_message_xml_oneshot(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
         xml: &str,
@@ -632,7 +1060,15 @@ impl DeviceSimulator {
             .map_err(|_| Error::Config("平台地址非法".into()))?;
         let ids = DialogIds::new();
         let cseq = self.next_cseq();
-        let req = builder::message_xml(&self.config, &ids, cseq, local_host, local_port, xml);
+        let req = builder::message_xml(
+            &self.config,
+            &ids,
+            cseq,
+            local_host,
+            local_port,
+            xml,
+            transport.protocol(),
+        );
         transport
             .send_to(&sip_core::SipMessage::Request(req), dst)
             .await
@@ -641,49 +1077,93 @@ impl DeviceSimulator {
     /// 发送一次心跳(MESSAGE + Keepalive XML)。返回平台响应状态码。
     pub async fn send_keepalive(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<u16> {
         let sn = self.next_cseq();
         let ka = Keepalive::ok(self.config.device_id.as_str(), sn);
         let xml = ka.to_xml()?;
+        let started = std::time::Instant::now();
         let status = self
             .send_message_xml(transport, local_host, local_port, &xml)
             .await?;
-        let resp_status = status;
-        if resp_status == 200 {
-            self.observer.on_event(common::DeviceEvent::HeartbeatOk);
+        if status == 200 {
+            self.observer.on_event(common::DeviceEvent::HeartbeatOk {
+                rtt_ms: started.elapsed().as_millis() as u64,
+            });
         } else {
             self.observer.on_event(common::DeviceEvent::HeartbeatFail);
         }
-        Ok(resp_status)
+        Ok(status)
     }
 
     /// 主动上报一条视频侦测报警(FR-9)。设备 → 平台 MESSAGE + Alarm Notify XML。
     /// `description` 为报警描述;返回平台响应状态码。
+    ///
+    /// 默认按"运动目标检测"(A.2.5.3 视频报警类型 2)上报。
     pub async fn report_alarm(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
         description: &str,
     ) -> Result<u16> {
+        self.report_alarm_typed(
+            transport,
+            local_host,
+            local_port,
+            description,
+            gb28181_protocol::manscdp::VideoAlarmType::MotionDetection,
+        )
+        .await
+    }
+
+    /// 主动上报一条指定类型的视频报警。
+    ///
+    /// 存在报警订阅时会先过一遍订阅筛选条件(A.2.4.6):平台只订阅一级警情或特定
+    /// 报警方式/类型时,不满足的报警不推送(返回 0 表示"按订阅条件被过滤")。
+    pub async fn report_alarm_typed(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        local_host: &str,
+        local_port: u16,
+        description: &str,
+        alarm_type: gb28181_protocol::manscdp::VideoAlarmType,
+    ) -> Result<u16> {
         let sn = self.next_cseq();
         // 报警时间用校时后的 ISO8601(与平台时间对齐,见 common::clock)。
         let time = common::clock::synced_iso8601();
-        let alarm = gb28181_protocol::manscdp::AlarmNotify::video(
+        let position = Some(*self.position.lock());
+        let alarm = gb28181_protocol::manscdp::AlarmNotify::video_typed(
             self.config.device_id.as_str(),
             sn,
             time,
             description,
+            alarm_type,
+            position,
         );
         let xml = alarm.to_xml()?;
 
         // 若存在报警订阅对话:在对话内以 SIP NOTIFY 上报(GB28181 订阅语义);
         // 否则(如手动触发、平台未订阅)退化为独立 MESSAGE(全新 Call-ID)。
-        let alarm_dialog = self.alarm_dialog.lock().await.clone();
-        if let Some((dialog, sub_dst)) = alarm_dialog {
+        let subscription = self.alarm_dialog.lock().await.clone();
+        if let Some(AlarmSubscription {
+            dialog,
+            peer: sub_dst,
+            filter,
+        }) = subscription
+        {
+            // 订阅筛选:不满足条件就不推(之前完全忽略订阅条件,全推)。
+            if !filter.accepts(alarm.priority, alarm.method, Some(alarm_type as u32)) {
+                tracing::info!(
+                    priority = alarm.priority,
+                    method = alarm.method,
+                    alarm_type = alarm_type as u32,
+                    "报警不满足平台订阅筛选条件,不上报"
+                );
+                return Ok(0);
+            }
             let cseq = self.next_cseq();
             let req = builder::notify_in_dialog(
                 &self.config,
@@ -692,10 +1172,11 @@ impl DeviceSimulator {
                 local_host,
                 local_port,
                 &xml,
+                transport.protocol(),
             );
-            let mut rx = transport.register(dialog.call_id.clone());
+            let mut rx = transport.register(&dialog.call_id);
             let result = sip_core::client_transact(
-                transport,
+                transport.as_ref(),
                 sub_dst,
                 &req,
                 &mut rx,
@@ -717,13 +1198,13 @@ impl DeviceSimulator {
     /// 直接丢弃不回 200,故不等待响应,发出即返回,避免无谓的事务重传阻塞。
     pub async fn report_video_upload(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<()> {
         let sn = self.next_cseq();
         let time = common::clock::synced_iso8601();
-        let pos = self.position.lock().map(|p| *p).ok();
+        let pos = Some(*self.position.lock());
         let notify = gb28181_protocol::manscdp::VideoUploadNotify::new(
             self.config.device_id.as_str(),
             sn,
@@ -739,16 +1220,14 @@ impl DeviceSimulator {
     /// 位置订阅场景下由周期任务调用;也可手动触发。返回平台响应状态码。
     pub async fn report_position(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
         longitude: f64,
         latitude: f64,
     ) -> Result<u16> {
         // 记录当前坐标,供位置订阅的周期 NOTIFY 复用。
-        if let Ok(mut p) = self.position.lock() {
-            *p = (longitude, latitude);
-        }
+        *self.position.lock() = (longitude, latitude);
         let sn = self.next_cseq();
         // 位置上报时间用校时后的 ISO8601(与平台时间对齐)。
         let time = common::clock::synced_iso8601();
@@ -771,7 +1250,7 @@ impl DeviceSimulator {
     /// Event/Subscription-State 头),`dst` 为平台来源地址。
     async fn notify_catalog(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         dst: SocketAddr,
         dialog: &builder::NotifyDialog,
         sn: u32,
@@ -788,8 +1267,7 @@ impl DeviceSimulator {
                 status: status.clone(),
             })
             .collect();
-        *self.catalog_snapshot.lock().unwrap() =
-            CatalogSnapshot::from_items(publishable.iter().cloned());
+        *self.catalog_snapshot.lock() = CatalogSnapshot::from_items(publishable.iter().cloned());
         let notify = CatalogNotify::new(self.config.device_id.as_str(), sn, items);
         let xml = notify.to_xml()?;
 
@@ -801,12 +1279,18 @@ impl DeviceSimulator {
             &self.local_host(),
             self.local_port(),
             &xml,
+            transport.protocol(),
         );
         // 对话内 NOTIFY 的响应按订阅 Call-ID 回来;注册该路由收 200,收完注销。
-        let mut rx = transport.register(dialog.call_id.clone());
-        let result =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await;
+        let mut rx = transport.register(&dialog.call_id);
+        let result = sip_core::client_transact(
+            transport.as_ref(),
+            dst,
+            &req,
+            &mut rx,
+            sip_core::Timing::default(),
+        )
+        .await;
         transport.unregister(&dialog.call_id);
         Ok(result?.status)
     }
@@ -816,18 +1300,18 @@ impl DeviceSimulator {
     /// 计算当前目录相对上次快照的 diff(ADD/DEL/UPDATE/ON/OFF),若有变更且存在活跃目录订阅,
     /// 在订阅对话内发一条只含变更项的 Catalog NOTIFY,并刷新快照基线。无订阅/无变更时不发。
     /// CRUD(upsert_channel/remove_channel)或状态切换后调用。
-    pub async fn notify_catalog_changed(&self, transport: &Arc<UdpTransport>) -> Result<()> {
+    pub async fn notify_catalog_changed(&self, transport: &Arc<dyn SipTransport>) -> Result<()> {
         use gb28181_protocol::manscdp::{CatalogNotify, CatalogSnapshot};
         let next = CatalogSnapshot::from_items(self.catalog_publishable());
         let changes = {
-            let snap = self.catalog_snapshot.lock().unwrap();
+            let snap = self.catalog_snapshot.lock();
             snap.diff(&next)
         };
         if changes.is_empty() {
             return Ok(());
         }
         // 刷新基线(无论有无订阅,快照都应跟上当前目录)。
-        *self.catalog_snapshot.lock().unwrap() = next;
+        *self.catalog_snapshot.lock() = next;
 
         let dialog = self.catalog_dialog.lock().await.clone();
         let Some((dialog, dst)) = dialog else {
@@ -844,11 +1328,17 @@ impl DeviceSimulator {
             &self.local_host(),
             self.local_port(),
             &xml,
+            transport.protocol(),
         );
-        let mut rx = transport.register(dialog.call_id.clone());
-        let result =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await;
+        let mut rx = transport.register(&dialog.call_id);
+        let result = sip_core::client_transact(
+            transport.as_ref(),
+            dst,
+            &req,
+            &mut rx,
+            sip_core::Timing::default(),
+        )
+        .await;
         transport.unregister(&dialog.call_id);
         result?;
         Ok(())
@@ -861,8 +1351,9 @@ impl DeviceSimulator {
     /// `interval` 缺省/为 0 时取 5 秒兜底。同一 CmdType 再次订阅会替换旧任务。
     async fn start_position_subscription(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         interval: Option<u64>,
+        expires: u64,
     ) {
         let secs = interval.filter(|s| *s > 0).unwrap_or(5);
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -873,11 +1364,24 @@ impl DeviceSimulator {
         let local_port = self.local_port();
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs));
+            // 订阅到期定时器:之前只把 expires 写进头,从不真的到期,
+            // 于是平台早就忘了这个订阅,设备还在无限上报。
+            let expiry = tokio::time::sleep(std::time::Duration::from_secs(expires));
+            tokio::pin!(expiry);
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break, // 订阅被替换/取消。
+                    _ = &mut expiry => {
+                        tracing::info!(expires, "移动位置订阅到期,停止周期上报");
+                        sim.observer.on_event(common::DeviceEvent::SubscriptionChanged {
+                            kind: "MobilePosition".into(),
+                            active: false,
+                            notify_count: 0,
+                        });
+                        break;
+                    }
                     _ = ticker.tick() => {
-                        let (lon, lat) = sim.position.lock().map(|p| *p).unwrap_or((0.0, 0.0));
+                        let (lon, lat) = *sim.position.lock();
                         if let Err(e) = sim
                             .report_position(&tp, &local_host, local_port, lon, lat)
                             .await
@@ -898,7 +1402,112 @@ impl DeviceSimulator {
                 stop_tx,
             },
         );
-        tracing::info!(interval = secs, "移动位置订阅已建立,开始周期上报");
+        tracing::info!(interval = secs, expires, "移动位置订阅已建立,开始周期上报");
+    }
+
+    /// 为无周期任务的订阅(Catalog / Alarm)挂一个到期定时器。
+    ///
+    /// 到期后清理对话并发一条 `Subscription-State: terminated` 的收尾 NOTIFY,
+    /// 让平台知道订阅结束而不是"设备突然不吭声了"。
+    async fn arm_subscription_expiry(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+        kind: &str,
+        dialog: builder::NotifyDialog,
+        dst: SocketAddr,
+        expires: u64,
+    ) {
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let sim = Arc::clone(self);
+        let tp = Arc::clone(transport);
+        let kind_owned = kind.to_string();
+        let task = tokio::spawn(async move {
+            let expiry = tokio::time::sleep(std::time::Duration::from_secs(expires));
+            tokio::pin!(expiry);
+            tokio::select! {
+                _ = &mut stop_rx => {}
+                _ = &mut expiry => {
+                    tracing::info!(kind = %kind_owned, expires, "订阅到期");
+                    sim.terminate_subscription(&tp, &kind_owned, &dialog, dst).await;
+                }
+            }
+        });
+        let mut subs = self.subscriptions.lock().await;
+        subs.insert(
+            kind.to_string(),
+            Subscription {
+                _task: task,
+                stop_tx,
+            },
+        );
+        self.observer
+            .on_event(common::DeviceEvent::SubscriptionChanged {
+                kind: kind.to_string(),
+                active: true,
+                notify_count: 0,
+            });
+    }
+
+    /// 终止一个订阅:清对话、停周期任务,并发 `Subscription-State: terminated` NOTIFY。
+    ///
+    /// 由平台 `SUBSCRIBE Expires: 0`(退订)或到期定时器触发。
+    async fn terminate_subscription(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+        kind: &str,
+        dialog: &builder::NotifyDialog,
+        dst: SocketAddr,
+    ) {
+        // 先摘掉周期任务,避免收尾 NOTIFY 之后还继续上报。
+        // 注意:不能在持有 subscriptions 锁时 await 发送,否则与订阅建立路径互相排队。
+        let removed = self.subscriptions.lock().await.remove(kind);
+        if let Some(sub) = removed {
+            let _ = sub.stop_tx.send(());
+        }
+        match kind {
+            "Catalog" => *self.catalog_dialog.lock().await = None,
+            "Alarm" => *self.alarm_dialog.lock().await = None,
+            _ => {}
+        }
+        self.observer
+            .on_event(common::DeviceEvent::SubscriptionChanged {
+                kind: kind.to_string(),
+                active: false,
+                notify_count: 0,
+            });
+        // 对话内订阅才需要收尾 NOTIFY(MobilePosition/PTZPosition 走独立 MESSAGE)。
+        if matches!(kind, "Catalog" | "Alarm") {
+            if let Err(e) = self.notify_terminated(transport, dialog, dst).await {
+                tracing::warn!(kind = %kind, error = %e, "订阅终止 NOTIFY 发送失败");
+            }
+        }
+        tracing::info!(kind = %kind, "订阅已终止");
+    }
+
+    /// 发一条 `Subscription-State: terminated` 的空 NOTIFY 作为订阅收尾。
+    async fn notify_terminated(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        dialog: &builder::NotifyDialog,
+        dst: SocketAddr,
+    ) -> Result<()> {
+        let cseq = self.next_cseq();
+        let mut req = builder::notify_in_dialog(
+            &self.config,
+            dialog,
+            cseq,
+            &self.local_host(),
+            self.local_port(),
+            "",
+            transport.protocol(),
+        );
+        req.headers
+            .set("Subscription-State", "terminated;reason=timeout");
+        req.body.clear();
+        // fire-and-forget:平台可能已经忘了这个订阅并回 481,没必要为此重传。
+        transport
+            .send_to(&sip_core::SipMessage::Request(req), dst)
+            .await
     }
 
     /// 启动(或重建)PTZ 精准位置事件订阅的周期上报任务(GB28181-2022 §9.11.2)。
@@ -908,8 +1517,9 @@ impl DeviceSimulator {
     /// 变化时触发;模拟器按周期上报当前 precise_pose。
     async fn start_ptz_position_subscription(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         interval: Option<u64>,
+        expires: u64,
     ) {
         let secs = interval.filter(|s| *s > 0).unwrap_or(5);
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -922,9 +1532,20 @@ impl DeviceSimulator {
         let counter = notify_count.clone();
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs));
+            let expiry = tokio::time::sleep(std::time::Duration::from_secs(expires));
+            tokio::pin!(expiry);
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
+                    _ = &mut expiry => {
+                        tracing::info!(expires, "PTZ 精准位置订阅到期,停止周期上报");
+                        sim.observer.on_event(common::DeviceEvent::SubscriptionChanged {
+                            kind: "PTZPosition".into(),
+                            active: false,
+                            notify_count: 0,
+                        });
+                        break;
+                    }
                     _ = ticker.tick() => {
                         if let Err(e) = sim
                             .report_ptz_position(&tp, &local_host, local_port)
@@ -965,16 +1586,12 @@ impl DeviceSimulator {
     /// 复用 PTZPosition 应答体(Pan/Tilt/Zoom),独立 MESSAGE fire-and-forget。
     pub async fn report_ptz_position(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<()> {
         let sn = self.next_cseq();
-        let (pan, tilt, zoom) = self
-            .control_state
-            .lock()
-            .map(|s| s.precise_pose)
-            .unwrap_or((0.0, 0.0, 1.0));
+        let (pan, tilt, zoom) = self.control_state.lock().precise_pose;
         let notify = gb28181_protocol::manscdp::PtzPreciseStatusResponse::new(
             self.config.device_id.as_str(),
             sn,
@@ -997,28 +1614,90 @@ impl DeviceSimulator {
         *self.catalog_dialog.lock().await = None;
     }
 
-    /// 处理一条入站请求:OPTIONS 简单回 200;MESSAGE 解析 XML 查询并应答;
-    /// SUBSCRIBE 回 200 并按需启动周期 NOTIFY。返回是否已应答(true=已回,false=暂不处理)。
+    /// 处理一条入站请求(带服务端事务去重)。
+    ///
+    /// 去重是必须的:UDP 下平台的请求会重传,而重复执行业务逻辑会产生真实故障
+    /// (最典型的是重传 INVITE 被回 486 Busy Here,点播失败)。命中已完成事务时
+    /// 直接重发缓存响应;上一轮仍在处理时吸收掉。
+    pub async fn answer_inbound(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+        incoming: &sip_core::Incoming,
+    ) -> Result<bool> {
+        let sip_core::SipMessage::Request(req) = &incoming.message else {
+            return Ok(false);
+        };
+
+        let token = match self.server_txns.admit(req) {
+            sip_core::Admit::Retransmit(cached) => {
+                tracing::info!(
+                    method = %req.method,
+                    status = cached.status,
+                    "入站请求重传,重发缓存响应(不重跑业务逻辑)"
+                );
+                transport
+                    .send_to(&sip_core::SipMessage::Response(cached), incoming.from)
+                    .await?;
+                return Ok(true);
+            }
+            sip_core::Admit::Absorb => {
+                tracing::debug!(method = %req.method, "入站请求重传,上一轮仍在处理,吸收");
+                return Ok(true);
+            }
+            sip_core::Admit::Proceed(token) => token,
+        };
+
+        let result = self
+            .dispatch_inbound(transport, req, incoming.from, &token)
+            .await;
+        // 没有产生最终响应(出错或未处理)时释放事务槽位,否则后续重传会被永久吸收。
+        if !matches!(result, Ok(true)) {
+            self.server_txns.abandon(&token);
+        }
+        result
+    }
+
+    /// 发送最终响应并登记到服务端事务表(供重传直接命中)。
+    async fn respond(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        dst: SocketAddr,
+        token: &sip_core::TxToken,
+        resp: sip_core::Response,
+    ) -> Result<()> {
+        self.server_txns.complete(token, &resp);
+        transport
+            .send_to(&sip_core::SipMessage::Response(resp), dst)
+            .await
+    }
+
+    /// 按方法分派入站请求。OPTIONS 回 200 并带 Allow;MESSAGE 解析 XML 查询并应答;
+    /// SUBSCRIBE 回 200 并按需启动周期 NOTIFY;未实现的方法回 405。
     ///
     /// 取 `self: &Arc<Self>`(而非 `&self`):移动位置订阅需要把设备句柄交给后台
     /// 周期上报任务,任务生命周期独立于单次入站处理。
-    pub async fn answer_inbound(
+    async fn dispatch_inbound(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
-        incoming: &sip_core::Incoming,
+        transport: &Arc<dyn SipTransport>,
+        req: &sip_core::Request,
+        from: SocketAddr,
+        token: &sip_core::TxToken,
     ) -> Result<bool> {
-        if let sip_core::SipMessage::Request(req) = &incoming.message {
+        let incoming_from = from;
+        {
             match req.method {
                 sip_core::Method::Options => {
-                    let resp = sip_core::SipMessage::Response(builder::response_ok(req));
-                    transport.send_to(&resp, incoming.from).await?;
+                    // OPTIONS 应答带 Allow,便于平台探知设备支持的方法集。
+                    let mut resp = builder::response_ok(req);
+                    resp.headers.set("Allow", sip_core::Method::ALLOW_HEADER);
+                    self.respond(transport, incoming_from, token, resp).await?;
                     Ok(true)
                 }
                 sip_core::Method::Message => {
                     // GB28181 规范:先对查询 MESSAGE 回空 200 OK(事务应答),
                     // 再由设备发一条独立的 MESSAGE 把应答 XML 送回平台(新事务)。
-                    let ack = sip_core::SipMessage::Response(builder::response_ok(req));
-                    transport.send_to(&ack, incoming.from).await?;
+                    self.respond(transport, incoming_from, token, builder::response_ok(req))
+                        .await?;
 
                     // body 可能是查询(Query)或控制(Control)。按**根元素**区分,
                     // 不能靠 parse 成功与否(quick-xml 忽略根名,Query 会误吞 Control)。
@@ -1027,12 +1706,20 @@ impl DeviceSimulator {
                         let body_str =
                             builder::decode_xml_body(&req.body, self.config.signaling_encoding);
                         let body_str = body_str.as_str();
-                        let is_control =
-                            body_str.contains("<Control>") || body_str.contains("<Control ");
-                        if is_control {
+                        // 按**真正解析出的根元素**分派,而不是 `contains("<Control>")`:
+                        // 后者可被注释或文本节点里的假标签欺骗,改变设备的处理路径。
+                        let envelope = gb28181_protocol::manscdp::parse_envelope(body_str)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, "MANSCDP 报文无法解析根元素");
+                                gb28181_protocol::manscdp::Envelope {
+                                    root: String::new(),
+                                    cmd_type: String::new(),
+                                }
+                            });
+                        if envelope.root == "Control" {
                             if let Ok(ctrl) = gb28181_protocol::manscdp::Control::parse(body_str) {
                                 let xml = self.handle_control(&ctrl).await?;
-                                self.send_reply_message(transport, incoming.from, &xml)
+                                self.send_reply_message(transport, incoming_from, &xml)
                                     .await?;
                                 // 平台命令时间线:上报语义摘要(控制类,含方向/变倍/预置位等细节)。
                                 self.observer
@@ -1046,45 +1733,59 @@ impl DeviceSimulator {
                                 // 抓拍/升级等需设备主动发 NOTIFY 的命令:回 200/结果后异步执行。
                                 self.spawn_control_side_effects(transport, &ctrl);
                             }
-                        } else if body_str.contains("Broadcast") {
+                        } else if envelope.cmd_type == "Broadcast" {
                             // 语音广播:回 Broadcast Response(OK/ERROR),接受则反向发 INVITE。
                             if let Ok(bc) =
                                 gb28181_protocol::manscdp::BroadcastNotify::parse(body_str)
                             {
-                                self.handle_broadcast(transport, &bc, incoming.from).await?;
+                                self.handle_broadcast(transport, &bc, incoming_from).await?;
                                 self.observer
                                     .on_event(common::DeviceEvent::PlatformCommand {
                                         kind: "broadcast".into(),
                                         summary: "平台语音广播请求 → 已应答".into(),
                                     });
                             }
-                        } else if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str)
-                        {
-                            if let Ok(xml) = self.handle_query(&query) {
-                                self.send_reply_message(transport, incoming.from, &xml)
-                                    .await?;
-                                // 平台命令时间线:上报语义摘要(查询类)。
-                                self.observer
-                                    .on_event(common::DeviceEvent::PlatformCommand {
-                                        kind: "query".into(),
-                                        summary: self.query_summary(&query.cmd_type),
-                                    });
+                        } else if envelope.root == "Query" || envelope.root == "Notify" {
+                            if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str) {
+                                let max_body = Self::max_body_for(transport.protocol());
+                                if let Ok(replies) = self.handle_query_replies(&query, max_body) {
+                                    for xml in &replies {
+                                        self.send_reply_message(transport, incoming_from, xml)
+                                            .await?;
+                                    }
+                                    // 平台命令时间线:上报语义摘要(查询类)。
+                                    self.observer
+                                        .on_event(common::DeviceEvent::PlatformCommand {
+                                            kind: "query".into(),
+                                            summary: self.query_summary(&query.cmd_type),
+                                        });
+                                }
                             }
+                        } else {
+                            tracing::warn!(
+                                root = %envelope.root,
+                                cmd_type = %envelope.cmd_type,
+                                "无法识别的 MANSCDP 报文,已回 200 但不处理"
+                            );
                         }
                     }
                     Ok(true)
                 }
                 sip_core::Method::Invite => {
                     // 解析 SDP,启动推流,回 200 OK。
-                    self.handle_invite(transport, req, incoming.from).await
+                    self.handle_invite(transport, req, incoming_from, token)
+                        .await
                 }
                 sip_core::Method::Bye => {
                     // 停止推流,回 200 OK。
-                    self.handle_bye(transport, req, incoming.from).await
+                    self.handle_bye(transport, req, incoming_from, token).await
                 }
                 sip_core::Method::Cancel => {
-                    // 取消点播:停掉可能已起的推流,回 200 OK(与 BYE 同处理)。
-                    self.handle_bye(transport, req, incoming.from).await
+                    // 取消点播(RFC 3261 §9.2):对 CANCEL 本身回 200,
+                    // 同时对被取消的 INVITE 回 487 Request Terminated。
+                    // 之前只回 200,平台会一直等 INVITE 的最终响应。
+                    self.handle_cancel(transport, req, incoming_from, token)
+                        .await
                 }
                 sip_core::Method::Ack => {
                     // ACK 无需响应,但标志会话已确认。
@@ -1094,10 +1795,15 @@ impl DeviceSimulator {
                     // 平台订阅(Catalog/MobilePosition/Alarm):先回 200 OK 建立订阅。
                     // 用固定 to_tag,使 200 的 To-tag 与后续对话内 NOTIFY 的 From-tag 一致。
                     let local_tag = builder::rand_token("");
-                    let resp = sip_core::SipMessage::Response(builder::response_ok_tagged(
-                        req, &local_tag,
-                    ));
-                    transport.send_to(&resp, incoming.from).await?;
+                    // Expires: 0 是退订(RFC 3265 §3.2.4):回 200 后终止该订阅。
+                    let requested_expires = req.headers.expires().unwrap_or(3600);
+                    self.respond(
+                        transport,
+                        incoming_from,
+                        token,
+                        builder::response_ok_tagged(req, &local_tag),
+                    )
+                    .await?;
 
                     {
                         let body_str =
@@ -1117,30 +1823,52 @@ impl DeviceSimulator {
                                     .get("Event")
                                     .unwrap_or(&query.cmd_type)
                                     .to_string(),
-                                expires: req
-                                    .headers
-                                    .get("Expires")
-                                    .and_then(|s| s.trim().parse().ok())
-                                    .unwrap_or(3600),
+                                expires: requested_expires.min(u32::MAX as u64) as u32,
                             };
+                            // Expires: 0 → 退订。终止周期任务、清对话,并发一条
+                            // Subscription-State: terminated 的收尾 NOTIFY。
+                            if requested_expires == 0 {
+                                self.terminate_subscription(
+                                    transport,
+                                    &query.cmd_type,
+                                    &dialog,
+                                    incoming_from,
+                                )
+                                .await;
+                                return Ok(true);
+                            }
                             match query.cmd_type.as_str() {
                                 // 移动位置订阅:启动周期位置 NOTIFY(独立 MESSAGE 路径)。
                                 "MobilePosition" => {
-                                    self.start_position_subscription(transport, query.interval)
-                                        .await;
+                                    self.start_position_subscription(
+                                        transport,
+                                        query.interval,
+                                        requested_expires,
+                                    )
+                                    .await;
                                 }
                                 // 目录订阅:记录对话供 CRUD 增量 NOTIFY,并回发一条全量目录 NOTIFY。
                                 "Catalog" => {
                                     *self.catalog_dialog.lock().await =
-                                        Some((dialog.clone(), incoming.from));
+                                        Some((dialog.clone(), incoming_from));
+                                    self.arm_subscription_expiry(
+                                        transport,
+                                        "Catalog",
+                                        dialog.clone(),
+                                        incoming_from,
+                                        requested_expires,
+                                    )
+                                    .await;
                                     let sim = Arc::clone(self);
                                     let tp = Arc::clone(transport);
                                     let sn = query.sn;
-                                    let dst = incoming.from;
+                                    let dst = incoming_from;
+                                    let dialog_for_notify = dialog.clone();
                                     // 独立任务发送:notify 走事务会等待平台响应,不占用入站循环。
                                     tokio::spawn(async move {
-                                        if let Err(e) =
-                                            sim.notify_catalog(&tp, dst, &dialog, sn).await
+                                        if let Err(e) = sim
+                                            .notify_catalog(&tp, dst, &dialog_for_notify, sn)
+                                            .await
                                         {
                                             tracing::warn!(error=%e, "目录订阅通知失败");
                                         }
@@ -1148,13 +1876,37 @@ impl DeviceSimulator {
                                 }
                                 // 报警订阅:记录对话,后续 report_alarm 走对话内 NOTIFY。
                                 "Alarm" => {
-                                    *self.alarm_dialog.lock().await = Some((dialog, incoming.from));
+                                    let filter =
+                                        gb28181_protocol::manscdp::AlarmSubscribeFilter::from_query(
+                                            &query,
+                                        );
+                                    tracing::info!(
+                                        ?filter,
+                                        "报警订阅已建立(按 A.2.4.6 筛选条件过滤上报)"
+                                    );
+                                    *self.alarm_dialog.lock().await = Some(AlarmSubscription {
+                                        dialog: dialog.clone(),
+                                        peer: incoming_from,
+                                        filter,
+                                    });
+                                    self.arm_subscription_expiry(
+                                        transport,
+                                        "Alarm",
+                                        dialog,
+                                        incoming_from,
+                                        requested_expires,
+                                    )
+                                    .await;
                                 }
                                 // PTZ 精准位置事件订阅(GB28181-2022 §9.11.1/9.11.2):
                                 // 启动周期 PTZ 精准状态 NOTIFY(独立 MESSAGE 路径,与位置订阅一致)。
                                 "PTZPosition" => {
-                                    self.start_ptz_position_subscription(transport, query.interval)
-                                        .await;
+                                    self.start_ptz_position_subscription(
+                                        transport,
+                                        query.interval,
+                                        requested_expires,
+                                    )
+                                    .await;
                                 }
                                 _ => {}
                             }
@@ -1164,12 +1916,18 @@ impl DeviceSimulator {
                 }
                 sip_core::Method::Info => {
                     // 会话内回放控制(MANSRTSP):PLAY(Scale=N)调速 / 恢复,PAUSE 暂停。
-                    self.handle_info(transport, req, incoming.from).await
+                    self.handle_info(transport, req, incoming_from, token).await
                 }
-                _ => Ok(false),
+                // REGISTER 是设备发出的,不该由设备处理;PRACK/UPDATE/REFER/PUBLISH 未实现。
+                // 静默丢弃会让平台一直重传,按 RFC 3261 §8.2.1 回 405 + Allow。
+                method => {
+                    tracing::info!(%method, "未实现的入站方法,回 405 Method Not Allowed");
+                    let mut resp = builder::response_status(req, 405, "Method Not Allowed");
+                    resp.headers.set("Allow", sip_core::Method::ALLOW_HEADER);
+                    self.respond(transport, incoming_from, token, resp).await?;
+                    Ok(true)
+                }
             }
-        } else {
-            Ok(false)
         }
     }
 
@@ -1180,9 +1938,10 @@ impl DeviceSimulator {
     /// 无活跃会话时也回 200(避免平台重传)。
     async fn handle_info(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
+        token: &sip_core::TxToken,
     ) -> Result<bool> {
         if let Ok(body) = std::str::from_utf8(&req.body) {
             let head = body.trim_start();
@@ -1213,8 +1972,8 @@ impl DeviceSimulator {
                 }
             }
         }
-        let resp = sip_core::SipMessage::Response(builder::response_ok(req));
-        transport.send_to(&resp, from).await?;
+        self.respond(transport, from, token, builder::response_ok(req))
+            .await?;
         Ok(true)
     }
 
@@ -1292,6 +2051,7 @@ impl DeviceSimulator {
             return match op {
                 CruiseOp::SetPoint { track, preset } => format!("巡航{track}增点(预置{preset})"),
                 CruiseOp::DelPoint { track, preset } => format!("巡航{track}删点(预置{preset})"),
+                CruiseOp::DelTrack { track } => format!("删除整条巡航{track}"),
                 CruiseOp::SetSpeed { track, speed } => format!("巡航{track}设速{speed}"),
                 CruiseOp::SetDwell { track, dwell } => format!("巡航{track}停留{dwell}s"),
                 CruiseOp::Start { track } => {
@@ -1301,6 +2061,16 @@ impl DeviceSimulator {
                         format!("巡航{track}启动")
                     }
                 }
+            };
+        }
+        // 自动扫描(表 A.10)。
+        if let Some(op) = ctrl.scan_op() {
+            use gb28181_protocol::manscdp::ScanOp;
+            return match op {
+                ScanOp::Start { group } => format!("自动扫描{group}开始"),
+                ScanOp::SetLeftBoundary { group } => format!("自动扫描{group}设左边界"),
+                ScanOp::SetRightBoundary { group } => format!("自动扫描{group}设右边界"),
+                ScanOp::SetSpeed { group, speed } => format!("自动扫描{group}设速{speed}"),
             };
         }
         // 辅助控制。
@@ -1331,7 +2101,7 @@ impl DeviceSimulator {
     /// 查询命令的人类可读摘要(供 UI 命令时间线)。
     fn query_summary(&self, cmd_type: &str) -> String {
         let ch_count = {
-            let tree = self.catalog_tree.lock().unwrap();
+            let tree = self.catalog_tree.lock();
             if tree.is_empty() {
                 self.config.channels.len()
             } else {
@@ -1358,54 +2128,172 @@ impl DeviceSimulator {
         }
     }
 
-    /// 处理 Query,返回应答 XML。
+    /// 构造目录应答条目(扁平通道或多通道目录树)。
+    fn catalog_items(&self) -> Vec<gb28181_protocol::manscdp::CatalogItem> {
+        use gb28181_protocol::manscdp::CatalogItem;
+        // GB-2022 输出新增字段(安全能力/IP/端口),GB-2016 置 None 不输出。
+        let is_2022 = self.config.gb_version.is_2022();
+        let tree = self.catalog_tree.lock();
+        if tree.is_empty() {
+            // 扁平通道(单通道兼容路径)。
+            self.config
+                .channels
+                .iter()
+                .map(|ch| CatalogItem {
+                    device_id: ch.channel_id.to_string(),
+                    name: ch.name.clone(),
+                    manufacturer: Some(self.config.device_info.manufacturer.clone()),
+                    model: Some(self.config.device_info.model.clone()),
+                    civil_code: None,
+                    parental: Some(0),
+                    parent_id: Some(self.config.device_id.to_string()),
+                    status: ch.status.clone(),
+                    security_level_code: is_2022.then(|| "A".to_string()),
+                    ip_address: None,
+                    port: None,
+                })
+                .collect()
+        } else {
+            // 多通道目录树(FR-34):根设备自引用节点不作为通道项。
+            tree.iter()
+                .filter(|n| n.id != n.parent_id)
+                .map(|n| CatalogItem {
+                    device_id: n.id.clone(),
+                    name: n.name.clone(),
+                    manufacturer: Some(self.config.device_info.manufacturer.clone()),
+                    model: Some(self.config.device_info.model.clone()),
+                    civil_code: n.civil_code.clone(),
+                    parental: Some(n.node_type.parental()),
+                    parent_id: Some(n.parent_id.clone()),
+                    status: n.status.clone(),
+                    security_level_code: is_2022.then(|| "A".to_string()),
+                    ip_address: None,
+                    port: None,
+                })
+                .collect()
+        }
+    }
+
+    /// 处理 Query,返回**一条或多条**应答 XML。
+    ///
+    /// 只有目录可能需要多条:单条 UDP MESSAGE 装整棵目录树容易超 MTU 被静默截断。
+    /// 其余查询体量固定,恒为一条。
+    fn handle_query_replies(
+        &self,
+        query: &gb28181_protocol::manscdp::Query,
+        max_body: usize,
+    ) -> Result<Vec<String>> {
+        if query.cmd_type == "Catalog" {
+            return self.catalog_replies(query, max_body);
+        }
+        Ok(vec![self.handle_query(query)?])
+    }
+
+    /// 单条 MANSCDP body 的上限:UDP 受 MTU 约束需要分片,TCP 是流式传输不需要。
+    fn max_body_for(protocol: common::Transport) -> usize {
+        match protocol {
+            common::Transport::Udp => MAX_MANSCDP_BODY_BYTES,
+            common::Transport::Tcp => usize::MAX,
+        }
+    }
+
+    /// 目录应答:先按整条试算,超过安全阈值才按条目数分片(SumNum 恒为总数)。
+    ///
+    /// 这样小目录的报文与之前完全一致,只有真会超 MTU 的大目录才分多条。
+    fn catalog_replies(
+        &self,
+        query: &gb28181_protocol::manscdp::Query,
+        max_body: usize,
+    ) -> Result<Vec<String>> {
+        use gb28181_protocol::manscdp::CatalogResponse;
+        let items = self.catalog_items();
+        let single = CatalogResponse::new(&query.device_id, query.sn, items.clone()).to_xml()?;
+        if single.len() <= max_body || items.is_empty() {
+            return Ok(vec![single]);
+        }
+        // 按平均条目大小估算每条能装多少个,再留一档余量(GB18030 中文会略微膨胀)。
+        let per_message = ((max_body * items.len()) / single.len()).max(1);
+        let total = items.len();
+        let parts = CatalogResponse::split(&query.device_id, query.sn, items, per_message);
+        tracing::info!(
+            total,
+            per_message,
+            messages = parts.len(),
+            "目录较大,分多条 MESSAGE 应答(SumNum 为总数)"
+        );
+        parts.iter().map(|p| p.to_xml()).collect()
+    }
+
+    /// 按录像检索请求(A.2.4.5)的时间区间生成录像段。
+    ///
+    /// 模拟器没有真实录像,但**必须遵守请求的时间范围** —— 否则平台时间轴上
+    /// 永远只有一段固定录像,回放定位无从验证。这里按整点切段(每段 1 小时,
+    /// 最多 24 段),并按 `Type` 过滤(time/alarm/manual/all)。
+    fn record_items_for(
+        &self,
+        query: &gb28181_protocol::manscdp::Query,
+    ) -> Vec<gb28181_protocol::manscdp::RecordItem> {
+        use gb28181_protocol::manscdp::RecordItem;
+        const MAX_SEGMENTS: usize = 24;
+
+        let wanted = query.record_type.as_deref().unwrap_or("all").trim();
+        // 只请求 alarm/manual 时模拟器没有对应录像,返回空列表(SumNum=0)。
+        if !wanted.is_empty() && !wanted.eq_ignore_ascii_case("all") && wanted != "time" {
+            return Vec::new();
+        }
+
+        let (Some(start), Some(end)) = (
+            query
+                .start_time
+                .as_deref()
+                .and_then(common::clock::parse_iso8601),
+            query
+                .end_time
+                .as_deref()
+                .and_then(common::clock::parse_iso8601),
+        ) else {
+            // 平台没给时间区间(不合规但现实存在):退回单段占位。
+            return vec![RecordItem::timed(
+                &query.device_id,
+                "record",
+                common::clock::synced_iso8601(),
+                common::clock::synced_iso8601(),
+            )];
+        };
+        if end <= start {
+            return Vec::new();
+        }
+
+        const HOUR: i64 = 3600;
+        let mut items = Vec::new();
+        // 从起始时间所在整点开始切段。
+        let mut seg_start = start - start.rem_euclid(HOUR);
+        if seg_start < start {
+            seg_start = start;
+        }
+        while seg_start < end && items.len() < MAX_SEGMENTS {
+            let seg_end = (seg_start - seg_start.rem_euclid(HOUR) + HOUR).min(end);
+            if seg_end <= seg_start {
+                break;
+            }
+            items.push(RecordItem::timed(
+                &query.device_id,
+                format!("record-{}", items.len() + 1),
+                common::clock::epoch_to_iso8601(seg_start),
+                common::clock::epoch_to_iso8601(seg_end),
+            ));
+            seg_start = seg_end;
+        }
+        items
+    }
+
+    /// 处理 Query,返回应答 XML(目录只返回首条,完整分片见 [`Self::handle_query_replies`])。
     fn handle_query(&self, query: &gb28181_protocol::manscdp::Query) -> Result<String> {
         use gb28181_protocol::manscdp::*;
         match query.cmd_type.as_str() {
             "Catalog" => {
-                // GB-2022 输出新增字段(安全能力/IP/端口),GB-2016 置 None 不输出。
-                let is_2022 = self.config.gb_version.is_2022();
-                let tree = self.catalog_tree.lock().unwrap();
-                let items: Vec<CatalogItem> = if tree.is_empty() {
-                    // 扁平通道(单通道兼容路径)。
-                    self.config
-                        .channels
-                        .iter()
-                        .map(|ch| CatalogItem {
-                            device_id: ch.channel_id.to_string(),
-                            name: ch.name.clone(),
-                            manufacturer: Some(self.config.device_info.manufacturer.clone()),
-                            model: Some(self.config.device_info.model.clone()),
-                            civil_code: None,
-                            parental: Some(0),
-                            parent_id: Some(self.config.device_id.to_string()),
-                            status: ch.status.clone(),
-                            security_level_code: is_2022.then(|| "A".to_string()),
-                            ip_address: None,
-                            port: None,
-                        })
-                        .collect()
-                } else {
-                    // 多通道目录树(FR-34):根设备自引用节点不作为通道项。
-                    tree.iter()
-                        .filter(|n| n.id != n.parent_id)
-                        .map(|n| CatalogItem {
-                            device_id: n.id.clone(),
-                            name: n.name.clone(),
-                            manufacturer: Some(self.config.device_info.manufacturer.clone()),
-                            model: Some(self.config.device_info.model.clone()),
-                            civil_code: n.civil_code.clone(),
-                            parental: Some(n.node_type.parental()),
-                            parent_id: Some(n.parent_id.clone()),
-                            status: n.status.clone(),
-                            security_level_code: is_2022.then(|| "A".to_string()),
-                            ip_address: None,
-                            port: None,
-                        })
-                        .collect()
-                };
-                let resp = CatalogResponse::new(&query.device_id, query.sn, items);
-                resp.to_xml()
+                let items = self.catalog_items();
+                CatalogResponse::new(&query.device_id, query.sn, items).to_xml()
             }
             "DeviceInfo" => {
                 let resp = DeviceInfoResponse {
@@ -1422,32 +2310,41 @@ impl DeviceSimulator {
                 resp.to_xml()
             }
             "DeviceStatus" => {
-                let resp = DeviceStatusResponse {
-                    cmd_type: "DeviceStatus".into(),
-                    sn: query.sn,
-                    device_id: query.device_id.clone(),
-                    result: "OK".into(),
-                    online: "ONLINE".into(),
-                    status: "OK".into(),
+                // A.2.6.6 的可选字段平台是会读的:DeviceTime 用于显示设备时钟/判断是否
+                // 需要校时,Alarmstatus 用于报警值守面板。我们本就做了网络校时,
+                // 报一个真实时间几乎零成本。
+                let (recording, alarming) = {
+                    let st = self.control_state.lock();
+                    (st.recording, st.alarming)
                 };
-                resp.to_xml()
+                let alarm_channels: Vec<String> = self
+                    .config
+                    .channels
+                    .iter()
+                    .map(|c| c.channel_id.to_string())
+                    .collect();
+                DeviceStatusResponse::online(
+                    &query.device_id,
+                    query.sn,
+                    Some(common::clock::synced_iso8601()),
+                    recording,
+                    &alarm_channels,
+                    alarming,
+                )
+                .to_xml()
             }
             "RecordInfo" => {
-                // 返回一段模拟录像(FR-10)。真实实现应按查询时间范围列举本地录像。
-                let items = vec![RecordItem {
-                    device_id: query.device_id.clone(),
-                    name: "record".into(),
-                    start_time: "2026-07-03T10:00:00".into(),
-                    end_time: "2026-07-03T10:05:00".into(),
-                    kind: "time".into(),
-                }];
-                let resp = RecordInfoResponse::with_name(
+                // A.2.4.5:StartTime / EndTime 是**必选**检索条件。之前无论平台查哪一天
+                // 都返回同一段硬编码录像("2026-07-03T10:00"),平台侧时间轴对不上。
+                // 现在按请求区间切成整点段返回。
+                let items = self.record_items_for(query);
+                RecordInfoResponse::with_name(
                     &query.device_id,
                     self.config.device_info.device_name.clone(),
                     query.sn,
                     items,
-                );
-                resp.to_xml()
+                )
+                .to_xml()
             }
             "ConfigDownload" => {
                 // 设备配置查询:按 ConfigType 返回基本参数(BasicParam)和/或视频参数(VideoParamOpt)。
@@ -1469,25 +2366,18 @@ impl DeviceSimulator {
                 let items: Vec<PresetItem> = self
                     .presets
                     .lock()
-                    .map(|p| {
-                        p.iter()
-                            .map(|(id, name)| PresetItem {
-                                preset_id: *id as u32,
-                                preset_name: name.clone(),
-                            })
-                            .collect()
+                    .iter()
+                    .map(|(id, name)| PresetItem {
+                        preset_id: *id as u32,
+                        preset_name: name.clone(),
                     })
-                    .unwrap_or_default();
+                    .collect();
                 let resp = PresetQueryResponse::new(&query.device_id, query.sn, items);
                 resp.to_xml()
             }
             "AlarmStatus" => {
                 // 报警状态查询(FR-17):GB-2022 每报警通道一项 DutyStatus,GB-2016 用 NotNumber。
-                let alarming = self
-                    .control_state
-                    .lock()
-                    .map(|s| s.alarming)
-                    .unwrap_or(false);
+                let alarming = self.control_state.lock().alarming;
                 // 报警通道:取设备各通道 ID(模拟器无独立报警通道时用查询目标 ID 兜底)。
                 let channels: Vec<String> = if self.config.channels.is_empty() {
                     vec![query.device_id.clone()]
@@ -1509,11 +2399,10 @@ impl DeviceSimulator {
             }
             "HomePositionQuery" => {
                 // 看守位查询(FR-17):ResetTime 固定 30,PresetIndex 为"有无看守位"标志。
-                let (enabled, has_home) = self
-                    .control_state
-                    .lock()
-                    .map(|s| (s.home_enabled, s.home_set))
-                    .unwrap_or((true, false));
+                let (enabled, has_home) = {
+                    let s = self.control_state.lock();
+                    (s.home_enabled, s.home_set)
+                };
                 HomePositionQueryResponse::new(&query.device_id, query.sn, enabled, has_home)
                     .to_xml()
             }
@@ -1526,8 +2415,10 @@ impl DeviceSimulator {
                 let tracks: Vec<u32> = self
                     .control_state
                     .lock()
-                    .map(|s| s.cruise_tracks.keys().copied().collect())
-                    .unwrap_or_default();
+                    .cruise_tracks
+                    .keys()
+                    .copied()
+                    .collect();
                 CruiseTrackListResponse::new(&query.device_id, query.sn, &tracks).to_xml()
             }
             "CruiseTrackQuery" => {
@@ -1536,17 +2427,15 @@ impl DeviceSimulator {
                 let presets: Vec<u32> = self
                     .control_state
                     .lock()
-                    .map(|s| s.cruise_tracks.get(&group).cloned().unwrap_or_default())
+                    .cruise_tracks
+                    .get(&group)
+                    .cloned()
                     .unwrap_or_default();
                 CruiseTrackQueryResponse::new(&query.device_id, query.sn, group, &presets).to_xml()
             }
             "PTZPosition" => {
                 // PTZ 精准状态查询(FR-17,GB-2022):返回最近精准云台姿态。
-                let (pan, tilt, zoom) = self
-                    .control_state
-                    .lock()
-                    .map(|s| s.precise_pose)
-                    .unwrap_or((0.0, 0.0, 1.0));
+                let (pan, tilt, zoom) = self.control_state.lock().precise_pose;
                 PtzPreciseStatusResponse::new(&query.device_id, query.sn, pan, tilt, zoom).to_xml()
             }
             _ => Err(Error::Gb28181(format!(
@@ -1574,23 +2463,19 @@ impl DeviceSimulator {
                         .filter(|name| !name.is_empty())
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("预置位{idx}"));
-                    if let Ok(mut p) = self.presets.lock() {
-                        p.insert(idx, name.clone());
-                    }
+                    self.presets.lock().insert(idx, name.clone());
                     tracing::info!(preset = idx, preset_name = %name, "预置位设置");
                 }
                 Some((PresetAction::Delete, idx)) => {
-                    if let Ok(mut p) = self.presets.lock() {
-                        p.remove(&idx);
-                    }
+                    self.presets.lock().remove(&idx);
                     tracing::info!(preset = idx, "预置位删除");
                 }
                 Some((PresetAction::Call, idx)) => {
                     let name = self
                         .presets
                         .lock()
-                        .ok()
-                        .and_then(|presets| presets.get(&idx).cloned())
+                        .get(&idx)
+                        .cloned()
                         .unwrap_or_else(|| format!("预置位{idx}"));
                     tracing::info!(preset = idx, preset_name = %name, "预置位调用(转到)");
                     self.observer
@@ -1598,7 +2483,11 @@ impl DeviceSimulator {
                 }
                 None => {
                     // 优先级:巡航/辅助(0x8x)→ FI 光圈聚焦(0x4x)→ 方向/变倍运动。
-                    if let Some(op) = ctrl.cruise_op() {
+                    // 自动扫描(表 A.10)。0x89/0x8A 之前被错当成辅助开关(实际是
+                    // 0x8C/0x8D),扫描指令等于被静默吞掉;现在单独一支。
+                    if let Some(op) = ctrl.scan_op() {
+                        self.apply_scan_op(op);
+                    } else if let Some(op) = ctrl.cruise_op() {
                         self.apply_cruise_op(op);
                     } else if let Some(aux) = ctrl.aux_op() {
                         tracing::info!(func = aux.function.label(), on = aux.on, "辅助控制");
@@ -1628,9 +2517,7 @@ impl DeviceSimulator {
         // 精确云台控制(GB-2022):记录姿态供 PTZPosition 读回。
         if let Some(p) = &ctrl.ptz_precise_ctrl {
             tracing::info!(pan = p.pan, tilt = p.tilt, zoom = p.zoom, "精确云台控制");
-            if let Ok(mut s) = self.control_state.lock() {
-                s.precise_pose = (p.pan, p.tilt, p.zoom);
-            }
+            self.control_state.lock().precise_pose = (p.pan, p.tilt, p.zoom);
         }
         // 目标跟踪:白名单模式外忽略,仍应答 200/OK。
         if let Some(t) = &ctrl.target_track {
@@ -1646,17 +2533,22 @@ impl DeviceSimulator {
             let disk = ctrl.disk_num.unwrap_or(0);
             tracing::info!(disk, "格式化 SD 卡(模拟接受)");
         }
+        // 录像控制:更新录像态(供 DeviceStatus 的 Record 字段读回)。
+        if let Some(v) = ctrl.record_cmd.as_deref() {
+            let recording = v.eq_ignore_ascii_case("Record");
+            self.control_state.lock().recording = recording;
+            tracing::info!(record = %v, recording, "录像控制");
+        }
         // 布防/撤防:更新报警值守态(供 AlarmStatus 查询读回)。
         if let Some(g) = &ctrl.guard_cmd {
             let arm = g.eq_ignore_ascii_case("SetGuard");
-            if let Ok(mut s) = self.control_state.lock() {
-                s.alarming = arm;
-            }
+            self.control_state.lock().alarming = arm;
             tracing::info!(guard = %g, "布防/撤防");
         }
         // 看守位设置:更新启用/已设标志(供 HomePositionQuery 读回)。
         if let Some(hp) = &ctrl.home_position {
-            if let Ok(mut s) = self.control_state.lock() {
+            {
+                let mut s = self.control_state.lock();
                 s.home_enabled = hp.enabled != 0;
                 s.home_set = hp.enabled != 0;
             }
@@ -1715,12 +2607,34 @@ impl DeviceSimulator {
         resp.to_xml()
     }
 
+    /// 应用自动扫描控制操作(GB/T 28181-2022 表 A.10)。
+    fn apply_scan_op(&self, op: gb28181_protocol::manscdp::ScanOp) {
+        use gb28181_protocol::manscdp::ScanOp;
+        let mut s = self.control_state.lock();
+        match op {
+            ScanOp::Start { group } => {
+                s.scan_groups.entry(group).or_default().scanning = true;
+                tracing::info!(group, "自动扫描开始(画面自右向左)");
+            }
+            ScanOp::SetLeftBoundary { group } => {
+                s.scan_groups.entry(group).or_default().left_set = true;
+                tracing::info!(group, "设置自动扫描左边界");
+            }
+            ScanOp::SetRightBoundary { group } => {
+                s.scan_groups.entry(group).or_default().right_set = true;
+                tracing::info!(group, "设置自动扫描右边界");
+            }
+            ScanOp::SetSpeed { group, speed } => {
+                s.scan_groups.entry(group).or_default().speed = speed;
+                tracing::info!(group, speed, "设置自动扫描速度");
+            }
+        }
+    }
+
     /// 应用巡航轨迹控制操作到设备控制态(供 CruiseTrack* 查询读回)。
     fn apply_cruise_op(&self, op: gb28181_protocol::manscdp::CruiseOp) {
         use gb28181_protocol::manscdp::CruiseOp;
-        let Ok(mut s) = self.control_state.lock() else {
-            return;
-        };
+        let mut s = self.control_state.lock();
         match op {
             CruiseOp::SetPoint { track, preset } => {
                 let pts = s.cruise_tracks.entry(track).or_default();
@@ -1735,12 +2649,20 @@ impl DeviceSimulator {
                 }
                 tracing::info!(track, preset, "巡航删点");
             }
+            // 表 A.9 注2:字节6=00H 时删除整条巡航。
+            CruiseOp::DelTrack { track } => {
+                s.cruise_tracks.remove(&track);
+                s.cruise_params.remove(&track);
+                tracing::info!(track, "巡航删除整条轨迹");
+            }
             CruiseOp::SetSpeed { track, speed } => {
                 s.cruise_tracks.entry(track).or_default();
+                s.cruise_params.entry(track).or_default().0 = speed;
                 tracing::info!(track, speed, "巡航设速");
             }
             CruiseOp::SetDwell { track, dwell } => {
                 s.cruise_tracks.entry(track).or_default();
+                s.cruise_params.entry(track).or_default().1 = dwell;
                 tracing::info!(track, dwell, "巡航设停留");
             }
             CruiseOp::Start { track } => {
@@ -1761,7 +2683,7 @@ impl DeviceSimulator {
     /// 到"发出带正确 SDP 的 INVITE"为止(记忆:不盲写无法验证的部分),已足以让平台侧建流。
     async fn handle_broadcast(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         bc: &gb28181_protocol::manscdp::BroadcastNotify,
         from: SocketAddr,
     ) -> Result<()> {
@@ -1812,7 +2734,7 @@ impl DeviceSimulator {
     /// 已在入站循环里回过 200/结果,这里异步执行不阻塞应答。
     fn spawn_control_side_effects(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         ctrl: &gb28181_protocol::manscdp::Control,
     ) {
         // 在线升级:4 步进度 NOTIFY。
@@ -1851,7 +2773,7 @@ impl DeviceSimulator {
     /// 在线升级 4 步进度:percent [0,30,60,100],步间 1.5s,发 DeviceUpgradeResult NOTIFY。
     async fn run_upgrade_progress(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         up: &gb28181_protocol::manscdp::DeviceUpgrade,
     ) {
         let (h, p) = (self.local_host(), self.local_port());
@@ -1890,7 +2812,7 @@ impl DeviceSimulator {
     /// 模拟设备无摄像头,上传一段占位 JPEG 字节。
     async fn run_snapshot_upload(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         cfg: &gb28181_protocol::manscdp::SnapShotConfig,
     ) {
         let (h, p) = (self.local_host(), self.local_port());
@@ -1938,7 +2860,7 @@ impl DeviceSimulator {
     /// 向平台发送一条应答/通知 MESSAGE(查询应答、控制应答、位置通知等复用)。
     async fn send_reply_message(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         to: SocketAddr,
         xml: &str,
     ) -> Result<()> {
@@ -1950,6 +2872,7 @@ impl DeviceSimulator {
             &self.local_host(),
             self.local_port(),
             xml,
+            transport.protocol(),
         );
         transport
             .send_to(&sip_core::SipMessage::Request(reply), to)
@@ -1959,9 +2882,10 @@ impl DeviceSimulator {
     /// 处理 INVITE:解析平台 SDP,启动推流,回 200 OK(带本端 SDP)。
     async fn handle_invite(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
+        token: &sip_core::TxToken,
     ) -> Result<bool> {
         use std::net::IpAddr;
 
@@ -1991,60 +2915,106 @@ impl DeviceSimulator {
         });
         tracing::info!(%rtp_dst, ssrc, "INVITE:开始向平台推流");
 
-        // 启动推流任务(若配置了视频源)。
-        let mut sess_guard = self.session.lock().await;
-        if sess_guard.is_some() {
-            let busy =
-                sip_core::SipMessage::Response(builder::response_status(req, 486, "Busy Here"));
-            transport.send_to(&busy, from).await?;
-            return Ok(true);
+        // 会话互斥:只在这段临界区里判重,**不在持锁期间做网络/阻塞操作**。
+        // 之前 session 锁从判重一直持到推流任务写入槽位,期间跨越两次 send_to().await
+        // 和同步的视频源构建(容器转封装最长数秒),高并发点播会互相排队。
+        {
+            let busy = self.session.lock().await.is_some();
+            if busy {
+                self.respond(
+                    transport,
+                    from,
+                    token,
+                    builder::response_status(req, 486, "Busy Here"),
+                )
+                .await?;
+                return Ok(true);
+            }
         }
-        // 实时设备启动可能涉及 TCC 授权和最多 5 秒首帧等待，先发 100 防止
+        // 实时设备启动可能涉及 TCC 授权和最多 5 秒首帧等待,先发 100 防止
         // 平台在准备期间把事务误判为无响应。
         let trying = sip_core::SipMessage::Response(builder::response_status(req, 100, "Trying"));
         transport.send_to(&trying, from).await?;
 
-        // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 TCP-ACTIVE(RFC 4571)。
-        let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
+        // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 RTP over TCP。
+        // 主被动角色按 `a=setup` 取反(RFC 4145):平台 active → 设备 passive。
+        let use_tcp = platform_sdp.is_tcp();
+        let local_setup = platform_sdp.local_tcp_setup();
+        let local_passive = use_tcp && local_setup == sip_core::Setup::Passive;
 
         // 按配置选择视频源:实时采集(live:) > 文件(C档) > 轻量伪流(B档) > 不推流(A档)。
         let fps = self.config.video_fps;
-        let source: Option<Box<dyn media_rtp::VideoSource>> =
-            if let Some(ref path) = self.config.video_source {
-                let built: Result<Box<dyn media_rtp::VideoSource>> = if path.starts_with("live:") {
-                    // 实时源由 LiveSource 严格解析完整 URI;legacy live:0 明确映射主屏幕。
-                    media_rtp::LiveSource::capture(path, fps)
-                        .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
-                        .map_err(|e| Error::Media(format!("实时采集失败: {e}")))
-                } else {
-                    // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
-                    media_rtp::FileSource::from_path_av(path, fps)
-                        .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
-                        .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))
-                };
-                match built {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        // 采集/加载失败发生在点播(INVITE)这条异步流程里,不经 start_device
-                        // 返回值。必须推 RuntimeError 事件,否则前端一片安静、只见收流超时。
-                        self.observer.on_event(common::DeviceEvent::RuntimeError {
-                            scope: "capture".into(),
-                            message: e.to_string(),
-                        });
-                        let unavailable = sip_core::SipMessage::Response(builder::response_status(
-                            req,
-                            480,
-                            "Temporarily Unavailable",
-                        ));
-                        transport.send_to(&unavailable, from).await?;
-                        return Ok(true);
+        let source: Option<Box<dyn media_rtp::VideoSource>> = if let Some(ref path) =
+            self.config.video_source
+        {
+            let path = path.clone();
+            // 视频源构建是**同步阻塞**的(ffmpeg 转封装、摄像头授权、最长 5 秒首帧),
+            // 直接在异步上下文里调用会占住 runtime 工作线程。
+            let built =
+                tokio::task::spawn_blocking(move || -> Result<Box<dyn media_rtp::VideoSource>> {
+                    if path.starts_with("live:") {
+                        // 实时源由 LiveSource 严格解析完整 URI;legacy live:0 明确映射主屏幕。
+                        media_rtp::LiveSource::capture(&path, fps)
+                            .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
+                            .map_err(|e| Error::Media(format!("实时采集失败: {e}")))
+                    } else {
+                        // 含音频轨的文件走音视频复合流(from_path_av);裸流/无音频自动退化为纯视频。
+                        media_rtp::FileSource::from_path_av(&path, fps)
+                            .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
+                            .map_err(|e| Error::Media(format!("加载视频源失败: {e}")))
                     }
+                })
+                .await
+                .map_err(|e| Error::Media(format!("视频源构建任务异常: {e}")))?;
+            match built {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    // 采集/加载失败发生在点播(INVITE)这条异步流程里,不经 start_device
+                    // 返回值。必须推 RuntimeError 事件,否则前端一片安静、只见收流超时。
+                    self.observer.on_event(common::DeviceEvent::RuntimeError {
+                        scope: "capture".into(),
+                        message: e.to_string(),
+                    });
+                    self.respond(
+                        transport,
+                        from,
+                        token,
+                        builder::response_status(req, 480, "Temporarily Unavailable"),
+                    )
+                    .await?;
+                    return Ok(true);
                 }
-            } else {
-                self.config
-                    .light_bitrate_kbps
-                    .map(|kbps| Box::new(media_rtp::LightSource::new(kbps, fps)) as _)
-            };
+            }
+        } else {
+            self.config
+                .light_bitrate_kbps
+                .map(|kbps| Box::new(media_rtp::LightSource::new(kbps, fps)) as _)
+        };
+
+        // 预先绑定本端媒体端口,使 200 OK 的 SDP 能写**真实端口**
+        // (SDP 里 m= 端口 0 表示该媒体被禁用,之前恒填 0)。
+        let prepared = if source.is_some() {
+            match media_rtp::PreparedMedia::prepare(rtp_dst, use_tcp, local_passive).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.observer.on_event(common::DeviceEvent::RuntimeError {
+                        scope: "stream".into(),
+                        message: format!("本端媒体端口绑定失败: {e}"),
+                    });
+                    self.respond(
+                        transport,
+                        from,
+                        token,
+                        builder::response_status(req, 500, "Server Internal Error"),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+        } else {
+            None
+        };
+        let local_rtp_port = prepared.as_ref().map(|p| p.local_port()).unwrap_or(0);
 
         // 先构造并发送 200 OK(带本端 SDP,SSRC 回显平台值)。
         // TCP-PASSIVE 下平台收到 200 后才开始监听,故推流必须在 200 之后再连接。
@@ -2058,20 +3028,24 @@ impl DeviceSimulator {
             .strip_prefix("sip:")
             .and_then(|s| s.split('@').next())
             .unwrap_or(self.config.device_id.as_str());
-        let local_sdp =
-            sip_core::SessionDescription::new_device_response(channel, local_ip, 0, ssrc, use_tcp);
+        let local_sdp = sip_core::SessionDescription::new_device_response_with_setup(
+            channel,
+            local_ip,
+            local_rtp_port,
+            ssrc,
+            use_tcp,
+            use_tcp.then_some(local_setup),
+        );
         let sdp_body = local_sdp.to_string();
 
         let mut resp = builder::response_ok(req);
         resp.headers.set("Content-Type", "application/sdp");
         resp.body = sdp_body.as_bytes().to_vec();
-        transport
-            .send_to(&sip_core::SipMessage::Response(resp), from)
-            .await?;
+        self.respond(transport, from, token, resp).await?;
 
         // 200 OK 已发,启动推流(TCP 模式给平台一点时间建监听 + 收 ACK)。
         // 带回放控制:回放时平台可经会话内 INFO 调整倍速/暂停,直播则保持 1.0x。
-        if let Some(source) = source {
+        if let (Some(source), Some(prepared)) = (source, prepared) {
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
             let (start_tx, start_rx) = tokio::sync::oneshot::channel();
             let control = media_rtp::PlaybackControl::new();
@@ -2091,15 +3065,16 @@ impl DeviceSimulator {
                 if start_rx.await.is_err() {
                     return;
                 }
-                if use_tcp {
+                if use_tcp && !local_passive {
+                    // TCP-ACTIVE:给平台一点时间在收到 200 后建好监听。
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                let result = media_rtp::push_stream_controlled(
+                let result = media_rtp::push_stream_prepared(
+                    prepared,
                     source,
                     rtp_dst,
                     ssrc,
                     fps,
-                    use_tcp,
                     control_task,
                     async {
                         let _ = stop_rx.await;
@@ -2127,7 +3102,7 @@ impl DeviceSimulator {
                     simulator.observer.on_event(common::DeviceEvent::StreamStop);
                 }
             });
-            *sess_guard = Some(PushSession {
+            *self.session.lock().await = Some(PushSession {
                 marker,
                 _task: task,
                 stop_tx,
@@ -2137,7 +3112,6 @@ impl DeviceSimulator {
             self.observer.on_event(common::DeviceEvent::StreamStart);
             let _ = start_tx.send(());
         }
-        drop(sess_guard);
         let mode = if platform_sdp.is_download() {
             "下载"
         } else if platform_sdp.is_playback() {
@@ -2156,25 +3130,18 @@ impl DeviceSimulator {
     /// 处理 BYE:停止推流,回 200 OK。回放/下载会话结束后补发 MediaStatus 121。
     async fn handle_bye(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<dyn SipTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
+        token: &sip_core::TxToken,
     ) -> Result<bool> {
-        let mut sess_guard = self.session.lock().await;
-        let was_history = sess_guard.as_ref().map(|s| s.is_history).unwrap_or(false);
-        let had_session = if let Some(session) = sess_guard.take() {
-            let _ = session.stop_tx.send(()); // 触发停流
-            true
-        } else {
-            false
-        };
-        drop(sess_guard);
+        let (was_history, had_session) = self.stop_active_session().await;
         if had_session {
             self.observer.on_event(common::DeviceEvent::StreamStop);
         }
 
-        let resp = sip_core::SipMessage::Response(builder::response_ok(req));
-        transport.send_to(&resp, from).await?;
+        self.respond(transport, from, token, builder::response_ok(req))
+            .await?;
 
         // 回放/下载会话结束:补发 MediaStatus 121(历史媒体文件发送结束)。
         if was_history {
@@ -2193,13 +3160,63 @@ impl DeviceSimulator {
         Ok(true)
     }
 
+    /// 停掉当前活跃会话,返回 (是否历史会话, 之前是否有会话)。
+    ///
+    /// 单独抽出来是为了**不在持锁期间 await 网络发送**:BYE/CANCEL 都只需要瞬时
+    /// 摘掉会话槽位,后续应答与通知在锁外做。
+    async fn stop_active_session(&self) -> (bool, bool) {
+        let mut sess_guard = self.session.lock().await;
+        let was_history = sess_guard.as_ref().map(|s| s.is_history).unwrap_or(false);
+        let had_session = if let Some(session) = sess_guard.take() {
+            let _ = session.stop_tx.send(()); // 触发停流
+            true
+        } else {
+            false
+        };
+        (was_history, had_session)
+    }
+
+    /// 处理 CANCEL(RFC 3261 §9.2)。
+    ///
+    /// 正确行为是**两条响应**:对 CANCEL 本身回 200 OK,同时对被取消的 INVITE 回
+    /// 487 Request Terminated。之前只回 200,平台会一直等 INVITE 的最终响应,
+    /// 表现为"点播取消后平台界面卡在加载中"。
+    async fn handle_cancel(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+        req: &sip_core::Request,
+        from: SocketAddr,
+        token: &sip_core::TxToken,
+    ) -> Result<bool> {
+        let (_, had_session) = self.stop_active_session().await;
+        if had_session {
+            self.observer.on_event(common::DeviceEvent::StreamStop);
+        }
+
+        // 1) 对 CANCEL 回 200 OK。
+        self.respond(transport, from, token, builder::response_ok(req))
+            .await?;
+
+        // 2) 对原 INVITE 回 487。CANCEL 与被取消的 INVITE 共享 Via branch / CSeq 序号,
+        //    只是 CSeq 方法不同,据此构造 487 的事务标识头。
+        let mut terminated = builder::response_status(req, 487, "Request Terminated");
+        if let Some(cseq_num) = req.headers.cseq_number() {
+            terminated.headers.set("CSeq", format!("{cseq_num} INVITE"));
+        }
+        transport
+            .send_to(&sip_core::SipMessage::Response(terminated), from)
+            .await?;
+        tracing::info!("CANCEL:已回 200 并对原 INVITE 回 487");
+        Ok(true)
+    }
+
     /// 运行设备:注册 → 启动入站应答(OPTIONS)→ 周期心跳,直到 `shutdown` 完成。
     ///
     /// 心跳连续失败 `max_hb_fail` 次判定掉线,触发重注册(指数退避 backoff→2×,上限 backoff_max)。
     /// 这是设备"保持在线"的主循环(docs/10-functional/device-simulation.md §3.2/§3.3)。
     pub async fn run(
         self: Arc<Self>,
-        transport: Arc<UdpTransport>,
+        transport: Arc<dyn SipTransport>,
         local_host: String,
         local_port: u16,
         shutdown: impl std::future::Future<Output = ()>,
@@ -2221,7 +3238,7 @@ impl DeviceSimulator {
         );
         // 多通道目录树的视频通道 ID 也要注册,否则平台点播子通道的 INVITE 收不到(问题1)。
         {
-            let tree = self.catalog_tree.lock().unwrap();
+            let tree = self.catalog_tree.lock();
             aors.extend(
                 tree.iter()
                     .filter(|n| {
@@ -2247,8 +3264,9 @@ impl DeviceSimulator {
         });
 
         // 初次注册(失败则退避重试)。
+        // §9.1.1 c):注册重试间隔可调,一般不应短于 60s。压测场景会调小。
         let backoff_base = Duration::from_secs(1);
-        let backoff_max = Duration::from_secs(30);
+        let backoff_max = Duration::from_secs(self.config.register_retry_max_secs.max(1));
         let mut backoff = backoff_base;
         while (self.register(&transport, &local_host, local_port).await).is_err() {
             tokio::select! {
@@ -2261,10 +3279,11 @@ impl DeviceSimulator {
         tracing::info!(device=%self.config.device_id, "注册成功");
 
         // 心跳主循环 + 注册续约(FR-32)。
-        // 注册有效期 3600s(与 builder::register 一致),到期前 80%(2880s)主动重注册续约。
+        // 续约周期以**平台授予的 Expires** 为准(取其 80%),而不是硬编码 3600×80%。
+        // 平台只给 120s 时,按 2880s 续约会被判掉线。
         let interval = Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
-        let renew_after = Duration::from_secs(3600 * 80 / 100);
-        let mut renew_ticker = tokio::time::interval(renew_after);
+        let mut current_expires = self.granted_expires();
+        let mut renew_ticker = tokio::time::interval(renew_interval(current_expires));
         renew_ticker.reset(); // 跳过启动即触发
         let max_hb_fail = 3u32;
         let mut hb_fail = 0u32;
@@ -2273,8 +3292,19 @@ impl DeviceSimulator {
                 _ = &mut shutdown => break,
                 _ = renew_ticker.tick() => {
                     // 到期前主动续约,避免掉线后被动重注册。
-                    tracing::info!(device=%self.config.device_id, "注册续约(到期前 80%)");
+                    tracing::info!(
+                        device=%self.config.device_id,
+                        expires = current_expires,
+                        "注册续约(平台授予有效期的 80%)"
+                    );
                     let _ = self.register(&transport, &local_host, local_port).await;
+                    // 平台可能在续约时改授新的有效期,跟随调整续约周期。
+                    let granted = self.granted_expires();
+                    if granted != current_expires {
+                        current_expires = granted;
+                        renew_ticker = tokio::time::interval(renew_interval(current_expires));
+                        renew_ticker.reset();
+                    }
                 }
                 _ = tokio::time::sleep(interval) => {
                     match self.send_keepalive(&transport, &local_host, local_port).await {
@@ -2284,12 +3314,20 @@ impl DeviceSimulator {
                             if hb_fail >= max_hb_fail {
                                 tracing::warn!(device=%self.config.device_id, "心跳连续失败,重注册");
                                 hb_fail = 0;
+                                // 平台此时已把设备当离线,gauge 要跟上。
+                                self.set_online(false);
                                 let mut b = backoff_base;
                                 while self.register(&transport, &local_host, local_port).await.is_err() {
                                     tokio::select! {
                                         _ = &mut shutdown => { inbound_task.abort(); return; }
                                         _ = tokio::time::sleep(b) => { b = (b * 2).min(backoff_max); }
                                     }
+                                }
+                                let granted = self.granted_expires();
+                                if granted != current_expires {
+                                    current_expires = granted;
+                                    renew_ticker = tokio::time::interval(renew_interval(current_expires));
+                                    renew_ticker.reset();
                                 }
                             }
                         }
@@ -2298,6 +3336,7 @@ impl DeviceSimulator {
             }
         }
         inbound_task.abort();
+        self.set_online(false);
         self.stop_subscriptions().await;
         // 主动向平台注销(REGISTER Expires=0,§9.1.2.2):平台立即置离线,不等心跳超时。
         if let Err(e) = self.unregister(&transport, &local_host, local_port).await {
@@ -2312,7 +3351,7 @@ impl DeviceSimulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sip_core::{Headers, Response, SipMessage};
+    use sip_core::{Headers, Method, Request, Response, SipMessage, UdpTransport};
 
     fn test_cfg(host: &str, port: u16) -> DeviceConfig {
         DeviceConfig {
@@ -2334,6 +3373,8 @@ mod tests {
             video_source: None,
             video_fps: 25,
             light_bitrate_kbps: None,
+            register_expires_secs: DEFAULT_REGISTER_EXPIRES,
+            register_retry_max_secs: DEFAULT_REGISTER_RETRY_MAX_SECS,
             gb_version: common::GbVersion::V2022,
             signaling_encoding: common::SignalingEncoding::Gb18030,
         }
@@ -2341,11 +3382,11 @@ mod tests {
 
     /// mock 平台:收到首个 REGISTER 回 401(带挑战),第二个回 200。
     async fn mock_platform_register(
-        platform: Arc<UdpTransport>,
+        platform: Arc<dyn SipTransport>,
         device_addr: SocketAddr,
         call_id: String,
     ) {
-        let mut prx = platform.register(call_id.clone());
+        let mut prx = platform.register(&call_id);
         let mut seen = 0;
         let mut first_via: Option<String> = None;
         let mut first_from: Option<String> = None;
@@ -2408,7 +3449,7 @@ mod tests {
 
     #[tokio::test]
     async fn 注册闭环_401后带鉴权成功() {
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
         let device_addr = device_tp.local_addr().unwrap();
@@ -2432,7 +3473,7 @@ mod tests {
     async fn options_回_200() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
@@ -2482,7 +3523,7 @@ mod tests {
     async fn 目录查询应答含通道() {
         use sip_core::Method;
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
@@ -2569,6 +3610,7 @@ mod tests {
             record_type: None,
             indistinct_query: None,
             stream_number: None,
+            ..Default::default()
         };
         let ch = ChannelConfig {
             channel_id: DeviceId::new("35020000001310000132").unwrap(),
@@ -2667,6 +3709,7 @@ mod tests {
             record_type: None,
             indistinct_query: None,
             stream_number: None,
+            ..Default::default()
         };
         let mut cfg = test_cfg("127.0.0.1", 5060);
         cfg.channels.push(ChannelConfig {
@@ -2678,7 +3721,7 @@ mod tests {
 
         // 预置一条巡航轨迹 1 = [1,3],并置布防态,便于验证读回。
         {
-            let mut s = sim.control_state.lock().unwrap();
+            let mut s = sim.control_state.lock();
             s.alarming = true;
             s.home_set = true;
             s.cruise_tracks.insert(1, vec![1, 3]);
@@ -2714,8 +3757,16 @@ mod tests {
         assert!(reject_ssrf("192.168.1.10").is_err());
         assert!(reject_ssrf("10.0.0.1").is_err());
         assert!(reject_ssrf("224.0.0.1").is_err());
-        // 公网 IP 与域名放行(受控内网场景)。
-        assert!(reject_ssrf("203.0.113.9").is_ok());
+        // 云元数据端点必须被拒(169.254.169.254 属链路本地)。
+        assert!(reject_ssrf("169.254.169.254").is_err());
+        // 运营商级 NAT(100.64.0.0/10)与文档段(203.0.113.0/24)同样拒绝。
+        assert!(reject_ssrf("100.64.0.1").is_err());
+        assert!(reject_ssrf("203.0.113.9").is_err());
+        // IPv6 唯一本地与链路本地也拒绝。
+        assert!(reject_ssrf("fd00::1").is_err());
+        assert!(reject_ssrf("fe80::1").is_err());
+        // 真正的公网 IP 放行;域名留给解析后判定(见 resolve_safe_target)。
+        assert!(reject_ssrf("8.8.8.8").is_ok());
         assert!(reject_ssrf("upload.example.com").is_ok());
     }
 
@@ -2775,6 +3826,7 @@ mod tests {
             record_type: None,
             indistinct_query: None,
             stream_number: None,
+            ..Default::default()
         };
         let xml = sim.handle_query(&q).unwrap();
         // 8 视频通道 + 1 业务分组 = 9 项(根设备自引用被过滤)。
@@ -2801,7 +3853,7 @@ mod tests {
     #[tokio::test]
     async fn 语音广播_目标匹配回ok() {
         use sip_core::{Headers, Method, Request, SipMessage};
-        let device_tp = std::sync::Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
         let sim = std::sync::Arc::new(DeviceSimulator::new(test_cfg(
@@ -2863,7 +3915,7 @@ mod tests {
             ..Default::default()
         };
         sim.handle_control(&cruise).await.unwrap();
-        assert!(sim.control_state.lock().unwrap().cruise_tracks[&1].contains(&5));
+        assert!(sim.control_state.lock().cruise_tracks[&1].contains(&5));
 
         // 精确云台:pan=90 tilt=10 zoom=2。
         let precise = Control {
@@ -2878,10 +3930,7 @@ mod tests {
             ..Default::default()
         };
         sim.handle_control(&precise).await.unwrap();
-        assert_eq!(
-            sim.control_state.lock().unwrap().precise_pose,
-            (90.0, 10.0, 2.0)
-        );
+        assert_eq!(sim.control_state.lock().precise_pose, (90.0, 10.0, 2.0));
 
         // 布防 → alarming=true。
         let guard = Control {
@@ -2892,14 +3941,14 @@ mod tests {
             ..Default::default()
         };
         sim.handle_control(&guard).await.unwrap();
-        assert!(sim.control_state.lock().unwrap().alarming);
+        assert!(sim.control_state.lock().alarming);
     }
 
     #[tokio::test]
     async fn 移动位置订阅_回200并周期上报位置notify() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
@@ -2974,7 +4023,7 @@ mod tests {
     async fn 报警订阅_回200并记录对话供对话内notify() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
@@ -3024,7 +4073,8 @@ mod tests {
 
         // 报警订阅对话已记录(后续 report_alarm 将走对话内 NOTIFY)。
         let stored = sim.alarm_dialog.lock().await.clone();
-        let (dialog, dst) = stored.expect("应记录报警订阅对话");
+        let sub = stored.expect("应记录报警订阅对话");
+        let (dialog, dst) = (sub.dialog, sub.peer);
         assert_eq!(dialog.call_id, "alarm-sub-1");
         assert_eq!(dialog.event, "Alarm");
         assert_eq!(dialog.expires, 3600);
@@ -3040,7 +4090,7 @@ mod tests {
     async fn info回放控制_调速与暂停恢复并回200() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
@@ -3063,11 +4113,16 @@ mod tests {
             is_history: false,
         });
 
-        // 构造 INFO 请求的辅助闭包。
-        let make_info = |body: &str| {
+        // 构造 INFO 请求的辅助闭包。每条用独立 CSeq 与 branch —— 真实平台就是这样,
+        // 而复用同一 (branch, CSeq) 会被服务端事务层正确判定为重传。
+        let make_info = |cseq: u32, body: &str| {
             let mut h = Headers::new();
             h.set("Call-ID", "info-call-1");
-            h.set("CSeq", "2 INFO");
+            h.set("CSeq", format!("{cseq} INFO"));
+            h.set(
+                "Via",
+                format!("SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-info-{cseq}"),
+            );
             h.set(
                 "From",
                 "<sip:34020000002000000001@34020000002000000001>;tag=p",
@@ -3089,7 +4144,7 @@ mod tests {
         let mut prx = platform_tp.register("info-call-1");
 
         // PLAY + Scale=2.0 → 倍速 2.0,未暂停。
-        let inc = make_info("PLAY MANSRTSP/1.0\r\nCSeq: 2\r\nScale: 2.0\r\n\r\n");
+        let inc = make_info(2, "PLAY MANSRTSP/1.0\r\nCSeq: 2\r\nScale: 2.0\r\n\r\n");
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         assert_eq!(control.speed(), 2.0);
         assert!(!control.is_paused());
@@ -3101,14 +4156,253 @@ mod tests {
         matches!(ok.message, SipMessage::Response(r) if r.status == 200);
 
         // PAUSE → 暂停。
-        let inc = make_info("PAUSE MANSRTSP/1.0\r\nCSeq: 3\r\nPauseTime: now\r\n\r\n");
+        let inc = make_info(3, "PAUSE MANSRTSP/1.0\r\nCSeq: 3\r\nPauseTime: now\r\n\r\n");
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         assert!(control.is_paused());
 
         // PLAY(无 Scale)→ 恢复,倍速回 1.0。
-        let inc = make_info("PLAY MANSRTSP/1.0\r\nCSeq: 4\r\n\r\n");
+        let inc = make_info(4, "PLAY MANSRTSP/1.0\r\nCSeq: 4\r\n\r\n");
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         assert!(!control.is_paused());
         assert_eq!(control.speed(), 1.0);
+
+        // 同一 (branch, CSeq) 的重传:必须只重发缓存响应,**不能**再跑一遍业务逻辑。
+        control.pause();
+        assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
+        assert!(
+            control.is_paused(),
+            "重传的 INFO 不应被当成新命令重新执行 PLAY"
+        );
+    }
+
+    /// 平台 200 OK 丢包后重传 INVITE 是现场常态。缺服务端事务时设备会因
+    /// "已有会话"回 486 Busy Here,点播直接失败——这里锁定修复后的行为:
+    /// 重传命中缓存的 200 OK。
+    #[tokio::test]
+    async fn invite_重传命中缓存响应而非回486() {
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+
+        let mut cfg = test_cfg(&platform_addr.ip().to_string(), platform_addr.port());
+        // B 档轻量伪流:不依赖 ffmpeg / 文件。
+        cfg.light_bitrate_kbps = Some(128);
+        cfg.channels = vec![ChannelConfig {
+            channel_id: DeviceId::new("34020000001320000132").unwrap(),
+            name: "Camera-1".into(),
+            status: "ON".into(),
+        }];
+        let sim = Arc::new(DeviceSimulator::new(cfg));
+        sim.set_local_addr_for_test(&device_addr.ip().to_string(), device_addr.port());
+
+        let sdp = "v=0\r\n\
+o=34020000002000000001 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 40000 RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+y=0100000001\r\n";
+
+        let make_invite = || {
+            let mut h = Headers::new();
+            h.set("Call-ID", "invite-retrans");
+            h.set("CSeq", "1 INVITE");
+            h.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-inv-1");
+            h.set(
+                "From",
+                "<sip:34020000002000000001@34020000002000000001>;tag=p",
+            );
+            h.set("To", "<sip:34020000001320000132@34020000002000000001>");
+            h.set("Content-Type", "application/sdp");
+            sip_core::Incoming {
+                message: SipMessage::Request(Request {
+                    method: Method::Invite,
+                    uri: "sip:34020000001320000132@127.0.0.1".into(),
+                    headers: h,
+                    body: sdp.as_bytes().to_vec(),
+                }),
+                from: platform_addr,
+            }
+        };
+
+        let mut prx = platform_tp.register("invite-retrans");
+        assert!(sim
+            .answer_inbound(&device_tp, &make_invite())
+            .await
+            .unwrap());
+
+        // 收 100 Trying 与 200 OK。
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let inc = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+                .await
+                .expect("超时")
+                .expect("关闭");
+            if let SipMessage::Response(r) = inc.message {
+                statuses.push(r.status);
+            }
+        }
+        assert!(
+            statuses.contains(&200),
+            "首次 INVITE 应回 200,实际 {statuses:?}"
+        );
+
+        // 重传同一条 INVITE:应重发缓存的 200,而不是 486。
+        assert!(sim
+            .answer_inbound(&device_tp, &make_invite())
+            .await
+            .unwrap());
+        let inc = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+            .await
+            .expect("超时")
+            .expect("关闭");
+        match inc.message {
+            SipMessage::Response(r) => {
+                assert_eq!(r.status, 200, "重传 INVITE 不应被回 486 Busy Here");
+                assert!(!r.body.is_empty(), "缓存响应应含 SDP(与首次 200 完全一致)");
+            }
+            other => panic!("应为响应,实际 {other:?}"),
+        }
+
+        // 会话应仍是那一个(没有被重复建流)。
+        assert!(sim.session.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn 未实现方法回405并带allow头() {
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let sim = Arc::new(DeviceSimulator::new(test_cfg(
+            &platform_addr.ip().to_string(),
+            platform_addr.port(),
+        )));
+
+        let mut h = Headers::new();
+        h.set("Call-ID", "publish-call");
+        h.set("CSeq", "1 PUBLISH");
+        h.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-pub");
+        let inc = sip_core::Incoming {
+            message: SipMessage::Request(Request {
+                method: Method::Publish,
+                uri: "sip:34020000001320000001@127.0.0.1".into(),
+                headers: h,
+                body: Vec::new(),
+            }),
+            from: platform_addr,
+        };
+        let mut prx = platform_tp.register("publish-call");
+        assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+            .await
+            .expect("超时")
+            .expect("关闭");
+        match got.message {
+            SipMessage::Response(r) => {
+                assert_eq!(r.status, 405);
+                assert!(r.headers.get("Allow").unwrap().contains("INVITE"));
+            }
+            other => panic!("应为响应,实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 续约周期取平台授予有效期的八成() {
+        use std::time::Duration;
+        assert_eq!(renew_interval(3600), Duration::from_secs(2880));
+        assert_eq!(renew_interval(120), Duration::from_secs(96));
+        // 很短的有效期要留出一次事务往返余量,不能贴着到期。
+        assert!(renew_interval(30) < Duration::from_secs(30));
+        assert!(renew_interval(10) < Duration::from_secs(10));
+        assert!(renew_interval(1) >= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn 目录超过_mtu_时分多条应答且_sumnum_为总数() {
+        use gb28181_protocol::id_codec::{CatalogNode, CatalogNodeType};
+        let sim = DeviceSimulator::new(test_cfg("1.2.3.4", 5060));
+        // 造一棵足够大的目录树,单条 XML 必然超过 900 字节。
+        let mut nodes = vec![CatalogNode::new(
+            "34020000001320000001",
+            CatalogNodeType::Device,
+            "Root",
+            "34020000001320000001",
+        )];
+        for i in 0..40u32 {
+            nodes.push(CatalogNode::new(
+                format!("3402000000132000{:04}", 1000 + i),
+                CatalogNodeType::VideoChannel,
+                format!("通道-{i}"),
+                "34020000001320000001",
+            ));
+        }
+        sim.set_catalog_tree(nodes);
+
+        let query = gb28181_protocol::manscdp::Query {
+            cmd_type: "Catalog".into(),
+            sn: 7,
+            device_id: "34020000001320000001".into(),
+            ..Default::default()
+        };
+        let replies = sim.catalog_replies(&query, MAX_MANSCDP_BODY_BYTES).unwrap();
+        assert!(replies.len() > 1, "40 通道的目录应被分成多条");
+        for xml in &replies {
+            assert!(
+                xml.len() <= MAX_MANSCDP_BODY_BYTES * 2,
+                "分片后单条不应远超阈值,实际 {}",
+                xml.len()
+            );
+            assert!(xml.contains("<SumNum>40</SumNum>"), "SumNum 必须是总数");
+        }
+        // 各条 DeviceList 的 Num 属性之和应等于 SumNum。
+        let total: usize = replies
+            .iter()
+            .map(|x| {
+                x.split("<DeviceList Num=\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(total, 40, "分片的 Num 之和应等于总数");
+        // 条目 ID 不重不漏。
+        let mut ids: Vec<String> = replies
+            .iter()
+            .flat_map(|x| {
+                x.split("<DeviceID>")
+                    .skip(2) // 跳过根 DeviceID
+                    .filter_map(|s| s.split("</DeviceID>").next().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 40, "分片后条目应不重不漏");
+    }
+
+    #[test]
+    fn 假标签不能改变分派路径() {
+        use gb28181_protocol::manscdp::parse_envelope;
+        // 注释里塞 <Control> 不应把 Query 误判成 Control。
+        let sneaky = "<?xml version=\"1.0\"?><Query><!-- <Control> --><CmdType>Catalog</CmdType>\
+<SN>1</SN><DeviceID>34020000001320000001</DeviceID></Query>";
+        let env = parse_envelope(sneaky).unwrap();
+        assert_eq!(env.root, "Query");
+        assert_eq!(env.cmd_type, "Catalog");
+
+        // 文本节点里塞 <Control> 同样无效(会被转义)。
+        let escaped = "<?xml version=\"1.0\"?><Query><CmdType>Catalog</CmdType>\
+<DeviceName>&lt;Control&gt;</DeviceName></Query>";
+        assert_eq!(parse_envelope(escaped).unwrap().root, "Query");
+
+        // 真的 Control 报文能被识别。
+        let ctrl = "<?xml version=\"1.0\"?><Control><CmdType>DeviceControl</CmdType>\
+<SN>2</SN><DeviceID>34020000001320000001</DeviceID><RecordCmd>Record</RecordCmd></Control>";
+        let env = parse_envelope(ctrl).unwrap();
+        assert_eq!(env.root, "Control");
+        assert_eq!(env.cmd_type, "DeviceControl");
     }
 }

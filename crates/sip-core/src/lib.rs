@@ -10,8 +10,11 @@ pub mod transaction;
 pub mod transport;
 
 // 常用类型再导出,方便上层 `use sip_core::{...}`。
-pub use auth::{authorization, Challenge};
+pub use auth::{authorization, authorization_with_body, Algorithm, Challenge, Qop};
 pub use message::{Headers, Method, Request, Response, SipMessage};
-pub use sdp::{build_broadcast_offer, SessionDescription};
-pub use transaction::{client_transact, Timing};
-pub use transport::{Incoming, SipTrace, TraceDir, TraceObserver, UdpTransport};
+pub use sdp::{build_broadcast_offer, Direction, SessionDescription, Setup};
+pub use transaction::{client_transact, Admit, ServerTransactions, Timing, TxToken};
+pub use transport::{
+    Incoming, SipTrace, SipTransport, TcpTransport, TraceDir, TraceObserver, TransportStats,
+    TransportStatsSnapshot, UdpTransport,
+};

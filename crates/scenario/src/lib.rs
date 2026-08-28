@@ -24,6 +24,11 @@ pub struct LinearScenario {
     /// 基础设备 ID(起点,20 位数字)。
     pub base_device_id: String,
     /// SIP 认证密码(所有设备共享)。
+    ///
+    /// 桌面端不再把密码写进 TOML:场景由前端生成时留空,启动前由 Tauri 侧从
+    /// OS 钥匙串取值覆盖(见 `apps/desktop/src-tauri/src/secrets.rs`)。
+    /// CLI 直接读 TOML 文件的用法仍可在文件里写明密码。
+    #[serde(default)]
     pub password: String,
     /// 平台 host。
     pub server_host: String,
@@ -37,6 +42,15 @@ pub struct LinearScenario {
     /// 心跳间隔(秒)。
     #[serde(default = "default_heartbeat")]
     pub heartbeat_interval_secs: u64,
+    /// 注册有效期(秒)。平台可授予更短的时长,续约以平台授予值为准。
+    #[serde(default = "default_register_expires")]
+    pub register_expires_secs: u32,
+    /// 注册失败后的重试间隔上限(秒)。
+    ///
+    /// GB/T 28181-2022 §9.1.1 c) 建议不短于 60s,但压测要观察爬坡与恢复速度,
+    /// 默认取 10s。**这是为压测目的有意偏离标准**,单设备联调走 60s 的默认值。
+    #[serde(default = "default_register_retry_max")]
+    pub register_retry_max_secs: u64,
     /// 每设备通道数。
     #[serde(default = "default_channels")]
     pub channels_per_device: usize,
@@ -70,6 +84,12 @@ fn default_transport() -> Transport {
 }
 fn default_heartbeat() -> u64 {
     60
+}
+fn default_register_expires() -> u32 {
+    3600
+}
+fn default_register_retry_max() -> u64 {
+    10
 }
 fn default_channels() -> usize {
     1
@@ -123,11 +143,6 @@ impl Scenario for LinearScenario {
         {
             return Err(common::Error::Config(
                 "平台地址必须是有效的 IP:端口（当前不支持域名）".into(),
-            ));
-        }
-        if self.transport != Transport::Udp {
-            return Err(common::Error::Config(
-                "当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into(),
             ));
         }
         if self.heartbeat_interval_secs == 0 {
@@ -216,6 +231,8 @@ impl Scenario for LinearScenario {
                 video_source,
                 video_fps: self.video_fps,
                 light_bitrate_kbps,
+                register_expires_secs: self.register_expires_secs.max(1),
+                register_retry_max_secs: self.register_retry_max_secs.max(1),
                 gb_version: self.gb_version,
                 // 压测默认 GB18030(国标 §6.10);中文通道名不乱码。
                 signaling_encoding: common::SignalingEncoding::default(),
@@ -256,6 +273,8 @@ mod tests {
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
+            register_expires_secs: 3600,
+            register_retry_max_secs: 10,
             channels_per_device: 1,
             device_info: DeviceInfoTemplate {
                 device_name: "Dev".into(),
@@ -294,6 +313,8 @@ mod tests {
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
+            register_expires_secs: 3600,
+            register_retry_max_secs: 10,
             channels_per_device: 1,
             device_info: DeviceInfoTemplate {
                 device_name: "D".into(),
@@ -329,6 +350,8 @@ mod tests {
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
+            register_expires_secs: 3600,
+            register_retry_max_secs: 10,
             channels_per_device: 1,
             device_info: DeviceInfoTemplate {
                 device_name: "D".into(),

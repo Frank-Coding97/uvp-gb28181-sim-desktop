@@ -12,3 +12,7 @@ bytes.workspace = true
 tracing.workspace = true
 md-5.workspace = true
 dashmap.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+socket2.workspace = true
+serde.workspace = true

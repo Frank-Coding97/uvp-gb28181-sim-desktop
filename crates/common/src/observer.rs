@@ -7,16 +7,23 @@
 /// 设备运行过程中的关键事件。
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
-    /// 发起一次注册。
-    RegisterAttempt,
-    /// 注册成功。
-    RegisterSuccess,
+    /// 发起一次注册。`retry=true` 表示这是退避重试或掉线重注册,不是首次尝试。
+    ///
+    /// 区分首次与重试很重要:把重试也算进"尝试"会让成功率变成**尝试维度**而非
+    /// **设备维度**,长时间运行会被重试稀释,看不出真实的上线比例。
+    RegisterAttempt { retry: bool },
+    /// 注册成功,携带整条注册事务的往返耗时(毫秒)。
+    RegisterSuccess { rtt_ms: u64 },
     /// 注册失败(带归因)。
     RegisterFailure(FailureKind),
-    /// 心跳成功。
-    HeartbeatOk,
+    /// 心跳成功,携带往返耗时(毫秒)。
+    HeartbeatOk { rtt_ms: u64 },
     /// 心跳失败。
     HeartbeatFail,
+    /// 设备在线状态翻转(用于"当前在线设备数"这个 gauge)。
+    ///
+    /// 只在状态真的变化时上报,因此聚合方可以直接 +1/-1 而不需要按设备去重。
+    OnlineChanged { online: bool },
     /// 推流开始。
     StreamStart,
     /// 推流结束。
@@ -90,6 +97,10 @@ pub enum FailureKind {
     Timeout,
     /// 平台拒绝(4xx/5xx)。
     Rejected,
+    /// **本地**发送失败(ENOBUFS、socket 错误、队列满)。
+    ///
+    /// 单独一类是为了压测结论可信:本机瓶颈导致的失败绝不能算成"平台承载不住"。
+    Local,
     /// 网络/其它。
     Other,
 }

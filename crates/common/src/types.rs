@@ -12,7 +12,9 @@ pub enum Transport {
     /// UDP —— GB28181 最常用,压测默认。
     #[default]
     Udp,
-    /// TCP —— 预留枚举；当前 SIP 传输层尚未实现,上层会明确拒绝该配置。
+    /// TCP —— 适合目录树很大(单条报文超 MTU)或网络丢包较多的场景。
+    ///
+    /// 由 `sip_core::TcpTransport` 实现(RFC 3261 §18.3 流式重组)。
     Tcp,
 }
 

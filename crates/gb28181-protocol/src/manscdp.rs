@@ -25,8 +25,68 @@ fn strip_xml_decl(xml: &str) -> &str {
     }
 }
 
+/// MANSCDP 报文信封:根元素名 + CmdType。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Envelope {
+    /// 根元素名:Control / Query / Notify / Response。
+    pub root: String,
+    /// `<CmdType>` 文本;缺失时为空串。
+    pub cmd_type: String,
+}
+
+/// 真正**解析**出根元素与 CmdType,而不是用 `body.contains("<Control>")` 猜。
+///
+/// 为什么重要:子串判定可以被伪造 —— 在 Query 的注释或文本节点里塞一个
+/// `<Control>` 就能改变设备的分派路径。这里用 quick-xml 逐事件读,注释、
+/// 处理指令、CDATA 与文本节点都不会被误当成元素。
+pub fn parse_envelope(xml: &str) -> Result<Envelope> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let config = reader.config_mut();
+    config.trim_text(true);
+
+    let mut root: Option<String> = None;
+    let mut in_cmd_type = false;
+    let mut cmd_type = String::new();
+    let mut buf_depth = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                buf_depth += 1;
+                if root.is_none() {
+                    root = Some(name);
+                } else if buf_depth == 2 && name == "CmdType" {
+                    in_cmd_type = true;
+                }
+            }
+            Ok(Event::Text(t)) if in_cmd_type => {
+                cmd_type = t.unescape().unwrap_or_default().trim().to_string();
+            }
+            Ok(Event::End(_)) => {
+                in_cmd_type = false;
+                buf_depth = buf_depth.saturating_sub(1);
+            }
+            Ok(Event::Empty(e)) => {
+                if root.is_none() {
+                    root = Some(String::from_utf8_lossy(e.local_name().as_ref()).to_string());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => return Err(Error::Gb28181(format!("MANSCDP XML 解析失败: {e}"))),
+        }
+    }
+
+    match root {
+        Some(root) => Ok(Envelope { root, cmd_type }),
+        None => Err(Error::Gb28181("MANSCDP 报文无根元素".into())),
+    }
+}
+
 /// 平台 → 设备的查询请求(Query),用于提取 CmdType 与 SN 以决定如何应答。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename = "Query")]
 pub struct Query {
     /// 命令类型:Catalog / DeviceInfo / DeviceStatus / RecordInfo 等。
@@ -60,6 +120,49 @@ pub struct Query {
     /// 录像检索终止时间。
     #[serde(rename = "EndTime", default, skip_serializing_if = "Option::is_none")]
     pub end_time: Option<String>,
+    // ── 报警订阅筛选条件(GB28181-2022 A.2.4.6) ──
+    //
+    // 之前完全不解析,于是"只订阅一级警情"和"订阅全部"对设备是一样的,
+    // 设备会把所有报警都推上去。
+    /// 报警起始级别:0 全部;1~4 一至四级警情。
+    #[serde(
+        rename = "StartAlarmPriority",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start_alarm_priority: Option<String>,
+    /// 报警终止级别。
+    #[serde(
+        rename = "EndAlarmPriority",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end_alarm_priority: Option<String>,
+    /// 报警方式条件:0 全部;1 电话/2 设备/3 短信/4 GPS/5 视频/6 设备故障/7 其他。
+    /// 可组合,如 `1/2`。
+    #[serde(
+        rename = "AlarmMethod",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alarm_method: Option<String>,
+    /// 报警类型条件(含义取决于 AlarmMethod)。
+    #[serde(rename = "AlarmType", default, skip_serializing_if = "Option::is_none")]
+    pub alarm_type: Option<String>,
+    /// 报警发生起始时间。
+    #[serde(
+        rename = "StartAlarmTime",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start_alarm_time: Option<String>,
+    /// 报警发生终止时间。
+    #[serde(
+        rename = "EndAlarmTime",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end_alarm_time: Option<String>,
     /// 录像产生类型:time/alarm/manual/all。
     #[serde(rename = "Type", default, skip_serializing_if = "Option::is_none")]
     pub record_type: Option<String>,
@@ -157,6 +260,81 @@ impl BroadcastResponse {
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
         manscdp_to_xml(self)
+    }
+}
+
+/// 报警订阅筛选条件(A.2.4.6 解析结果)。
+///
+/// 设备据此决定"哪些报警要推给平台":只订阅一级警情时不该把四级警情也推上去。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AlarmSubscribeFilter {
+    /// 起始级别(含);None = 不限。
+    pub start_priority: Option<u8>,
+    /// 终止级别(含);None = 不限。
+    pub end_priority: Option<u8>,
+    /// 允许的报警方式集合;空 = 不限。
+    pub methods: Vec<u8>,
+    /// 允许的报警类型集合;空 = 不限。
+    pub types: Vec<u32>,
+}
+
+impl AlarmSubscribeFilter {
+    /// 从报警订阅请求解析筛选条件。
+    pub fn from_query(query: &Query) -> Self {
+        // 级别 "0" 表示全部 → 视为不限。
+        let priority = |v: &Option<String>| -> Option<u8> {
+            v.as_deref()?.trim().parse::<u8>().ok().filter(|p| *p != 0)
+        };
+        // 方式/类型可组合,如 "1/2";含 0 视为全部。
+        let split = |v: &Option<String>| -> Vec<u32> {
+            let Some(text) = v.as_deref() else {
+                return Vec::new();
+            };
+            let parsed: Vec<u32> = text
+                .split(['/', ',', ' '])
+                .filter_map(|p| p.trim().parse::<u32>().ok())
+                .collect();
+            if parsed.contains(&0) {
+                Vec::new()
+            } else {
+                parsed
+            }
+        };
+        AlarmSubscribeFilter {
+            start_priority: priority(&query.start_alarm_priority),
+            end_priority: priority(&query.end_alarm_priority),
+            methods: split(&query.alarm_method)
+                .into_iter()
+                .map(|v| v as u8)
+                .collect(),
+            types: split(&query.alarm_type),
+        }
+    }
+
+    /// 一条报警是否应当按此订阅上报。
+    pub fn accepts(&self, priority: u8, method: u8, alarm_type: Option<u32>) -> bool {
+        if let Some(start) = self.start_priority {
+            if priority < start {
+                return false;
+            }
+        }
+        if let Some(end) = self.end_priority {
+            if priority > end {
+                return false;
+            }
+        }
+        if !self.methods.is_empty() && !self.methods.contains(&method) {
+            return false;
+        }
+        if !self.types.is_empty() {
+            match alarm_type {
+                Some(t) if self.types.contains(&t) => {}
+                // 订阅限定了类型但报警没带类型 → 无法判定,保守放行。
+                None => {}
+                _ => return false,
+            }
+        }
+        true
     }
 }
 
@@ -571,10 +749,23 @@ impl Control {
         (bytes.len() >= 7).then_some(bytes)
     }
 
-    /// 解析巡航轨迹控制(PTZCmd byte3 = 0x84-0x88)。
+    /// 12 位数据值:字节6(数据2)为低 8 位,字节7(组合码2)高 4 位为高 4 位。
     ///
-    /// 上游 uvp-gb28181-sim 编码:0x84 增点(b4=轨迹# b5=预置#)/ 0x85 删点 /
-    /// 0x86 速度(b5=speed)/ 0x87 停留(b5=秒)/ 0x88 启动(b4=轨迹#,0=停)。
+    /// GB/T 28181-2022 表 A.9 注2 / 表 A.10 注2 都这样规定(巡航速度、停留时间、
+    /// 扫描速度)。只取字节6 会把 >255 的值截断。
+    fn data12(b: &[u8]) -> u32 {
+        (b[5] as u32) | (((b[6] >> 4) as u32) << 8)
+    }
+
+    /// 解析巡航轨迹控制(PTZCmd 字节4 = 0x84~0x88,GB/T 28181-2022 表 A.9)。
+    ///
+    /// - `0x84` 加入巡航点:字节5=巡航组号,字节6=预置位号(01H-FFH)
+    /// - `0x85` 删除巡航点:字节6=00H 时删除**整条**巡航
+    /// - `0x86` 设置巡航速度:12 位(字节6 低 8 位 + 字节7 高 4 位)
+    /// - `0x87` 设置巡航停留时间(秒):同样 12 位
+    /// - `0x88` 开始巡航:字节5=巡航组号
+    ///
+    /// 停止巡航用 PTZ 停止指令(字节4 各 bit 全 0),不在本函数范围。
     pub fn cruise_op(&self) -> Option<CruiseOp> {
         let b = self.ptz_bytes()?;
         match b[3] {
@@ -582,31 +773,59 @@ impl Control {
                 track: b[4] as u32,
                 preset: b[5] as u32,
             }),
+            // 表 A.9 注2:字节6 为 00H 时删除整条巡航。
+            0x85 if b[5] == 0 => Some(CruiseOp::DelTrack { track: b[4] as u32 }),
             0x85 => Some(CruiseOp::DelPoint {
                 track: b[4] as u32,
                 preset: b[5] as u32,
             }),
             0x86 => Some(CruiseOp::SetSpeed {
                 track: b[4] as u32,
-                speed: b[5] as u32,
+                speed: Self::data12(&b),
             }),
             0x87 => Some(CruiseOp::SetDwell {
                 track: b[4] as u32,
-                dwell: b[5] as u32,
+                dwell: Self::data12(&b),
             }),
             0x88 => Some(CruiseOp::Start { track: b[4] as u32 }),
             _ => None,
         }
     }
 
-    /// 解析辅助控制(PTZCmd byte3 = 0x89 开 / 0x8A 关,b4=辅助号)。
+    /// 解析自动扫描控制(PTZCmd 字节4 = 0x89 / 0x8A,GB/T 28181-2022 表 A.10)。
     ///
-    /// 辅助号:1=雨刷 2=红外灯 3=加热 4=除雾 5=制冷(海康/大华事实标准)。
+    /// - `0x89` + 字节6=00H → 开始自动扫描;=01H → 设左边界;=02H → 设右边界
+    /// - `0x8A` → 设置扫描速度(12 位:字节6 低 8 位 + 字节7 高 4 位)
+    ///
+    /// 字节5 是扫描组号。停止扫描用 PTZ 停止指令。
+    ///
+    /// **注意**:这两个码之前被错当成"辅助开关",辅助开关实际是 0x8C/0x8D
+    /// (表 A.11,2016 与 2022 一致)。
+    pub fn scan_op(&self) -> Option<ScanOp> {
+        let b = self.ptz_bytes()?;
+        let group = b[4] as u32;
+        match (b[3], b[5]) {
+            (0x89, 0x00) => Some(ScanOp::Start { group }),
+            (0x89, 0x01) => Some(ScanOp::SetLeftBoundary { group }),
+            (0x89, 0x02) => Some(ScanOp::SetRightBoundary { group }),
+            (0x89, _) => None,
+            (0x8A, _) => Some(ScanOp::SetSpeed {
+                group,
+                speed: Self::data12(&b),
+            }),
+            _ => None,
+        }
+    }
+
+    /// 解析辅助开关控制(PTZCmd 字节4 = 0x8C 开 / 0x8D 关,GB/T 28181-2022 表 A.11)。
+    ///
+    /// 字节5 为辅助开关编号,标准只明确 `1` 表示雨刷;
+    /// 2=红外灯 3=加热 4=除雾 5=制冷 是海康/大华的事实约定。
     pub fn aux_op(&self) -> Option<AuxOp> {
         let b = self.ptz_bytes()?;
         let on = match b[3] {
-            0x89 => true,
-            0x8A => false,
+            0x8C => true,
+            0x8D => false,
             _ => return None,
         };
         Some(AuxOp {
@@ -686,6 +905,19 @@ impl FiOp {
     }
 }
 
+/// 自动扫描控制操作(PTZCmd 0x89/0x8A 解析结果,GB/T 28181-2022 表 A.10)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanOp {
+    /// 开始自动扫描(画面从右向左移动)。
+    Start { group: u32 },
+    /// 设置自动扫描左边界。
+    SetLeftBoundary { group: u32 },
+    /// 设置自动扫描右边界。
+    SetRightBoundary { group: u32 },
+    /// 设置自动扫描速度(12 位)。
+    SetSpeed { group: u32, speed: u32 },
+}
+
 /// 巡航轨迹控制操作(PTZCmd 0x84-0x88 解析结果)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CruiseOp {
@@ -693,6 +925,8 @@ pub enum CruiseOp {
     SetPoint { track: u32, preset: u32 },
     /// 删除巡航点。
     DelPoint { track: u32, preset: u32 },
+    /// 删除整条巡航(表 A.9 注2:0x85 且字节6=00H)。
+    DelTrack { track: u32 },
     /// 设置巡航速度。
     SetSpeed { track: u32, speed: u32 },
     /// 设置停留时间(秒)。
@@ -1096,16 +1330,44 @@ pub struct Keepalive {
     /// 状态,通常 "OK"。
     #[serde(rename = "Status")]
     pub status: String,
+    /// 故障设备列表(A.2.5.2)。
+    ///
+    /// 标准里 `Info` 是**必选**元素(只是其内的 DeviceID 可以 0 个),
+    /// 之前完全不输出;严格校验 schema 的平台会拒收心跳,表现为设备一直离线。
+    #[serde(rename = "Info")]
+    pub info: KeepaliveInfo,
+}
+
+/// 心跳里的故障设备列表(A.2.5.2)。空列表表示所有通道正常。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KeepaliveInfo {
+    /// 故障设备/通道编码,可 0..n 个。
+    #[serde(rename = "DeviceID", default, skip_serializing_if = "Vec::is_empty")]
+    pub faulty_device_ids: Vec<String>,
 }
 
 impl Keepalive {
-    /// 构造一个 OK 心跳。
+    /// 构造一个 OK 心跳(无故障通道)。
     pub fn ok(device_id: impl Into<String>, sn: u32) -> Self {
         Keepalive {
             cmd_type: "Keepalive".into(),
             sn,
             device_id: device_id.into(),
             status: "OK".into(),
+            info: KeepaliveInfo::default(),
+        }
+    }
+
+    /// 构造一个携带故障通道列表的心跳(有故障时 Status=ERROR)。
+    pub fn with_faults(device_id: impl Into<String>, sn: u32, faulty: Vec<String>) -> Self {
+        Keepalive {
+            cmd_type: "Keepalive".into(),
+            sn,
+            device_id: device_id.into(),
+            status: if faulty.is_empty() { "OK" } else { "ERROR" }.into(),
+            info: KeepaliveInfo {
+                faulty_device_ids: faulty,
+            },
         }
     }
 
@@ -1205,6 +1467,48 @@ impl CatalogResponse {
         }
     }
 
+    /// 把目录拆成多条应答(GB/T 28181 §A.2.6.4:`SumNum` 为总数,每条的 `Num`
+    /// 为本条携带的条目数)。
+    ///
+    /// 为什么必须分片:单条 UDP MESSAGE 装整棵 NVR 目录树很容易超过 MTU,
+    /// 被中间设备静默截断,现象是"平台一直同步不到目录"。
+    /// `per_message` 为每条最多携带的条目数(0 视为 1)。
+    pub fn split(
+        device_id: impl Into<String>,
+        sn: u32,
+        items: Vec<CatalogItem>,
+        per_message: usize,
+    ) -> Vec<Self> {
+        let device_id = device_id.into();
+        let sum_num = items.len() as u32;
+        let chunk = per_message.max(1);
+        if items.is_empty() {
+            return vec![CatalogResponse {
+                cmd_type: "Catalog".into(),
+                sn,
+                device_id,
+                sum_num: 0,
+                device_list: DeviceList {
+                    num: 0,
+                    items: Vec::new(),
+                },
+            }];
+        }
+        items
+            .chunks(chunk)
+            .map(|part| CatalogResponse {
+                cmd_type: "Catalog".into(),
+                sn,
+                device_id: device_id.clone(),
+                sum_num,
+                device_list: DeviceList {
+                    num: part.len() as u32,
+                    items: part.to_vec(),
+                },
+            })
+            .collect()
+    }
+
     /// 序列化为完整 XML。
     pub fn to_xml(&self) -> Result<String> {
         manscdp_to_xml(self)
@@ -1261,6 +1565,92 @@ pub struct DeviceStatusResponse {
     /// 状态:OK / ERROR。
     #[serde(rename = "Status")]
     pub status: String,
+    /// 不正常工作原因(可选)。
+    #[serde(rename = "Reason", default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 是否编码:ON / OFF(可选)。
+    #[serde(rename = "Encode", default, skip_serializing_if = "Option::is_none")]
+    pub encode: Option<String>,
+    /// 是否录像:ON / OFF(可选)。
+    #[serde(rename = "Record", default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+    /// 设备时间和日期(可选)。
+    ///
+    /// 之前完全不输出。平台用它显示设备时钟、判断是否需要校时;我们本来就做了
+    /// 网络校时,报一个真实值几乎零成本。
+    #[serde(
+        rename = "DeviceTime",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub device_time: Option<String>,
+    /// 报警设备状态列表(可选,A.2.6.6)。
+    #[serde(
+        rename = "Alarmstatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alarm_status: Option<DeviceStatusAlarmList>,
+}
+
+/// [`DeviceStatusResponse`] 的报警设备状态列表(A.2.6.6)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStatusAlarmList {
+    #[serde(rename = "@Num")]
+    pub num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<DeviceStatusAlarmItem>,
+}
+
+/// 单个报警设备状态项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStatusAlarmItem {
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// ONDUTY / OFFDUTY / ALARM。
+    #[serde(rename = "DutyStatus")]
+    pub duty_status: String,
+}
+
+impl DeviceStatusResponse {
+    /// 构造一条"在线且工作正常"的设备状态应答。
+    ///
+    /// `device_time` 传校时后的 ISO8601 时间;`alarm_channels` 为报警通道 ID 列表
+    /// (按当前布防态给出 ALARM / OFFDUTY)。
+    pub fn online(
+        device_id: impl Into<String>,
+        sn: u32,
+        device_time: Option<String>,
+        recording: bool,
+        alarm_channels: &[String],
+        alarming: bool,
+    ) -> Self {
+        let duty = if alarming { "ALARM" } else { "OFFDUTY" };
+        let alarm_status = (!alarm_channels.is_empty()).then(|| DeviceStatusAlarmList {
+            num: alarm_channels.len() as u32,
+            items: alarm_channels
+                .iter()
+                .map(|id| DeviceStatusAlarmItem {
+                    device_id: id.clone(),
+                    duty_status: duty.into(),
+                })
+                .collect(),
+        });
+        DeviceStatusResponse {
+            cmd_type: "DeviceStatus".into(),
+            sn,
+            device_id: device_id.into(),
+            result: "OK".into(),
+            online: "ONLINE".into(),
+            status: "OK".into(),
+            reason: None,
+            // 设备一直在编码(推流靠它),录像态跟随录像控制命令。
+            encode: Some("ON".into()),
+            record: Some(if recording { "ON" } else { "OFF" }.into()),
+            device_time,
+            alarm_status,
+        }
+    }
 }
 
 impl DeviceStatusResponse {
@@ -1284,7 +1674,7 @@ impl DeviceStatusResponse {
 ///   <AlarmDescription>移动侦测</AlarmDescription>
 /// </Notify>
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "Notify")]
 pub struct AlarmNotify {
     #[serde(rename = "CmdType")]
@@ -1305,15 +1695,106 @@ pub struct AlarmNotify {
     /// 报警描述。
     #[serde(rename = "AlarmDescription", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 经度(可选)。GPS 报警(AlarmMethod=4)时应携带。
+    #[serde(rename = "Longitude", default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// 纬度(可选)。
+    #[serde(rename = "Latitude", default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    /// 扩展 Info:报警类型与类型参数(A.2.5.3)。
+    ///
+    /// 之前完全不输出 —— 视频报警(AlarmMethod=5)下平台只能显示"未知视频报警",
+    /// 无法区分运动侦测 / 入侵 / 越界等,这正是 `AlarmType` 的作用。
+    #[serde(rename = "Info", default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<AlarmNotifyInfo>,
+}
+
+/// 报警通知的扩展 Info(A.2.5.3)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlarmNotifyInfo {
+    /// 报警类型。含义取决于 `AlarmMethod`:
+    /// 方式 5(视频报警)下 1=人工 2=运动目标检测 3=遗留物 4=物体移除 5=绊线
+    /// 6=入侵 7=逆行 8=徘徊 9=流量统计 10=密度 11=视频异常 12=快速移动 13=图像遮挡。
+    #[serde(rename = "AlarmType")]
+    pub alarm_type: u32,
+    /// 报警类型扩展参数(入侵检测时携带 EventType:1 进入区域 / 2 离开区域)。
+    #[serde(
+        rename = "AlarmTypeParam",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alarm_type_param: Option<AlarmTypeParam>,
+}
+
+/// 报警类型扩展参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlarmTypeParam {
+    /// 1=进入区域;2=离开区域。
+    #[serde(rename = "EventType")]
+    pub event_type: u32,
+}
+
+/// 视频报警的报警类型(A.2.5.3,AlarmMethod=5)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum VideoAlarmType {
+    /// 1 人工视频报警。
+    Manual = 1,
+    /// 2 运动目标检测报警(最常用)。
+    MotionDetection = 2,
+    /// 3 遗留物检测。
+    ObjectLeft = 3,
+    /// 4 物体移除检测。
+    ObjectRemoved = 4,
+    /// 5 绊线检测。
+    TripwireCrossing = 5,
+    /// 6 入侵检测。
+    Intrusion = 6,
+    /// 7 逆行检测。
+    WrongWay = 7,
+    /// 8 徘徊检测。
+    Loitering = 8,
+    /// 9 流量统计。
+    FlowStatistics = 9,
+    /// 10 密度检测。
+    DensityDetection = 10,
+    /// 11 视频异常检测。
+    VideoAbnormal = 11,
+    /// 12 快速移动。
+    FastMoving = 12,
+    /// 13 图像遮挡。
+    Tampering = 13,
 }
 
 impl AlarmNotify {
-    /// 构造一条视频侦测报警(method=5)。
+    /// 构造一条视频侦测报警(AlarmMethod=5),默认类型为运动目标检测。
     pub fn video(
         device_id: impl Into<String>,
         sn: u32,
         time: impl Into<String>,
         desc: impl Into<String>,
+    ) -> Self {
+        Self::video_typed(
+            device_id,
+            sn,
+            time,
+            desc,
+            VideoAlarmType::MotionDetection,
+            None,
+        )
+    }
+
+    /// 构造一条指定类型的视频报警。
+    ///
+    /// `position` 为可选经纬度。平台靠 `Info/AlarmType` 区分具体的视频报警类型,
+    /// 不带这一项时只能显示成"未知视频报警"。
+    pub fn video_typed(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        desc: impl Into<String>,
+        alarm_type: VideoAlarmType,
+        position: Option<(f64, f64)>,
     ) -> Self {
         AlarmNotify {
             cmd_type: "Alarm".into(),
@@ -1323,6 +1804,34 @@ impl AlarmNotify {
             method: 5,
             time: time.into(),
             description: Some(desc.into()),
+            longitude: position.map(|(lon, _)| lon),
+            latitude: position.map(|(_, lat)| lat),
+            info: Some(AlarmNotifyInfo {
+                alarm_type: alarm_type as u32,
+                alarm_type_param: None,
+            }),
+        }
+    }
+
+    /// 构造一条 GPS 报警(AlarmMethod=4),携带经纬度。
+    pub fn gps(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        longitude: f64,
+        latitude: f64,
+    ) -> Self {
+        AlarmNotify {
+            cmd_type: "Alarm".into(),
+            sn,
+            device_id: device_id.into(),
+            priority: 1,
+            method: 4,
+            time: time.into(),
+            description: None,
+            longitude: Some(longitude),
+            latitude: Some(latitude),
+            info: None,
         }
     }
 
@@ -1342,15 +1851,68 @@ pub struct RecordItem {
     /// 录像名称。
     #[serde(rename = "Name")]
     pub name: String,
+    /// 文件路径名(可选)。
+    #[serde(rename = "FilePath", default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// 录像地址(可选)。
+    #[serde(rename = "Address", default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     /// 开始时间(ISO8601)。
     #[serde(rename = "StartTime")]
     pub start_time: String,
     /// 结束时间(ISO8601)。
     #[serde(rename = "EndTime")]
     pub end_time: String,
+    /// 保密属性:0 不涉密 / 1 涉密。
+    ///
+    /// GB/T 28181-2022 A.2.1.10 里这是**必选**字段,之前完全没输出 ——
+    /// 严格校验 schema 的平台会直接拒收整条录像应答。
+    #[serde(rename = "Secrecy")]
+    pub secrecy: u8,
     /// 录像类型:time(定时)/ alarm / manual。
     #[serde(rename = "Type")]
     pub kind: String,
+    /// 录像触发者 ID(可选)。
+    #[serde(
+        rename = "RecorderID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub recorder_id: Option<String>,
+    /// 录像文件大小(字节,可选)。
+    #[serde(rename = "FileSize", default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<String>,
+    /// 码流类型:0 主码流 / 1 子码流1 …(可选)。
+    #[serde(
+        rename = "StreamNumber",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_number: Option<u32>,
+}
+
+impl RecordItem {
+    /// 构造一条不涉密的定时录像项(模拟器最常用的形态)。
+    pub fn timed(
+        device_id: impl Into<String>,
+        name: impl Into<String>,
+        start_time: impl Into<String>,
+        end_time: impl Into<String>,
+    ) -> Self {
+        RecordItem {
+            device_id: device_id.into(),
+            name: name.into(),
+            file_path: None,
+            address: None,
+            start_time: start_time.into(),
+            end_time: end_time.into(),
+            secrecy: 0,
+            kind: "time".into(),
+            recorder_id: None,
+            file_size: None,
+            stream_number: None,
+        }
+    }
 }
 
 /// 录像列表查询应答(RecordInfo,设备 → 平台,FR-10)。
@@ -2375,16 +2937,78 @@ mod tests {
 
     #[test]
     fn 设备状态应答字段() {
-        let resp = DeviceStatusResponse {
-            cmd_type: "DeviceStatus".into(),
-            sn: 4,
-            device_id: "34020000001320000001".into(),
-            result: "OK".into(),
-            online: "ONLINE".into(),
-            status: "OK".into(),
-        };
+        // A.2.6.6:除 Online/Status 外,平台还会读 DeviceTime / Encode / Record /
+        // Alarmstatus —— 这些之前完全不输出。
+        let resp = DeviceStatusResponse::online(
+            "34020000001320000001",
+            4,
+            Some("2026-07-03T11:22:33".into()),
+            true,
+            &["34020000001340000001".to_string()],
+            true,
+        );
         let xml = resp.to_xml().unwrap();
         assert!(xml.contains("<Online>ONLINE</Online>"));
+        assert!(xml.contains("<Status>OK</Status>"));
+        assert!(xml.contains("<DeviceTime>2026-07-03T11:22:33</DeviceTime>"));
+        assert!(xml.contains("<Encode>ON</Encode>"));
+        assert!(xml.contains("<Record>ON</Record>"));
+        assert!(xml.contains("Num=\"1\""));
+        assert!(xml.contains("<DutyStatus>ALARM</DutyStatus>"));
+
+        // 未布防时是 OFFDUTY;无报警通道时整段省略。
+        let calm = DeviceStatusResponse::online("d", 5, None, false, &[], false);
+        let calm_xml = calm.to_xml().unwrap();
+        assert!(calm_xml.contains("<Record>OFF</Record>"));
+        assert!(!calm_xml.contains("DeviceTime"));
+        assert!(!calm_xml.contains("Alarmstatus"));
+    }
+
+    #[test]
+    fn 报警订阅筛选条件解析与判定() {
+        let mk = |xml: &str| Query::parse(xml).unwrap();
+        // 订阅一级到二级警情、只要设备报警与视频报警。
+        let q = mk(
+            r#"<?xml version="1.0"?><Query><CmdType>Alarm</CmdType><SN>1</SN>
+<DeviceID>34020000001320000001</DeviceID>
+<StartAlarmPriority>1</StartAlarmPriority><EndAlarmPriority>2</EndAlarmPriority>
+<AlarmMethod>2/5</AlarmMethod></Query>"#,
+        );
+        let f = AlarmSubscribeFilter::from_query(&q);
+        assert_eq!(f.start_priority, Some(1));
+        assert_eq!(f.end_priority, Some(2));
+        assert_eq!(f.methods, vec![2, 5]);
+        assert!(f.accepts(1, 5, None), "一级视频报警应被接受");
+        assert!(!f.accepts(3, 5, None), "三级超出订阅级别范围");
+        assert!(!f.accepts(1, 4, None), "GPS 报警不在订阅方式内");
+
+        // 级别 0 与方式 0 都表示"全部" → 不限。
+        let all = mk(
+            r#"<?xml version="1.0"?><Query><CmdType>Alarm</CmdType><SN>2</SN>
+<DeviceID>d</DeviceID><StartAlarmPriority>0</StartAlarmPriority>
+<AlarmMethod>0</AlarmMethod></Query>"#,
+        );
+        let fa = AlarmSubscribeFilter::from_query(&all);
+        assert_eq!(fa, AlarmSubscribeFilter::default());
+        assert!(fa.accepts(4, 7, Some(13)));
+
+        // 限定类型:不匹配的类型被拒;报警未带类型时保守放行。
+        let typed = mk(
+            r#"<?xml version="1.0"?><Query><CmdType>Alarm</CmdType><SN>3</SN>
+<DeviceID>d</DeviceID><AlarmMethod>5</AlarmMethod><AlarmType>2/6</AlarmType></Query>"#,
+        );
+        let ft = AlarmSubscribeFilter::from_query(&typed);
+        assert_eq!(ft.types, vec![2, 6]);
+        assert!(ft.accepts(1, 5, Some(6)));
+        assert!(!ft.accepts(1, 5, Some(11)));
+        assert!(ft.accepts(1, 5, None));
+
+        // 无筛选条件的订阅接受一切。
+        let bare = mk(
+            r#"<?xml version="1.0"?><Query><CmdType>Alarm</CmdType><SN>4</SN>
+<DeviceID>d</DeviceID></Query>"#,
+        );
+        assert!(AlarmSubscribeFilter::from_query(&bare).accepts(4, 7, Some(1)));
     }
 
     #[test]
@@ -2395,17 +3019,44 @@ mod tests {
         assert!(xml.contains("<AlarmMethod>5</AlarmMethod>"));
         assert!(xml.contains("<AlarmDescription>移动侦测</AlarmDescription>"));
         assert!(xml.contains("<DeviceID>35020000001310000132</DeviceID>"));
+        // A.2.5.3 的 Info/AlarmType:平台靠它区分具体的视频报警类型。
+        assert!(
+            xml.contains("<AlarmType>2</AlarmType>"),
+            "视频报警必须带 AlarmType,否则平台只能显示未知类型"
+        );
+    }
+
+    #[test]
+    fn 报警通知_类型与经纬度() {
+        let intrusion = AlarmNotify::video_typed(
+            "d",
+            1,
+            "2026-07-03T11:00:00",
+            "入侵",
+            VideoAlarmType::Intrusion,
+            Some((116.4, 39.9)),
+        );
+        let xml = intrusion.to_xml().unwrap();
+        assert!(xml.contains("<AlarmType>6</AlarmType>"));
+        assert!(xml.contains("<Longitude>116.4</Longitude>"));
+        assert!(xml.contains("<Latitude>39.9</Latitude>"));
+
+        // GPS 报警:AlarmMethod=4,带经纬度、不带 Info。
+        let gps = AlarmNotify::gps("d", 2, "2026-07-03T11:00:00", 1.5, 2.5);
+        let gps_xml = gps.to_xml().unwrap();
+        assert!(gps_xml.contains("<AlarmMethod>4</AlarmMethod>"));
+        assert!(gps_xml.contains("<Longitude>1.5</Longitude>"));
+        assert!(!gps_xml.contains("<AlarmType>"));
     }
 
     #[test]
     fn 录像列表应答含段() {
-        let items = vec![RecordItem {
-            device_id: "35020000001310000132".into(),
-            name: "rec1".into(),
-            start_time: "2026-07-03T10:00:00".into(),
-            end_time: "2026-07-03T10:05:00".into(),
-            kind: "time".into(),
-        }];
+        let items = vec![RecordItem::timed(
+            "35020000001310000132",
+            "rec1",
+            "2026-07-03T10:00:00",
+            "2026-07-03T10:05:00",
+        )];
         let resp = RecordInfoResponse::new("35020000001310000132", 12, items);
         assert_eq!(resp.sum_num, 1);
         let xml = resp.to_xml().unwrap();
@@ -2413,6 +3064,8 @@ mod tests {
         assert!(xml.contains("Num=\"1\""));
         assert!(xml.contains("<StartTime>2026-07-03T10:00:00</StartTime>"));
         assert!(xml.contains("<Type>time</Type>"));
+        // A.2.1.10 里 Secrecy 是必选,之前没输出会被严格校验的平台拒收。
+        assert!(xml.contains("<Secrecy>0</Secrecy>"));
     }
 
     #[test]
@@ -2661,12 +3314,68 @@ mod tests {
             mk("A50F0188020000").cruise_op(),
             Some(CruiseOp::Start { track: 2 })
         );
-        // 辅助控制开:byte3=0x89, aux=1(雨刷)
-        let aux = mk("A50F0189010000").aux_op().unwrap();
+        // 表 A.9 注2:0x85 且字节6=00H 删除整条巡航,非 00H 才是删单点。
+        assert_eq!(
+            mk("A50F0185030000").cruise_op(),
+            Some(CruiseOp::DelTrack { track: 3 })
+        );
+        assert_eq!(
+            mk("A50F0185030500").cruise_op(),
+            Some(CruiseOp::DelPoint {
+                track: 3,
+                preset: 5
+            })
+        );
+        // 巡航速度/停留是 12 位:字节6 低 8 位 + 字节7 高 4 位。
+        // 速度 = 0x34 | (0x2 << 8) = 0x234 = 564。
+        assert_eq!(
+            mk("A50F0186013420").cruise_op(),
+            Some(CruiseOp::SetSpeed {
+                track: 1,
+                speed: 0x234
+            })
+        );
+        assert_eq!(
+            mk("A50F01870A0F10").cruise_op(),
+            Some(CruiseOp::SetDwell {
+                track: 0x0A,
+                dwell: 0x10F
+            })
+        );
+
+        // 辅助开关是 0x8C(开)/0x8D(关)——表 A.11,2016 与 2022 一致。
+        let aux = mk("A50F018C010000").aux_op().unwrap();
         assert!(aux.on && aux.function == AuxFunction::Wiper);
-        // 辅助控制关:byte3=0x8A, aux=2(红外灯)
-        let aux2 = mk("A50F018A020000").aux_op().unwrap();
+        let aux2 = mk("A50F018D020000").aux_op().unwrap();
         assert!(!aux2.on && aux2.function == AuxFunction::InfraredLight);
+        // 0x89/0x8A **不是**辅助开关(这是之前的实现错误),而是自动扫描(表 A.10)。
+        assert!(
+            mk("A50F0189010000").aux_op().is_none(),
+            "0x89 是自动扫描,不能当辅助开关"
+        );
+        assert!(mk("A50F018A010000").aux_op().is_none());
+        assert_eq!(
+            mk("A50F0189010000").scan_op(),
+            Some(ScanOp::Start { group: 1 })
+        );
+        assert_eq!(
+            mk("A50F0189010100").scan_op(),
+            Some(ScanOp::SetLeftBoundary { group: 1 })
+        );
+        assert_eq!(
+            mk("A50F0189010200").scan_op(),
+            Some(ScanOp::SetRightBoundary { group: 1 })
+        );
+        // 扫描速度同样是 12 位。
+        assert_eq!(
+            mk("A50F018A020530").scan_op(),
+            Some(ScanOp::SetSpeed {
+                group: 2,
+                speed: 0x305
+            })
+        );
+        // 辅助开关码不应被当成扫描。
+        assert!(mk("A50F018C010000").scan_op().is_none());
         // FI 指令(表 A.6):0x42 聚焦近、0x41 聚焦远、0x48 光圈缩小、0x44 光圈放大。
         let near = mk("A50F0142000000").fi_op().unwrap();
         assert!(near.focus_near && !near.focus_far && !near.iris_open && !near.iris_close);

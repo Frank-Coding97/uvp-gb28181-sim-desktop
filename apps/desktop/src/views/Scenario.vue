@@ -26,15 +26,28 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { LineChart } from "echarts/charts";
-import { GridComponent, LegendComponent, TooltipComponent } from "echarts/components";
+import {
+  DataZoomComponent,
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+} from "echarts/components";
 import { init, use as useECharts, type ECharts } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 import { usePlatform } from "../platform";
+import { buildScenarioToml } from "../lib/scenarioToml";
 
-useECharts([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
+useECharts([
+  LineChart,
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+  DataZoomComponent,
+  CanvasRenderer,
+]);
 
 const message = useMessage();
-const { active: activePlatform } = usePlatform();
+const { active: activePlatform, activeHasSecret, refreshSecretStatus } = usePlatform();
 
 const form = ref({
   base_device_id: "34020000001320000001",
@@ -81,19 +94,53 @@ const platformLabel = computed(() => {
   return p ? `${p.name} · ${p.server_host}:${p.server_port} · ${p.transport}` : "未配置目标平台";
 });
 
+interface LatencySnapshot {
+  count: number;
+  avg_ms: number;
+  p50_ms: number;
+  p95_ms: number;
+  p99_ms: number;
+  max_ms: number;
+}
+
+interface TransportStats {
+  received: number;
+  parse_errors: number;
+  rejected_source: number;
+  dropped_queue_full: number;
+  unrouted: number;
+  sent: number;
+  send_errors: number;
+  oversized_sent: number;
+}
+
 interface MetricsSnapshot {
   register_attempted: number;
+  register_first_attempt: number;
+  register_retry: number;
   register_succeeded: number;
   register_failed: number;
   register_success_rate: number;
+  /** 设备维度成功率:不被退避重试稀释,更接近"多少台真的上线了"。 */
+  device_success_rate: number;
   heartbeat_succeeded: number;
   heartbeat_failed: number;
   active_streams: number;
+  devices_online: number;
+  devices_online_peak: number;
   fail_timeout: number;
   fail_rejected: number;
+  /** 本地瓶颈导致的失败(不是平台的问题)。 */
+  fail_local: number;
   fail_other: number;
   position_reported: number;
   alarm_reported: number;
+  register_latency: LatencySnapshot;
+  heartbeat_latency: LatencySnapshot;
+  transport?: TransportStats;
+  local_pressure: number;
+  /** false 表示出现了本机瓶颈,失败不能直接归因给平台。 */
+  results_trustworthy: boolean;
 }
 
 interface StressState {
@@ -120,15 +167,54 @@ interface StressStatus {
 }
 
 const latest = ref<MetricsSnapshot | null>(null);
+// 展示**设备维度**成功率:尝试维度会被退避重试稀释,长跑后失真。
 const successRate = computed(() =>
-  latest.value ? `${(latest.value.register_success_rate * 100).toFixed(1)}%` : "—",
+  latest.value ? `${(latest.value.device_success_rate * 100).toFixed(1)}%` : "—",
 );
 const successHealth = computed(() => {
-  if (!latest.value || latest.value.register_attempted === 0) return "等待采样";
-  const rate = latest.value.register_success_rate;
+  if (!latest.value || latest.value.register_first_attempt === 0) return "等待采样";
+  const rate = latest.value.device_success_rate;
   if (rate >= 0.98) return "健康";
   if (rate >= 0.9) return "需观察";
   return "异常";
+});
+const onlineText = computed(() => {
+  const m = latest.value;
+  if (!m) return "—";
+  return `${m.devices_online}`;
+});
+const onlineNote = computed(() => {
+  const m = latest.value;
+  if (!m) return "等待上线";
+  return `峰值 ${m.devices_online_peak} · 目标 ${form.value.count}`;
+});
+const latencyText = computed(() => {
+  const l = latest.value?.register_latency;
+  if (!l || l.count === 0) return "—";
+  return `${l.p95_ms} ms`;
+});
+const latencyNote = computed(() => {
+  const l = latest.value?.register_latency;
+  if (!l || l.count === 0) return "等待采样";
+  return `p50 ${l.p50_ms} · p99 ${l.p99_ms} · max ${l.max_ms} ms`;
+});
+const heartbeatLatencyNote = computed(() => {
+  const l = latest.value?.heartbeat_latency;
+  if (!l || l.count === 0) return "";
+  return `心跳 p95 ${l.p95_ms} ms`;
+});
+// 本机瓶颈提示:一旦出现,失败数就不能直接当成平台承载上限。
+const trustWarning = computed(() => {
+  const m = latest.value;
+  if (!m || m.results_trustworthy) return "";
+  const t = m.transport;
+  const parts: string[] = [];
+  if (m.fail_local) parts.push(`本地发送失败 ${m.fail_local}`);
+  if (t?.dropped_queue_full) parts.push(`入站队列丢弃 ${t.dropped_queue_full}`);
+  if (t?.send_errors) parts.push(`socket 发送错误 ${t.send_errors}`);
+  if (t?.parse_errors) parts.push(`报文解析失败 ${t.parse_errors}`);
+  if (t?.oversized_sent) parts.push(`超 MTU 报文 ${t.oversized_sent}`);
+  return `检测到本机瓶颈(${parts.join("、") || "本地压力 " + m.local_pressure}),失败数不能直接归因给平台;请降低设备数或放宽爬坡后重测。`;
 });
 const streamNote = computed(() => {
   if (!latest.value) return "等待点播";
@@ -146,6 +232,7 @@ const reportNote = computed(() => {
 const failureAdvice = computed(() => {
   const m = latest.value;
   if (!m || m.register_failed === 0) return "暂无失败。若平台无设备上线，优先检查平台地址、域 ID 与设备 ID 是否匹配。";
+  if (m.fail_local > 0 && m.fail_local >= m.fail_timeout) return "本机瓶颈为主:本地 socket 发送失败或队列溢出。先减少设备数、放宽爬坡速率,再判断平台承载。";
   if (m.fail_rejected >= m.fail_timeout && m.fail_rejected >= m.fail_other) return "平台拒绝较多：检查设备是否已添加、认证密码、平台域 ID 与设备编号规则。";
   if (m.fail_timeout >= m.fail_other) return "事务超时较多：检查平台 IP/端口、防火墙、SIP 监听地址和本机网络出口。";
   return "网络或其它错误较多：查看系统日志页，确认本机 socket 权限、媒体源和运行时依赖。";
@@ -160,14 +247,10 @@ const scenarioSummary = computed(() => {
   ].join(" · ");
 });
 
-function tomlString(value: string): string {
-  return JSON.stringify(value);
-}
-
 function validateForm(): string | null {
   const p = activePlatform.value;
   if (!p) return "请先在顶栏配置目标平台";
-  if (p.transport.toUpperCase() !== "UDP") return "当前 SIP 信令仅支持 UDP，请修改目标平台传输模式";
+  if (!activeHasSecret.value) return "当前平台档案尚未配置 SIP 密码，请在顶栏「编辑」中填写并保存";
   if (!/^\d{20}$/.test(form.value.base_device_id)) return "起始设备 ID 必须是 20 位数字";
   if (form.value.count < 1 || form.value.count > 10_000) return "设备数量必须在 1 到 10000 之间";
   if (form.value.media_profile === "C" && !form.value.video_source.trim()) {
@@ -176,36 +259,7 @@ function validateForm(): string | null {
   return null;
 }
 
-function buildToml(): string {
-  const p = activePlatform.value!;
-  const lines = [
-    `base_device_id = ${tomlString(form.value.base_device_id)}`,
-    `password = ${tomlString(p.password)}`,
-    `server_host = ${tomlString(p.server_host.trim())}`,
-    `server_port = ${p.server_port}`,
-    `server_domain = ${tomlString(p.server_domain.trim())}`,
-    `transport = ${tomlString(p.transport.toUpperCase())}`,
-    `heartbeat_interval_secs = ${form.value.heartbeat_interval}`,
-    `channels_per_device = ${form.value.channels_per_device}`,
-    `gb_version = ${tomlString(form.value.gb_version)}`,
-    `media_profile = ${tomlString(form.value.media_profile)}`,
-    `bitrate_kbps = ${form.value.bitrate_kbps}`,
-    `ramp_per_second = ${form.value.ramp_per_second}`,
-    `active_ratio = ${(form.value.active_ratio / 100).toFixed(2)}`,
-    "video_fps = 25",
-  ];
-  if (form.value.media_profile === "C") {
-    lines.push(`video_source = ${tomlString(form.value.video_source.trim())}`);
-  }
-  lines.push(
-    "[device_info]",
-    `device_name = ${tomlString("UVP-Sim")}`,
-    `manufacturer = ${tomlString("UVP")}`,
-    `model = ${tomlString("Desktop-Sim")}`,
-    `firmware = ${tomlString("0.1.2")}`,
-  );
-  return lines.join("\n");
-}
+
 
 async function pickVideoSource() {
   try {
@@ -226,12 +280,15 @@ function resetSeries() {
   times.length = 0;
   regRates.length = 0;
   hbFails.length = 0;
+  onlineCounts.length = 0;
+  p95Latency.length = 0;
   latest.value = null;
   hasReport.value = false;
   updateChart();
 }
 
 async function startStress() {
+  await refreshSecretStatus();
   const validation = validateForm();
   if (validation) {
     message.warning(validation);
@@ -241,12 +298,13 @@ async function startStress() {
   starting.value = true;
   statusText.value = "正在启动";
   try {
-    const toml = buildToml();
+    const toml = buildScenarioToml(form.value, activePlatform.value!);
     await invoke("validate_scenario", { toml });
     resetSeries();
     const result = await invoke<string>("start_stress", {
       toml,
       count: form.value.count,
+      profileId: activePlatform.value!.id,
       positionInterval: form.value.position_enabled ? form.value.position_interval : 0,
       alarmInterval: form.value.alarm_enabled ? form.value.alarm_interval : 0,
     });
@@ -327,29 +385,43 @@ async function reconcile(): Promise<StressStatus | null> {
   }
 }
 
-const MAX_POINTS = 60;
+// 保留**全量**采样点(用 dataZoom 缩放),而不是只留最后 60 个。
+// 之前 MAX_POINTS=60 意味着跑 10 分钟只剩最后一分钟曲线,长跑等于没有历史。
+// 上限只作为内存兜底(24 小时 @1s)。
+const MAX_POINTS = 86_400;
 const times: string[] = [];
 const regRates: number[] = [];
 const hbFails: number[] = [];
+const onlineCounts: number[] = [];
+const p95Latency: number[] = [];
 const chartEl = ref<HTMLElement | null>(null);
 const chart = shallowRef<ECharts | null>(null);
 let resizeObserver: ResizeObserver | null = null;
 
 function pushPoint(snapshot: MetricsSnapshot) {
   times.push(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
-  regRates.push(Number((snapshot.register_success_rate * 100).toFixed(1)));
+  regRates.push(Number((snapshot.device_success_rate * 100).toFixed(1)));
   hbFails.push(snapshot.heartbeat_failed);
+  onlineCounts.push(snapshot.devices_online);
+  p95Latency.push(snapshot.register_latency?.p95_ms ?? 0);
   if (times.length > MAX_POINTS) {
     times.shift();
     regRates.shift();
     hbFails.shift();
+    onlineCounts.shift();
+    p95Latency.shift();
   }
 }
 
 function updateChart() {
   chart.value?.setOption({
     xAxis: { data: [...times] },
-    series: [{ data: [...regRates] }, { data: [...hbFails] }],
+    series: [
+      { data: [...regRates] },
+      { data: [...onlineCounts] },
+      { data: [...p95Latency] },
+      { data: [...hbFails] },
+    ],
   });
 }
 
@@ -358,10 +430,17 @@ function initChart() {
   const instance = init(chartEl.value, undefined, { renderer: "canvas" });
   instance.setOption({
     animationDuration: 300,
-    color: ["#3884ff", "#e89320"],
+    color: ["#3884ff", "#08b388", "#8b5cf6", "#e89320"],
     tooltip: { trigger: "axis", backgroundColor: "rgba(14,39,71,.92)", borderWidth: 0, textStyle: { color: "#fff" } },
     legend: { right: 4, top: 0, textStyle: { color: "#627797" } },
-    grid: { left: 44, right: 48, top: 46, bottom: 28 },
+    grid: { left: 44, right: 52, top: 46, bottom: 44 },
+    // 全量数据 + 缩放:长跑也能回看任意时段。
+    dataZoom: [
+      { type: "inside", throttle: 60 },
+      { type: "slider", height: 14, bottom: 6, borderColor: "transparent",
+        fillerColor: "rgba(56,132,255,.12)", handleSize: "70%",
+        textStyle: { color: "#8fa1bd", fontSize: 9 } },
+    ],
     xAxis: {
       type: "category",
       boundaryGap: false,
@@ -386,12 +465,29 @@ function initChart() {
     ],
     series: [
       {
-        name: "注册成功率",
+        name: "上线成功率",
         type: "line",
         yAxisIndex: 0,
         smooth: true,
         showSymbol: false,
         areaStyle: { color: "rgba(56,132,255,.10)" },
+        data: [],
+      },
+      {
+        name: "在线设备数",
+        type: "line",
+        yAxisIndex: 1,
+        smooth: true,
+        showSymbol: false,
+        data: [],
+      },
+      {
+        // 拐点通常先体现在延迟上,再体现在失败上 —— 这条线是提前预警。
+        name: "注册延迟 p95(ms)",
+        type: "line",
+        yAxisIndex: 1,
+        smooth: true,
+        showSymbol: false,
         data: [],
       },
       {
@@ -491,8 +587,9 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <n-alert v-if="activePlatform?.transport === 'TCP'" type="warning" :show-icon="false" class="notice">
-      当前 SIP 信令层仅支持 UDP。请在顶栏将目标平台传输模式改为 UDP 后再启动。
+    <n-alert v-if="activePlatform?.transport === 'TCP'" type="info" :show-icon="false" class="notice">
+      当前使用 SIP over TCP:目录树很大(单条报文超 MTU)或网络丢包较多时更稳,
+      代价是每台设备一条 TCP 连接,万级压测请优先用 UDP。
     </n-alert>
 
     <div class="stress-sections" :class="{ running: running || starting || stopping || stopPending }">
@@ -584,11 +681,29 @@ onUnmounted(() => {
       </div>
     </section>
 
+    <div v-if="trustWarning" class="trust-warning" role="status" aria-live="polite">
+      <span aria-hidden="true">⚠</span>
+      <span>{{ trustWarning }}</span>
+    </div>
+
     <section class="metric-grid">
       <div class="glass-card metric primary">
-        <span>注册成功率</span>
+        <span>设备上线成功率</span>
         <strong>{{ successRate }}</strong>
-        <small>{{ latest?.register_succeeded ?? 0 }} / {{ latest?.register_attempted ?? 0 }} 次 · {{ successHealth }}</small>
+        <small>
+          {{ latest?.register_succeeded ?? 0 }} 成功 / {{ latest?.register_first_attempt ?? 0 }} 台
+          · 重试 {{ latest?.register_retry ?? 0 }} 次 · {{ successHealth }}
+        </small>
+      </div>
+      <div class="glass-card metric">
+        <span>当前在线设备</span>
+        <strong>{{ onlineText }}</strong>
+        <small>{{ onlineNote }}</small>
+      </div>
+      <div class="glass-card metric">
+        <span>注册延迟 p95</span>
+        <strong>{{ latencyText }}</strong>
+        <small>{{ latencyNote }}</small>
       </div>
       <div class="glass-card metric">
         <span>当前活跃流</span>
@@ -598,7 +713,10 @@ onUnmounted(() => {
       <div class="glass-card metric">
         <span>心跳成功</span>
         <strong>{{ latest?.heartbeat_succeeded ?? 0 }}</strong>
-        <small>失败 {{ latest?.heartbeat_failed ?? 0 }} 次 · {{ heartbeatNote }}</small>
+        <small>
+          失败 {{ latest?.heartbeat_failed ?? 0 }} 次 · {{ heartbeatNote }}
+          <template v-if="heartbeatLatencyNote"> · {{ heartbeatLatencyNote }}</template>
+        </small>
       </div>
       <div class="glass-card metric">
         <span>主动上报</span>
@@ -612,7 +730,7 @@ onUnmounted(() => {
         <div class="panel-head compact">
           <div>
             <div class="panel-title">实时趋势</div>
-            <div class="panel-sub">最近 60 个采样点</div>
+            <div class="panel-sub">全量采样点(每秒一次)· 可滚轮/拖动缩放</div>
           </div>
           <span class="live-indicator" :class="{ on: running }">{{ running ? "LIVE" : "PAUSED" }}</span>
         </div>
@@ -626,6 +744,7 @@ onUnmounted(() => {
         <div class="failure-list">
           <div><span><i class="timeout" />事务超时</span><b>{{ latest?.fail_timeout ?? 0 }}</b></div>
           <div><span><i class="rejected" />平台拒绝</span><b>{{ latest?.fail_rejected ?? 0 }}</b></div>
+          <div><span><i class="local" />本机瓶颈</span><b>{{ latest?.fail_local ?? 0 }}</b></div>
           <div><span><i class="other" />网络或其它</span><b>{{ latest?.fail_other ?? 0 }}</b></div>
         </div>
         <div class="failure-advice">{{ failureAdvice }}</div>
@@ -676,7 +795,7 @@ h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22
 .report-option span, .report-option em { color: var(--text-tertiary); font-size: 10px; font-style: normal; }
 .action-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .action-row span { margin-left: auto; color: var(--text-tertiary); font-size: 10.5px; }
-.metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 0; }
+.metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 0; }
 .metric { position: relative; overflow: hidden; padding: 10px 14px; border-radius: var(--radius-md); }
 .metric::after { content: ""; position: absolute; width: 64px; height: 64px; right: -20px; top: -25px; border-radius: 50%; background: var(--accent-dim); }
 .metric.primary { border-color: rgba(56,132,255,.28); background: linear-gradient(145deg, rgba(255,255,255,.72), rgba(217,231,255,.46)); }
@@ -698,7 +817,15 @@ h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22
 .failure-list i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
 .failure-list i.timeout { background: var(--warning); }
 .failure-list i.rejected { background: var(--error); }
+.failure-list i.local { background: var(--accent-deep, #1e63dc); }
 .failure-list i.other { background: var(--violet); }
+.trust-warning {
+  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px;
+  padding: 8px 10px; border-radius: var(--radius-sm); font-size: 11.5px; line-height: 1.5;
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 32%, transparent);
+  color: var(--text-primary);
+}
 .failure-list b { color: var(--text-primary); font-size: 14px; font-variant-numeric: tabular-nums; }
 .failure-advice { margin-top: 18px; padding: 10px 12px; border-radius: var(--radius-sm); background: rgba(56,132,255,.07); color: var(--text-secondary); font-size: 11.5px; line-height: 1.55; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(8,179,136,0); } }

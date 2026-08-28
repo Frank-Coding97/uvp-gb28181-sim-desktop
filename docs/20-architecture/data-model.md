@@ -8,7 +8,10 @@
 
 **当前无数据库**。持久化只有一处:`export_report` 命令把一次压测的场景参数(原始 TOML)+ 设备数 + 结束时的 `MetricsSnapshot` 汇总成**单个 JSON 文件**,写到**系统临时目录**下的 `uvp-reports/report-<epoch 秒>.json`。
 
-压测指标全程为**内存原子计数**(`stress-engine::Metrics`),不落时间序列,不建库;每秒仅通过 `metrics_tick` 事件投影给 UI(见 `20-architecture/api-contract.md#4`)。
+压测指标为**内存原子计数**(`stress-engine::Metrics`,含延迟直方图),不建库;
+每秒通过 `metrics_tick` 事件投影给 UI(见 `20-architecture/api-contract.md#4`),
+**同时追加一行 JSONL 时序**到 `<app 数据目录>/uvp-reports/series-run<id>-<ts>.jsonl`,
+导出报告时一并打包。SQLite 仍未引入(下节为草案)。
 
 ## 1.1 规划中(未实现):SQLite 持久化
 

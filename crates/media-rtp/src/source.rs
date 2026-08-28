@@ -5,7 +5,24 @@
 //! - `LightSource`:合成低码率伪包 —— B 档(测 RTP 通道/带宽,内容不要求可解码)
 //! - `FileSource`:H.264 文件循环 —— C 档 / 单设备联调
 
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use bytes::Bytes;
 use common::{Error, Result};
+
+/// 把用户提供的文件路径整成"一定被 ffmpeg 当作路径"的形式。
+///
+/// 以 `-` 开头的路径会被 ffmpeg 当成选项(参数注入);加 `./` 前缀即消除歧义。
+/// 这里不用 shell,所以不存在命令注入,只需要防这一类**参数**注入。
+fn safe_input_path(path: &str) -> String {
+    if path.starts_with('-') {
+        format!("./{path}")
+    } else {
+        path.to_string()
+    }
+}
 
 /// 判断字节流是否以 Annex B 起始码开头(`00 00 01` 或 `00 00 00 01`)。
 fn starts_with_annexb(b: &[u8]) -> bool {
@@ -119,11 +136,15 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     })?;
 
     // ① 无损转封装(copy + h264_mp4toannexb)。
+    //
+    // `-i` 的值来自用户选择的文件路径:以 `-` 开头的路径会被 ffmpeg 当成选项解析。
+    // 用 `./` 前缀把相对路径固定成路径语义(见 safe_input_path)。
+    let input = safe_input_path(src);
     let copy_ok = Command::new(&ffmpeg)
         .args([
             "-y",
             "-i",
-            src,
+            &input,
             "-c:v",
             "copy",
             "-bsf:v",
@@ -143,7 +164,7 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
         .args([
             "-y",
             "-i",
-            src,
+            &input,
             "-an",
             "-c:v",
             "libx264",
@@ -194,9 +215,10 @@ fn extract_g711a(src: &str) -> Result<Vec<u8>> {
         return Ok(Vec::new()); // 无 ffmpeg:静默退化为纯视频。
     };
 
+    let input = safe_input_path(src);
     let res = Command::new(&ffmpeg)
         .args([
-            "-y", "-i", src, "-vn", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1", "-f", "alaw",
+            "-y", "-i", &input, "-vn", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1", "-f", "alaw",
         ])
         .arg(&out)
         .output()
@@ -211,10 +233,13 @@ fn extract_g711a(src: &str) -> Result<Vec<u8>> {
 }
 
 /// 一帧编码数据(H.264 Annex B 访问单元,含起始码)。
+///
+/// `data` 用 [`Bytes`] 而不是 `Vec<u8>`:克隆变成引用计数,
+/// 于是"每拍 clone 一帧"和"同一素材被上千台虚拟设备共享"都不再产生拷贝。
 #[derive(Debug, Clone)]
 pub struct Frame {
     /// 帧字节(Annex B)。
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// 是否关键帧(含 SPS/PPS/IDR)。
     pub key_frame: bool,
 }
@@ -308,22 +333,40 @@ impl VideoSource for LightSource {
         let mut data = Vec::with_capacity(self.frame_bytes + 5);
         data.extend_from_slice(&[0, 0, 0, 1, nal_type]);
         data.resize(self.frame_bytes + 5, 0xAB);
-        Some(Frame { data, key_frame })
+        Some(Frame {
+            data: data.into(),
+            key_frame,
+        })
     }
 }
 
 /// G.711A 每 20ms 分包的字节数(8kHz × 0.02s × 1B)。
 const G711_PACKET_BYTES: usize = 160;
 
+/// 一份已解析好的媒体素材(可被任意多个 [`FileSource`] 共享)。
+///
+/// 万级压测的真实内存瓶颈就在这里:原来每台设备各持一份 `Vec<Frame>`,
+/// 10k 台 × 10MB 素材 ≈ 100GB。改成进程内按路径缓存 + `Arc` 共享后,
+/// 无论多少台设备,同一素材只在内存里存一份。
+#[derive(Debug)]
+pub struct MediaAsset {
+    frames: Arc<[Frame]>,
+    codec: crate::ps::VideoCodec,
+    audio: Arc<[Bytes]>,
+}
+
+/// 已解析素材的进程内缓存(键为规范化后的源路径 + 是否抽音频)。
+fn asset_cache() -> &'static Mutex<HashMap<String, Arc<MediaAsset>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<MediaAsset>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// H.264 Annex B 文件循环源。加载时按起始码切成访问单元,循环产出。
 /// 若源含音频轨,同时持 G.711A 音频分包,与视频同步循环产出(音视频复合流)。
 pub struct FileSource {
-    frames: Vec<Frame>,
+    /// 共享素材:帧序列 + 音频包 + 编码。
+    asset: Arc<MediaAsset>,
     cursor: usize,
-    /// 视频编码(从 NAL 类型探测:H.264 或 H.265)。
-    codec: crate::ps::VideoCodec,
-    /// G.711A 音频分包(每包 20ms/160B);空表示无音频轨。
-    audio: Vec<Vec<u8>>,
     audio_cursor: usize,
     /// 每个视频帧对应几个音频包(按帧率折算:25fps→40ms/帧→2 包)。
     audio_per_frame: usize,
@@ -335,9 +378,7 @@ impl FileSource {
     /// 直接支持 H.264/H.265 **Annex B 裸流**;容器(MP4/FLV/MKV/MOV)自动经 ffmpeg
     /// 转封装为 Annex B(见 [`ensure_annexb`])。要音视频复合流用 [`from_path_av`](Self::from_path_av)。
     pub fn from_path(path: &str) -> Result<Self> {
-        let annexb = prepare_video_source(path)?;
-        let bytes = std::fs::read(&annexb).map_err(Error::Io)?;
-        Self::from_bytes(&bytes)
+        Self::from_path_with_audio(path, 25, false)
     }
 
     /// 从视频文件加载视频 + 音频(音视频复合流)。`fps` 用于折算每帧音频包数。
@@ -346,97 +387,152 @@ impl FileSource {
     /// (`-c:a pcm_alaw -ar 8000 -ac 1 -f alaw`),按 160B/20ms 分包。源无音频轨时音频为空,
     /// 退化为纯视频。裸流(.h264)无音频。
     pub fn from_path_av(path: &str, fps: u32) -> Result<Self> {
-        let mut s = Self::from_path(path)?;
-        // 裸流无容器音频;仅对容器源尝试抽音频。
-        if let Ok(alaw) = extract_g711a(path) {
-            if !alaw.is_empty() {
-                s.audio = alaw.chunks(G711_PACKET_BYTES).map(|c| c.to_vec()).collect();
-                // 每帧时长 = 1/fps 秒;每音频包 20ms;每帧音频包数 = (1000/fps)/20。
-                let fps = fps.max(1);
-                s.audio_per_frame = ((1000 / fps) / 20).max(1) as usize;
+        Self::from_path_with_audio(path, fps, true)
+    }
+
+    /// 统一的文件加载入口:**同一 (路径, 是否抽音频) 的素材在进程内只解析一次**,
+    /// 之后所有设备通过 `Arc` 共享同一份帧数据。
+    fn from_path_with_audio(path: &str, fps: u32, with_audio: bool) -> Result<Self> {
+        let key = format!("{}|audio={}", path, with_audio);
+        if let Some(asset) = asset_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+            return Ok(Self::from_asset(asset, fps));
+        }
+
+        let annexb = prepare_video_source(path)?;
+        let bytes = std::fs::read(&annexb).map_err(Error::Io)?;
+        let (frames, codec) = parse_annexb_frames(&bytes)?;
+        let mut audio: Vec<Bytes> = Vec::new();
+        if with_audio {
+            // 裸流无容器音频;仅对容器源尝试抽音频。
+            if let Ok(alaw) = extract_g711a(path) {
+                audio = alaw
+                    .chunks(G711_PACKET_BYTES)
+                    .map(Bytes::copy_from_slice)
+                    .collect();
             }
         }
-        Ok(s)
+        let asset = Arc::new(MediaAsset {
+            frames: frames.into(),
+            codec,
+            audio: audio.into(),
+        });
+        if let Ok(mut cache) = asset_cache().lock() {
+            cache.insert(key, Arc::clone(&asset));
+        }
+        Ok(Self::from_asset(asset, fps))
+    }
+
+    /// 用已缓存素材构造一个独立游标的源。
+    fn from_asset(asset: Arc<MediaAsset>, fps: u32) -> Self {
+        // 每帧时长 = 1/fps 秒;每音频包 20ms;每帧音频包数 = (1000/fps)/20。
+        let fps = fps.max(1);
+        let audio_per_frame = if asset.audio.is_empty() {
+            0
+        } else {
+            ((1000 / fps) / 20).max(1) as usize
+        };
+        FileSource {
+            asset,
+            cursor: 0,
+            audio_cursor: 0,
+            audio_per_frame,
+        }
+    }
+
+    /// 清空素材缓存(测试与"换素材后重载"用)。
+    pub fn clear_asset_cache() {
+        if let Ok(mut cache) = asset_cache().lock() {
+            cache.clear();
+        }
     }
 
     /// 从内存中的 Annex B 字节切帧(纯视频)。
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let nals = split_annex_b(bytes);
-        if nals.is_empty() {
-            return Err(Error::Media("H.264 流为空或无起始码".into()));
-        }
-        let codec = detect_codec(&nals);
-        let frames = group_into_frames(nals, codec);
-        Ok(FileSource {
-            frames,
-            cursor: 0,
-            codec,
-            audio: Vec::new(),
-            audio_cursor: 0,
-            audio_per_frame: 0,
-        })
+        let (frames, codec) = parse_annexb_frames(bytes)?;
+        Ok(Self::from_asset(
+            Arc::new(MediaAsset {
+                frames: frames.into(),
+                codec,
+                audio: Vec::new().into(),
+            }),
+            25,
+        ))
     }
 
     /// 帧总数。
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.asset.frames.len()
     }
 
     /// 是否无帧。
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.asset.frames.is_empty()
     }
+}
+
+/// 把 Annex B 字节切成帧序列并探测编码。
+fn parse_annexb_frames(bytes: &[u8]) -> Result<(Vec<Frame>, crate::ps::VideoCodec)> {
+    let nals = split_annex_b(bytes);
+    if nals.is_empty() {
+        return Err(Error::Media("H.264 流为空或无起始码".into()));
+    }
+    let codec = detect_codec(&nals);
+    Ok((group_into_frames(nals, codec), codec))
 }
 
 impl VideoSource for FileSource {
     fn next_frame(&mut self) -> Option<Frame> {
-        if self.frames.is_empty() {
+        let frames = &self.asset.frames;
+        if frames.is_empty() {
             return None;
         }
-        let f = self.frames[self.cursor].clone();
-        self.cursor = (self.cursor + 1) % self.frames.len(); // 循环
+        // Frame::clone 只复制 Bytes 的引用计数,不拷帧数据。
+        let f = frames[self.cursor].clone();
+        self.cursor = (self.cursor + 1) % frames.len(); // 循环
         Some(f)
     }
 
     fn has_audio(&self) -> bool {
-        !self.audio.is_empty()
+        !self.asset.audio.is_empty()
     }
 
     fn seek(&mut self, permille: u32) {
-        if self.frames.is_empty() {
+        let frames = &self.asset.frames;
+        if frames.is_empty() {
             return;
         }
         // 千分比 → 帧游标;从最近的关键帧起播,避免解码花屏。
-        let target = (self.frames.len() as u64 * permille.min(1000) as u64 / 1000) as usize;
-        let target = target.min(self.frames.len() - 1);
+        let target = (frames.len() as u64 * permille.min(1000) as u64 / 1000) as usize;
+        let target = target.min(frames.len() - 1);
         // 向前找最近关键帧(找不到就用 target)。
         let start = (0..=target)
             .rev()
-            .find(|&i| self.frames[i].key_frame)
+            .find(|&i| frames[i].key_frame)
             .unwrap_or(target);
         self.cursor = start;
         // 音频游标按比例同步。
-        if !self.audio.is_empty() {
-            self.audio_cursor = (self.audio.len() as u64 * permille.min(1000) as u64 / 1000)
-                as usize
-                % self.audio.len();
+        let audio = &self.asset.audio;
+        if !audio.is_empty() {
+            self.audio_cursor =
+                (audio.len() as u64 * permille.min(1000) as u64 / 1000) as usize % audio.len();
         }
     }
 
     fn next_audio(&mut self) -> Vec<Vec<u8>> {
-        if self.audio.is_empty() {
+        let audio = &self.asset.audio;
+        if audio.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(self.audio_per_frame);
         for _ in 0..self.audio_per_frame {
-            out.push(self.audio[self.audio_cursor].clone());
-            self.audio_cursor = (self.audio_cursor + 1) % self.audio.len(); // 循环
+            out.push(audio[self.audio_cursor].to_vec());
+            self.audio_cursor = (self.audio_cursor + 1) % audio.len(); // 循环
         }
         out
     }
 
     fn codec(&self) -> crate::ps::VideoCodec {
-        self.codec
+        self.asset.codec
     }
 }
 
@@ -516,7 +612,7 @@ fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Fr
         // 已有一个含 VCL 的帧,又来新 VCL → 切帧。
         if is_vcl && has_vcl {
             frames.push(Frame {
-                data: std::mem::take(&mut cur),
+                data: std::mem::take(&mut cur).into(),
                 key_frame: cur_key,
             });
             cur_key = false;
@@ -532,7 +628,7 @@ fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Fr
     }
     if !cur.is_empty() {
         frames.push(Frame {
-            data: cur,
+            data: cur.into(),
             key_frame: cur_key,
         });
     }
@@ -925,7 +1021,44 @@ impl FrameSender for std::sync::mpsc::SyncSender<Frame> {
 /// 纯 SPS+PPS 片段（等待 IDR 的前缀）保留在缓冲区,不提前发出。
 /// 否则缓冲末尾恰好以 IDR 起始码结束时,SPS+PPS 会被单独发出为"关键帧",
 /// 导致平台收到 332/332 全是无效的纯头部碎片而关闭连接。
+/// 未切出完整 AU 时缓冲的上界(8 MiB)。
+///
+/// 若码流始终找不到 AU 边界(编码器异常、管道里混进非码流字节),缓冲会无界增长,
+/// 而且每次读都要重扫全缓冲 → O(n²)。超限即整体丢弃重新同步,并计数。
+pub const MAX_ANNEXB_BUFFER: usize = 8 * 1024 * 1024;
+
+/// 因缓冲超限而被丢弃的字节总数(可观测性:区分"采集丢帧"与"网络丢包")。
+static ANNEXB_RESYNC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// 因通道满被丢弃的帧数。
+static CAPTURE_DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// 采集侧丢弃统计快照 (重同步丢弃字节数, 通道满丢弃帧数)。
+///
+/// 之前采集侧的丢弃全是静默的 —— 现场无法判断画面卡是采集丢帧还是网络丢包。
+pub fn capture_drop_stats() -> (u64, u64) {
+    (
+        ANNEXB_RESYNC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        CAPTURE_DROPPED_FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// 记一次"通道满丢帧"。供采集线程在 `try_send` 失败时调用。
+pub(crate) fn note_dropped_frame() {
+    CAPTURE_DROPPED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
+    // 缓冲上界保护:始终切不出 AU 时丢弃并重新同步,而不是无界堆积 + 反复全量重扫。
+    if buf.len() > MAX_ANNEXB_BUFFER {
+        ANNEXB_RESYNC_BYTES.fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            bytes = buf.len(),
+            limit = MAX_ANNEXB_BUFFER,
+            "Annex B 缓冲超限且未切出访问单元,丢弃并重新同步"
+        );
+        buf.clear();
+        return;
+    }
     // 找所有起始码位置。
     let mut starts = Vec::new();
     let mut i = 0;
@@ -960,7 +1093,7 @@ fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
         if is_vcl && has_vcl {
             // 当前积累的 AU 含 VCL,可以安全发出。
             tx.send_frame(Frame {
-                data: std::mem::take(&mut cur),
+                data: std::mem::take(&mut cur).into(),
                 key_frame: cur_key,
             });
             cur_key = false;
@@ -980,7 +1113,7 @@ fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
     // 只有 cur 包含 VCL 才发尾部帧;纯 SPS+PPS（等待 IDR）保留在 buf 中。
     if has_vcl && !cur.is_empty() {
         tx.send_frame(Frame {
-            data: cur,
+            data: cur.into(),
             key_frame: cur_key,
         });
         drained_to = last;
@@ -1060,6 +1193,47 @@ mod tests {
         assert!(f1.key_frame);
         let f2 = s.next_frame().unwrap();
         assert!(!f2.key_frame);
+    }
+
+    #[test]
+    fn 素材在设备间共享同一份内存() {
+        FileSource::clear_asset_cache();
+        let dir = std::env::temp_dir().join("uvp-asset-share-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("share.h264");
+        std::fs::write(&path, sample_h264()).unwrap();
+        let p = path.to_string_lossy().to_string();
+
+        let a = FileSource::from_path(&p).unwrap();
+        let b = FileSource::from_path(&p).unwrap();
+        // 两个源必须指向同一份已解析素材(万级压测的内存前提)。
+        assert!(
+            Arc::ptr_eq(&a.asset, &b.asset),
+            "同一素材不应被每台设备各解析一份"
+        );
+        assert_eq!(a.len(), b.len());
+
+        // 游标彼此独立。
+        let mut a = a;
+        let mut b = b;
+        let _ = a.next_frame();
+        assert_eq!(a.cursor, 1);
+        assert_eq!(b.cursor, 0);
+        let _ = b.next_frame();
+
+        FileSource::clear_asset_cache();
+        let c = FileSource::from_path(&p).unwrap();
+        assert!(!Arc::ptr_eq(&a.asset, &c.asset), "清缓存后应重新解析");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 帧克隆是引用计数而非拷贝() {
+        let mut src = FileSource::from_bytes(&sample_h264()).unwrap();
+        let f1 = src.next_frame().unwrap();
+        let f2 = f1.clone();
+        // Bytes 克隆共享底层缓冲:指针相同即证明没拷数据。
+        assert_eq!(f1.data.as_ptr(), f2.data.as_ptr());
     }
 
     #[test]

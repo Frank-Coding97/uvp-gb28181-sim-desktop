@@ -19,6 +19,8 @@ export interface DeviceForm {
   heartbeat_interval?: number;
   max_heartbeat_timeout?: number;
   expires?: number;
+  /** 输出帧率。对文件源与实时采集都生效(引擎按它切帧与打时间戳)。 */
+  video_fps?: number;
 }
 
 const FORM_KEY = "uvp_device_form";
@@ -36,6 +38,7 @@ function defaultForm(): DeviceForm {
     heartbeat_interval: 60,
     max_heartbeat_timeout: 3,
     expires: 3600,
+    video_fps: 25,
   };
 }
 
@@ -81,13 +84,15 @@ export function useDevice() {
   );
 
   // 注册上线。返回 {ok, msg}:调用方决定如何提示(顶栏走错误条,页面走 message)。
+  // 密码不经此处:只传 profile_id,由 Rust 侧从 OS 钥匙串取。
   async function startDevice(platform: PlatformProfile | undefined): Promise<{ ok: boolean; msg: string }> {
     if (!platform) return { ok: false, msg: "请先在顶栏配置目标平台" };
     persistForm();
     try {
       const config = {
+        profile_id: platform.id,
         server_host: platform.server_host, server_port: platform.server_port,
-        server_domain: platform.server_domain, password: platform.password,
+        server_domain: platform.server_domain,
         transport: platform.transport,
         signaling_encoding: platform.signaling_encoding ?? "GB18030",
         ...form.value,

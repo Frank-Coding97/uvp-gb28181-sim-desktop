@@ -12,6 +12,10 @@ use super::{drain_frames, ffmpeg_bin, Frame, VideoSource, G711_PACKET_BYTES};
 const DEFAULT_SCREEN_WIDTH: u32 = 1280;
 const DEFAULT_SCREEN_HEIGHT: u32 = 720;
 const DEFAULT_SCREEN_BITRATE_KBPS: u32 = 2500;
+/// 默认 GOP:25 fps 下 2 秒一个关键帧,与前端下拉框的推荐值一致。
+const DEFAULT_GOP: u32 = 50;
+const MIN_GOP: u32 = 1;
+const MAX_GOP: u32 = 600;
 const MIN_SCREEN_DIMENSION: u32 = 160;
 const MAX_SCREEN_LONG_SIDE: u32 = 3840;
 const MAX_SCREEN_SHORT_SIDE: u32 = 2160;
@@ -54,13 +58,15 @@ impl LiveVideoCodec {
     }
 }
 
-/// Validated output profile for a native ScreenCaptureKit source.
+/// Validated output profile for a live capture source (screen or camera).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveVideoProfile {
     pub width: u32,
     pub height: u32,
     pub bitrate_kbps: u32,
     pub codec: LiveVideoCodec,
+    /// Key-frame interval in frames. Encoders force an IDR every `gop` frames.
+    pub gop: u32,
 }
 
 impl Default for LiveVideoProfile {
@@ -70,6 +76,7 @@ impl Default for LiveVideoProfile {
             height: DEFAULT_SCREEN_HEIGHT,
             bitrate_kbps: DEFAULT_SCREEN_BITRATE_KBPS,
             codec: LiveVideoCodec::H264,
+            gop: DEFAULT_GOP,
         }
     }
 }
@@ -91,7 +98,24 @@ impl LiveVideoProfile {
                 "screen bitrate must be between {MIN_SCREEN_BITRATE_KBPS} and {MAX_SCREEN_BITRATE_KBPS} kbps"
             )));
         }
+        if !(MIN_GOP..=MAX_GOP).contains(&self.gop) {
+            return Err(Error::Media(format!(
+                "gop must be between {MIN_GOP} and {MAX_GOP} frames"
+            )));
+        }
         Ok(())
+    }
+
+    /// Render the encoding parameters as canonical URI query pairs (no leading `&`).
+    fn as_query(&self) -> String {
+        format!(
+            "width={}&height={}&bitrate={}&codec={}&gop={}",
+            self.width,
+            self.height,
+            self.bitrate_kbps,
+            self.codec.as_str(),
+            self.gop,
+        )
     }
 }
 
@@ -262,11 +286,12 @@ impl LiveAudioSource {
 /// A fully parsed live-source URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveSourceSpec {
-    /// AVFoundation camera and optional microphone indexes.
+    /// AVFoundation camera and optional microphone indexes, plus the output profile.
     Camera {
         video_index: u32,
         audio_index: Option<u32>,
         audio_codec: LiveAudioCodec,
+        profile: LiveVideoProfile,
     },
     /// ScreenCaptureKit display ID, optional system/microphone audio, and output profile.
     Screen {
@@ -294,7 +319,7 @@ impl LiveSourceSpec {
         }
 
         if let Some(rest) = uri.strip_prefix("live:camera:") {
-            let (index, audio, audio_codec) = parse_camera_query(rest)?;
+            let (index, audio, audio_codec, profile) = parse_camera_query(rest)?;
             let video_index = parse_decimal(index, "AVFoundation video index")?;
             let audio_index = if audio == "none" {
                 None
@@ -305,6 +330,7 @@ impl LiveSourceSpec {
                 video_index,
                 audio_index,
                 audio_codec,
+                profile,
             });
         }
 
@@ -325,7 +351,7 @@ impl LiveSourceSpec {
         }
 
         Err(Error::Media(format!(
-            "invalid live URI '{uri}'; expected live:camera:<video_index>?audio=<audio_index|none>&audio_codec=<g711a|g711u|aac|opus> or live:screen:<display_id>?audio=<system|microphone:index|none>&audio_codec=<g711a|g711u|aac|opus>&width=<even>&height=<even>&bitrate=<kbps>&codec=<h264|h265>"
+            "invalid live URI '{uri}'; expected live:camera:<video_index>?audio=<audio_index|none>&audio_codec=<g711a|g711u|aac|opus> or live:screen:<display_id>?audio=<system|microphone:index|none>&audio_codec=<g711a|g711u|aac|opus>, both optionally with &width=<even>&height=<even>&bitrate=<kbps>&codec=<h264|h265>&gop=<frames>"
         )))
     }
 
@@ -336,10 +362,12 @@ impl LiveSourceSpec {
                 video_index,
                 audio_index,
                 audio_codec,
+                profile,
             } => format!(
-                "live:camera:{video_index}?audio={}&audio_codec={}",
+                "live:camera:{video_index}?audio={}&audio_codec={}&{}",
                 audio_index.map_or_else(|| "none".into(), |index| index.to_string()),
                 audio_codec.as_str(),
+                profile.as_query(),
             ),
             Self::Screen {
                 display_id,
@@ -347,13 +375,10 @@ impl LiveSourceSpec {
                 audio_codec,
                 profile,
             } => format!(
-                "live:screen:{display_id}?audio={}&audio_codec={}&width={}&height={}&bitrate={}&codec={}",
+                "live:screen:{display_id}?audio={}&audio_codec={}&{}",
                 audio.as_uri_value(),
                 audio_codec.as_str(),
-                profile.width,
-                profile.height,
-                profile.bitrate_kbps,
-                profile.codec.as_str(),
+                profile.as_query(),
             ),
         }
     }
@@ -367,7 +392,86 @@ impl std::str::FromStr for LiveSourceSpec {
     }
 }
 
-fn parse_camera_query(rest: &str) -> Result<(&str, &str, LiveAudioCodec)> {
+/// 记录 URI 里出现过的编码参数,最后组装成校验过的 profile。
+/// 摄像头与屏幕两条 URI 共用同一套 `width/height/bitrate/codec/gop` 语义。
+#[derive(Default)]
+struct ProfileQuery {
+    width: Option<u32>,
+    height: Option<u32>,
+    bitrate_kbps: Option<u32>,
+    codec: Option<LiveVideoCodec>,
+    gop: Option<u32>,
+}
+
+impl ProfileQuery {
+    /// 吃掉一个编码参数;返回 `false` 表示这个 key 不是编码参数,交回调用方处理。
+    fn accept(&mut self, key: &str, value: &str, label: &str) -> Result<bool> {
+        match key {
+            "width" => set_once(
+                &mut self.width,
+                parse_decimal(value, "video width")?,
+                key,
+                label,
+            )?,
+            "height" => set_once(
+                &mut self.height,
+                parse_decimal(value, "video height")?,
+                key,
+                label,
+            )?,
+            "bitrate" => set_once(
+                &mut self.bitrate_kbps,
+                parse_decimal(value, "video bitrate")?,
+                key,
+                label,
+            )?,
+            "codec" => set_once(&mut self.codec, LiveVideoCodec::parse(value)?, key, label)?,
+            "gop" => set_once(
+                &mut self.gop,
+                parse_decimal(value, "video gop")?,
+                key,
+                label,
+            )?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// 分辨率/码率/编码必须成组出现(省略则整体取默认);GOP 可单独给。
+    fn finish(self, label: &str) -> Result<LiveVideoProfile> {
+        let defaults = LiveVideoProfile::default();
+        let gop = self.gop.unwrap_or(defaults.gop);
+        let profile = match (self.width, self.height, self.bitrate_kbps, self.codec) {
+            (None, None, None, None) => LiveVideoProfile { gop, ..defaults },
+            (Some(width), Some(height), Some(bitrate_kbps), Some(codec)) => LiveVideoProfile {
+                width,
+                height,
+                bitrate_kbps,
+                codec,
+                gop,
+            },
+            _ => {
+                return Err(Error::Media(format!(
+                    "{label} URI must provide width, height, bitrate, and codec together"
+                )))
+            }
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, key: &str, label: &str) -> Result<()> {
+    if slot.is_some() {
+        return Err(Error::Media(format!(
+            "{label} URI repeats the '{key}' parameter"
+        )));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn parse_camera_query(rest: &str) -> Result<(&str, &str, LiveAudioCodec, LiveVideoProfile)> {
     let (id, query) = rest
         .split_once('?')
         .ok_or_else(|| Error::Media("camera URI must include '?audio=...'".into()))?;
@@ -378,20 +482,25 @@ fn parse_camera_query(rest: &str) -> Result<(&str, &str, LiveAudioCodec)> {
     }
     let mut audio = None;
     let mut audio_codec = None;
+    let mut profile = ProfileQuery::default();
     for item in query.split('&') {
         let (key, value) = item
             .split_once('=')
             .ok_or_else(|| Error::Media("camera URI query must contain key=value pairs".into()))?;
+        if key.is_empty() || value.is_empty() || value.contains('=') {
+            return Err(Error::Media(
+                "camera URI contains an invalid query parameter".into(),
+            ));
+        }
         match key {
-            "audio" if audio.is_none() && !value.is_empty() => audio = Some(value),
-            "audio_codec" if audio_codec.is_none() => {
-                audio_codec = Some(LiveAudioCodec::parse(value)?)
-            }
-            "audio" | "audio_codec" => {
-                return Err(Error::Media(format!(
-                    "camera URI repeats or empties the '{key}' parameter"
-                )))
-            }
+            "audio" => set_once(&mut audio, value, key, "camera")?,
+            "audio_codec" => set_once(
+                &mut audio_codec,
+                LiveAudioCodec::parse(value)?,
+                key,
+                "camera",
+            )?,
+            _ if profile.accept(key, value, "camera")? => {}
             _ => {
                 return Err(Error::Media(format!(
                     "unknown camera URI parameter '{key}'"
@@ -403,6 +512,7 @@ fn parse_camera_query(rest: &str) -> Result<(&str, &str, LiveAudioCodec)> {
         id,
         audio.ok_or_else(|| Error::Media("camera URI must include audio".into()))?,
         audio_codec.unwrap_or_default(),
+        profile.finish("camera")?,
     ))
 }
 
@@ -420,10 +530,7 @@ fn parse_screen_query(
 
     let mut audio = None;
     let mut audio_codec = None;
-    let mut width = None;
-    let mut height = None;
-    let mut bitrate_kbps = None;
-    let mut codec = None;
+    let mut profile = ProfileQuery::default();
     for item in query.split('&') {
         let (key, value) = item
             .split_once('=')
@@ -434,54 +541,14 @@ fn parse_screen_query(
             ));
         }
         match key {
-            "audio" => {
-                if audio.is_some() {
-                    return Err(Error::Media(
-                        "screen URI repeats the 'audio' parameter".into(),
-                    ));
-                }
-                audio = Some(LiveAudioSource::parse(value)?);
-            }
-            "audio_codec" => {
-                if audio_codec.is_some() {
-                    return Err(Error::Media(
-                        "screen URI repeats the 'audio_codec' parameter".into(),
-                    ));
-                }
-                audio_codec = Some(LiveAudioCodec::parse(value)?);
-            }
-            "width" => {
-                if width.is_some() {
-                    return Err(Error::Media(
-                        "screen URI repeats the 'width' parameter".into(),
-                    ));
-                }
-                width = Some(parse_decimal(value, "screen width")?);
-            }
-            "height" => {
-                if height.is_some() {
-                    return Err(Error::Media(
-                        "screen URI repeats the 'height' parameter".into(),
-                    ));
-                }
-                height = Some(parse_decimal(value, "screen height")?);
-            }
-            "bitrate" => {
-                if bitrate_kbps.is_some() {
-                    return Err(Error::Media(
-                        "screen URI repeats the 'bitrate' parameter".into(),
-                    ));
-                }
-                bitrate_kbps = Some(parse_decimal(value, "screen bitrate")?);
-            }
-            "codec" => {
-                if codec.is_some() {
-                    return Err(Error::Media(
-                        "screen URI repeats the 'codec' parameter".into(),
-                    ));
-                }
-                codec = Some(LiveVideoCodec::parse(value)?);
-            }
+            "audio" => set_once(&mut audio, LiveAudioSource::parse(value)?, key, "screen")?,
+            "audio_codec" => set_once(
+                &mut audio_codec,
+                LiveAudioCodec::parse(value)?,
+                key,
+                "screen",
+            )?,
+            _ if profile.accept(key, value, "screen")? => {}
             _ => {
                 return Err(Error::Media(format!(
                     "unsupported screen URI parameter '{key}'"
@@ -492,26 +559,12 @@ fn parse_screen_query(
 
     let audio =
         audio.ok_or_else(|| Error::Media("screen URI must include an 'audio' parameter".into()))?;
-    let profile = match (width, height, bitrate_kbps, codec) {
-        (None, None, None, None) => LiveVideoProfile::default(),
-        (Some(width), Some(height), Some(bitrate_kbps), Some(codec)) => {
-            let profile = LiveVideoProfile {
-                width,
-                height,
-                bitrate_kbps,
-                codec,
-            };
-            profile.validate()?;
-            profile
-        }
-        _ => {
-            return Err(Error::Media(
-                "screen URI must provide width, height, bitrate, and codec together".into(),
-            ))
-        }
-    };
-
-    Ok((id, audio, audio_codec.unwrap_or_default(), profile))
+    Ok((
+        id,
+        audio,
+        audio_codec.unwrap_or_default(),
+        profile.finish("screen")?,
+    ))
 }
 
 fn parse_decimal(value: &str, label: &str) -> Result<u32> {
@@ -761,7 +814,8 @@ impl LiveSource {
                     video_index,
                     audio_index,
                     audio_codec,
-                } => Self::capture_camera(video_index, audio_index, audio_codec, fps),
+                    profile,
+                } => Self::capture_camera(video_index, audio_index, audio_codec, profile, fps),
                 LiveSourceSpec::Screen {
                     display_id,
                     audio,
@@ -789,6 +843,7 @@ impl LiveSource {
         video_index: u32,
         audio_index: Option<u32>,
         audio_codec: LiveAudioCodec,
+        profile: LiveVideoProfile,
         fps: u32,
     ) -> Result<Self> {
         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
@@ -804,6 +859,20 @@ impl LiveSource {
             || format!("{video_index}:none"),
             |index| format!("{video_index}:{index}"),
         );
+        // 输出编码参数全部来自 URI(前端"摄像头视频参数"那一列),不再硬编码 1280x720/libx264。
+        let scale_filter = format!(
+            "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
+            w = profile.width,
+            h = profile.height
+        );
+        let bitrate = format!("{}k", profile.bitrate_kbps);
+        // 恒定码率的缓冲上限取 2 倍码率:低延迟场景不希望 VBV 攒太久。
+        let bufsize = format!("{}k", profile.bitrate_kbps.saturating_mul(2));
+        let gop_text = profile.gop.to_string();
+        let video_encoder = match profile.codec {
+            LiveVideoCodec::H264 => "libx264",
+            LiveVideoCodec::H265 => "libx265",
+        };
         let mut command = Command::new(&ffmpeg);
         command.args([
             "-hide_banner",
@@ -823,28 +892,61 @@ impl LiveSource {
             "-map",
             "0:v:0",
             "-c:v",
-            "libx264",
+            video_encoder,
             "-preset",
             "ultrafast",
             "-tune",
             "zerolatency",
-            "-x264-params",
-            "slices=1:sliced-threads=0",
             "-pix_fmt",
             "yuv420p",
             "-vf",
-            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+            &scale_filter,
+            "-b:v",
+            &bitrate,
+            "-maxrate",
+            &bitrate,
+            "-bufsize",
+            &bufsize,
             "-g",
-            &input_fps_text,
+            &gop_text,
             "-fps_mode",
             "passthrough",
-            "-f",
-            "h264",
-            "pipe:1",
         ]);
+        // x264 的 slice 参数是 libx264 专属;libx265 用 -x265-params 表达同样的意图。
+        match profile.codec {
+            LiveVideoCodec::H264 => {
+                command.args(["-x264-params", "slices=1:sliced-threads=0"]);
+                command.args(["-f", "h264"]);
+            }
+            LiveVideoCodec::H265 => {
+                command.args(["-x265-params", "log-level=error"]);
+                command.args(["-tag:v", "hvc1", "-f", "hevc"]);
+            }
+        }
+        command.arg("pipe:1");
+        // 带音频时编码后的音频 ES 走 pipe:2(stderr),于是 stderr 不能再承载日志。
+        // 单进程是刻意的:一个 AVFoundation 会话同时拥有连续互通相机的两条轨,
+        // 第二个进程会让 iPhone 麦克风在视频活动时卡住。
+        //
+        // 但"日志完全看不到"是不可接受的:失败时只能报一句"stopped unexpectedly"。
+        // 用 ffmpeg 自带的 FFREPORT 把日志写到文件,既不占 stderr 也保住了诊断。
+        let report_path = if audio_index.is_some() {
+            let path = std::env::temp_dir().join(format!(
+                "uvp-ffmpeg-camera-{video_index}-{}.log",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            // FFREPORT 的 file= 里 ':' 与 '\\' 需转义。
+            let escaped = path
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace(':', "\\:");
+            command.env("FFREPORT", format!("file={escaped}:level=32"));
+            Some(path)
+        } else {
+            None
+        };
         if audio_index.is_some() {
-            // One AVFoundation session owns both Continuity Camera tracks. A second
-            // process can make an iPhone microphone stall while video is active.
             command.args(["-map", "0:a:0"]);
             audio_codec.append_ffmpeg_output(&mut command, "pipe:2");
         }
@@ -873,22 +975,47 @@ impl LiveSource {
         let alive = Arc::clone(&producer_alive);
         let video_stop = Arc::clone(&stop_flag);
         let video_error = Arc::clone(&terminal_error);
+        let report_tail_for_thread = report_path.clone();
+        let video_codec = profile.codec;
         std::thread::spawn(move || {
             let mut pending = Vec::with_capacity(256 * 1024);
             let mut chunk = [0_u8; 32 * 1024];
+            // 区分"正常 EOF"与"读失败":之前 `Ok(0) | Err(_) => break` 把两者
+            // 合成一句"stopped unexpectedly",错误 kind 直接丢了。
+            let mut read_error_kind: Option<String> = None;
             loop {
                 match stdout.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(e) => {
+                        read_error_kind = Some(e.kind().to_string());
+                        break;
+                    }
                     Ok(n) => {
                         ready.store(true, Ordering::Release);
                         pending.extend_from_slice(&chunk[..n]);
-                        drain_frames(&mut pending, &tx);
+                        // NAL 头布局按编码分支:H.265 是 2 字节头、类型位不同,
+                        // 用 H.264 的切分器会把 VPS/SPS/PPS 和关键帧判断全判错。
+                        match video_codec {
+                            LiveVideoCodec::H264 => drain_frames(&mut pending, &tx),
+                            LiveVideoCodec::H265 => drain_hevc_frames(&mut pending, &tx),
+                        }
                     }
                 }
             }
             if !video_stop.load(Ordering::Acquire) {
                 if let Ok(mut error) = video_error.lock() {
-                    *error = Some(format!("AVFoundation {video_label} stopped unexpectedly"));
+                    let mut msg = format!("AVFoundation {video_label} stopped unexpectedly");
+                    if let Some(kind) = read_error_kind {
+                        msg.push_str(&format!(" (read error: {kind})"));
+                    }
+                    if let Some(tail) = report_tail_for_thread
+                        .as_deref()
+                        .map(read_report_tail)
+                        .filter(|t| !t.is_empty())
+                    {
+                        msg.push_str(&format!("; ffmpeg log: {tail}"));
+                    }
+                    *error = Some(msg);
                 }
             }
             alive.store(false, Ordering::Release);
@@ -921,7 +1048,12 @@ impl LiveSource {
                             for packet in parser.push(&chunk[..n]) {
                                 ready_thread.store(true, Ordering::Release);
                                 match audio_tx.try_send(packet) {
-                                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                    Ok(()) => {}
+                                    // 满了就丢:保低延迟。但必须计数,否则现场无法
+                                    // 区分"采集丢包"与"网络丢包"。
+                                    Err(mpsc::TrySendError::Full(_)) => {
+                                        crate::source::note_dropped_frame()
+                                    }
                                     Err(mpsc::TrySendError::Disconnected(_)) => return,
                                 }
                             }
@@ -939,7 +1071,7 @@ impl LiveSource {
             audio_tail = Some(Arc::new(Mutex::new(VecDeque::new())));
         }
 
-        wait_for_ffmpeg_startup(
+        if let Err(error) = wait_for_ffmpeg_startup(
             &mut startup.children,
             &video_ready,
             audio_ready.as_deref(),
@@ -950,7 +1082,17 @@ impl LiveSource {
                 audio_index,
                 input_fps,
             },
-        )?;
+        ) {
+            // 带音频时 stderr 被音频占用,诊断信息在 FFREPORT 文件里。
+            let tail = report_path
+                .as_deref()
+                .map(read_report_tail)
+                .unwrap_or_default();
+            if tail.is_empty() {
+                return Err(error);
+            }
+            return Err(Error::Media(format!("{error}; ffmpeg log: {tail}")));
+        }
         let children = startup.disarm();
 
         Ok(Self {
@@ -962,7 +1104,7 @@ impl LiveSource {
             audio_credit_90k: 0,
             audio_codec,
             fps,
-            codec: LiveVideoCodec::H264,
+            codec: profile.codec,
             children,
             stop_flag,
             producer_alive,
@@ -1054,6 +1196,11 @@ impl LiveSource {
                     Error::Media(format!("failed to initialize OpenH264 screen encoder: {e}"))
                 })?;
                 std::thread::spawn(move || {
+                    // OpenH264 的 EncoderConfig 不提供 IDR 周期,只能在编码循环里
+                    // 每 gop 帧显式 force_intra_frame(),否则只有第一帧是关键帧,
+                    // 平台中途接流要等很久才能出画。
+                    let gop = profile.gop.max(1) as u64;
+                    let mut encoded: u64 = 0;
                     while !encoder_stop.load(Ordering::Acquire) {
                         let bgra = match raw_rx.recv_timeout(Duration::from_millis(100)) {
                             Ok(frame) => frame,
@@ -1066,6 +1213,10 @@ impl LiveSource {
                             out[1] = pixel[1];
                             out[2] = pixel[0];
                         }
+                        if encoded % gop == 0 {
+                            encoder.force_intra_frame();
+                        }
+                        encoded = encoded.wrapping_add(1);
                         let yuv =
                             YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (width, height)));
                         let Ok(bitstream) = encoder.encode(&yuv) else {
@@ -1074,10 +1225,16 @@ impl LiveSource {
                         let data = bitstream.to_vec();
                         if !data.is_empty() {
                             ready.store(true, Ordering::Release);
-                            let _ = tx.try_send(Frame {
-                                key_frame: h264_is_keyframe(&data),
-                                data,
-                            });
+                            if tx
+                                .try_send(Frame {
+                                    key_frame: h264_is_keyframe(&data),
+                                    data: data.into(),
+                                })
+                                .is_err()
+                            {
+                                // 通道满/断开:丢这一帧并计数(消费侧还会快进到最近关键帧)。
+                                crate::source::note_dropped_frame();
+                            }
                         }
                     }
                     encoder_alive.store(false, Ordering::Release);
@@ -1092,6 +1249,7 @@ impl LiveSource {
                 let size = format!("{}x{}", profile.width, profile.height);
                 let fps_text = fps.to_string();
                 let bitrate = format!("{}k", profile.bitrate_kbps);
+                let gop_text = profile.gop.to_string();
                 let mut child = Command::new(&ffmpeg)
                     .args([
                         "-hide_banner",
@@ -1116,7 +1274,7 @@ impl LiveSource {
                         "-b:v",
                         &bitrate,
                         "-g",
-                        &fps_text,
+                        &gop_text,
                         "-f",
                         "hevc",
                         "pipe:1",
@@ -1357,7 +1515,10 @@ impl LiveSource {
                                         for packet in parser.push(&chunk[..n]) {
                                             ready_thread.store(true, Ordering::Release);
                                             match audio_tx.try_send(packet) {
-                                                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                                Ok(()) => {}
+                                                Err(mpsc::TrySendError::Full(_)) => {
+                                                    crate::source::note_dropped_frame()
+                                                }
                                                 Err(mpsc::TrySendError::Disconnected(_)) => return,
                                             }
                                         }
@@ -1425,7 +1586,10 @@ impl LiveSource {
                                 for packet in parser.push(&chunk[..n]) {
                                     ready_thread.store(true, Ordering::Release);
                                     match audio_tx.try_send(packet) {
-                                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                        Ok(()) => {}
+                                        Err(mpsc::TrySendError::Full(_)) => {
+                                            crate::source::note_dropped_frame()
+                                        }
                                         Err(mpsc::TrySendError::Disconnected(_)) => return,
                                     }
                                 }
@@ -1669,6 +1833,23 @@ fn kill_children(children: &mut [Child]) {
     }
 }
 
+/// 读取 FFREPORT 日志文件的最后若干行(带音频的摄像头路径唯一的诊断来源)。
+fn read_report_tail(path: &std::path::Path) -> String {
+    const MAX_LINES: usize = 12;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let mut lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() > MAX_LINES {
+        lines = lines.split_off(lines.len() - MAX_LINES);
+    }
+    lines.join(" | ")
+}
+
 fn locked_tail(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
     tail.lock()
         .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join(" | "))
@@ -1731,10 +1912,15 @@ fn drain_hevc_frames(buf: &mut Vec<u8>, tx: &mpsc::SyncSender<Frame>) {
         // is set; additional slices must remain in the current frame.
         let starts_next_access_unit = first_slice || matches!(nal_type, 32..=35 | 39);
         if has_vcl && starts_next_access_unit {
-            let _ = tx.try_send(Frame {
-                data: buf[frame_start..position].to_vec(),
-                key_frame,
-            });
+            if tx
+                .try_send(Frame {
+                    data: bytes::Bytes::copy_from_slice(&buf[frame_start..position]),
+                    key_frame,
+                })
+                .is_err()
+            {
+                crate::source::note_dropped_frame();
+            }
             frame_start = position;
             key_frame = false;
             has_vcl = false;
@@ -2039,5 +2225,112 @@ impl VideoSource for LiveSource {
             .lock()
             .ok()
             .and_then(|mut error| error.take())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 摄像头_uri_省略编码档时取默认() {
+        let spec = LiveSourceSpec::parse("live:camera:0?audio=none").expect("parse");
+        assert_eq!(
+            spec,
+            LiveSourceSpec::Camera {
+                video_index: 0,
+                audio_index: None,
+                audio_codec: LiveAudioCodec::G711A,
+                profile: LiveVideoProfile::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn 摄像头_uri_携带编码档与gop() {
+        let spec = LiveSourceSpec::parse(
+            "live:camera:2?audio=1&audio_codec=aac&width=1920&height=1080&bitrate=4000&codec=h265&gop=100",
+        )
+        .expect("parse");
+        assert_eq!(
+            spec,
+            LiveSourceSpec::Camera {
+                video_index: 2,
+                audio_index: Some(1),
+                audio_codec: LiveAudioCodec::Aac,
+                profile: LiveVideoProfile {
+                    width: 1920,
+                    height: 1080,
+                    bitrate_kbps: 4000,
+                    codec: LiveVideoCodec::H265,
+                    gop: 100,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn gop_可以单独给出() {
+        let spec = LiveSourceSpec::parse("live:screen:3?audio=system&gop=25").expect("parse");
+        let LiveSourceSpec::Screen { profile, .. } = spec else {
+            panic!("expected screen spec");
+        };
+        assert_eq!(profile.gop, 25);
+        // 其余参数仍是默认档。
+        assert_eq!(profile.width, DEFAULT_SCREEN_WIDTH);
+        assert_eq!(profile.codec, LiveVideoCodec::H264);
+    }
+
+    #[test]
+    fn 编码档参数必须成组出现() {
+        let error = LiveSourceSpec::parse("live:screen:3?audio=none&width=1920").expect_err("err");
+        assert!(
+            error.to_string().contains("together"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn 重复参数被拒() {
+        let error =
+            LiveSourceSpec::parse("live:camera:0?audio=none&gop=25&gop=50").expect_err("err");
+        assert!(
+            error.to_string().contains("repeats"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn gop_越界被拒() {
+        assert!(LiveSourceSpec::parse("live:camera:0?audio=none&gop=0").is_err());
+        assert!(LiveSourceSpec::parse("live:camera:0?audio=none&gop=601").is_err());
+    }
+
+    #[test]
+    fn 未知参数被拒() {
+        assert!(LiveSourceSpec::parse("live:camera:0?audio=none&fps=30").is_err());
+        assert!(LiveSourceSpec::parse("live:screen:1?audio=none&fps=30").is_err());
+    }
+
+    #[test]
+    fn 规范化_uri_可往返() {
+        for uri in [
+            "live:camera:0?audio=none&audio_codec=g711a&width=1280&height=720&bitrate=2500&codec=h264&gop=50",
+            "live:screen:4?audio=microphone:2&audio_codec=opus&width=640&height=360&bitrate=800&codec=h265&gop=25",
+        ] {
+            let spec = LiveSourceSpec::parse(uri).expect("parse");
+            assert_eq!(spec.canonical_uri(), uri);
+            assert_eq!(LiveSourceSpec::parse(&spec.canonical_uri()).expect("re-parse"), spec);
+        }
+    }
+
+    #[test]
+    fn legacy_短屏幕_uri_仍兼容() {
+        for uri in ["live:0", "live:ffmpeg:0"] {
+            let spec = LiveSourceSpec::parse(uri).expect("parse");
+            assert!(matches!(spec, LiveSourceSpec::Screen { display_id: 0, .. }));
+        }
+        // 规范形式则要求非零 display_id。
+        assert!(LiveSourceSpec::parse("live:screen:0?audio=none").is_err());
     }
 }

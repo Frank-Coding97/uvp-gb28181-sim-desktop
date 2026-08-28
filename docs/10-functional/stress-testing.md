@@ -53,7 +53,13 @@ TOML 定义(字段平铺在顶层,无 `scenario:` 包裹),对应 `30-crates/scen
 
 ## 5. 指标采集(FR-26、FR-27)
 
-引擎每秒聚合无锁原子指标,经 **Tauri 事件 `metrics_tick`** 推 UI(见 `20-architecture/api-contract.md`)。时序落 SQLite 为规划中;当前报告导出为最终快照 JSON(见 `20-architecture/data-model.md`)。
+引擎每秒聚合无锁原子指标(含注册/心跳延迟直方图的 p50/p95/p99),经
+**Tauri 事件 `metrics_tick`** 推 UI(见 `20-architecture/api-contract.md`),
+并**每秒追加一行 JSONL 时序**;报告导出为"最终快照 + 全量时序"JSON
+(见 `20-architecture/data-model.md`)。SQLite 落库仍为规划中。
+
+指标快照带 `results_trustworthy` / `local_pressure`:出现本机队列丢弃、socket
+发送失败或报文解析失败时,失败数里混进了本机瓶颈,不能直接当成平台承载上限。
 
 | 指标 | 说明 |
 |---|---|

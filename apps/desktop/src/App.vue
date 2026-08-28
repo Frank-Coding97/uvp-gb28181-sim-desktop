@@ -18,9 +18,13 @@ import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
 import { useDevice } from "./device";
+import { useTheme } from "./theme";
 
 const route = useRoute();
 const router = useRouter();
+
+// 主题:浅色 / 暗色 / 跟随系统。切 <html data-theme> + Naive UI 主题。
+const { isDark, naiveTheme, label: themeLabel, toggle: toggleTheme } = useTheme();
 
 function icon(comp: any) {
   return () => h(NIcon, null, { default: () => h(comp) });
@@ -35,8 +39,17 @@ const menuOptions: MenuOption[] = [
 ];
 
 // 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
-const { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile } = usePlatform();
-provide("platform", { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile });
+// 密码不在档案里(存 OS 钥匙串),这里只维护「是否已配置」与保存动作。
+const {
+  profiles, activeId, active, secretStatus, activeHasSecret,
+  setActive, addProfile, updateProfile, removeProfile,
+  savePassword, refreshSecretStatus, migrateLegacyPasswords,
+} = usePlatform();
+provide("platform", {
+  profiles, activeId, active, secretStatus, activeHasSecret,
+  setActive, addProfile, updateProfile, removeProfile,
+  savePassword, refreshSecretStatus,
+});
 const profileOptions = computed(() =>
   profiles.value.map((p) => ({ label: `${p.name}  (${p.server_host}:${p.server_port})`, value: p.id }))
 );
@@ -44,33 +57,50 @@ const profileOptions = computed(() =>
 // 表单只在编辑目标切换时重新装载;关闭后重开保留未保存的草稿。
 const editOpen = ref(false);
 let editTargetId: string | null = null;
+// password 是「待写入钥匙串」的一次性输入,留空表示不改动已保存的密码。
 const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP", signaling_encoding: "GB18030" });
+const secretHint = computed(() =>
+  activeHasSecret.value ? "已保存到系统钥匙串,留空则不改动" : "尚未配置,注册前必须填写"
+);
 function openEdit() {
   if (active.value && editTargetId !== activeId.value) {
-    Object.assign(editForm.value, active.value);
+    Object.assign(editForm.value, active.value, { password: "" });
     editTargetId = activeId.value;
   }
 }
 function openEditModal() {
   openEdit();
+  refreshSecretStatus();
   editOpen.value = true;
 }
-function saveEdit() {
-  updateProfile(activeId.value, { ...editForm.value });
+async function saveEdit() {
+  const { password, ...profile } = editForm.value;
+  updateProfile(activeId.value, profile);
+  if (password) {
+    try {
+      const msg = await savePassword(activeId.value, password);
+      topMessage.value = { text: msg, ok: true };
+    } catch (e) {
+      topMessage.value = { text: `密码保存失败:${String(e)}`, ok: false };
+      return; // 密码没存上就别关窗,让用户重试
+    }
+  }
+  editForm.value.password = "";
   editTargetId = activeId.value;
   editOpen.value = false;
 }
 function addNew() {
   addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
-    server_domain: "34020000002000000001", password: "change-me", transport: "UDP", signaling_encoding: "GB18030" });
+    server_domain: "34020000002000000001", transport: "UDP", signaling_encoding: "GB18030" });
   openEdit();
 }
-function onDeleteProfile() {
-  removeProfile(activeId.value);
+async function onDeleteProfile() {
+  await removeProfile(activeId.value);
   openEdit(); // 删除后 activeId 可能切换,重新装载当前档案到表单
 }
 const transportOptions = [
-  { label: "UDP（当前支持）", value: "UDP" },
+  { label: "UDP(国标最常用)", value: "UDP" },
+  { label: "TCP(大目录/丢包网络更稳)", value: "TCP" },
 ];
 const encodingOptions = [
   { label: "GB18030(国标默认)", value: "GB18030" },
@@ -143,6 +173,15 @@ onMounted(async () => {
   uptimeTimer = window.setInterval(tickUptime, 1000);
   // app 启动/刷新后与引擎对账,反映后台是否已有设备在跑。
   reconcile();
+  // 旧版本可能把密码明文存在 localStorage:搬进钥匙串并抹掉明文。
+  const migrated = await migrateLegacyPasswords();
+  if (migrated.length) {
+    topMessage.value = {
+      text: `已将 ${migrated.length} 个平台档案的密码迁移到系统钥匙串并清除本地明文`,
+      ok: true,
+    };
+  }
+  await refreshSecretStatus();
 });
 onUnmounted(() => { unlisten?.(); unlistenErr?.(); if (uptimeTimer) clearInterval(uptimeTimer); });
 
@@ -158,7 +197,7 @@ const themeOverrides = {
     heightSmall: "26px",
     heightMedium: "30px",
   },
-  Card: { color: "rgba(255,255,255,0.5)", borderRadius: "10px" },
+  Card: { borderRadius: "10px" },
   Button: { borderRadiusSmall: "5px", borderRadiusMedium: "6px", fontSizeSmall: "11.5px", heightSmall: "26px" },
   Input: { borderRadius: "6px", fontSizeSmall: "12px", heightSmall: "26px" },
   Select: { borderRadius: "6px", fontSizeSmall: "12px" },
@@ -170,6 +209,7 @@ const themeOverrides = {
   <n-config-provider
     :locale="zhCN"
     :date-locale="dateZhCN"
+    :theme="naiveTheme"
     :theme-overrides="themeOverrides"
   >
     <n-message-provider>
@@ -177,7 +217,7 @@ const themeOverrides = {
         <n-notification-provider>
           <div class="shell">
             <!-- 侧边栏 -->
-            <aside class="sidebar">
+            <aside class="sidebar" aria-label="主导航">
               <div class="brand">
                 <div class="brand-logo">UVP</div>
                 <div>
@@ -209,6 +249,14 @@ const themeOverrides = {
                     @update:value="setActive"
                   />
                   <n-button size="small" tertiary @click="openEditModal">编辑</n-button>
+                  <span
+                    class="plat-secret"
+                    :class="{ missing: !activeHasSecret }"
+                    :title="activeHasSecret ? 'SIP 密码已存入系统钥匙串' : '尚未配置 SIP 密码,无法注册'"
+                  >
+                    <span aria-hidden="true">{{ activeHasSecret ? "🔒" : "⚠" }}</span>
+                    {{ activeHasSecret ? "密码已配置" : "缺密码" }}
+                  </span>
                   <!-- 平台档案编辑:稳定模态框,点击遮罩/ESC 不关闭,误触不丢失输入。 -->
                   <n-modal
                     v-model:show="editOpen"
@@ -223,7 +271,19 @@ const themeOverrides = {
                       <n-input v-model:value="editForm.server_host" size="small" placeholder="平台 IP" />
                       <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
                       <n-input v-model:value="editForm.server_domain" size="small" placeholder="平台域 ID" />
-                      <n-input v-model:value="editForm.password" size="small" type="password" show-password-on="click" placeholder="SIP 密码" />
+                      <div class="pe-secret">
+                        <n-input
+                          v-model:value="editForm.password"
+                          size="small"
+                          type="password"
+                          show-password-on="click"
+                          :placeholder="activeHasSecret ? 'SIP 密码(留空不改)' : 'SIP 密码'"
+                        />
+                        <p class="pe-hint" :class="{ warn: !activeHasSecret }">
+                          <span aria-hidden="true">{{ activeHasSecret ? "🔒" : "⚠" }}</span>
+                          {{ secretHint }}
+                        </p>
+                      </div>
                       <n-select v-model:value="editForm.transport" size="small" :options="transportOptions" />
                       <n-select v-model:value="editForm.signaling_encoding" size="small" :options="encodingOptions" />
                       <div class="pe-actions">
@@ -235,8 +295,8 @@ const themeOverrides = {
                   </n-modal>
                 </div>
                 <!-- 全局连接状态与注册/注销：单行极简设计，与左侧等高 -->
-                <div class="connection-card">
-                  <span class="conn-dot" :style="{ background: statusMeta.color }" />
+                <div class="connection-card" role="status" aria-live="polite">
+                  <span class="conn-dot" :style="{ background: statusMeta.color }" aria-hidden="true" />
                   <span class="conn-status-text">
                     {{ statusMeta.text }}
                     <template v-if="deviceState === 'Registered' || deviceState === 'InCall'"> · 在线 {{ uptime }}</template>
@@ -244,23 +304,38 @@ const themeOverrides = {
                   <div class="reg-btns">
                     <n-button size="small" type="primary" :disabled="startDisabled" @click="onRegister">注册</n-button>
                     <n-button size="small" secondary type="error" :disabled="stopDisabled" @click="onLogout">注销</n-button>
+                    <button
+                      class="theme-toggle"
+                      type="button"
+                      :title="`外观:${themeLabel}(点击切换)`"
+                      :aria-label="`切换外观,当前为${themeLabel}`"
+                      @click="toggleTheme"
+                    >
+                      <span aria-hidden="true">{{ isDark ? "🌙" : "☀️" }}</span>
+                    </button>
                   </div>
                 </div>
               </header>
               <!-- 顶栏轻量提示(注册/注销结果),2.5s 自动消失。 -->
               <transition name="fade">
-                <div v-if="topMessage" class="top-toast" :class="{ ok: topMessage.ok, err: !topMessage.ok }">
+                <div
+                  v-if="topMessage"
+                  class="top-toast"
+                  role="status"
+                  aria-live="polite"
+                  :class="{ ok: topMessage.ok, err: !topMessage.ok }"
+                >
                   {{ topMessage.text }}
                 </div>
               </transition>
               <!-- 全局错误条:后端运行时错误(如点播采集失败),所有页面可见,可关闭。 -->
-              <div v-if="lastError" class="error-bar">
+              <div v-if="lastError" class="error-bar" role="alert" aria-live="assertive">
                 <span class="eb-icon">⚠</span>
                 <span class="eb-scope">{{ errorScopeLabel[lastError.scope] ?? lastError.scope }}失败</span>
                 <span class="eb-msg" :title="lastError.message">{{ lastError.message }}</span>
-                <button class="eb-close" @click="dismissError" title="关闭">✕</button>
+                <button class="eb-close" type="button" aria-label="关闭错误提示" @click="dismissError">✕</button>
               </div>
-              <section class="content">
+              <section class="content" role="main" aria-label="页面内容">
                 <!-- keep-alive:切换标签页不销毁组件,保留各页表单/运行/曲线状态。 -->
                 <router-view v-slot="{ Component }">
                   <keep-alive>
@@ -280,7 +355,7 @@ const themeOverrides = {
 .shell { display: flex; height: 100vh; }
 .sidebar {
   width: 180px; flex-shrink: 0;
-  background: rgba(255, 255, 255, 0.45);
+  background: var(--bg-surface);
   border-right: 1px solid var(--border-default);
   backdrop-filter: var(--blur-light);
   display: flex; flex-direction: column;
@@ -312,26 +387,51 @@ const themeOverrides = {
 .plat-label { font-size: 11.5px; color: var(--text-secondary); }
 .plat-edit { display: flex; flex-direction: column; gap: 6px; width: 100%; }
 .pe-actions { display: flex; gap: 6px; margin-top: 4px; }
+.pe-secret { display: flex; flex-direction: column; gap: 3px; }
+.pe-hint { margin: 0; font-size: 10.5px; color: var(--text-tertiary); line-height: 1.35; }
+.pe-hint.warn { color: var(--warning); }
+/* 顶栏密码状态徽标:一眼看出当前档案能否注册 */
+.plat-secret {
+  display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto;
+  padding: 1px 7px; border-radius: 999px; font-size: 10.5px; white-space: nowrap;
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--success) 32%, transparent);
+  color: var(--success);
+}
+.plat-secret.missing {
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 36%, transparent);
+  color: var(--warning);
+}
 /* 顶栏右侧连接状态条：单行，与左侧目标平台等高 */
 .connection-card {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 0 4px 0 10px; border-radius: var(--radius-xs);
-  background: rgba(255,255,255,.58); border: 1px solid var(--border-subtle);
-  box-shadow: 0 1px 0 rgba(255,255,255,.7) inset, 0 2px 8px rgba(16,46,98,.04);
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-card);
   backdrop-filter: var(--blur-light); -webkit-backdrop-filter: var(--blur-light);
   height: 28px; box-sizing: border-box;
 }
 .conn-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px rgba(56,132,255,.1); }
 .conn-status-text { color: var(--text-primary); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
 .reg-btns { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; margin-left: 2px; }
+/* 外观切换:轻量图标按钮,与注册/注销同一行 */
+.theme-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0; cursor: pointer;
+  border: 1px solid var(--border-default); border-radius: var(--radius-xs);
+  background: var(--bg-surface); color: var(--text-secondary); font-size: 12px;
+  transition: border-color var(--transition), background var(--transition);
+}
+.theme-toggle:hover { border-color: var(--accent); background: var(--bg-hover); }
 /* 顶栏轻量提示条:居中浮在顶栏下方,不占布局。 */
 .top-toast {
   position: absolute; top: 50px; left: 50%; transform: translateX(-50%);
   z-index: 50; padding: 5px 14px; border-radius: 999px; font-size: 11.5px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.1); backdrop-filter: var(--blur-light);
 }
-.top-toast.ok { background: color-mix(in srgb, var(--success) 16%, #fff); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
-.top-toast.err { background: color-mix(in srgb, var(--error) 16%, #fff); color: var(--error); border: 1px solid color-mix(in srgb, var(--error) 40%, transparent); }
+.top-toast.ok { background: color-mix(in srgb, var(--success) 16%, var(--bg-base)); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
+.top-toast.err { background: color-mix(in srgb, var(--error) 16%, var(--bg-base)); color: var(--error); border: 1px solid color-mix(in srgb, var(--error) 40%, transparent); }
 .fade-enter-active, .fade-leave-active { transition: opacity .18s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
 /* 全局错误条:顶栏与内容之间,醒目但不遮挡,可手动关闭。 */

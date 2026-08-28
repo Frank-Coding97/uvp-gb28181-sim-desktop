@@ -1,0 +1,36 @@
+# gitleaks 配置:在 CI 里阻止密码/密钥再次进入仓库。
+#
+# 背景:历史上 `platform.ts` 里曾硬编码过一个平台 SIP 密码与内网地址
+# (提交 e310d45bc 只改了工作区、没重写历史)。现在密码统一存 OS 钥匙串,
+# 这份配置负责保证类似情况不再发生。
+title = "uvp-gb28181-desktop"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "sip-password-literal"
+description = "疑似硬编码的 SIP/平台密码"
+regex = '''(?i)(password|passwd|pwd)\s*[:=]\s*["'][^"'\s]{6,}["']'''
+tags = ["password"]
+[rules.allowlist]
+# 占位符与测试用值不算泄露。
+regexes = [
+  '''(?i)["'](change-me|placeholder|example|your[-_]?password|12345678|\*\*\*)["']''',
+  '''(?i)password\s*[:=]\s*["']{2}''',
+]
+paths = [
+  '''.*\.test\.ts$''',
+  '''crates/.*/tests/.*''',
+  '''crates/.*/examples/.*''',
+  # Rust 单测里的固定测试密码。
+  '''crates/.*/src/.*\.rs$''',
+]
+
+[allowlist]
+description = "全局豁免"
+paths = [
+  '''package-lock\.json''',
+  '''Cargo\.lock''',
+  '''\.gitleaks\.toml''',
+]

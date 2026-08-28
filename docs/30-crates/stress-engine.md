@@ -32,8 +32,15 @@ pub struct Metrics { /* 原子计数 */ }   // + snapshot() / register_success_r
 - **批量主动上报施压**:`position_secs`/`alarm_secs` 控制每台设备周期上报定位/报警,计入指标。
 
 ## 指标
-- `Metrics`:原子计数,热路径无锁;`snapshot()` → `MetricsSnapshot`(见 `20-architecture/api-contract.md#4`),含 `position_reported`/`alarm_reported`。
-- **不落库**(无 SQLite,规划中,见 `20-architecture/data-model.md`);实时更新经 `metrics_tick` 事件推给 UI。
+- `Metrics`:原子计数,热路径无锁;`snapshot()` → `MetricsSnapshot`(见 `20-architecture/api-contract.md#4`)。
+  含 `devices_online`(gauge)+ 峰值、`register_latency` / `heartbeat_latency`
+  (对数分桶直方图,p50/p95/p99/max)、首次尝试与重试分离的 `device_success_rate`、
+  以及 `fail_local`(本机瓶颈,与平台失败严格区分)。
+- `snapshot_with_transport()` 附带传输层统计,据此给出 `results_trustworthy`。
+- **不落 SQLite**(规划中,见 `20-architecture/data-model.md`);实时更新经 `metrics_tick`
+  事件推给 UI,并由桌面端每秒追加 JSONL 时序供报告导出。
+- 调度:按 `DEVICES_PER_SOCKET`(64)分片建共享 socket,接收循环并行化;
+  爬坡按 `1s / ramp` 均匀发放而非批量突发。
 - 失败归因分类见 `20-architecture/data-model.md#4`。
 
 ## 对外服务

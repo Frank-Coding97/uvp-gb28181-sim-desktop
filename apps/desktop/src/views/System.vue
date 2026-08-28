@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 interface LogLine { ts_ms: number; level: string; target: string; message: string; }
+/** 后端每 100ms 聚合一次推来的日志批。`dropped` 是因队列满被丢弃的条数。 */
+interface LogBatch { lines: LogLine[]; dropped: number; }
 
 const LEVELS = ["error", "warn", "info", "debug", "trace"];
 const level = ref("info");
@@ -15,6 +17,8 @@ const paused = ref(false);
 const filterText = ref("");
 const levelFilter = ref<string>("");   // 空=全部
 const logBox = ref<HTMLElement | null>(null);
+/** 累计被后端丢弃的日志条数(压测高频日志下会出现)。 */
+const droppedTotal = ref(0);
 let unlisten: UnlistenFn | null = null;
 
 // 当前级别文本里取主级别(EnvFilter 可能是 "info,media_rtp=debug",取开头)。
@@ -68,9 +72,12 @@ async function refreshHistory() {
 onMounted(async () => {
   try { level.value = await invoke<string>("get_log_level"); } catch { /* 忽略 */ }
   await refreshHistory();
-  unlisten = await listen<LogLine>("log_line", (e) => {
-    if (paused.value) return;
-    logs.value.push(e.payload);
+  // 后端按 100ms 批量推送(而不是每条日志一个事件),压测时前端不再被 IPC 压垮。
+  unlisten = await listen<LogBatch>("log_batch", (e) => {
+    const { lines, dropped } = e.payload;
+    if (dropped) droppedTotal.value += dropped;
+    if (paused.value || !lines?.length) return;
+    logs.value.push(...lines);
     if (logs.value.length > MAX) logs.value.splice(0, logs.value.length - MAX);
     scrollToBottom();
   });
@@ -128,33 +135,27 @@ onUnmounted(() => unlisten?.());
           <span class="log-msg">{{ l.message }}</span>
         </div>
       </div>
-      <div class="log-foot">共 {{ filtered.length }} 条 · 当前级别 {{ level }}</div>
+      <div class="log-foot" role="status" aria-live="polite">
+        共 {{ filtered.length }} 条 · 当前级别 {{ level }}
+        <span v-if="droppedTotal" class="log-dropped">
+          · 已丢弃 {{ droppedTotal }} 条(日志产生速率超过推送上限,降低级别可减少丢弃)
+        </span>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
 .page { max-width: 1320px; }
-.page-header { margin-bottom: 10px; }
-.page-title { font-size: 17px; font-weight: 700; color: var(--text-primary); }
-.page-sub { font-size: 11.5px; color: var(--text-tertiary); margin-top: 2px; }
 .panel { padding: 12px 14px; border-radius: var(--radius-md); }
-.panel-title {
-  font-size: 11px; font-weight: 650; color: var(--text-tertiary);
-  text-transform: uppercase; letter-spacing: .4px; margin-bottom: 8px;
-}
+/* 页头与表单原语已提到 theme.css;这里只留本页的差异化覆盖。 */
+.panel-title { margin-bottom: 8px; }
 .log-ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .ctl-group { display: inline-flex; align-items: center; gap: 6px; }
 .ctl-label { font-size: 11px; color: var(--text-secondary); }
-.seg {
-  display: inline-flex; padding: 2px; gap: 2px; border-radius: var(--radius-xs);
-  background: rgba(255,255,255,0.5); border: 1px solid var(--border-default);
-}
 .seg button {
-  border: none; background: transparent; padding: 2px 8px; border-radius: 4px;
-  font-size: 10.5px; color: var(--text-secondary); cursor: pointer; transition: all var(--transition);
+  padding: 2px 8px;
 }
-.seg button.on { background: var(--accent); color: #fff; box-shadow: 0 1px 4px var(--accent-glow); }
 .mini-select {
   height: 24px; padding: 0 6px; border: 1px solid var(--border-default);
   border-radius: var(--radius-xs); background: rgba(255,255,255,0.7); font-size: 11px; color: var(--text-primary);
@@ -189,4 +190,5 @@ onUnmounted(() => unlisten?.());
 .log-target { color: var(--text-secondary); flex: 0 0 auto; max-width: 200px; overflow: hidden; text-overflow: ellipsis; font-size: 10.5px; }
 .log-msg { color: var(--text-primary); flex: 1 1 auto; white-space: pre-wrap; word-break: break-all; }
 .log-foot { margin-top: 6px; font-size: 10.5px; color: var(--text-tertiary); }
+.log-dropped { color: var(--warning); }
 </style>

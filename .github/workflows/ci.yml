@@ -27,14 +27,50 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: 格式检查
         run: cargo fmt --all -- --check
+      # --all-targets 覆盖测试与 example,否则测试代码里的告警进不了质量门。
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: 单元 + 集成测试
         run: cargo test --workspace
 
+  # ── 前端质量门:类型检查 / 单测 / 生产构建 ─────────────
+  frontend-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: 安装前端依赖
+        working-directory: apps/desktop
+        run: npm ci
+      - name: 类型检查
+        working-directory: apps/desktop
+        run: npx vue-tsc --noEmit
+      - name: 前端单测
+        working-directory: apps/desktop
+        run: npx vitest run
+      - name: 生产构建
+        working-directory: apps/desktop
+        run: npx vite build
+
+  # ── 凭据扫描:防止密码/密钥再次被提交 ──────────────────
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # ── 三平台桌面安装包 ─────────────────────────────────
   build-desktop:
-    needs: rust-check
+    needs: [rust-check, frontend-check]
     strategy:
       fail-fast: false
       matrix:

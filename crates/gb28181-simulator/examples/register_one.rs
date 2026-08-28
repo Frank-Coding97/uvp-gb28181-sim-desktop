@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use common::{DeviceId, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
+use sip_core::SipTransport;
 use sip_core::UdpTransport;
 
 /// 读环境变量,缺省用给定默认值。
@@ -79,6 +80,8 @@ async fn main() {
         light_bitrate_kbps: std::env::var("LIGHT_KBPS")
             .ok()
             .and_then(|s| s.parse().ok()),
+        register_expires_secs: 3600,
+        register_retry_max_secs: 60,
         gb_version: if std::env::var("GB_VERSION").as_deref() == Ok("2016") {
             common::GbVersion::V2016
         } else {
@@ -89,7 +92,7 @@ async fn main() {
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。
     let local_ip = discover_local_ip(&format!("{server_host}:{server_port}"));
-    let transport = UdpTransport::bind("0.0.0.0:0")
+    let transport: Arc<dyn SipTransport> = UdpTransport::bind("0.0.0.0:0")
         .await
         .expect("绑定 UDP 失败");
     let local_port = transport.local_addr().expect("取本地端口失败").port();

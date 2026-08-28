@@ -11,7 +11,7 @@ use std::sync::Arc;
 use common::{Error, Result};
 
 use crate::ps::PsMuxer;
-use crate::rtp::{RtpSender, CLOCK_HZ};
+use crate::rtp::CLOCK_HZ;
 use crate::source::VideoSource;
 
 /// 回放控制:运行中可调的推流速率倍速 + 暂停开关(平台经 INFO/MANSRTSP 下发)。
@@ -117,7 +117,7 @@ pub async fn push_stream(
 /// 带回放控制(倍速/暂停)的推流。`control` 可在运行中被平台经 INFO 调整:
 /// 倍速影响取帧间隔(2x → 间隔减半),暂停时保持会话但不取帧/发送。
 pub async fn push_stream_controlled(
-    mut source: Box<dyn VideoSource>,
+    source: Box<dyn VideoSource>,
     dst: SocketAddr,
     ssrc: u32,
     fps: u32,
@@ -125,16 +125,30 @@ pub async fn push_stream_controlled(
     control: Arc<PlaybackControl>,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
-    let mut sender = if use_tcp {
-        RtpSender::new_tcp(dst, ssrc).await?
-    } else {
-        RtpSender::new(dst, ssrc).await?
-    };
+    let prepared = crate::rtp::PreparedMedia::prepare(dst, use_tcp, false).await?;
+    push_stream_prepared(prepared, source, dst, ssrc, fps, control, stop).await
+}
+
+/// 用**已预先绑定端口**的媒体通道推流。
+///
+/// 调用方(设备侧 INVITE 处理)需要在发 200 OK 之前就知道本端 RTP 端口,
+/// 才能把真实端口写进 SDP;实际连接/accept 留到这里做。
+pub async fn push_stream_prepared(
+    prepared: crate::rtp::PreparedMedia,
+    mut source: Box<dyn VideoSource>,
+    dst: SocketAddr,
+    ssrc: u32,
+    fps: u32,
+    control: Arc<PlaybackControl>,
+    stop: impl Future<Output = ()>,
+) -> Result<()> {
+    let use_tcp = prepared.is_tcp();
+    let mut sender = prepared.into_sender(ssrc).await?;
     tracing::info!(%dst, ssrc = format!("{ssrc:#x}"), use_tcp, fps, live = source.is_live(), "推流开始:已建立发送通道");
     // PSM stream_type 跟随源编码,并按源能力稳定声明音频 ES。
     let audio_codec = source.audio_codec();
     let audio_frame_duration = audio_codec.frame_duration_90k();
-    let mux = if source.has_audio() {
+    let mut mux = if source.has_audio() {
         PsMuxer::with_codecs(source.codec(), audio_codec)
     } else {
         PsMuxer::with_video(source.codec())
@@ -155,6 +169,20 @@ pub async fn push_stream_controlled(
     let mut first_frame = true;
     let mut empty_polls: u64 = 0;
 
+    // PS 封装复用缓冲:稳态零分配(原来每帧一次 Vec::with_capacity + 全帧 memcpy)。
+    let mut ps_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    // 节拍改用**绝对 deadline**。原来每轮新建 `sleep(interval)`,周期 =
+    // 本拍工作耗时 + 固定睡眠,于是实际帧率恒低于目标、RTP 时钟比墙钟越走越慢,
+    // 平台侧表现为延迟单调增长且永不追回。
+    let mut next_tick = tokio::time::Instant::now();
+    // 落后超过这个量就认为"错过的拍不再补发"(等价 MissedTickBehavior::Skip),
+    // 避免暂停/卡顿恢复后瞬间突发一大串包打爆队列。
+    const MAX_LAG: std::time::Duration = std::time::Duration::from_millis(500);
+    // RTCP SR 周期(RFC 3550 建议 5s 量级)。部分平台靠 RTCP 判活。
+    let rtcp_interval = std::time::Duration::from_secs(5);
+    let mut next_rtcp = tokio::time::Instant::now() + rtcp_interval;
+
     tokio::pin!(stop);
     let result = loop {
         // 按当前倍速动态计算取帧间隔(倍速越高间隔越短);暂停时用固定轮询间隔。
@@ -163,7 +191,12 @@ pub async fn push_stream_controlled(
         } else {
             (base_interval_us / control.speed().max(0.01)).max(1.0) as u64
         };
-        let sleep = tokio::time::sleep(std::time::Duration::from_micros(sleep_us));
+        next_tick += std::time::Duration::from_micros(sleep_us);
+        let now = tokio::time::Instant::now();
+        if next_tick + MAX_LAG < now {
+            next_tick = now;
+        }
+        let sleep = tokio::time::sleep_until(next_tick);
         tokio::select! {
             _ = &mut stop => {
                 tracing::info!(frames_sent, keyframes_sent, bytes_sent, "推流正常停止(收到 stop/BYE)");
@@ -194,13 +227,15 @@ pub async fn push_stream_controlled(
                             candidate
                         }
                     });
-                    let ps = mux.mux_frame_av_with_audio_pts(
+                    mux.mux_into(
+                        &mut ps_buf,
                         &frame.data,
                         ps_timestamp,
                         frame.key_frame,
                         &audio,
                         audio_start_pts,
                     );
+                    let ps = &ps_buf;
                     if !audio.is_empty() {
                         audio_timestamp = Some(
                             audio_start_pts.wrapping_add(
@@ -214,7 +249,7 @@ pub async fn push_stream_controlled(
                             "推流:准备发送首帧"
                         );
                     }
-                    if let Err(e) = sender.send_frame(&ps, timestamp).await {
+                    if let Err(e) = sender.send_frame(ps, timestamp).await {
                         // 关键诊断:断在发送时,报告已发多少帧——区分"一帧没发出"vs"发了一阵才断"。
                         tracing::warn!(
                             error = %e, frames_sent, keyframes_sent, bytes_sent,
@@ -239,6 +274,14 @@ pub async fn push_stream_controlled(
                     timestamp = timestamp.wrapping_add(ts_step);
                     ps_timestamp =
                         ps_timestamp.wrapping_add(u64::from(ts_step)) & PS_CLOCK_MASK;
+                    // 周期发 RTCP SR,把发送包数/字节数反馈给平台(FR-32)。
+                    if tokio::time::Instant::now() >= next_rtcp {
+                        if let Err(error) = sender.send_rtcp_sr(timestamp).await {
+                            // RTCP 失败不该中断媒体流:UDP 下平台可能压根没开 RTCP 端口。
+                            tracing::debug!(%error, "RTCP SR 发送失败(忽略)");
+                        }
+                        next_rtcp = tokio::time::Instant::now() + rtcp_interval;
+                    }
                 } else if source.is_live() {
                     // 实时源暂时无视频帧时仍消费并丢弃音频，防止有界通道保留旧包、
                     // 恢复画面后永久落后。下一有效帧会把音频时钟重新对齐视频 PTS。
@@ -321,7 +364,7 @@ mod tests {
                 None // 采集线程还没攒够第一帧
             } else {
                 Some(Frame {
-                    data: vec![0, 0, 0, 1, 0x65, 0x11],
+                    data: bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x11]),
                     key_frame: true,
                 })
             }

@@ -3,6 +3,7 @@
 //! 验证 stress-engine 的核心闭环:场景生成 N 设备 → 编排器共享传输批量注册 →
 //! mock 平台收到 N 个 REGISTER 并回 200。
 
+use sip_core::SipTransport;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -67,6 +68,8 @@ fn scenario_for(port: u16) -> LinearScenario {
         server_domain: "34020000002000000001".into(),
         transport: common::Transport::Udp,
         heartbeat_interval_secs: 3600,
+        register_expires_secs: 3600,
+        register_retry_max_secs: 10,
         channels_per_device: 1,
         device_info: DeviceInfoTemplate {
             device_name: "IT".into(),

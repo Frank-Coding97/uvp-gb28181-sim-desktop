@@ -85,6 +85,51 @@ impl Headers {
             .and_then(|s| s.split_whitespace().next())
             .and_then(|n| n.parse().ok())
     }
+
+    /// 解析 CSeq 的方法部分(响应匹配需要,RFC 3261 §17.1.3)。
+    pub fn cseq_method(&self) -> Option<&str> {
+        self.cseq().and_then(|s| s.split_whitespace().nth(1))
+    }
+
+    /// 首个 Via 的 `branch` 参数——事务标识(RFC 3261 §8.1.1.7)。
+    pub fn via_branch(&self) -> Option<&str> {
+        param_value(self.get("Via")?, "branch")
+    }
+
+    /// From 头的 `tag` 参数。
+    pub fn from_tag(&self) -> Option<&str> {
+        param_value(self.get("From")?, "tag")
+    }
+
+    /// To 头的 `tag` 参数。
+    pub fn to_tag(&self) -> Option<&str> {
+        param_value(self.get("To")?, "tag")
+    }
+
+    /// Expires 头(秒)。注册续约与订阅到期都要以平台授予值为准。
+    pub fn expires(&self) -> Option<u64> {
+        self.get("Expires")?.trim().parse().ok()
+    }
+
+    /// Contact 头里的 `expires` 参数(平台可能在 Contact 而非 Expires 头里授予时长)。
+    pub fn contact_expires(&self) -> Option<u64> {
+        param_value(self.get("Contact")?, "expires")?.parse().ok()
+    }
+}
+
+/// 从形如 `<sip:a@b>;tag=xyz;q=0.5` 的头值里取参数值。
+///
+/// 只按 `;` 切分并做大小写不敏感的名字比较;值两侧的引号会被去掉。
+/// 刻意不做完整 URI 解析——SIP 参数名不会出现在 quoted-string 之外的歧义位置。
+fn param_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    value.split(';').skip(1).find_map(|part| {
+        let (k, v) = part.split_once('=')?;
+        if k.trim().eq_ignore_ascii_case(name) {
+            Some(v.trim().trim_matches('"'))
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]
@@ -113,5 +158,38 @@ mod tests {
         let mut h = Headers::new();
         h.set("CSeq", "42 REGISTER");
         assert_eq!(h.cseq_number(), Some(42));
+        assert_eq!(h.cseq_method(), Some("REGISTER"));
+    }
+
+    #[test]
+    fn via_branch_与_tag_解析() {
+        let mut h = Headers::new();
+        h.append(
+            "Via",
+            "SIP/2.0/UDP 1.2.3.4:5060;rport;branch=z9hG4bK-abc123",
+        );
+        h.append("Via", "SIP/2.0/UDP 5.6.7.8:5060;branch=z9hG4bK-outer");
+        // 只取首个 Via —— 事务标识是最靠上那一跳的 branch。
+        assert_eq!(h.via_branch(), Some("z9hG4bK-abc123"));
+
+        h.set("From", "<sip:34020000001320000001@3402.gov>;tag=devtag");
+        h.set("To", "<sip:34020000002000000001@3402.gov>;tag=\"srvtag\"");
+        assert_eq!(h.from_tag(), Some("devtag"));
+        assert_eq!(h.to_tag(), Some("srvtag"), "带引号的值应去引号");
+
+        h.set("To", "<sip:34020000002000000001@3402.gov>");
+        assert_eq!(h.to_tag(), None, "无 tag 参数应返回 None");
+    }
+
+    #[test]
+    fn expires_解析优先头再看_contact_参数() {
+        let mut h = Headers::new();
+        h.set("Expires", "1800");
+        assert_eq!(h.expires(), Some(1800));
+
+        let mut h2 = Headers::new();
+        h2.set("Contact", "<sip:dev@1.2.3.4:5060>;expires=600");
+        assert_eq!(h2.expires(), None);
+        assert_eq!(h2.contact_expires(), Some(600));
     }
 }

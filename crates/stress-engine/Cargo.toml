@@ -21,3 +21,5 @@ sip-core = { path = "../sip-core" }
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true

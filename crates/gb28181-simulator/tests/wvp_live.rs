@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use common::{DeviceId, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
+use sip_core::SipTransport;
 use sip_core::UdpTransport;
 
 fn required_env(key: &str) -> String {
@@ -22,6 +23,8 @@ fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
             .expect("WVP_SERVER_PORT 非法"),
         server_domain: required_env("WVP_SERVER_DOMAIN"),
         transport: Transport::Udp,
+        register_expires_secs: 3600,
+        register_retry_max_secs: 60,
         gb_version: GbVersion::V2022,
         signaling_encoding: common::SignalingEncoding::Gb18030,
         heartbeat_interval_secs: 30,
@@ -49,7 +52,7 @@ async fn wvp联调_注册运行并应答查询() {
         status: "ON".into(),
     }];
     let sim = Arc::new(DeviceSimulator::new(wvp_cfg(ch)));
-    let tp = UdpTransport::bind("0.0.0.0:0").await.unwrap();
+    let tp: Arc<dyn SipTransport> = UdpTransport::bind("0.0.0.0:0").await.unwrap();
     let local_host = required_env("WVP_LOCAL_HOST");
     let local_port = tp.local_addr().unwrap().port();
     eprintln!("本端 {local_host}:{local_port} → WVP 联调目标");

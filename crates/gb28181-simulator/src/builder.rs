@@ -98,9 +98,23 @@ fn platform_uri(cfg: &DeviceConfig) -> String {
     )
 }
 
+/// Via 头值。`protocol` 必须来自**实际使用的传输对象**
+/// ([`sip_core::SipTransport::protocol`]),而不是配置里单独声明的字段 ——
+/// 后者曾导致"配置写 TCP、Via 写 TCP、实际从 UDP socket 发出",平台按 Via 回包就走错路径。
+fn via(protocol: common::Transport, local_host: &str, local_port: u16) -> String {
+    format!(
+        "SIP/2.0/{} {}:{};rport;branch={}",
+        protocol,
+        local_host,
+        local_port,
+        rand_token("z9hG4bK")
+    )
+}
+
 /// 构造 REGISTER 请求。`authorization` 为 None 时是首次(无鉴权)请求;
 /// 为 Some 时是携带 Authorization 的重新请求。每次调用生成新的 Via branch;
 /// `cseq` 递增,`local` 为本端 host:port。
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     cfg: &DeviceConfig,
     ids: &DialogIds,
@@ -109,19 +123,11 @@ pub fn register(
     local_port: u16,
     authorization: Option<&str>,
     expires: u32,
+    protocol: common::Transport,
 ) -> Request {
     let aor = device_aor(cfg);
     let mut headers = Headers::new();
-    headers.append(
-        "Via",
-        format!(
-            "SIP/2.0/{} {}:{};rport;branch={}",
-            cfg.transport,
-            local_host,
-            local_port,
-            rand_token("z9hG4bK")
-        ),
-    );
+    headers.append("Via", via(protocol, local_host, local_port));
     headers.append("From", format!("<{aor}>;tag={}", ids.from_tag));
     headers.append("To", format!("<{aor}>"));
     headers.append("Call-ID", ids.call_id.clone());
@@ -145,6 +151,7 @@ pub fn register(
 }
 
 /// 构造承载 MANSCDP XML 的 MESSAGE 请求(如 Keepalive)。
+#[allow(clippy::too_many_arguments)]
 pub fn message_xml(
     cfg: &DeviceConfig,
     ids: &DialogIds,
@@ -152,19 +159,11 @@ pub fn message_xml(
     local_host: &str,
     local_port: u16,
     xml: &str,
+    protocol: common::Transport,
 ) -> Request {
     let aor = device_aor(cfg);
     let mut headers = Headers::new();
-    headers.append(
-        "Via",
-        format!(
-            "SIP/2.0/{} {}:{};rport;branch={}",
-            cfg.transport,
-            local_host,
-            local_port,
-            rand_token("z9hG4bK")
-        ),
-    );
+    headers.append("Via", via(protocol, local_host, local_port));
     headers.append("From", format!("<{aor}>;tag={}", ids.from_tag));
     headers.append(
         "To",
@@ -267,19 +266,11 @@ pub fn notify_in_dialog(
     local_host: &str,
     local_port: u16,
     xml: &str,
+    protocol: common::Transport,
 ) -> Request {
     let aor = device_aor(cfg);
     let mut headers = Headers::new();
-    headers.append(
-        "Via",
-        format!(
-            "SIP/2.0/{} {}:{};rport;branch={}",
-            cfg.transport,
-            local_host,
-            local_port,
-            rand_token("z9hG4bK")
-        ),
-    );
+    headers.append("Via", via(protocol, local_host, local_port));
     // From = 本端设备(带本端 tag);To = 平台(沿用 SUBSCRIBE 的 From,含其 tag)。
     headers.append("From", format!("<{aor}>;tag={}", dialog.local_tag));
     headers.append("To", dialog.remote_from.clone());
@@ -330,6 +321,8 @@ mod tests {
             video_source: None,
             video_fps: 25,
             light_bitrate_kbps: None,
+            register_expires_secs: crate::device::DEFAULT_REGISTER_EXPIRES,
+            register_retry_max_secs: crate::device::DEFAULT_REGISTER_RETRY_MAX_SECS,
             gb_version: common::GbVersion::V2022,
             signaling_encoding: common::SignalingEncoding::Gb18030,
         }
@@ -338,7 +331,7 @@ mod tests {
     #[test]
     fn register_含必备头() {
         let ids = DialogIds::new();
-        let req = register(&cfg(), &ids, 1, "5.6.7.8", 5070, None, 3600);
+        let req = register(&cfg(), &ids, 1, "5.6.7.8", 5070, None, 3600, Transport::Udp);
         let text = String::from_utf8(req.to_bytes()).unwrap();
         assert!(text.starts_with("REGISTER sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"));
         assert!(text.contains("branch=z9hG4bK"));
@@ -350,8 +343,17 @@ mod tests {
     #[test]
     fn register_带鉴权() {
         let ids = DialogIds::new();
-        let first = register(&cfg(), &ids, 1, "5.6.7.8", 5070, None, 3600);
-        let authenticated = register(&cfg(), &ids, 2, "5.6.7.8", 5070, Some("Digest xxx"), 3600);
+        let first = register(&cfg(), &ids, 1, "5.6.7.8", 5070, None, 3600, Transport::Udp);
+        let authenticated = register(
+            &cfg(),
+            &ids,
+            2,
+            "5.6.7.8",
+            5070,
+            Some("Digest xxx"),
+            3600,
+            Transport::Udp,
+        );
         let text = String::from_utf8(authenticated.to_bytes()).unwrap();
         assert!(text.contains("Authorization: Digest xxx"));
         assert!(text.contains("CSeq: 2 REGISTER"));
@@ -366,7 +368,15 @@ mod tests {
     #[test]
     fn message_携带_xml_体() {
         let ids = DialogIds::new();
-        let req = message_xml(&cfg(), &ids, 3, "5.6.7.8", 5070, "<Notify/>");
+        let req = message_xml(
+            &cfg(),
+            &ids,
+            3,
+            "5.6.7.8",
+            5070,
+            "<Notify/>",
+            Transport::Udp,
+        );
         let text = String::from_utf8(req.to_bytes()).unwrap();
         assert!(text.contains("Content-Type: Application/MANSCDP+xml"));
         assert!(text.contains("Content-Length: 9"));
@@ -399,7 +409,15 @@ mod tests {
             event: "Catalog".into(),
             expires: 3600,
         };
-        let req = notify_in_dialog(&cfg(), &dialog, 7, "5.6.7.8", 5070, "<Notify/>");
+        let req = notify_in_dialog(
+            &cfg(),
+            &dialog,
+            7,
+            "5.6.7.8",
+            5070,
+            "<Notify/>",
+            Transport::Udp,
+        );
         let text = String::from_utf8(req.to_bytes()).unwrap();
         assert!(text.starts_with("NOTIFY sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"));
         // 沿用订阅 Call-ID;From 带本端 tag;To 为平台 From(带其 tag)。
