@@ -206,6 +206,9 @@ async function firePosition() {
       </MediaAudioFields>
     </div>
 
+    <div v-if="screenProfileValidationError" class="source-notice error">
+      {{ screenProfileValidationError }}
+    </div>
     <div v-if="liveCatalog.avfoundation_error" class="source-notice error">
       {{ liveCatalog.avfoundation_error }}
     </div>
