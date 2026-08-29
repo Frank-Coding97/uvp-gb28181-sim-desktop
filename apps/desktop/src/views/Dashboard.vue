@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -70,34 +70,30 @@ const {
   form,
   deviceLive,
   statusMeta,
-  startDisabled,
   canReport,
   startDevice,
+  stopDevice,
   reconcile,
 } = useDevice();
 
 const editing = ref(false);
 const saving = ref(false);
+const registrationBusy = ref(false);
 const sourceLoading = ref(false);
 const previewState = ref<PreviewState>("idle");
 const captureState = ref<CaptureState>("stopped");
 const previewError = ref("");
-const frameUrl = ref("");
 const canvasRef = ref<HTMLCanvasElement | null>(null);
-const binarySessionActive = ref(false);
-let binarySession: ReturnType<typeof usePreviewSession> | null = null;
+const hasFrame = ref(false);
+let session: ReturnType<typeof usePreviewSession> | null = null;
+let previewPageActive = true;
 const previewLatency = ref<number | null>(null);
 const previewFps = ref(0);
+const previewSkipped = ref(0);
 const sourceProbe = ref("");
-let unlistenFrame: UnlistenFn | null = null;
-let unlistenPreviewState: UnlistenFn | null = null;
-let unlistenPreviewError: UnlistenFn | null = null;
-let unlistenPreviewTransport: UnlistenFn | null = null;
 let unlistenCaptureState: UnlistenFn | null = null;
 let unlistenDeviceError: UnlistenFn | null = null;
 let unlistenSubscription: UnlistenFn | null = null;
-let fpsWindowStart = 0;
-let fpsWindowFrames = 0;
 
 const subscriptions = reactive<Record<SubscriptionKind, SubscriptionState>>({
   MobilePosition: { kind: "MobilePosition", active: false, notify_count: 0 },
@@ -390,6 +386,22 @@ async function registerDevice() {
   else message.error(result.msg);
 }
 
+async function toggleRegistration() {
+  if (registrationBusy.value) return;
+  registrationBusy.value = true;
+  try {
+    if (!deviceLive.value) {
+      await registerDevice();
+      return;
+    }
+    const result = await stopDevice();
+    if (result.ok) message.success(result.msg);
+    else message.error(result.msg);
+  } finally {
+    registrationBusy.value = false;
+  }
+}
+
 async function fireAlarm() {
   try {
     message.success(await invoke<string>("fire_alarm", { description: "移动侦测报警" }));
@@ -399,39 +411,37 @@ async function fireAlarm() {
 }
 
 async function startPreview() {
-  if (!isTauri || !deviceLive.value || captureState.value !== "ready" || previewState.value === "playing" || previewState.value === "starting") return;
+  if (!previewPageActive || !isTauri || !deviceLive.value || captureState.value !== "ready" || previewState.value === "playing" || previewState.value === "starting") return;
   previewError.value = "";
   previewState.value = "starting";
-  if (!binarySession) binarySession = usePreviewSession(canvasRef.value, {
+  if (!session) session = usePreviewSession(canvasRef.value, {
     onState: (next) => { previewState.value = next; },
     onError: (error) => { previewError.value = error; },
     onFrame: (stats) => {
+      hasFrame.value = true;
       previewLatency.value = stats.latencyMs;
       previewFps.value = stats.fps;
+      previewSkipped.value = stats.skipped;
     },
   });
-  if (binarySession) {
-    const started = await binarySession.start();
-    if (started) {
-      binarySessionActive.value = true;
-      return;
-    }
-  }
+  await session.start();
+}
+
+async function retryPreview() {
+  if (!session || !previewPageActive) return;
+  previewError.value = "";
   try {
-    await invoke<string>("start_preview", { source: form.value.video_source });
+    await session.retry();
   } catch (error) {
-    const text = String(error);
-    if (!text.includes("已有预览正在运行")) {
-      previewState.value = "error";
-      previewError.value = text;
-    }
+    previewState.value = "error";
+    previewError.value = `预览重试失败：${String(error)}`;
   }
 }
 
 watch(deviceLive, (running) => {
   if (!running) {
     captureState.value = "stopped";
-    frameUrl.value = "";
+    hasFrame.value = false;
     previewState.value = "idle";
     previewLatency.value = null;
   }
@@ -446,43 +456,11 @@ onMounted(async () => {
   syncDeviceIdFromProfile();
   resetDraft();
   if (!isTauri) return;
-  unlistenFrame = await listen<{ data: string; captured_at_ms: number }>("preview_frame", (event) => {
-    frameUrl.value = `data:image/jpeg;base64,${event.payload.data}`;
-    previewLatency.value = Math.max(0, Date.now() - event.payload.captured_at_ms);
-    const now = performance.now();
-    if (!fpsWindowStart) fpsWindowStart = now;
-    fpsWindowFrames += 1;
-    if (now - fpsWindowStart >= 1000) {
-      previewFps.value = Math.round(fpsWindowFrames * 1000 / (now - fpsWindowStart));
-      fpsWindowFrames = 0;
-      fpsWindowStart = now;
-    }
-    previewState.value = "playing";
-  });
-  unlistenPreviewState = await listen<string>("preview_state", (event) => {
-    if (["starting", "playing", "stopped"].includes(event.payload)) {
-      previewState.value = event.payload as PreviewState;
-    }
-  });
-  unlistenPreviewError = await listen<string>("preview_error", (event) => {
-    previewState.value = "error";
-    previewError.value = event.payload;
-  });
-  unlistenPreviewTransport = await listen<{ state?: string; transport?: string; timeout_ms?: number }>("preview_transport", (event) => {
-    if (event.payload.state === "stalled") {
-      previewState.value = "error";
-      previewError.value = `预览通道消费超时（${event.payload.timeout_ms ?? 500}ms），已停止发送`;
-      void binarySession?.stop().finally(() => {
-        binarySessionActive.value = false;
-        previewState.value = "error";
-      });
-    }
-  });
   unlistenCaptureState = await listen<string>("capture_state", (event) => {
     captureState.value = event.payload as CaptureState;
-    if (event.payload === "ready") void startPreview();
+    if (event.payload === "ready" && previewPageActive) void startPreview();
     if (event.payload === "stopped" || event.payload === "error") {
-      frameUrl.value = "";
+      hasFrame.value = false;
       previewState.value = event.payload === "error" ? "error" : "idle";
     }
   });
@@ -502,17 +480,20 @@ onMounted(async () => {
 });
 
 onActivated(async () => {
+  previewPageActive = true;
   const runtime = await reconcile();
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
   await startPreview();
 });
 
+onDeactivated(() => {
+  previewPageActive = false;
+  void session?.stop();
+});
+
 onUnmounted(() => {
-  void binarySession?.stop();
-  unlistenFrame?.();
-  unlistenPreviewState?.();
-  unlistenPreviewError?.();
-  unlistenPreviewTransport?.();
+  previewPageActive = false;
+  void session?.stop();
   unlistenCaptureState?.();
   unlistenDeviceError?.();
   unlistenSubscription?.();
@@ -543,17 +524,19 @@ onUnmounted(() => {
         </div>
 
         <div class="preview-stage">
-          <canvas v-show="binarySessionActive" ref="canvasRef" aria-label="设备采集预览" />
-          <img v-if="frameUrl" :src="frameUrl" alt="设备采集预览" />
-          <div v-else class="preview-cover">
+          <canvas v-show="hasFrame" ref="canvasRef" aria-label="设备采集预览" />
+          <div v-if="!hasFrame" class="preview-cover">
             <div class="cover-mark"><n-icon :size="42"><VideocamOutline /></n-icon></div>
             <strong>{{ previewEmptyTitle }}</strong>
             <span>{{ previewEmptyHint }}</span>
+            <n-button v-if="previewState === 'error' && captureState === 'ready'" size="small" type="primary" secondary @click="retryPreview">
+              重试预览
+            </n-button>
           </div>
           <div class="preview-overlay top-left"><i :class="{ on: previewState === 'playing' }" /> UVP-SIM</div>
           <div class="preview-overlay bottom-row">
             <span>{{ sourceSummary }}</span>
-            <span v-if="previewLatency !== null">{{ previewFps }} FPS · {{ previewLatency }} ms</span>
+            <span v-if="previewLatency !== null">{{ previewFps }} FPS · {{ previewLatency }} ms · 跳 {{ previewSkipped }}</span>
             <span v-else>1280x720 · H.264</span>
           </div>
         </div>
@@ -727,9 +710,9 @@ onUnmounted(() => {
         </div>
 
         <div class="primary-actions">
-          <n-button type="primary" size="large" :disabled="startDisabled" @click="registerDevice">
+          <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy" @click="toggleRegistration">
             <template #icon><n-icon><RadioOutline /></n-icon></template>
-            注册设备
+            {{ deviceLive ? "注销设备" : "注册设备" }}
           </n-button>
         </div>
 

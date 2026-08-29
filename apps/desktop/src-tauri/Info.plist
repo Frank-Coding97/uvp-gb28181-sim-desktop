@@ -8,7 +8,7 @@
 <plist version="1.0">
 <dict>
     <key>NSCameraUsageDescription</key>
-    <string>用于把本机或连续互通摄像头作为国标 IPC 视频源，实时推流到用户配置的上级平台。</string>
+    <string>用于采集本机或连续互通摄像头画面，在应用内预览或作为用户配置的视频源。</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>用于把用户选择的麦克风音频与摄像头画面一起推流到用户配置的国标平台。</string>
     <key>NSScreenCaptureUsageDescription</key>

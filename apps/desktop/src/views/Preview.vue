@@ -1,28 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { NButton, useMessage } from "naive-ui";
+import { computed, onActivated, onDeactivated, onUnmounted, ref } from "vue";
+import { NButton } from "naive-ui";
 import { useDevice } from "../device";
 import { usePreviewSession } from "../composables/preview/session";
 
-const message = useMessage();
 const { form, deviceState } = useDevice();
-const frameUrl = ref("");
 const previewLatency = ref<number | null>(null);
 const previewFps = ref(0);
-const previewSequence = ref(0);
-let fpsWindowStart = 0;
-let fpsWindowFrames = 0;
+const previewSkipped = ref(0);
 const state = ref<"idle" | "starting" | "playing" | "stopped" | "error">("idle");
 const error = ref("");
 const canvasRef = ref<HTMLCanvasElement | null>(null);
-const binarySessionActive = ref(false);
-let binarySession: ReturnType<typeof usePreviewSession> | null = null;
-let unlistenFrame: UnlistenFn | null = null;
-let unlistenState: UnlistenFn | null = null;
-let unlistenError: UnlistenFn | null = null;
-let unlistenTransport: UnlistenFn | null = null;
+const hasFrame = ref(false);
+let session: ReturnType<typeof usePreviewSession> | null = null;
 
 const source = computed(() => form.value.video_source.trim());
 const stateText = computed(() => ({ idle: "未启动", starting: "启动中", playing: "播放中", stopped: "已停止", error: "异常" }[state.value]));
@@ -37,77 +27,38 @@ const sourceType = computed(() => {
 async function start() {
   error.value = "";
   state.value = "starting";
-  if (!binarySession) binarySession = usePreviewSession(canvasRef.value, {
+  if (!session) session = usePreviewSession(canvasRef.value, {
     onState: (next) => { state.value = next; },
     onError: (reason) => { error.value = reason; },
     onFrame: (stats) => {
+      hasFrame.value = true;
       previewLatency.value = stats.latencyMs;
       previewFps.value = stats.fps;
+      previewSkipped.value = stats.skipped;
     },
   });
-  if (binarySession && await binarySession.start()) {
-    binarySessionActive.value = true;
-    return;
-  }
-  try {
-    message.success(await invoke<string>("start_preview", { source: source.value }));
-  } catch (e) {
-    state.value = "error";
-    error.value = String(e);
-  }
+  await session.start();
 }
 
 async function stop() {
+  await session?.stop();
+  hasFrame.value = false;
+  previewLatency.value = null;
+}
+
+async function retry() {
+  error.value = "";
   try {
-    await binarySession?.stop();
-    binarySessionActive.value = false;
-    await invoke<string>("stop_preview");
-    state.value = "stopped";
-    frameUrl.value = "";
-    previewLatency.value = null;
-  } catch (e) {
-    error.value = String(e);
+    await session?.retry();
+  } catch (reason) {
     state.value = "error";
+    error.value = `预览重试失败：${String(reason)}`;
   }
 }
 
-onMounted(async () => {
-  unlistenFrame = await listen<{ data: string; captured_at_ms: number; sequence?: number }>("preview_frame", (event) => {
-    frameUrl.value = `data:image/jpeg;base64,${event.payload.data}`;
-    previewLatency.value = Math.max(0, Date.now() - event.payload.captured_at_ms);
-    previewSequence.value = event.payload.sequence ?? previewSequence.value + 1;
-    const now = performance.now();
-    if (!fpsWindowStart) fpsWindowStart = now;
-    fpsWindowFrames += 1;
-    if (now - fpsWindowStart >= 1000) {
-      previewFps.value = Math.round(fpsWindowFrames * 1000 / (now - fpsWindowStart));
-      fpsWindowFrames = 0;
-      fpsWindowStart = now;
-    }
-    state.value = "playing";
-  });
-  unlistenState = await listen<string>("preview_state", (event) => {
-    if (event.payload === "starting" || event.payload === "playing" || event.payload === "stopped") {
-      state.value = event.payload;
-    }
-  });
-  await start();
-  unlistenError = await listen<string>("preview_error", (event) => {
-    error.value = event.payload;
-    state.value = "error";
-  });
-  unlistenTransport = await listen<{ state?: string; timeout_ms?: number }>("preview_transport", (event) => {
-    if (event.payload.state === "stalled") {
-      error.value = `预览通道消费超时（${event.payload.timeout_ms ?? 500}ms）`;
-      state.value = "error";
-      void binarySession?.stop().finally(() => {
-        binarySessionActive.value = false;
-        state.value = "error";
-      });
-    }
-  });
-});
-onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); unlistenTransport?.(); void binarySession?.stop(); void invoke("stop_preview"); });
+onActivated(() => { void start(); });
+onDeactivated(() => { void stop(); });
+onUnmounted(() => { void stop(); });
 </script>
 
 <template>
@@ -122,25 +73,25 @@ onUnmounted(() => { unlistenFrame?.(); unlistenState?.(); unlistenError?.(); unl
 
     <div class="preview-grid">
       <section class="glass-card panel preview-stage">
-        <div v-show="frameUrl || binarySessionActive" class="video-wrap">
-          <canvas v-show="binarySessionActive" ref="canvasRef" aria-label="推流预览画面" />
-          <img v-show="!binarySessionActive" :src="frameUrl" alt="推流预览画面" />
+        <div v-show="hasFrame" class="video-wrap">
+          <canvas ref="canvasRef" aria-label="推流预览画面" />
         </div>
-        <div v-if="!frameUrl && !binarySessionActive" class="empty-stage">
+        <div v-if="!hasFrame" class="empty-stage">
           <div class="empty-icon">◉</div>
           <strong>{{ state === 'error' ? '预览无法启动' : '等待预览画面' }}</strong>
           <span>{{ error || '选择媒体源后点击“开始预览”' }}</span>
         </div>
-        <div class="stage-foot"><span>{{ sourceType }}</span><span>状态：{{ stateText }}<template v-if="previewLatency !== null"> · {{ previewFps }} FPS · 同帧处理 {{ previewLatency }} ms</template></span></div>
+        <div class="stage-foot"><span>{{ sourceType }}</span><span>状态：{{ stateText }}<template v-if="previewLatency !== null"> · {{ previewFps }} FPS · {{ previewLatency }} ms · 跳 {{ previewSkipped }}</template></span></div>
       </section>
 
       <aside class="glass-card panel control-panel">
         <div class="panel-title">预览控制</div>
         <div class="info-row"><span>媒体源</span><code>{{ source || '未配置' }}</code></div>
         <div class="info-row"><span>设备状态</span><b>{{ deviceState === 'InCall' ? '平台推流中' : deviceState }}</b></div>
-        <div class="hint">注册成功后采集源会持续运行，本地预览直接订阅这一路编码帧；平台点播时复用同一批帧，不会再次打开摄像头或屏幕。</div>
+        <div class="hint">预览复用唯一 H.264 采集流，由不打开摄像头的隔离 worker 转成 MJPEG。页面切换只更换 Canvas，不会重启摄像头或平台推流。</div>
         <div class="actions">
           <n-button type="primary" :disabled="!canStart" @click="start">订阅预览</n-button>
+          <n-button v-if="state === 'error'" type="warning" secondary @click="retry">重试 worker</n-button>
           <n-button :disabled="state === 'idle' || state === 'stopped'" @click="stop">停止预览</n-button>
         </div>
         <div v-if="error" class="error-box">{{ error }}</div>

@@ -3,14 +3,11 @@
 //! 按 docs/20-architecture/api-contract.md 注册 IPC 命令。
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
-use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 
-use base64::Engine;
 use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use serde::{Deserialize, Serialize};
@@ -22,10 +19,12 @@ use tauri::{
 }; // Tauri 2 emit/state 需要对应 trait
 use tokio::sync::{broadcast, Mutex};
 
-#[allow(dead_code)]
-mod preview_ffmpeg;
-mod preview_store;
-use preview_store::{PreviewEnvelope, PreviewFrameStore};
+mod camera_lease;
+mod preview_channel;
+mod preview_manager;
+use camera_lease::{CameraLease, CameraLeaseError, CameraLeaseGrant, CameraLeaseOwner};
+use preview_channel::DesktopPreviewBus;
+use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
 
 /// 应用全局状态（托管在 Tauri managed state）。
 struct AppState {
@@ -41,13 +40,12 @@ struct AppState {
     last_scenario: Mutex<Option<(String, usize)>>,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
-    /// 本地预览解码任务；输入来自注册期共享采集总线，不会再打开第二路摄像头。
-    preview: Mutex<Option<PreviewHandle>>,
-    binary_preview: Mutex<Option<BinaryPreviewHandle>>,
-    preview_store: Arc<PreviewFrameStore>,
-    preview_ack_session: Arc<AtomicU64>,
-    preview_ack_sequence: Arc<AtomicU64>,
+    /// 采集侧 MJPEG 旁路的最新帧总线。
     preview_bus: Arc<DesktopPreviewBus>,
+    /// 应用级唯一预览 Channel 管理器；页面只 attach/detach。
+    preview_manager: Arc<PreviewManager>,
+    /// 物理摄像头在设备采集与浏览器 Demo 之间的唯一租约。
+    camera_lease: Arc<CameraLease>,
 }
 
 /// 压测运行句柄。收到停止请求后仅标记 `stopping`，由后台任务退出时释放。
@@ -65,80 +63,13 @@ struct DeviceHandle {
     local_host: String,
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
-}
-
-struct PreviewHandle {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    child: Arc<std::sync::Mutex<Option<Child>>>,
-    done: Arc<std::sync::atomic::AtomicBool>,
-}
-
-struct BinaryPreviewHandle {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    done: Arc<std::sync::atomic::AtomicBool>,
-}
-
-const PREVIEW_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-struct PreviewFramePayload {
-    data: String,
-    captured_at_ms: u64,
-    sequence: u64,
-}
-
-/// 推流器到桌面预览的有界同帧总线。慢消费者只丢帧，不阻塞 RTP。
-struct DesktopPreviewBus {
-    /// 预览是实时画面，不应回放积压帧；watch 通道只保留最新访问单元。
-    subscribers:
-        std::sync::Mutex<Vec<tokio::sync::watch::Sender<Option<media_rtp::PreviewPacket>>>>,
-    latest_config_keyframe: std::sync::Mutex<Option<media_rtp::PreviewPacket>>,
-    store: Arc<PreviewFrameStore>,
-}
-
-impl DesktopPreviewBus {
-    #[allow(dead_code)] // 单元测试直接构造独立总线；生产由 AppState 注入共享 store。
-    fn new() -> Self {
-        let store = Arc::new(PreviewFrameStore::new());
-        Self::with_store(store)
-    }
-
-    fn with_store(store: Arc<PreviewFrameStore>) -> Self {
-        Self {
-            subscribers: std::sync::Mutex::new(Vec::new()),
-            latest_config_keyframe: std::sync::Mutex::new(None),
-            store,
-        }
-    }
-
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<media_rtp::PreviewPacket>> {
-        let initial = self.latest_config_keyframe.lock().unwrap().clone();
-        let (tx, rx) = tokio::sync::watch::channel(initial);
-        self.subscribers.lock().unwrap().push(tx);
-        rx
-    }
-}
-
-impl media_rtp::PreviewSink for DesktopPreviewBus {
-    fn publish(&self, packet: media_rtp::PreviewPacket) {
-        self.store.publish(packet.clone());
-        if media_rtp::is_config_keyframe(&packet) {
-            *self.latest_config_keyframe.lock().unwrap() = Some(packet.clone());
-        }
-        let mut subscribers = self.subscribers.lock().unwrap();
-        subscribers.retain(|tx| tx.send(Some(packet.clone())).is_ok());
-    }
-
-    fn stopped(&self) {
-        // 关闭当前订阅发送端，让预览线程退出并让前端收到 stopped。
-        self.subscribers.lock().unwrap().clear();
-        self.latest_config_keyframe.lock().unwrap().take();
-        self.store.clear();
-    }
+    camera_lease_token: Option<u64>,
 }
 
 impl AppState {
     fn new() -> Self {
-        let preview_store = Arc::new(PreviewFrameStore::new());
+        let preview_bus = Arc::new(DesktopPreviewBus::new());
+        let preview_manager = Arc::new(PreviewManager::new(Arc::clone(&preview_bus)));
         AppState {
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
@@ -146,12 +77,9 @@ impl AppState {
             last_metrics: Mutex::new(None),
             last_scenario: Mutex::new(None),
             device: Mutex::new(None),
-            preview: Mutex::new(None),
-            binary_preview: Mutex::new(None),
-            preview_store: Arc::clone(&preview_store),
-            preview_ack_session: Arc::new(AtomicU64::new(0)),
-            preview_ack_sequence: Arc::new(AtomicU64::new(0)),
-            preview_bus: Arc::new(DesktopPreviewBus::with_store(preview_store)),
+            preview_bus,
+            preview_manager,
+            camera_lease: Arc::new(CameraLease::new()),
         }
     }
 }
@@ -159,6 +87,28 @@ impl AppState {
 /// 把设备事件映射成 `device_state` 字符串,通过 Tauri 事件推给前端(状态灯)。
 struct StateEmitter {
     app: AppHandle,
+}
+
+fn camera_capture_guidance(message: &str) -> String {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("not authorized")
+        || normalized.contains("permission denied")
+        || normalized.contains("camera access denied")
+        || normalized.contains("tcc")
+    {
+        return format!(
+            "[camera_permission_denied] 摄像头权限未授权。请前往“系统设置 → 隐私与安全性 → 摄像头”，允许 UVP GB28181 Sim，然后回到首页重新注册设备。原始错误：{message}"
+        );
+    }
+    if normalized.contains("device or resource busy")
+        || normalized.contains("already in use")
+        || normalized.contains("cannot use device")
+    {
+        return format!(
+            "[camera_in_use] 摄像头正被其他采集会话占用，请先停止视频采集 Demo 或其他相机应用后重试。原始错误：{message}"
+        );
+    }
+    message.to_string()
 }
 
 impl DeviceObserver for StateEmitter {
@@ -180,6 +130,7 @@ impl DeviceObserver for StateEmitter {
                 return;
             }
             DeviceEvent::CaptureFailure(message) => {
+                let message = camera_capture_guidance(&message);
                 let _ = self.app.emit("capture_state", "error");
                 let ts_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -726,7 +677,7 @@ async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
     tokio::task::spawn_blocking(move || {
         use media_rtp::VideoSource;
 
-        let mut source = media_rtp::LiveSource::capture(&canonical_uri, 30)
+        let mut source = media_rtp::LiveSource::capture(&canonical_uri, 30, None)
             .map_err(|error| error.to_string())?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut video_ready = false;
@@ -766,515 +717,94 @@ async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
     .map_err(|error| format!("实时采集探测任务异常: {error}"))?
 }
 
-/// 订阅推流器的同帧预览。source 参数保留用于兼容旧前端，新实现不再重新采集。
-#[tauri::command]
-async fn start_preview(
-    _source: String,
-    state: tauri::State<'_, AppState>,
-    app: AppHandle,
-) -> Result<String, String> {
-    let mut preview_guard = state.preview.lock().await;
-    if preview_guard.is_some() {
-        let finished = preview_guard.as_ref().is_some_and(|handle| {
-            handle.done.load(Ordering::Relaxed)
-                || handle
-                    .child
-                    .lock()
-                    .ok()
-                    .and_then(|mut child| {
-                        child
-                            .as_mut()
-                            .map(|process| process.try_wait().ok().flatten().is_some())
-                    })
-                    .unwrap_or(false)
-        });
-        if finished {
-            *preview_guard = None;
-        } else {
-            return Err("已有预览正在运行，请先停止当前预览".into());
+struct TauriPreviewTarget(Channel<InvokeResponseBody>);
+
+impl PreviewForwardTarget for TauriPreviewTarget {
+    fn send(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        self.0.send(InvokeResponseBody::Raw(bytes)).map_err(|_| ())
+    }
+}
+
+struct TauriPreviewEvents(AppHandle);
+
+impl PreviewEventSink for TauriPreviewEvents {
+    fn publish_status(&self, status: &media_rtp::PreviewStatus) {
+        let _ = self.0.emit("preview_status", status);
+        if status.phase == media_rtp::PreviewPhase::Unavailable {
+            let _ = self.0.emit(
+                "preview_error",
+                status
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "预览 worker 当前不可用".into()),
+            );
         }
     }
-    let rx = state.preview_bus.subscribe();
-    let child_slot = Arc::new(std::sync::Mutex::new(None));
-    let child_slot_reader = Arc::clone(&child_slot);
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_reader = Arc::clone(&stop);
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let done_reader = Arc::clone(&done);
-    let app_reader = app.clone();
-    std::thread::spawn(move || {
-        let mut rx = rx;
-        let _ = app_reader.emit("preview_state", "starting");
-        let first_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let first = loop {
-            if stop_reader.load(Ordering::Relaxed) {
-                done_reader.store(true, Ordering::Relaxed);
-                return;
-            }
-            if std::time::Instant::now() >= first_deadline {
-                let _ = app_reader.emit(
-                    "preview_error",
-                    "预览等待视频参数集超时：采集源没有产生可解码关键帧",
-                );
-                let _ = app_reader.emit("preview_state", "stopped");
-                done_reader.store(true, Ordering::Relaxed);
-                return;
-            }
-            if rx.has_changed().is_err() {
-                let _ = app_reader.emit("preview_state", "stopped");
-                done_reader.store(true, Ordering::Relaxed);
-                return;
-            }
-            match rx.borrow_and_update().clone() {
-                Some(packet) if media_rtp::is_config_keyframe(&packet) => break packet,
-                Some(_) | None => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        };
-        let ffmpeg = match media_rtp::ffmpeg_bin() {
-            Some(path) => path,
-            None => {
-                let _ = app_reader.emit("preview_error", "未找到内置 FFmpeg，无法解码同帧预览");
-                let _ = app_reader.emit("preview_state", "stopped");
-                done_reader.store(true, Ordering::Relaxed);
-                return;
-            }
-        };
-        let last_captured = Arc::new(AtomicU64::new(first.captured_at_ms));
-        let last_captured_reader = Arc::clone(&last_captured);
-        let input_format = if packet_is_h265(&first) {
-            "hevc"
-        } else {
-            "h264"
-        };
-        // 裸 H.264/HEVC 管道通常没有有效 PTS；仅设置 +genpts 仍可能让 MJPEG
-        // 编码器收到重复时间戳并停止输出。先按源帧率用帧序号生成 PTS，再降到预览帧率。
-        let source_fps = first.fps.max(1);
-        let source_fps_text = source_fps.to_string();
-        let preview_filter = if source_fps <= 30 {
-            format!("setpts=N/({source_fps}*TB),scale=640:-2")
-        } else {
-            format!("setpts=N/({source_fps}*TB),fps=30,scale=640:-2")
-        };
-        let mut command = Command::new(ffmpeg);
-        command.args([
-            "-hide_banner",
-            "-nostdin",
-            "-loglevel",
-            "warning",
-            "-fflags",
-            "nobuffer+genpts",
-            "-flags",
-            "low_delay",
-            "-avioflags",
-            "direct",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-f",
-            input_format,
-            "-framerate",
-            &source_fps_text,
-            "-i",
-            "pipe:0",
-            "-an",
-            "-vf",
-            &preview_filter,
-            "-fps_mode",
-            "passthrough",
-            "-q:v",
-            "7",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-flush_packets",
-            "1",
-            "pipe:1",
-        ]);
-        let stderr = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let stderr_reader = Arc::clone(&stderr);
-        let mut child = match command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = app_reader.emit(
-                    "preview_error",
-                    format!("启动内置 FFmpeg 解码失败：{error}"),
-                );
-                done_reader.store(true, Ordering::Relaxed);
-                return;
-            }
-        };
-        let mut stdin = child.stdin.take().expect("preview ffmpeg stdin");
-        let mut stdout = child.stdout.take().expect("preview ffmpeg stdout");
-        if let Some(mut child_stderr) = child.stderr.take() {
-            std::thread::spawn(move || {
-                let mut chunk = [0_u8; 4096];
-                while let Ok(n) = child_stderr.read(&mut chunk) {
-                    if n == 0 {
-                        break;
-                    }
-                    if let Ok(mut output) = stderr_reader.lock() {
-                        output.extend_from_slice(&chunk[..n]);
-                        if output.len() > 16 * 1024 {
-                            let drain = output.len() - 16 * 1024;
-                            output.drain(..drain);
-                        }
-                    }
-                }
-            });
-        }
-        if let Ok(mut slot) = child_slot_reader.lock() {
-            *slot = Some(child);
-        }
-        let stop_frames = Arc::clone(&stop_reader);
-        let latest_frame = Arc::new(std::sync::Mutex::new(None::<PreviewFramePayload>));
-        let latest_frame_writer = Arc::clone(&latest_frame);
-        let frame_reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let frame_reader_done_reader = Arc::clone(&frame_reader_done);
-        let preview_frames = Arc::new(AtomicU64::new(0));
-        let preview_frames_reader = Arc::clone(&preview_frames);
-        let frame_event_stop = Arc::clone(&stop_reader);
-        let frame_event_slot = Arc::clone(&latest_frame);
-        let frame_event_done = Arc::clone(&frame_reader_done);
-        let frame_event_app = app_reader.clone();
-        std::thread::spawn(move || loop {
-            let payload = frame_event_slot
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take());
-            if let Some(payload) = payload {
-                let _ = frame_event_app.emit(
-                    "preview_frame",
-                    serde_json::json!({
-                        "data": payload.data,
-                        "captured_at_ms": payload.captured_at_ms,
-                        "sequence": payload.sequence,
-                    }),
-                );
-                let _ = frame_event_app.emit("preview_state", "playing");
-                continue;
-            }
-            if frame_event_stop.load(Ordering::Relaxed) || frame_event_done.load(Ordering::Acquire)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        });
-        std::thread::spawn(move || {
-            let mut buf = Vec::with_capacity(256 * 1024);
-            let mut chunk = [0_u8; 32 * 1024];
-            loop {
-                if stop_frames.load(Ordering::Relaxed) {
-                    break;
-                }
-                match stdout.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        while let Some(start) = buf.windows(2).position(|w| w == [0xff, 0xd8]) {
-                            let Some(end_rel) =
-                                buf[start + 2..].windows(2).position(|w| w == [0xff, 0xd9])
-                            else {
-                                if start > 0 {
-                                    buf.drain(..start);
-                                }
-                                break;
-                            };
-                            let end = start + 2 + end_rel + 2;
-                            let frame = buf[start..end].to_vec();
-                            buf.drain(..end);
-                            let encoded = base64::engine::general_purpose::STANDARD.encode(frame);
-                            let sequence =
-                                preview_frames_reader.fetch_add(1, Ordering::Relaxed) + 1;
-                            if let Ok(mut slot) = latest_frame_writer.lock() {
-                                *slot = Some(PreviewFramePayload {
-                                    data: encoded,
-                                    captured_at_ms: last_captured_reader.load(Ordering::Relaxed),
-                                    sequence,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            frame_reader_done_reader.store(true, Ordering::Release);
-        });
-        if stdin.write_all(&first.data).is_err() {
-            done_reader.store(true, Ordering::Relaxed);
-            return;
-        }
-        let mut input_frames = 1_u64;
-        let pts_step = u64::from(media_rtp::CLOCK_HZ / source_fps);
-        let mut last_input_pts = first.pts_90k;
-        let mut needs_keyframe = false;
-        let mut last_output_check = std::time::Instant::now();
-        loop {
-            if stop_reader.load(Ordering::Relaxed) {
-                break;
-            }
-            match rx.has_changed() {
-                Ok(true) => {
-                    let Some(packet) = rx.borrow_and_update().clone() else {
-                        continue;
-                    };
-                    // watch 通道只保留最新帧，消费者忙时可能跨过参考帧；跳过普通帧，
-                    // 直到下一个带 SPS/PPS/IDR 的访问单元，避免 FFmpeg 长时间花屏或停解码。
-                    if packet.pts_90k > last_input_pts.saturating_add(pts_step) {
-                        needs_keyframe = true;
-                    }
-                    last_input_pts = packet.pts_90k;
-                    let is_config_keyframe = media_rtp::is_config_keyframe(&packet);
-                    if needs_keyframe && !is_config_keyframe {
-                        continue;
-                    }
-                    if is_config_keyframe {
-                        needs_keyframe = false;
-                    }
-                    last_captured.store(packet.captured_at_ms, Ordering::Relaxed);
-                    if stdin.write_all(&packet.data).is_err() {
-                        break;
-                    }
-                    input_frames += 1;
-                }
-                Ok(false) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(_) => break,
-            }
-            if last_output_check.elapsed() >= std::time::Duration::from_secs(5) {
-                if input_frames >= 25 && preview_frames.load(Ordering::Relaxed) <= 1 {
-                    let detail = stderr
-                        .lock()
-                        .ok()
-                        .map(|output| String::from_utf8_lossy(&output).trim().to_string())
-                        .unwrap_or_default();
-                    let message = if detail.is_empty() {
-                        format!("预览解码未持续输出画面（已输入 {input_frames} 帧）")
-                    } else {
-                        format!("预览解码未持续输出画面：{detail}")
-                    };
-                    let _ = app_reader.emit("preview_error", message);
-                    break;
-                }
-                last_output_check = std::time::Instant::now();
-            }
-        }
-        drop(stdin);
-        if let Ok(mut slot) = child_slot_reader.lock() {
-            if let Some(mut child) = slot.take() {
-                let _ = child.kill();
-            }
-        }
-        let _ = app_reader.emit("preview_state", "stopped");
-        done_reader.store(true, Ordering::Relaxed);
-    });
-    *preview_guard = Some(PreviewHandle {
-        stop,
-        child: child_slot,
-        done,
-    });
-    let _ = app.emit("preview_state", "starting");
-    Ok("已订阅同帧预览，等待平台点播".into())
 }
 
-fn packet_is_h265(packet: &media_rtp::PreviewPacket) -> bool {
-    matches!(packet.codec, media_rtp::VideoCodec::H265)
+#[derive(Serialize)]
+struct PreviewAttachDto {
+    token: u64,
+    status: media_rtp::PreviewStatus,
 }
 
-/// 预览编码访问单元的二进制传输通道。
-/// 每次最多发送一个未 ACK 的 envelope，避免 Channel 队列无限增长。
+/// 页面挂载应用级唯一预览通道。重复调用会原子替换当前目标，不会重启媒体。
 #[tauri::command]
 async fn start_binary_preview(
     channel: Channel<InvokeResponseBody>,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<String, String> {
-    let mut guard = state.binary_preview.lock().await;
-    if guard
-        .as_ref()
-        .is_some_and(|handle| !handle.done.load(Ordering::Acquire))
-    {
-        return Err("已有二进制预览正在运行".into());
-    }
-    if guard.is_some() {
-        // A stalled sender has already stopped its worker; release the old
-        // handle before accepting a new session.
-        *guard = None;
-    }
-    let mut rx = state.preview_bus.subscribe();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_reader = Arc::clone(&stop);
-    let done_reader = Arc::clone(&done);
-    let ack_session = Arc::clone(&state.preview_ack_session);
-    let ack_sequence = Arc::clone(&state.preview_ack_sequence);
-    let app_reader = app.clone();
-    let store = Arc::clone(&state.preview_store);
-    std::thread::spawn(move || {
-        let mut pending = rx.borrow().clone();
-        let mut last_sent_session = None;
-        let mut last_sent_sequence = 0_u64;
-        let _ = app_reader.emit(
-            "preview_transport",
-            serde_json::json!({
-                "state": "starting",
-                "transport": "binary-channel",
-            }),
-        );
-        loop {
-            let observed = if let Some(packet) = pending.take() {
-                packet
-            } else {
-                if stop_reader.load(Ordering::Acquire) || rx.has_changed().is_err() {
-                    break;
-                }
-                let Some(packet) = rx.borrow_and_update().clone() else {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    continue;
-                };
-                packet
-            };
-
-            let consumer_gap = last_sent_session == Some(observed.session_id)
-                && observed.sequence > last_sent_sequence.saturating_add(1);
-            let packet = if consumer_gap {
-                let config = store.latest_config_after(observed.session_id, last_sent_sequence);
-                if let Some(config) = config {
-                    // The watch receiver may have skipped past this config
-                    // frame. Revisit only its immediately following packet;
-                    // a larger gap still lacks decoder reference frames.
-                    if observed.sequence == config.sequence.saturating_add(1) {
-                        pending = Some(observed.clone());
-                    }
-                    config
-                } else {
-                    // Do not feed a delta frame after a consumer-side gap;
-                    // wait for the next SPS/PPS/IDR access unit.
-                    continue;
-                }
-            } else if let Some(packet) = store.latest_after(
-                observed.session_id,
-                last_sent_session
-                    .filter(|session| *session == observed.session_id)
-                    .map_or(0, |_| last_sent_sequence),
-            ) {
-                packet
-            } else {
-                continue;
-            };
-            let envelope = PreviewEnvelope::from_packet(packet.clone()).encode();
-            ack_session.store(0, Ordering::Release);
-            ack_sequence.store(0, Ordering::Release);
-            if channel.send(InvokeResponseBody::Raw(envelope)).is_err() {
-                let _ = app_reader.emit(
-                    "preview_transport",
-                    serde_json::json!({
-                        "state": "send_error",
-                        "session_id": packet.session_id,
-                        "sequence": packet.sequence,
-                    }),
-                );
-                break;
-            }
-            let deadline = std::time::Instant::now() + PREVIEW_ACK_TIMEOUT;
-            loop {
-                if stop_reader.load(Ordering::Acquire) {
-                    break;
-                }
-                if ack_session.load(Ordering::Acquire) == packet.session_id
-                    && ack_sequence.load(Ordering::Acquire) == packet.sequence
-                {
-                    last_sent_session = Some(packet.session_id);
-                    last_sent_sequence = packet.sequence;
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    let _ = app_reader.emit(
-                        "preview_transport",
-                        serde_json::json!({
-                            "state": "stalled",
-                            "session_id": packet.session_id,
-                            "sequence": packet.sequence,
-                            "timeout_ms": PREVIEW_ACK_TIMEOUT.as_millis(),
-                        }),
-                    );
-                    stop_reader.store(true, Ordering::Release);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        }
-        let _ = app_reader.emit(
-            "preview_transport",
-            serde_json::json!({
-                "state": "stopped",
-                "transport": "binary-channel",
-            }),
-        );
-        done_reader.store(true, Ordering::Release);
-    });
-    *guard = Some(BinaryPreviewHandle { stop, done });
-    Ok("二进制预览通道已启动".into())
-}
-
-#[tauri::command]
-fn ack_preview_frame(
-    session_id: u64,
-    sequence: u64,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    state
-        .preview_ack_session
-        .store(session_id, Ordering::Release);
-    state
-        .preview_ack_sequence
-        .store(sequence, Ordering::Release);
-    Ok(())
+) -> Result<PreviewAttachDto, String> {
+    let target: Arc<dyn PreviewForwardTarget> = Arc::new(TauriPreviewTarget(channel));
+    let events: Arc<dyn PreviewEventSink> = Arc::new(TauriPreviewEvents(app));
+    let token = state.preview_manager.attach(target, events).await;
+    Ok(PreviewAttachDto {
+        token,
+        status: state.preview_bus.latest_status(),
+    })
 }
 
 #[tauri::command]
 async fn stop_binary_preview(
+    token: u64,
     state: tauri::State<'_, AppState>,
-    app: AppHandle,
 ) -> Result<String, String> {
-    let mut guard = state.binary_preview.lock().await;
-    if let Some(handle) = guard.take() {
-        handle.stop.store(true, Ordering::Release);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
-        while !handle.done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        state.preview_ack_session.store(0, Ordering::Release);
-        state.preview_ack_sequence.store(0, Ordering::Release);
-        let _ = app.emit(
-            "preview_transport",
-            serde_json::json!({ "state": "stopped" }),
-        );
+    Ok(if state.preview_manager.detach(token) {
+        "预览页面已解除挂载"
+    } else {
+        "预览页面已过期，无需解除"
     }
-    Ok("二进制预览已停止".into())
+    .into())
 }
 
 #[tauri::command]
-async fn stop_preview(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
-    let mut guard = state.preview.lock().await;
-    if let Some(handle) = guard.take() {
-        handle.stop.store(true, Ordering::Relaxed);
-        if let Ok(mut child) = handle.child.lock() {
-            if let Some(mut process) = child.take() {
-                let _ = process.kill();
-            }
-        }
-        let _ = app.emit("preview_state", "stopped");
+async fn retry_binary_preview(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let guard = state.device.lock().await;
+    let Some(device) = guard.as_ref() else {
+        return Err("设备尚未启动".into());
+    };
+    if device.sim.retry_preview().await {
+        Ok("正在重建本地预览，摄像头采集保持运行".into())
+    } else {
+        Err("当前媒体源没有可重试的摄像头预览".into())
     }
-    Ok("预览已停止".into())
+}
+
+#[tauri::command]
+fn acquire_camera_demo(
+    state: tauri::State<'_, AppState>,
+) -> Result<CameraLeaseGrant, CameraLeaseError> {
+    state.camera_lease.acquire(CameraLeaseOwner::Demo)
+}
+
+#[tauri::command]
+fn release_camera_demo(token: u64, state: tauri::State<'_, AppState>) -> bool {
+    state.camera_lease.release(token)
+}
+
+#[tauri::command]
+fn get_camera_lease(state: tauri::State<'_, AppState>) -> Option<CameraLeaseGrant> {
+    state.camera_lease.current()
 }
 
 /// 前端传入的单设备配置。
@@ -1336,6 +866,7 @@ async fn start_device(
     if config.password.is_empty() {
         return Err("SIP 认证密码不能为空".into());
     }
+    let mut uses_physical_camera = false;
     if let Some(source) = config.video_source.take() {
         let source = source.trim().to_string();
         if source.is_empty() {
@@ -1344,6 +875,7 @@ async fn start_device(
             if source.starts_with("live:") {
                 let spec = media_rtp::LiveSourceSpec::parse(&source)
                     .map_err(|error| format!("实时媒体源配置无效: {error}"))?;
+                uses_physical_camera = matches!(&spec, media_rtp::LiveSourceSpec::Camera { .. });
                 let catalog = tokio::task::spawn_blocking(media_rtp::list_live_sources)
                     .await
                     .map_err(|error| format!("实时设备枚举任务异常: {error}"))?
@@ -1506,6 +1038,17 @@ async fn start_device(
     }
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let camera_lease_token = if uses_physical_camera {
+        Some(
+            state
+                .camera_lease
+                .acquire(CameraLeaseOwner::Device)
+                .map_err(|error| format!("[{}] {}", error.code, error.message))?
+                .token,
+        )
+    } else {
+        None
+    };
     let sim_run = sim.clone();
     let tp_run = udp.clone();
     let host_run = local_host.clone();
@@ -1523,6 +1066,7 @@ async fn start_device(
         local_host,
         local_port,
         stop_tx,
+        camera_lease_token,
     });
     Ok("设备已启动".into())
 }
@@ -1534,14 +1078,8 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
     match guard.take() {
         Some(h) => {
             h.sim.stop_shared_media().await;
-            if let Some(preview) = state.preview.lock().await.take() {
-                preview.stop.store(true, Ordering::Relaxed);
-                if let Ok(mut child) = preview.child.lock() {
-                    if let Some(mut process) = child.take() {
-                        let _ = process.kill();
-                    }
-                }
-                let _ = app.emit("preview_state", "stopped");
+            if let Some(token) = h.camera_lease_token {
+                state.camera_lease.release(token);
             }
             let _ = h.stop_tx.send(());
             let _ = app.emit("device_state", "Disconnected");
@@ -1804,10 +1342,38 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .setup(|app| {
-            // 注册实时日志回调:每条日志发 `log_line` 事件给前端日志页。
+            // 日志落盘。内存环形缓冲只够 UI 翻看，排查采集/预览这类"跑一次才复现"
+            // 的问题时拿不出来——落到文件才能事后直接读。
+            let log_path = app.path().app_log_dir().ok().map(|dir| {
+                let _ = std::fs::create_dir_all(&dir);
+                dir.join("desktop.log")
+            });
+            if let Some(path) = &log_path {
+                // 每次启动截断，只保留本次运行，避免翻历史噪音。
+                let _ = std::fs::write(path, b"");
+                tracing::info!(path = %path.display(), "日志文件已就绪");
+            }
+            let file = log_path.as_ref().and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+                    .map(std::sync::Mutex::new)
+            });
             let handle = app.handle().clone();
             common::logging::set_callback(move |line| {
                 let _ = handle.emit("log_line", line);
+                if let Some(file) = &file {
+                    if let Ok(mut file) = file.lock() {
+                        use std::io::Write;
+                        let _ = writeln!(
+                            file,
+                            "{} {:5} {} {}",
+                            line.ts_ms, line.level, line.target, line.message
+                        );
+                    }
+                }
             });
             Ok(())
         })
@@ -1820,11 +1386,12 @@ pub fn run() {
             export_report,
             list_live_sources,
             probe_live_source,
-            start_preview,
-            stop_preview,
             start_binary_preview,
-            ack_preview_frame,
             stop_binary_preview,
+            retry_binary_preview,
+            acquire_camera_demo,
+            release_camera_demo,
+            get_camera_lease,
             start_device,
             stop_device,
             fire_alarm,
@@ -1840,64 +1407,52 @@ pub fn run() {
             get_log_level,
             get_recent_logs,
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri 应用启动失败");
+        .build(tauri::generate_context!())
+        .expect("Tauri 应用启动失败")
+        .run(|app_handle, event| {
+            // 退出时必须把采集停掉。macOS 上父进程被杀不会带走子进程，
+            // 留下的 FFmpeg 会一直占着摄像头，下次启动就只能拿到一帧静止画面。
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                let (device, preview_manager, camera_lease) = {
+                    let state = app_handle.state::<AppState>();
+                    (
+                        state
+                            .device
+                            .try_lock()
+                            .ok()
+                            .and_then(|mut guard| guard.take()),
+                        Arc::clone(&state.preview_manager),
+                        Arc::clone(&state.camera_lease),
+                    )
+                };
+                if let Some(handle) = device {
+                    tauri::async_runtime::block_on(handle.sim.stop_shared_media());
+                    if let Some(token) = handle.camera_lease_token {
+                        camera_lease.release(token);
+                    }
+                }
+                tauri::async_runtime::block_on(preview_manager.shutdown());
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use media_rtp::PreviewSink;
 
-    fn packet(captured_at_ms: u64) -> media_rtp::PreviewPacket {
-        media_rtp::PreviewPacket {
-            data: vec![0, 0, 0, 1, 0x65, captured_at_ms as u8],
-            key_frame: false,
-            codec: media_rtp::VideoCodec::H264,
-            session_id: 1,
-            sequence: captured_at_ms,
-            fps: 25,
-            pts_90k: captured_at_ms,
-            captured_at_ms,
-        }
+    #[test]
+    fn tcc拒绝映射为可执行系统设置提示() {
+        let message = camera_capture_guidance("AVFoundation: not authorized to capture video");
+        assert!(message.contains("系统设置 → 隐私与安全性 → 摄像头"));
+        assert!(message.contains("[camera_permission_denied]"));
     }
 
     #[test]
-    fn 预览总线只保留最新帧() {
-        let bus = DesktopPreviewBus::new();
-        let mut receiver = bus.subscribe();
-        bus.publish(packet(1));
-        bus.publish(packet(2));
-
-        assert!(receiver.has_changed().expect("预览订阅仍应有效"));
-        assert_eq!(
-            receiver
-                .borrow_and_update()
-                .as_ref()
-                .map(|frame| frame.captured_at_ms),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn 延迟订阅从最近参数关键帧启动() {
-        let bus = DesktopPreviewBus::new();
-        let config = media_rtp::PreviewPacket {
-            data: vec![0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3],
-            key_frame: true,
-            codec: media_rtp::VideoCodec::H264,
-            session_id: 1,
-            sequence: 1,
-            fps: 25,
-            pts_90k: 3,
-            captured_at_ms: 3,
-        };
-        bus.publish(config.clone());
-
-        let receiver = bus.subscribe();
-        assert_eq!(
-            receiver.borrow().as_ref().map(|frame| frame.captured_at_ms),
-            Some(3)
-        );
+    fn 普通媒体错误不伪装成权限错误() {
+        let original = "preview FFmpeg produced no JPEG within 2000 ms";
+        assert_eq!(camera_capture_guidance(original), original);
     }
 }

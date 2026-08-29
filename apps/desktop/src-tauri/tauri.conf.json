@@ -34,6 +34,7 @@
     "publisher": "UVP",
     "copyright": "Copyright © 2026 UVP. MIT License.",
     "macOS": {
+      "entitlements": "./Entitlements.plist",
       "minimumSystemVersion": "13.0"
     },
     "icon": [

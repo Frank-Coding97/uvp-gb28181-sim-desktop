@@ -370,6 +370,9 @@ pub fn start_shared_media(
                 std::thread::sleep(remaining);
             }
         }
+        // LiveSource::drop 会等待并回收它持有的 camera/preview children。
+        // alive 只能在这个析构完成后变 false，CameraLease 才能安全转交。
+        drop(source);
         producer
             .alive
             .store(false, std::sync::atomic::Ordering::Release);
@@ -392,6 +395,16 @@ impl SharedMedia {
     /// 设备注销时停止唯一采集线程并释放底层摄像头/屏幕句柄。
     pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 请求停止并等待底层源完成析构；返回 false 表示超过调用方给定上限。
+    pub async fn stop_and_wait(&self, timeout: std::time::Duration) -> bool {
+        self.stop();
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.is_alive() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        !self.is_alive()
     }
 
     /// 保持注册和主采集不动，只允许预览 supervisor 新建 preview generation。

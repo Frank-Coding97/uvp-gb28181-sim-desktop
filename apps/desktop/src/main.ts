@@ -11,6 +11,7 @@ import Channels from "./views/Channels.vue";
 import Scenario from "./views/Scenario.vue";
 import System from "./views/System.vue";
 import Preview from "./views/Preview.vue";
+import CameraDemo from "./views/CameraDemo.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -23,6 +24,7 @@ const router = createRouter({
     // 压力测试(场景编排 + 实时监控已合并到一页)。
     { path: "/scenario",  component: Scenario },
     { path: "/system",    component: System },     // 系统信息(日志等)
+    { path: "/camera-demo", component: CameraDemo },
     { path: "/monitor",   redirect: "/scenario" }, // 旧路由兼容,重定向到合并页
     { path: "/config",    redirect: "/device" },   // 平台配置已并入顶栏,旧路由重定向
   ],

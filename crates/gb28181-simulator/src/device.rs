@@ -425,8 +425,19 @@ impl DeviceSimulator {
     /// 停止注册期唯一采集源，释放摄像头/屏幕和编码器。
     pub async fn stop_shared_media(&self) {
         if let Some(media) = self.shared_media.lock().await.take() {
-            media.stop();
+            if !media.stop_and_wait(std::time::Duration::from_secs(3)).await {
+                tracing::warn!("共享媒体在 3 秒内未完成 owned child 回收");
+            }
         }
+    }
+
+    /// 只重建本地预览 worker；注册、主采集与平台推流保持不动。
+    pub async fn retry_preview(&self) -> bool {
+        self.shared_media
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|media| media.retry_preview())
     }
 
     /// 查询采集源是否已经真正产出过编码帧，供桌面端刷新页面后恢复状态。

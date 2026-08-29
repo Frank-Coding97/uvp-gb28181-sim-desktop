@@ -275,7 +275,7 @@ fn run_supervisor(
                     .is_some_and(|at| at.elapsed() >= OUTPUT_WATCHDOG)
                 && current
                     .last_output
-                    .is_none_or(|at| at.elapsed() >= OUTPUT_WATCHDOG)
+                    .map_or(true, |at| at.elapsed() >= OUTPUT_WATCHDOG)
             {
                 attempt_failure = Some(format!(
                     "preview FFmpeg produced no JPEG within {} ms; input={}, output={}, stderr: {}",
@@ -400,6 +400,7 @@ fn register_failure(
     *failures = failures.saturating_add(1);
     status.reason = Some(reason.clone());
     if *failures <= MAX_AUTOMATIC_RECOVERIES {
+        status.preview_generation = status.preview_generation.wrapping_add(1).max(1);
         status.recoveries = *failures;
         status.phase = PreviewPhase::Recovering;
         *retry_not_before = (*failures == MAX_AUTOMATIC_RECOVERIES)
@@ -824,16 +825,51 @@ mod tests {
     }
 
     #[test]
-    fn 第三次连续失败才进入不可用() {
+    fn 自动恢复推进预览代际且第三次连续失败进入不可用() {
+        let sink = Arc::new(RecordingSink::default());
+        let sink_trait: Arc<dyn PreviewSink> = sink.clone();
+        let active_child = Arc::new(Mutex::new(None));
+        let mut attempt = None;
+        let mut status = PreviewStatus::new(7, PreviewPhase::Playing);
         let mut failures = 0;
-        failures += 1;
-        assert!(failures <= MAX_AUTOMATIC_RECOVERIES);
-        assert_eq!(failures, 1);
-        failures += 1;
-        assert!(failures <= MAX_AUTOMATIC_RECOVERIES);
-        assert_eq!(failures, 2);
-        failures += 1;
-        assert!(failures > MAX_AUTOMATIC_RECOVERIES);
+        let mut retry_not_before = None;
+
+        register_failure(
+            "first".into(),
+            &mut attempt,
+            &active_child,
+            &sink_trait,
+            &mut status,
+            &mut failures,
+            &mut retry_not_before,
+        );
+        assert_eq!(status.preview_generation, 2);
+        assert_eq!(status.phase, PreviewPhase::Recovering);
+
+        register_failure(
+            "second".into(),
+            &mut attempt,
+            &active_child,
+            &sink_trait,
+            &mut status,
+            &mut failures,
+            &mut retry_not_before,
+        );
+        assert_eq!(status.preview_generation, 3);
+        assert_eq!(status.phase, PreviewPhase::Recovering);
+
+        register_failure(
+            "third".into(),
+            &mut attempt,
+            &active_child,
+            &sink_trait,
+            &mut status,
+            &mut failures,
+            &mut retry_not_before,
+        );
+        assert_eq!(status.preview_generation, 3);
+        assert_eq!(status.phase, PreviewPhase::Unavailable);
+        assert_eq!(failures, MAX_AUTOMATIC_RECOVERIES + 1);
     }
 
     #[test]
