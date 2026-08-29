@@ -1833,9 +1833,11 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "common",
+ "libc",
  "openh264",
  "rand",
  "screencapturekit",
+ "serde",
  "tokio",
  "tracing",
 ]

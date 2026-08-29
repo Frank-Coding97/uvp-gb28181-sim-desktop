@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use common::{Error, Result};
@@ -14,36 +14,10 @@ use crate::ps::PsMuxer;
 use crate::rtp::{RtpSender, CLOCK_HZ};
 use crate::source::VideoSource;
 
-static NEXT_PREVIEW_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-
-pub(crate) fn next_preview_session_id() -> u64 {
-    NEXT_PREVIEW_SESSION_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-/// 推流过程中复制给桌面预览的编码帧。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewPacket {
-    pub data: Vec<u8>,
-    pub key_frame: bool,
-    pub codec: crate::ps::VideoCodec,
-    /// 预览会话代际；新会话不会消费旧会话残留帧。
-    pub session_id: u64,
-    /// 会话内单调递增的访问单元序号。
-    pub sequence: u64,
-    /// 编码源帧率；预览通过裸 H.264 管道输入时用它补齐帧时间戳。
-    pub fps: u32,
-    pub pts_90k: u64,
-    pub captured_at_ms: u64,
-}
-
 /// 编码访问单元是否携带解码所需的参数集。
 ///
 /// 注册后再接入的预览/RTP 订阅者不能只从 IDR 开始：H.264 还需要 SPS/PPS，
 /// H.265 还需要 VPS/SPS/PPS。该函数只识别 Annex B NAL 头，不解析具体参数内容。
-pub fn is_config_keyframe(packet: &PreviewPacket) -> bool {
-    packet.key_frame && contains_codec_config(&packet.data, packet.codec)
-}
-
 /// Annex B 访问单元是否包含当前编码对应的参数集。
 pub fn contains_codec_config(data: &[u8], codec: crate::ps::VideoCodec) -> bool {
     let mut h264_sps = false;
@@ -82,13 +56,6 @@ pub fn contains_codec_config(data: &[u8], codec: crate::ps::VideoCodec) -> bool 
 }
 
 /// 可选预览帧接收器。发布必须是非阻塞的，不能影响 RTP 推流。
-pub trait PreviewSink: Send + Sync {
-    fn publish(&self, packet: PreviewPacket);
-
-    /// 推流会话结束时通知预览订阅者。
-    fn stopped(&self) {}
-}
-
 /// 回放控制:运行中可调的推流速率倍速 + 暂停开关(平台经 INFO/MANSRTSP 下发)。
 ///
 /// 直播场景保持默认(1.0 倍速、不暂停),行为与原先一致;回放场景平台可下发
@@ -191,28 +158,14 @@ pub async fn push_stream(
 
 /// 带回放控制(倍速/暂停)的推流。`control` 可在运行中被平台经 INFO 调整:
 /// 倍速影响取帧间隔(2x → 间隔减半),暂停时保持会话但不取帧/发送。
-pub async fn push_stream_controlled(
-    source: Box<dyn VideoSource>,
-    dst: SocketAddr,
-    ssrc: u32,
-    fps: u32,
-    use_tcp: bool,
-    control: Arc<PlaybackControl>,
-    stop: impl Future<Output = ()>,
-) -> Result<()> {
-    push_stream_controlled_with_preview(source, dst, ssrc, fps, use_tcp, control, None, stop).await
-}
-
-/// 带可选同帧预览发布的推流入口。
 #[allow(clippy::too_many_arguments)]
-pub async fn push_stream_controlled_with_preview(
+pub async fn push_stream_controlled(
     mut source: Box<dyn VideoSource>,
     dst: SocketAddr,
     ssrc: u32,
     fps: u32,
     use_tcp: bool,
     control: Arc<PlaybackControl>,
-    preview: Option<Arc<dyn PreviewSink>>,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
     let mut sender = if use_tcp {
@@ -240,7 +193,6 @@ pub async fn push_stream_controlled_with_preview(
 
     // 诊断计数:发出的帧数 / 关键帧数 / 字节数,退出时汇报,定位"断在第几帧"。
     let mut frames_sent: u64 = 0;
-    let session_id = next_preview_session_id();
     let mut keyframes_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
     let mut first_frame = true;
@@ -273,17 +225,6 @@ pub async fn push_stream_controlled_with_preview(
                     continue; // 暂停中,不取帧。
                 }
                 if let Some(frame) = source.next_frame() {
-                    let frame_codec = source.codec();
-                    let preview_packet = preview.as_ref().map(|_| PreviewPacket {
-                        data: frame.data.clone(),
-                        key_frame: frame.key_frame,
-                        codec: frame_codec,
-                        session_id,
-                        sequence: frames_sent + 1,
-                        fps,
-                        pts_90k: ps_timestamp,
-                        captured_at_ms: now_ms(),
-                    });
                     // 音视频复合流：取该视频时间窗内的完整编码音频访问单元。
                     let audio = source.next_audio();
                     let audio_start_pts = audio_timestamp.map_or(ps_timestamp, |candidate| {
@@ -329,9 +270,6 @@ pub async fn push_stream_controlled_with_preview(
                         tracing::info!("推流:首帧已成功发出");
                         first_frame = false;
                     }
-                    if let (Some(sink), Some(packet)) = (&preview, preview_packet) {
-                        sink.publish(packet);
-                    }
                     frames_sent += 1;
                     if frame.key_frame {
                         keyframes_sent += 1;
@@ -367,18 +305,10 @@ pub async fn push_stream_controlled_with_preview(
     result
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::source::{FileSource, Frame};
-    use std::sync::Mutex;
     use tokio::net::UdpSocket;
 
     fn sample_h264() -> Vec<u8> {
@@ -388,13 +318,6 @@ mod tests {
         v.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x11]);
         v.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x22]);
         v
-    }
-
-    struct CollectSink(Mutex<Vec<PreviewPacket>>);
-    impl PreviewSink for CollectSink {
-        fn publish(&self, packet: PreviewPacket) {
-            self.0.lock().unwrap().push(packet);
-        }
     }
 
     #[tokio::test]
@@ -425,51 +348,6 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
-    #[tokio::test]
-    async fn 推流发送的同一帧会发布给预览接收器() {
-        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let rx_addr = rx.local_addr().unwrap();
-        let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
-        let sink_read = Arc::clone(&sink);
-        let source = Box::new(FileSource::from_bytes(&sample_h264()).unwrap());
-        let (tx_stop, rx_stop) = tokio::sync::oneshot::channel::<()>();
-        let handle = tokio::spawn(async move {
-            push_stream_controlled_with_preview(
-                source,
-                rx_addr,
-                0x7788,
-                50,
-                false,
-                PlaybackControl::new(),
-                Some(sink_read as Arc<dyn PreviewSink>),
-                async {
-                    let _ = rx_stop.await;
-                },
-            )
-            .await
-        });
-        let mut buf = [0u8; 2048];
-        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let _ = tx_stop.send(());
-        handle.await.unwrap().unwrap();
-        let packets = sink.0.lock().unwrap();
-        assert!(!packets.is_empty());
-        assert!(packets[0].key_frame);
-        assert_eq!(packets[0].fps, 50);
-        assert!(packets[0].session_id > 0);
-        assert_eq!(packets[0].sequence, 1);
-        assert!(packets.windows(2).all(|pair| {
-            pair[0].session_id == pair[1].session_id && pair[1].sequence == pair[0].sequence + 1
-        }));
-        assert!(packets[0].data.windows(2).any(|w| w == [0, 0]));
-        assert!(packets[0].data.iter().any(|byte| *byte & 0x1f == 5));
-    }
-
-    /// 模拟实时源:前 N 次 next_frame 返回 None(采集尚未就绪),之后持续产帧。
-    /// 用于验证 pusher 不会因实时源启动初期暂空而提前停流(live 播不出的根因)。
     struct SlowLive {
         warmup: u32,
         calls: u32,

@@ -369,15 +369,15 @@ impl DeviceSimulator {
             };
             let source = Box::new(media_rtp::LightSource::new(kbps, self.config.video_fps))
                 as Box<dyn media_rtp::VideoSource>;
-            let preview = self.preview_sink.lock().unwrap().clone();
-            let media = media_rtp::start_shared_media(source, self.config.video_fps, preview);
+            let media = media_rtp::start_shared_media(source, self.config.video_fps);
             *self.shared_media.lock().await = Some(media);
             return self.wait_for_media_ready().await;
         };
         let fps = self.config.video_fps;
+        let preview = self.preview_sink.lock().unwrap().clone();
         let source = tokio::task::spawn_blocking(move || {
             if path.starts_with("live:") {
-                media_rtp::LiveSource::capture(&path, fps)
+                media_rtp::LiveSource::capture(&path, fps, preview)
                     .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
                     .map_err(|error| Error::Media(format!("实时采集失败: {error}")))
             } else {
@@ -388,8 +388,7 @@ impl DeviceSimulator {
         })
         .await
         .map_err(|error| Error::Media(format!("媒体源启动任务异常: {error}")))??;
-        let preview = self.preview_sink.lock().unwrap().clone();
-        let media = media_rtp::start_shared_media(source, fps, preview);
+        let media = media_rtp::start_shared_media(source, fps);
         *self.shared_media.lock().await = Some(media);
         self.wait_for_media_ready().await
     }
@@ -2197,14 +2196,13 @@ impl DeviceSimulator {
                 if use_tcp {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                let result = media_rtp::push_stream_controlled_with_preview(
+                let result = media_rtp::push_stream_controlled(
                     source,
                     rtp_dst,
                     ssrc,
                     fps,
                     use_tcp,
                     control_task,
-                    None,
                     async {
                         let _ = stop_rx.await;
                     },

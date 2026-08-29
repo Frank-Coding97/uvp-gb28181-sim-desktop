@@ -279,6 +279,11 @@ pub trait VideoSource: Send {
     fn take_error(&mut self) -> Option<String> {
         None
     }
+
+    /// 可选的本地预览控制面；只重建解码 worker，不重启物理采集。
+    fn preview_control(&self) -> Option<std::sync::Arc<crate::preview_worker::PreviewControl>> {
+        None
+    }
 }
 
 /// 注册期唯一采集源的帧总线。预览和平台点播各自订阅，任何慢消费者都不会阻塞采集。
@@ -295,6 +300,7 @@ pub struct SharedMedia {
     error: std::sync::Mutex<Option<String>>,
     frames_seen: std::sync::atomic::AtomicU64,
     seek_permille_plus1: std::sync::atomic::AtomicU32,
+    preview_control: Option<std::sync::Arc<crate::preview_worker::PreviewControl>>,
 }
 
 #[derive(Clone)]
@@ -307,9 +313,9 @@ struct SharedFrame {
 pub fn start_shared_media(
     mut source: Box<dyn VideoSource>,
     fps: u32,
-    preview: Option<std::sync::Arc<dyn crate::pusher::PreviewSink>>,
 ) -> std::sync::Arc<SharedMedia> {
     let fps = fps.max(1);
+    let preview_control = source.preview_control();
     let (frames, _) = tokio::sync::broadcast::channel((fps * 4).max(32) as usize);
     let media = std::sync::Arc::new(SharedMedia {
         frames,
@@ -322,13 +328,12 @@ pub fn start_shared_media(
         error: std::sync::Mutex::new(None),
         frames_seen: std::sync::atomic::AtomicU64::new(0),
         seek_permille_plus1: std::sync::atomic::AtomicU32::new(0),
+        preview_control,
     });
     let producer = std::sync::Arc::clone(&media);
     std::thread::spawn(move || {
         let interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
         let mut pts_90k = 0_u64;
-        let session_id = crate::pusher::next_preview_session_id();
-        let mut sequence = 0_u64;
         let pts_step = u64::from(crate::rtp::CLOCK_HZ / fps);
         while !producer.stop.load(std::sync::atomic::Ordering::Acquire) {
             let tick = std::time::Instant::now();
@@ -356,19 +361,6 @@ pub fn start_shared_media(
                 {
                     *producer.latest_config_keyframe.lock().unwrap() = Some(shared_frame.clone());
                 }
-                if let Some(sink) = &preview {
-                    sequence = sequence.saturating_add(1);
-                    sink.publish(crate::pusher::PreviewPacket {
-                        data: shared_frame.frame.data.clone(),
-                        key_frame: shared_frame.frame.key_frame,
-                        codec: producer.video_codec,
-                        session_id,
-                        sequence,
-                        fps,
-                        pts_90k,
-                        captured_at_ms: now_ms(),
-                    });
-                }
                 let _ = producer.frames.send(shared_frame);
                 pts_90k = pts_90k.wrapping_add(pts_step);
             } else if !source.is_live() {
@@ -381,9 +373,6 @@ pub fn start_shared_media(
         producer
             .alive
             .store(false, std::sync::atomic::Ordering::Release);
-        if let Some(sink) = preview {
-            sink.stopped();
-        }
     });
     media
 }
@@ -403,6 +392,15 @@ impl SharedMedia {
     /// 设备注销时停止唯一采集线程并释放底层摄像头/屏幕句柄。
     pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 保持注册和主采集不动，只允许预览 supervisor 新建 preview generation。
+    pub fn retry_preview(&self) -> bool {
+        let Some(control) = &self.preview_control else {
+            return false;
+        };
+        control.retry();
+        true
     }
 
     pub fn is_alive(&self) -> bool {
@@ -501,7 +499,7 @@ impl VideoSource for SharedVideoSource {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -1145,7 +1143,7 @@ mod obsolete_live {
     }
 }
 
-trait FrameSender {
+pub(crate) trait FrameSender {
     fn send_frame(&self, frame: Frame);
 }
 
@@ -1166,13 +1164,17 @@ impl FrameSender for std::sync::mpsc::SyncSender<Frame> {
 /// 纯 SPS+PPS 片段（等待 IDR 的前缀）保留在缓冲区,不提前发出。
 /// 否则缓冲末尾恰好以 IDR 起始码结束时,SPS+PPS 会被单独发出为"关键帧",
 /// 导致平台收到 332/332 全是无效的纯头部碎片而关闭连接。
-fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
-    // 找所有起始码位置。
-    let mut starts = Vec::new();
+pub(crate) fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
+    // 找所有起始码位置，同时保留 3/4 字节起始码长度，避免把四字节起始码
+    // 的第一个 0 粘到前一个 NAL。
+    let mut starts = Vec::<(usize, usize)>::new();
     let mut i = 0;
     while i + 3 <= buf.len() {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            starts.push(i);
+        if i + 4 <= buf.len() && buf[i..i + 4] == [0, 0, 0, 1] {
+            starts.push((i, 4));
+            i += 4;
+        } else if buf[i..i + 3] == [0, 0, 1] {
+            starts.push((i, 3));
             i += 3;
         } else {
             i += 1;
@@ -1182,52 +1184,48 @@ fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
         return; // 不足两个起始码,等更多数据
     }
 
-    let last = *starts.last().unwrap();
-    let complete = &buf[..last];
-    let mut positions: Vec<usize> = starts.iter().copied().filter(|&p| p < last).collect();
-    positions.push(last);
-
-    let mut cur: Vec<u8> = Vec::new();
-    let mut cur_key = false;
+    let mut frame_start = starts[0].0;
+    let mut key_frame = false;
     let mut has_vcl = false;
-    // 记录最后一次成功发送帧之后的 buf 位置,只 drain 到这里。
-    let mut drained_to: usize = 0;
+    let mut drained_to = 0;
 
-    for w in positions.windows(2) {
-        let nal = &complete[w[0]..w[1]];
-        let hdr_off = if nal.len() >= 4 && nal[2] == 0 { 4 } else { 3 };
-        let nal_type = nal.get(hdr_off).map(|b| b & 0x1f).unwrap_or(0);
-        let is_vcl = nal_type == 1 || nal_type == 5;
-        if is_vcl && has_vcl {
-            // 当前积累的 AU 含 VCL,可以安全发出。
+    for &(position, start_len) in &starts {
+        let Some(&header) = buf.get(position + start_len) else {
+            break;
+        };
+        let nal_type = header & 0x1f;
+        let is_vcl = (1..=5).contains(&nal_type);
+        // first_mb_in_slice 是 slice header 的首个 ue(v)。值为 0 时，RBSP
+        // 的第一个 bit 必为 1；非首 slice 的值大于 0，以 0 开始。
+        let first_slice = is_vcl
+            && buf
+                .get(position + start_len + 1)
+                .is_some_and(|payload| payload & 0x80 != 0);
+        // SPS/PPS/AUD/前缀 SEI 出现在已有 VCL 后时属于下一张图，必须先
+        // 结束前一 AU。旧实现直到 IDR 才切，导致 SPS/PPS 错粘到前一张 P 图。
+        let starts_next_access_unit = first_slice || matches!(nal_type, 6..=9);
+
+        if position > frame_start && has_vcl && starts_next_access_unit {
             tx.send_frame(Frame {
-                data: std::mem::take(&mut cur),
-                key_frame: cur_key,
+                data: buf[frame_start..position].to_vec(),
+                key_frame,
             });
-            cur_key = false;
+            frame_start = position;
+            key_frame = false;
             has_vcl = false;
-            // 已发送到 w[0](下一 NAL 的起始位置)之前的所有数据。
-            drained_to = w[0];
+            drained_to = position;
         }
-        if nal_type == 5 || nal_type == 7 || nal_type == 8 {
-            cur_key = true;
+
+        if nal_type == 5 {
+            key_frame = true;
         }
         if is_vcl {
             has_vcl = true;
         }
-        cur.extend_from_slice(nal);
     }
 
-    // 只有 cur 包含 VCL 才发尾部帧;纯 SPS+PPS（等待 IDR）保留在 buf 中。
-    if has_vcl && !cur.is_empty() {
-        tx.send_frame(Frame {
-            data: cur,
-            key_frame: cur_key,
-        });
-        drained_to = last;
-    }
-
-    // 只 drain 已确实发出的部分,未发出的 SPS+PPS 保留供下次拼接。
+    // 只有见到下一 AU 的起点才能证明当前 AU 完整。未闭合的 VCL、参数集和
+    // 多 slice 尾部全部保留，等下次 read 后重新解析。
     if drained_to > 0 {
         buf.drain(..drained_to);
     }
@@ -1236,75 +1234,6 @@ fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct PreviewCollector(std::sync::Mutex<Vec<crate::pusher::PreviewPacket>>);
-
-    impl crate::pusher::PreviewSink for PreviewCollector {
-        fn publish(&self, packet: crate::pusher::PreviewPacket) {
-            self.0.lock().unwrap().push(packet);
-        }
-    }
-
-    struct SyntheticLive {
-        sequence: u8,
-    }
-
-    impl VideoSource for SyntheticLive {
-        fn next_frame(&mut self) -> Option<Frame> {
-            self.sequence = self.sequence.wrapping_add(1);
-            Some(Frame {
-                data: vec![0, 0, 0, 1, 0x65, self.sequence],
-                key_frame: self.sequence % 5 == 1,
-            })
-        }
-
-        fn is_live(&self) -> bool {
-            true
-        }
-    }
-
-    struct ConfigThenFrames {
-        sequence: u8,
-    }
-
-    impl VideoSource for ConfigThenFrames {
-        fn next_frame(&mut self) -> Option<Frame> {
-            self.sequence = self.sequence.wrapping_add(1);
-            let data = if self.sequence == 1 {
-                vec![
-                    0,
-                    0,
-                    0,
-                    1,
-                    0x67,
-                    0x42,
-                    0x00, // SPS
-                    0,
-                    0,
-                    0,
-                    1,
-                    0x68,
-                    0xce, // PPS
-                    0,
-                    0,
-                    0,
-                    1,
-                    0x65,
-                    self.sequence, // IDR
-                ]
-            } else {
-                vec![0, 0, 0, 1, 0x65, self.sequence]
-            };
-            Some(Frame {
-                data,
-                key_frame: true,
-            })
-        }
-
-        fn is_live(&self) -> bool {
-            true
-        }
-    }
 
     #[test]
     fn ffmpeg查找_返回可执行或none不panic() {
@@ -1321,95 +1250,6 @@ mod tests {
     }
 
     #[test]
-    fn 注册期共享媒体_预览先收到帧_点播订阅仍能收到同一流() {
-        let preview = std::sync::Arc::new(PreviewCollector(std::sync::Mutex::new(Vec::new())));
-        let media = start_shared_media(
-            Box::new(SyntheticLive { sequence: 0 }),
-            100,
-            Some(preview.clone() as std::sync::Arc<dyn crate::pusher::PreviewSink>),
-        );
-        let mut rtp_source = media.subscribe();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let mut first_rtp = None;
-        while std::time::Instant::now() < deadline {
-            if let Some(frame) = rtp_source.next_frame() {
-                first_rtp = Some(frame);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        media.stop();
-        assert!(first_rtp.is_some(), "点播订阅应能从注册期共享源收到帧");
-        assert!(
-            !preview.0.lock().unwrap().is_empty(),
-            "注册期预览应先收到编码帧"
-        );
-    }
-
-    #[test]
-    fn 延迟点播订阅_首帧使用最近的参数关键帧() {
-        let preview = std::sync::Arc::new(PreviewCollector(std::sync::Mutex::new(Vec::new())));
-        let media = start_shared_media(
-            Box::new(ConfigThenFrames { sequence: 0 }),
-            200,
-            Some(preview.clone() as std::sync::Arc<dyn crate::pusher::PreviewSink>),
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while preview.0.lock().unwrap().len() < 5 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let mut rtp_source = media.subscribe();
-        let first = rtp_source
-            .next_frame()
-            .expect("延迟订阅应立即得到 bootstrap 参数关键帧");
-        let packet = crate::pusher::PreviewPacket {
-            data: first.data,
-            key_frame: first.key_frame,
-            codec: crate::ps::VideoCodec::H264,
-            session_id: 1,
-            sequence: 1,
-            fps: 200,
-            pts_90k: 0,
-            captured_at_ms: 0,
-        };
-        assert!(
-            crate::pusher::is_config_keyframe(&packet),
-            "延迟订阅的首帧必须包含 SPS/PPS/IDR"
-        );
-        media.stop();
-    }
-
-    #[test]
-    fn 参数集识别_支持_h264_和_h265() {
-        let h264 = crate::pusher::PreviewPacket {
-            data: vec![0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3],
-            key_frame: true,
-            codec: crate::ps::VideoCodec::H264,
-            session_id: 1,
-            sequence: 1,
-            fps: 25,
-            pts_90k: 0,
-            captured_at_ms: 0,
-        };
-        let h265 = crate::pusher::PreviewPacket {
-            data: vec![
-                0, 0, 1, 0x40, 1, // VPS (type 32)
-                0, 0, 1, 0x42, 1, // SPS (type 33)
-                0, 0, 1, 0x44, 1, // PPS (type 34)
-            ],
-            key_frame: true,
-            codec: crate::ps::VideoCodec::H265,
-            session_id: 1,
-            sequence: 1,
-            fps: 25,
-            pts_90k: 0,
-            captured_at_ms: 0,
-        };
-        assert!(crate::pusher::is_config_keyframe(&h264));
-        assert!(crate::pusher::is_config_keyframe(&h265));
-    }
-
-    #[test]
     fn drain_frames_切帧并保留不完整尾部() {
         use std::sync::mpsc;
         // 两个完整访问单元(SPS+PPS+IDR / 非关键帧 slice)+ 一个不完整尾部起始码。
@@ -1419,9 +1259,9 @@ mod tests {
         buf.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce]);
         buf.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x11, 0x22]);
         // 帧2:非关键 slice(1)
-        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x33, 0x44]);
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x80, 0x44]);
         // 不完整尾部:又一个 slice 起点(应保留等后续数据)
-        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x55]);
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x80]);
         let (tx, rx) = mpsc::channel::<Frame>();
         drain_frames(&mut buf, &tx);
         drop(tx);
@@ -1551,6 +1391,43 @@ mod tests {
             frames.len()
         );
         assert!(!buf.is_empty(), "SPS+PPS+IDR起始码应保留在 buf");
+    }
+
+    #[test]
+    fn drain_frames_重复参数集必须归入后续_idr() {
+        use std::sync::mpsc;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x80, 0x11]); // 前一张 P 图
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00]); // 下一 GOP 的 SPS
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce]); // 下一 GOP 的 PPS
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x80, 0x22]); // 下一 GOP 的 IDR
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x61, 0x80, 0x33]); // 下一张 P 图，闭合 IDR AU
+        let (tx, rx) = mpsc::channel::<Frame>();
+
+        drain_frames(&mut buf, &tx);
+        drop(tx);
+        let frames: Vec<Frame> = rx.into_iter().collect();
+
+        assert_eq!(frames.len(), 2);
+        assert!(!frames[0].key_frame, "SPS/PPS 不得粘到前一张 P 图");
+        assert!(
+            frames[1].key_frame,
+            "SPS/PPS/IDR 应组成可重启 decoder 的 AU"
+        );
+        let has_nal = |kind| {
+            frames[1]
+                .data
+                .windows(4)
+                .any(|nal| nal[..3] == [0, 0, 1] && nal[3] & 0x1f == kind)
+                || frames[1]
+                    .data
+                    .windows(5)
+                    .any(|nal| nal[..4] == [0, 0, 0, 1] && nal[4] & 0x1f == kind)
+        };
+        assert!(has_nal(7));
+        assert!(has_nal(8));
+        assert!(has_nal(5));
     }
 }
 

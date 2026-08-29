@@ -11,6 +11,11 @@ tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 rand.workspace = true
+serde.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# 用于把预览 worker 的 stdin 设为非阻塞，保证停止与故障恢复有界。
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 openh264 = "=0.6.5"

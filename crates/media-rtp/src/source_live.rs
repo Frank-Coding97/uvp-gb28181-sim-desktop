@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 use common::{Error, Result};
 
 use super::{drain_frames, ffmpeg_bin, Frame, FrameSender, VideoSource, G711_PACKET_BYTES};
+use crate::preview::{CapturedAccessUnit, PreviewSink};
+use crate::preview_worker::{
+    spawn_preview_worker, PreviewControl, PreviewWorkerHandle, PreviewWorkerInput,
+};
 
 const DEFAULT_SCREEN_WIDTH: u32 = 1280;
 const DEFAULT_SCREEN_HEIGHT: u32 = 720;
@@ -18,6 +22,7 @@ const MAX_SCREEN_SHORT_SIDE: u32 = 2160;
 const MIN_SCREEN_BITRATE_KBPS: u32 = 128;
 const MAX_SCREEN_BITRATE_KBPS: u32 = 20_000;
 const STDERR_TAIL_LINES: usize = 32;
+static NEXT_CAMERA_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Video codec actually available for native live-screen capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -743,6 +748,8 @@ pub struct LiveSource {
     stop_flag: Arc<AtomicBool>,
     producer_alive: Arc<AtomicBool>,
     terminal_error: Arc<Mutex<Option<String>>>,
+    preview_worker: Option<PreviewWorkerHandle>,
+    preview_control: Option<Arc<PreviewControl>>,
     #[cfg(target_os = "macos")]
     screen_stream: Option<screencapturekit::stream::SCStream>,
     last_key: Option<Frame>,
@@ -756,6 +763,8 @@ struct LatestFrameQueue {
     frames: Mutex<VecDeque<Frame>>,
     capacity: usize,
     dropped: AtomicBool,
+    /// 累计入队帧数，仅用于诊断：能区分"没读到字节"和"读到了但切不出帧"。
+    pushed: std::sync::atomic::AtomicU64,
 }
 
 impl LatestFrameQueue {
@@ -764,10 +773,12 @@ impl LatestFrameQueue {
             frames: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity: capacity.max(1),
             dropped: AtomicBool::new(false),
+            pushed: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     fn push(&self, frame: Frame) {
+        self.pushed.fetch_add(1, Ordering::Relaxed);
         let Ok(mut frames) = self.frames.lock() else {
             return;
         };
@@ -785,6 +796,10 @@ impl LatestFrameQueue {
             .and_then(|mut frames| frames.pop_front())
     }
 
+    fn pushed_total(&self) -> u64 {
+        self.pushed.load(Ordering::Relaxed)
+    }
+
     fn take_dropped(&self) -> bool {
         self.dropped.swap(false, Ordering::AcqRel)
     }
@@ -796,9 +811,54 @@ impl FrameSender for LatestFrameQueue {
     }
 }
 
+/// 单一 H.264 AU 出口：主路先提交，预览只做有界 try_send。
+struct EncodedFrameHub {
+    primary: Arc<LatestFrameQueue>,
+    preview: Option<PreviewWorkerInput>,
+    generation: u64,
+    sequence: std::sync::atomic::AtomicU64,
+}
+
+impl EncodedFrameHub {
+    fn new(
+        primary: Arc<LatestFrameQueue>,
+        preview: Option<PreviewWorkerInput>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            primary,
+            preview,
+            generation,
+            sequence: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl FrameSender for EncodedFrameHub {
+    fn send_frame(&self, frame: Frame) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let captured_at_ms = crate::source::now_ms();
+        let preview_frame = self.preview.as_ref().map(|_| {
+            CapturedAccessUnit::new(
+                self.generation,
+                sequence,
+                frame.data.clone(),
+                frame.key_frame,
+                captured_at_ms,
+            )
+        });
+
+        // 这条顺序是硬合同：任何预览错误都发生在主路已经拿到 AU 之后。
+        self.primary.push(frame);
+        if let (Some(input), Some(access_unit)) = (&self.preview, preview_frame) {
+            let _ = input.try_send(access_unit);
+        }
+    }
+}
+
 impl LiveSource {
     /// Parse a complete live URI and start its platform backend.
-    pub fn capture(uri: &str, fps: u32) -> Result<Self> {
+    pub fn capture(uri: &str, fps: u32, preview: Option<Arc<dyn PreviewSink>>) -> Result<Self> {
         let spec = LiveSourceSpec::parse(uri)?;
         let fps = fps.max(1);
         #[cfg(target_os = "macos")]
@@ -808,7 +868,7 @@ impl LiveSource {
                     video_index,
                     audio_index,
                     audio_codec,
-                } => Self::capture_camera(video_index, audio_index, audio_codec, fps),
+                } => Self::capture_camera(video_index, audio_index, audio_codec, fps, preview),
                 LiveSourceSpec::Screen {
                     display_id,
                     audio,
@@ -820,6 +880,7 @@ impl LiveSource {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = fps;
+            let _ = preview;
             match spec {
                 LiveSourceSpec::Camera { .. } => Err(Error::Media(
                     "canonical camera capture is not supported on this platform".into(),
@@ -831,12 +892,25 @@ impl LiveSource {
         }
     }
 
+    /// 启动唯一 AVFoundation 采集；预览只消费它产出的 H.264 AU 副本。
     #[cfg(target_os = "macos")]
     fn capture_camera(
         video_index: u32,
         audio_index: Option<u32>,
         audio_codec: LiveAudioCodec,
         fps: u32,
+        preview: Option<Arc<dyn PreviewSink>>,
+    ) -> Result<Self> {
+        Self::capture_camera_inner(video_index, audio_index, audio_codec, fps, preview)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_camera_inner(
+        video_index: u32,
+        audio_index: Option<u32>,
+        audio_codec: LiveAudioCodec,
+        fps: u32,
+        preview: Option<Arc<dyn PreviewSink>>,
     ) -> Result<Self> {
         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
             Error::Media("macOS camera capture requires ffmpeg with AVFoundation support".into())
@@ -845,76 +919,10 @@ impl LiveSource {
             ensure_audio_encoder(&ffmpeg, audio_codec)?;
         }
         let input_fps = camera_input_fps(fps);
-        let input_fps_text = input_fps.to_string();
-        let output_fps_text = fps.to_string();
-        let video_filter =
-            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
-                .to_string();
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
-        let input = audio_index.map_or_else(
-            || format!("{video_index}:none"),
-            |index| format!("{video_index}:{index}"),
-        );
         let mut command = Command::new(&ffmpeg);
-        command.args([
-            "-hide_banner",
-            "-nostdin",
-            "-loglevel",
-            if audio_index.is_some() {
-                "quiet"
-            } else {
-                "warning"
-            },
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-            "-avioflags",
-            "direct",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-f",
-            "avfoundation",
-            "-thread_queue_size",
-            "1",
-            "-pixel_format",
-            "uyvy422",
-            "-framerate",
-            &input_fps_text,
-            "-i",
-            &input,
-            "-map",
-            "0:v:0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-tune",
-            "zerolatency",
-            "-x264-params",
-            &format!(
-                "slices=1:sliced-threads=0:repeat-headers=1:keyint={fps}:min-keyint={fps}:scenecut=0:rc-lookahead=0"
-            ),
-            "-bf",
-            "0",
-            "-refs",
-            "1",
-            "-pix_fmt",
-            "yuv420p",
-            "-vf",
-            &video_filter,
-            "-g",
-            &output_fps_text,
-            "-fps_mode",
-            "cfr",
-            "-f",
-            "h264",
-            "-flush_packets",
-            "1",
-            "pipe:1",
-        ]);
+        let camera_args = camera_command_args_for_test(video_index, audio_index, audio_codec, fps);
+        command.args(&camera_args);
         if audio_index.is_some() {
             // One AVFoundation session owns both Continuity Camera tracks. A second
             // process can make an iPhone microphone stall while video is active.
@@ -937,8 +945,17 @@ impl LiveSource {
         let producer_alive = Arc::new(AtomicBool::new(true));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
+        let generation = NEXT_CAMERA_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1);
+        let (preview_input, preview_worker) = preview.map_or((None, None), |sink| {
+            let (input, worker) = spawn_preview_worker(ffmpeg.clone(), fps, generation, sink);
+            (Some(input), Some(worker))
+        });
+        let preview_control = preview_worker.as_ref().map(PreviewWorkerHandle::control);
         let tx = Arc::new(LatestFrameQueue::new(2));
         let rx = Arc::clone(&tx);
+        let hub = EncodedFrameHub::new(Arc::clone(&tx), preview_input, generation);
         let mut stdout = startup.children[0]
             .stdout
             .take()
@@ -950,16 +967,36 @@ impl LiveSource {
         std::thread::spawn(move || {
             let mut pending = Vec::with_capacity(256 * 1024);
             let mut chunk = [0_u8; 32 * 1024];
+            let mut total_bytes = 0_u64;
+            let mut total_frames = 0_u64;
+            tracing::info!(generation, "camera H.264 stdout reader started");
             loop {
                 match stdout.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         ready.store(true, Ordering::Release);
+                        total_bytes += n as u64;
                         pending.extend_from_slice(&chunk[..n]);
-                        drain_frames(&mut pending, tx.as_ref());
+                        drain_frames(&mut pending, &hub);
+                        let drained = hub.primary.pushed_total();
+                        if drained != total_frames && (drained <= 1 || drained % 150 == 0) {
+                            tracing::info!(
+                                total_bytes,
+                                total_frames = drained,
+                                pending_bytes = pending.len(),
+                                "camera H.264 frames drained"
+                            );
+                        }
+                        total_frames = drained;
                     }
                 }
             }
+            tracing::warn!(
+                generation,
+                total_bytes,
+                total_frames,
+                "camera H.264 reader stopped"
+            );
             if !video_stop.load(Ordering::Acquire) {
                 if let Ok(mut error) = video_error.lock() {
                     *error = Some(format!("AVFoundation {video_label} stopped unexpectedly"));
@@ -1041,6 +1078,8 @@ impl LiveSource {
             stop_flag,
             producer_alive,
             terminal_error,
+            preview_worker,
+            preview_control,
             screen_stream: None,
             last_key: None,
             consecutive_empty: 0,
@@ -1597,6 +1636,8 @@ impl LiveSource {
             stop_flag,
             producer_alive,
             terminal_error,
+            preview_worker: None,
+            preview_control: None,
             screen_stream: Some(stream),
             last_key: None,
             consecutive_empty: 0,
@@ -1611,6 +1652,95 @@ fn camera_input_fps(output_fps: u32) -> u32 {
         30 | 60 => output_fps,
         _ => 30,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn cfr_output_args(output_fps: &str) -> [&str; 4] {
+    ["-r", output_fps, "-fps_mode", "cfr"]
+}
+
+#[cfg(target_os = "macos")]
+fn camera_command_args_for_test(
+    video_index: u32,
+    audio_index: Option<u32>,
+    _audio_codec: LiveAudioCodec,
+    fps: u32,
+) -> Vec<String> {
+    let input_fps = camera_input_fps(fps);
+    let input = audio_index.map_or_else(
+        || format!("{video_index}:none"),
+        |index| format!("{video_index}:{index}"),
+    );
+    let output_fps = fps.max(1).to_string();
+    let cfr_args = cfr_output_args(&output_fps);
+    let input_fps = input_fps.to_string();
+    let x264_params = format!(
+        "slices=1:sliced-threads=0:repeat-headers=1:keyint={}:min-keyint={}:scenecut=0:rc-lookahead=0",
+        fps.max(1),
+        fps.max(1)
+    );
+    vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        if audio_index.is_some() {
+            "quiet".into()
+        } else {
+            "warning".into()
+        },
+        "-fflags".into(),
+        "nobuffer".into(),
+        "-flags".into(),
+        "low_delay".into(),
+        "-avioflags".into(),
+        "direct".into(),
+        "-probesize".into(),
+        "32".into(),
+        "-analyzeduration".into(),
+        "0".into(),
+        "-use_wallclock_as_timestamps".into(),
+        "1".into(),
+        "-f".into(),
+        "avfoundation".into(),
+        "-thread_queue_size".into(),
+        "8".into(),
+        "-pixel_format".into(),
+        "uyvy422".into(),
+        "-framerate".into(),
+        input_fps,
+        "-i".into(),
+        input,
+        "-map".into(),
+        "0:v:0".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "ultrafast".into(),
+        "-tune".into(),
+        "zerolatency".into(),
+        "-x264-params".into(),
+        x264_params,
+        "-bf".into(),
+        "0".into(),
+        "-refs".into(),
+        "1".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-vf".into(),
+        "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
+            .into(),
+        "-g".into(),
+        output_fps.clone(),
+        cfr_args[0].into(),
+        cfr_args[1].into(),
+        cfr_args[2].into(),
+        cfr_args[3].into(),
+        "-f".into(),
+        "h264".into(),
+        "-flush_packets".into(),
+        "1".into(),
+        "pipe:1".into(),
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -1665,11 +1795,15 @@ fn capture_stderr_tail(child: &mut Child, label: &str) -> Result<Arc<Mutex<VecDe
         .ok_or_else(|| Error::Media(format!("failed to open {label} stderr")))?;
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
     let output = Arc::clone(&tail);
+    let owned_label = label.to_string();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr)
             .lines()
             .map_while(std::result::Result::ok)
         {
+            // 同时打进日志：只留在环形缓冲里的话，采集失败时除了"超时"什么都看不到，
+            // FFmpeg 真正说了什么反而丢了。
+            tracing::warn!(label = %owned_label, line = %line, "ffmpeg stderr");
             if let Ok(mut lines) = output.lock() {
                 if lines.len() == STDERR_TAIL_LINES {
                     lines.pop_front();
@@ -2029,6 +2163,9 @@ impl Drop for LiveSource {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
         self.producer_alive.store(false, Ordering::Release);
+        if let Some(mut worker) = self.preview_worker.take() {
+            worker.stop();
+        }
         #[cfg(target_os = "macos")]
         if let Some(stream) = self.screen_stream.take() {
             let _ = stream.stop_capture();
@@ -2117,17 +2254,314 @@ impl VideoSource for LiveSource {
             .ok()
             .and_then(|mut error| error.take())
     }
+
+    fn preview_control(&self) -> Option<Arc<PreviewControl>> {
+        self.preview_control.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    struct CameraProbeSink {
+        frames: std::sync::atomic::AtomicU64,
+        changed_frames: std::sync::atomic::AtomicU64,
+        last_fingerprint: std::sync::atomic::AtomicU64,
+        first_published_at_ms: std::sync::atomic::AtomicU64,
+        latencies_ms: Mutex<Vec<u64>>,
+        latest_status: Mutex<Option<crate::preview::PreviewStatus>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PreviewSink for CameraProbeSink {
+        fn publish(&self, frame: crate::preview::PreviewJpeg) {
+            use std::hash::{Hash, Hasher};
+
+            let published_at_ms = crate::source::now_ms();
+            self.first_published_at_ms
+                .compare_exchange(0, published_at_ms, Ordering::AcqRel, Ordering::Acquire)
+                .ok();
+            self.latencies_ms
+                .lock()
+                .unwrap()
+                .push(published_at_ms.saturating_sub(frame.captured_at_ms));
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            frame.data.hash(&mut hasher);
+            let fingerprint = hasher.finish();
+            let previous = self.last_fingerprint.swap(fingerprint, Ordering::AcqRel);
+            if previous != 0 && previous != fingerprint {
+                self.changed_frames.fetch_add(1, Ordering::Relaxed);
+            }
+            self.frames.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn status(&self, status: crate::preview::PreviewStatus) {
+            *self.latest_status.lock().unwrap() = Some(status);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn owned_ffmpeg_roles() -> (Vec<u32>, Vec<u32>) {
+        let output = Command::new("/bin/ps")
+            .args(["-Ao", "pid=,command="])
+            .output()
+            .expect("应能读取进程列表");
+        let mut camera = Vec::new();
+        let mut preview = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let line = line.trim_start();
+            let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(pid) = pid.trim().parse() else {
+                continue;
+            };
+            if command.contains("slices=1:sliced-threads=0:repeat-headers=1")
+                && command.contains("avfoundation")
+            {
+                camera.push(pid);
+            }
+            if command.contains("-f h264 -i pipe:0")
+                && command.contains("scale=480:-2,format=yuvj420p")
+            {
+                preview.push(pid);
+            }
+        }
+        (camera, preview)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn signal_process(pid: u32, signal: libc::c_int) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn percentile(values: &[u64], percentile: usize) -> u64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        sorted[(sorted.len() - 1) * percentile.min(100) / 100]
+    }
+
+    /// 当前 Mac 真实摄像头硬门禁。默认 60 秒；普通 CI 不运行。
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "需要真实 Mac 摄像头与系统授权"]
+    fn macos_camera_preview_probe() {
+        let index = std::env::var("UVP_TEST_CAMERA_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let seconds = std::env::var("UVP_TEST_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(5);
+        let inject_faults = std::env::var("UVP_TEST_INJECT_FAULTS").as_deref() == Ok("1");
+        if inject_faults {
+            assert!(seconds >= 60, "故障注入门禁至少运行 60 秒");
+        }
+        let started_at_ms = crate::source::now_ms();
+        let sink = Arc::new(CameraProbeSink::default());
+        let sink_trait: Arc<dyn PreviewSink> = sink.clone();
+        let uri = format!("live:camera:{index}?audio=none&audio_codec=g711a");
+        let source =
+            LiveSource::capture(&uri, 30, Some(sink_trait)).expect("真实摄像头采集应在授权后启动");
+        let first_h264_deadline = Instant::now() + Duration::from_secs(5);
+        while source.rx.pushed_total() == 0 && Instant::now() < first_h264_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let first_h264_ms = crate::source::now_ms().saturating_sub(started_at_ms);
+        assert!(source.rx.pushed_total() > 0, "5 秒内没有 H.264 AU");
+        assert!(first_h264_ms <= 5_000, "H.264 首帧 {first_h264_ms}ms");
+
+        let first_jpeg_deadline = Instant::now() + Duration::from_secs(5);
+        while sink.frames.load(Ordering::Acquire) == 0 && Instant::now() < first_jpeg_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            sink.frames.load(Ordering::Acquire) > 0,
+            "5 秒内没有 MJPEG 帧"
+        );
+        let (initial_camera_pids, initial_preview_pids) = owned_ffmpeg_roles();
+        assert_eq!(
+            initial_camera_pids.len(),
+            1,
+            "只能有一个 AVFoundation 采集进程"
+        );
+        assert_eq!(initial_preview_pids.len(), 1, "应有一个隔离预览 worker");
+        let initial_camera_pid = initial_camera_pids[0];
+        let initial_preview_pid = initial_preview_pids[0];
+
+        let run_started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let mut killed_preview_pid = None;
+        let mut stopped_preview_pid = None;
+        let mut stop_released = false;
+        while Instant::now() < deadline {
+            let elapsed = run_started.elapsed();
+            if inject_faults && killed_preview_pid.is_none() && elapsed >= Duration::from_secs(20) {
+                assert!(
+                    signal_process(initial_preview_pid, libc::SIGKILL),
+                    "应能终止测试持有的预览 worker {initial_preview_pid}"
+                );
+                killed_preview_pid = Some(initial_preview_pid);
+            }
+            if inject_faults && stopped_preview_pid.is_none() && elapsed >= Duration::from_secs(40)
+            {
+                let (camera, preview) = owned_ffmpeg_roles();
+                assert_eq!(camera, vec![initial_camera_pid], "预览恢复不得重启摄像头");
+                assert_eq!(preview.len(), 1, "kill 后应已创建新的预览 worker");
+                assert_ne!(preview[0], initial_preview_pid, "预览 worker PID 应已更新");
+                assert!(
+                    signal_process(preview[0], libc::SIGSTOP),
+                    "应能暂停测试持有的预览 worker {}",
+                    preview[0]
+                );
+                stopped_preview_pid = Some(preview[0]);
+            }
+            if inject_faults && !stop_released && elapsed >= Duration::from_secs(50) {
+                if let Some(pid) = stopped_preview_pid {
+                    // supervisor 可能已因 500ms stdin 背压把它局部回收；若仍存在则恢复。
+                    let _ = signal_process(pid, libc::SIGCONT);
+                    stop_released = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let h264 = source.rx.pushed_total();
+        let jpeg = sink.frames.load(Ordering::Acquire);
+        let first_jpeg_ms = sink
+            .first_published_at_ms
+            .load(Ordering::Acquire)
+            .saturating_sub(started_at_ms);
+        let latencies = sink.latencies_ms.lock().unwrap().clone();
+        let latency_p50_ms = percentile(&latencies, 50);
+        let latency_p95_ms = percentile(&latencies, 95);
+        let midpoint = latencies.len() / 2;
+        let first_half_p95_ms = percentile(&latencies[..midpoint], 95);
+        let second_half_p95_ms = percentile(&latencies[midpoint..], 95);
+        let changed_frames = sink.changed_frames.load(Ordering::Acquire);
+        let (camera_pids, preview_pids) = owned_ffmpeg_roles();
+        eprintln!(
+            "camera_probe seconds={seconds} inject_faults={inject_faults} h264={h264} jpeg={jpeg} changed_jpeg={changed_frames} first_h264_ms={first_h264_ms} first_jpeg_ms={first_jpeg_ms} latency_p50_ms={latency_p50_ms} latency_p95_ms={latency_p95_ms} first_half_p95_ms={first_half_p95_ms} second_half_p95_ms={second_half_p95_ms} initial_camera_pid={initial_camera_pid} initial_preview_pid={initial_preview_pid} killed_preview_pid={killed_preview_pid:?} stopped_preview_pid={stopped_preview_pid:?} camera_pids={camera_pids:?} preview_pids={preview_pids:?} status={:?}",
+            sink.latest_status.lock().unwrap()
+        );
+        assert_eq!(camera_pids, vec![initial_camera_pid], "摄像头 PID 不得变化");
+        assert_eq!(preview_pids.len(), 1, "应有一个不打开设备的预览 worker");
+        assert!(first_jpeg_ms <= 5_000, "MJPEG 首帧 {first_jpeg_ms}ms");
+        assert!(h264 >= seconds.saturating_mul(27), "H.264 平均不足 27 FPS");
+        assert!(jpeg >= seconds.saturating_mul(27), "MJPEG 平均不足 27 FPS");
+        assert!(
+            changed_frames >= jpeg.saturating_mul(9) / 10,
+            "JPEG 长期重复，变化帧 {changed_frames}/{jpeg}"
+        );
+        assert!(
+            latency_p95_ms < 1_000,
+            "AU→JPEG P95 延迟 {latency_p95_ms}ms"
+        );
+        assert!(
+            second_half_p95_ms <= first_half_p95_ms.saturating_add(500),
+            "延迟持续增长：前半 P95={first_half_p95_ms}ms，后半 P95={second_half_p95_ms}ms"
+        );
+        if inject_faults {
+            assert_ne!(
+                preview_pids[0], initial_preview_pid,
+                "故障后应由新 worker 服务"
+            );
+            let status = sink.latest_status.lock().unwrap().clone().unwrap();
+            assert_eq!(status.phase, crate::preview::PreviewPhase::Playing);
+            assert_eq!(status.recoveries, 2, "两种故障应各触发一次局部恢复");
+        }
+
+        drop(source);
+        let stop_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < stop_deadline {
+            let (camera, preview) = owned_ffmpeg_roles();
+            if camera.is_empty() && preview.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("3 秒内仍有本应用 owned FFmpeg 进程");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn camera采集命令只有一个视频输出且不含预览旁路() {
+        let args = camera_command_args_for_test(0, None, LiveAudioCodec::G711A, 30);
+        let command = args.join(" ");
+
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "-f" && pair[1] == "avfoundation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "-f" && pair[1] == "h264")
+                .count(),
+            1
+        );
+        assert!(!command.contains("pipe:3"));
+        assert!(!command.contains("mjpeg"));
+    }
+
+    #[test]
+    fn cfr输出必须显式指定目标帧率() {
+        assert_eq!(cfr_output_args("30"), ["-r", "30", "-fps_mode", "cfr"]);
+    }
+
     fn frame(id: u8) -> Frame {
         Frame {
             data: vec![id],
             key_frame: false,
         }
+    }
+
+    #[test]
+    fn encoded_frame_hub先交主路且预览满载不阻塞() {
+        let primary = Arc::new(LatestFrameQueue::new(8));
+        let (preview, _rx) = crate::preview_worker::preview_input_channel_for_test(7, 1);
+        assert_eq!(
+            preview.try_send(CapturedAccessUnit::new(7, 1, vec![0, 0, 1, 5, 1], true, 1,)),
+            crate::preview_worker::PreviewSendResult::Sent
+        );
+        let hub = EncodedFrameHub::new(Arc::clone(&primary), Some(preview), 7);
+
+        hub.send_frame(Frame {
+            data: vec![0, 0, 1, 1, 2],
+            key_frame: false,
+        });
+
+        assert_eq!(primary.pushed_total(), 1);
+        assert_eq!(primary.pop().unwrap().data, vec![0, 0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn encoded_frame_hub给预览附加代际序号和主读取时刻() {
+        let primary = Arc::new(LatestFrameQueue::new(8));
+        let (preview, rx) = crate::preview_worker::preview_input_channel_for_test(9, 2);
+        let hub = EncodedFrameHub::new(primary, Some(preview), 9);
+        let mut data = vec![0, 0, 1, 7, 1];
+        data.extend_from_slice(&[0, 0, 1, 8, 2]);
+        data.extend_from_slice(&[0, 0, 1, 5, 3]);
+
+        hub.send_frame(Frame {
+            data,
+            key_frame: true,
+        });
+        let access_unit = rx.try_recv().unwrap();
+        assert_eq!(access_unit.generation, 9);
+        assert_eq!(access_unit.sequence, 1);
+        assert!(access_unit.config_keyframe);
+        assert!(access_unit.captured_at_ms > 0);
     }
 
     #[test]

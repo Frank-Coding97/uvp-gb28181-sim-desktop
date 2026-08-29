@@ -8,16 +8,20 @@
 //! - `source`:视频源抽象(空媒体 / 真实文件循环)
 //! - `pusher`:把视频源→PS→RTP 按帧率推流的驱动
 
+pub mod preview;
+pub mod preview_worker;
+pub use preview::{CapturedAccessUnit, PreviewJpeg, PreviewPhase, PreviewSink, PreviewStatus};
+pub use preview_worker::{
+    preview_worker_args, spawn_preview_worker, PreviewControl, PreviewSendResult,
+    PreviewWorkerHandle, PreviewWorkerInput,
+};
 pub mod ps;
 pub mod pusher;
 pub mod rtp;
 pub mod source;
 
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};
-pub use pusher::{
-    contains_codec_config, is_config_keyframe, push_stream, push_stream_controlled,
-    push_stream_controlled_with_preview, PlaybackControl, PreviewPacket, PreviewSink,
-};
+pub use pusher::{contains_codec_config, push_stream, push_stream_controlled, PlaybackControl};
 pub use rtp::{build_rtcp_sr, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
     ffmpeg_bin, list_live_sources, prepare_video_source, start_shared_media, FileSource, Frame,
