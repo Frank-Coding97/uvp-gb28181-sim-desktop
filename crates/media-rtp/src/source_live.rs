@@ -1725,6 +1725,8 @@ fn camera_command_args_for_test(
         "8".into(),
         "-pixel_format".into(),
         "uyvy422".into(),
+        "-video_size".into(),
+        "1280x720".into(),
         "-framerate".into(),
         input_fps,
         "-i".into(),
@@ -2609,6 +2611,22 @@ mod tests {
         );
         assert!(!command.contains("pipe:3"));
         assert!(!command.contains("mjpeg"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn camera采集必须显式请求横向画面() {
+        let args = camera_command_args_for_test(0, None, LiveAudioCodec::G711A, 30);
+        let input_position = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("采集命令必须包含输入");
+        let size_position = args
+            .windows(2)
+            .position(|pair| pair == ["-video_size", "1280x720"])
+            .expect("AVFoundation 默认可能选择竖屏模式，必须显式请求 1280x720");
+
+        assert!(size_position < input_position, "输入尺寸必须在 -i 之前生效");
     }
 
     #[test]
