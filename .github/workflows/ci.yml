@@ -67,6 +67,9 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 显式指定配置,不依赖 action 的自动发现:漏掉它会退回默认规则,
+          # 把测试夹具里的占位口令全部报成泄露。
+          GITLEAKS_CONFIG: .gitleaks.toml
 
   # ── 三平台桌面安装包 ─────────────────────────────────
   build-desktop:

@@ -1,8 +1,8 @@
 # gitleaks 配置:在 CI 里阻止密码/密钥再次进入仓库。
 #
-# 背景:历史上 `platform.ts` 里曾硬编码过一个平台 SIP 密码与内网地址
-# (提交 e310d45bc 只改了工作区、没重写历史)。现在密码统一存 OS 钥匙串,
-# 这份配置负责保证类似情况不再发生。
+# 背景:历史上 `platform.ts` 里曾硬编码过一个平台 SIP 密码与内网地址。
+# 那次泄露已通过 git-filter-repo 重写历史彻底清除(占位符 REDACTED-SIP-PASSWORD),
+# 现在密码统一存 OS 钥匙串,这份配置负责保证类似情况不再发生。
 title = "uvp-gb28181-desktop"
 
 [extend]
@@ -11,13 +11,22 @@ useDefault = true
 [[rules]]
 id = "sip-password-literal"
 description = "疑似硬编码的 SIP/平台密码"
-regex = '''(?i)(password|passwd|pwd)\s*[:=]\s*["'][^"'\s]{6,}["']'''
+# 用捕获组把"值"单独拿出来:没有捕获组时 gitleaks 的 secret 是整段
+# `password = "xxx"`,allowlist 里按值精确豁免就永远匹配不上。
+regex = '''(?i)(?:password|passwd|pwd)\s*[:=]\s*["']([^"'\s]{6,})["']'''
+secretGroup = 1
 tags = ["password"]
 [rules.allowlist]
-# 占位符与测试用值不算泄露。
+# allowlist 的 regexes 匹配捕获到的 secret 本身(不含引号),所以这里写裸值。
+regexTarget = "secret"
 regexes = [
-  '''(?i)["'](change-me|placeholder|example|your[-_]?password|12345678|\*\*\*)["']''',
-  '''(?i)password\s*[:=]\s*["']{2}''',
+  # 文档/示例里的占位符与公开默认值(12345678 是 GB/T 28181 教程通用示例口令)。
+  '''(?i)^(change-me|placeholder|example|your[-_]?password|12345678|123456|REDACTED-SIP-PASSWORD)$''',
+  # 单测里的固定夹具值。
+  '''(?i)^(secret|secret123|correct|correct_password|wrong_password|test_?password|hunter2|abc123)$''',
+  '''^\*+$''',
+  # 模板插值(如 `password = "${p.password}"`)不是明文。
+  '''^\$\{[^}]*\}$''',
 ]
 paths = [
   '''.*\.test\.ts$''',
@@ -33,4 +42,8 @@ paths = [
   '''package-lock\.json''',
   '''Cargo\.lock''',
   '''\.gitleaks\.toml''',
+  # 构建产物与依赖目录:不是源码,且会让扫描从秒级变成分钟级。
+  '''^target/''',
+  '''^apps/desktop/dist/''',
+  '''(^|/)node_modules/''',
 ]

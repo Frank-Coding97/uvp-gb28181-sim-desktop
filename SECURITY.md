@@ -19,18 +19,28 @@
 - 导出的压测报告里场景是**结构化脱敏**后再序列化的(`serialize_redacted_scenario`),
   不是对 TOML 文本做正则替换,因此 quoted key、多行字符串等写法都绕不过去。
 
-### 已知的历史泄露
+### 历史泄露:已清理
 
-提交 `e310d45bc`(“安全:移除仓库中的平台凭据”)只修改了工作区,**没有重写 git 历史**。
-在此之前 `apps/desktop/src/platform.ts` 里硬编码过一个平台 SIP 密码与内网地址,
-现在仍可通过 `git show e310d45bc~1:apps/desktop/src/platform.ts` 取出。
+早期 `apps/desktop/src/platform.ts` 里硬编码过一个平台 SIP 密码与内网地址,提交
+`e310d45bc`(“安全:移除仓库中的平台凭据”)当时只改了工作区、**没有重写 git 历史**。
 
-如果这个仓库曾经对外可见:
+现已用 `git filter-repo --replace-text` 重写全量历史,替换后的占位符为
+`REDACTED-SIP-PASSWORD`(内网地址改写到 `192.168.0.0/24` 文档段)。同时删除了与本仓库
+**无共同祖先**的上游 KMP 旧项目分支(`main`、`feat/media`、`feat/protocol`、
+`feat/desktop-ui`)及其本地标签(`v1.0.0`、`v1.0.1`)—— 那条死掉的历史线是大部分凭据
+blob 的来源,连同它一起被 GC 剪除,仓库从 724 个提交收敛到 202 个。
 
-1. **先轮换那个 SIP 密码** —— 历史重写救不回已经泄露的凭据,轮换是唯一有效补救。
-2. 需要清理历史时用 `git filter-repo --replace-text`,然后强推并通知所有克隆者
-   (破坏性操作,需要明确授权)。
-3. CI 已接入 gitleaks(`.gitleaks.toml`),防止同类问题再次进入仓库。
+`gitleaks git`(全历史)与 `gitleaks dir`(工作区)现在都是 **no leaks found**。
+
+仍需注意的两点:
+
+1. **历史重写救不回已经泄露的凭据。** 如果那台平台仍在用旧口令,轮换是唯一有效补救。
+   本项目那批地址是纯局域网实验环境,风险已确认可接受。
+2. 强推后旧 SHA 在托管方 GC 之前可能仍可访问,已有的克隆/fork 也仍带旧对象。
+   同类事故的正确处置顺序始终是:**先轮换凭据,再重写历史**。
+
+再次发生时的处置:`git bundle create ../backup.bundle --all` 备份 → 删掉无关 ref →
+`git filter-repo --replace-text 替换表` → `gitleaks git` 复核 → 强推并通知克隆者。
 
 ## SIP 入站来源
 
