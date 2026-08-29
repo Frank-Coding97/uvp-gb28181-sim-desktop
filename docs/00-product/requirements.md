@@ -33,7 +33,7 @@
 | FR-19 | 平台下发抓拍:SnapShotCmd(经 Alarm Notify 上报)+ SnapShotConfig(GB-2022,JPEG 经 HTTP PUT 上传 + 完成 NOTIFY,含 SSRF 上传白名单校验) | P2 | M6 |
 | FR-30 | 在线升级 DeviceUpgrade:4 步进度(0/30/60/100%)DeviceUpgradeResult NOTIFY 闭环 | P2 | M6 |
 | FR-31 | 主动通知:录像完成/异常/存储满 MediaStatusNotify(NotifyType 121/122/123) | P1 | M6 |
-| FR-32 | 信令健壮性:Expires 到期 80% 主动续约、RTCP SR 周期反馈(5s)、Catalog 增量 NOTIFY(状态 diff) | P1 | M6 |
+| FR-32 | 信令健壮性:Expires 到期 80% 主动续约、RTCP 双向(周期发 SR + 接收平台 RR,收流侧按 RFC 3550 回报 RR)、Catalog 增量 NOTIFY(状态 diff,按附录 N 批量) | P1 | M6 |
 | FR-33 | 媒体编码扩展:H.265(PSM stream_type 0x24)、AAC 音频复合流 | P2 | M6 |
 | FR-34 | 多视频通道 + 虚拟通道 CRUD + 模板(单设备/8ch NVR/3×2 跨区划/16ch 双业务分组);报警通道作独立 Catalog 节点(typeCode 134) | P1 | M6 |
 | FR-35 | OSD 叠加:时间戳(左上)、通道名(右上)、自定义水印(斜向平铺)烧入推流画面(行业惯例) | P2 | M6 |

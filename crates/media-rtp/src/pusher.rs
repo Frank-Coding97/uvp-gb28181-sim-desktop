@@ -29,6 +29,34 @@ pub struct PlaybackControl {
     seek_permille_plus1: AtomicU32,
     /// 待处理的强制关键帧请求(A.2.3.1.7 IFrameCmd)。推流循环消费后清零。
     keyframe_requested: AtomicBool,
+    /// 本次会话的发送统计与 RTCP 反馈句柄,由推流循环在建立通道后回填。
+    ///
+    /// 发送器是在推流任务内部创建的,而"平台收得怎么样"要给设备控制台看 ——
+    /// 借这个已经在两侧共享的控制块把句柄递出来,免得给推流函数再加出参。
+    telemetry: std::sync::OnceLock<SessionTelemetry>,
+}
+
+/// 一次推流会话的遥测句柄(发送侧 + 平台反馈侧)。
+#[derive(Debug, Clone)]
+pub struct SessionTelemetry {
+    /// 本端发送统计。
+    pub stats: Arc<crate::rtp::SendStats>,
+    /// 平台回报的收流质量(RTCP RR)。
+    pub feedback: Arc<crate::rtcp::RtcpFeedback>,
+    /// 本端 RTCP 端口;TCP 模式或未抢到 RTP+1 时为 None。
+    pub local_rtcp_port: Option<u16>,
+    /// 该流的 RTP 时钟频率,用于把抖动换算成毫秒。
+    pub clock_hz: u32,
+    /// 发送通道建立的时刻。`RtcpFeedback` 里的"最近一次报告"记的是相对这个
+    /// 时刻的毫秒数,消费方算"报告有多旧"必须用同一个原点。
+    pub started: std::time::Instant,
+}
+
+impl SessionTelemetry {
+    /// 距发送通道建立至今的毫秒数(传给 `RtcpFeedback::snapshot`)。
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
 }
 
 impl Default for PlaybackControl {
@@ -38,6 +66,7 @@ impl Default for PlaybackControl {
             paused: AtomicBool::new(false),
             seek_permille_plus1: AtomicU32::new(0),
             keyframe_requested: AtomicBool::new(false),
+            telemetry: std::sync::OnceLock::new(),
         }
     }
 }
@@ -46,6 +75,16 @@ impl PlaybackControl {
     /// 新建默认控制(1.0 倍速、未暂停)。
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// 推流循环建立发送通道后回填遥测句柄。重复调用只有第一次生效。
+    pub fn set_telemetry(&self, telemetry: SessionTelemetry) {
+        let _ = self.telemetry.set(telemetry);
+    }
+
+    /// 本次会话的遥测句柄;通道还没建立时为 None。
+    pub fn telemetry(&self) -> Option<&SessionTelemetry> {
+        self.telemetry.get()
     }
 
     /// 设置倍速(`scale` 为浮点倍数,如 2.0 / 0.5)。非正数忽略。
@@ -161,7 +200,15 @@ pub async fn push_stream_prepared(
 ) -> Result<()> {
     let use_tcp = prepared.is_tcp();
     let mut sender = prepared.into_sender(ssrc).await?;
-    tracing::info!(%dst, ssrc = format!("{ssrc:#x}"), use_tcp, fps, live = source.is_live(), "推流开始:已建立发送通道");
+    let local_rtcp_port = sender.local_rtcp_port();
+    control.set_telemetry(SessionTelemetry {
+        stats: sender.stats(),
+        feedback: sender.feedback(),
+        local_rtcp_port,
+        clock_hz: CLOCK_HZ,
+        started: sender.started(),
+    });
+    tracing::info!(%dst, ssrc = format!("{ssrc:#x}"), use_tcp, fps, live = source.is_live(), local_rtcp_port, "推流开始:已建立发送通道");
     // PSM stream_type 跟随源编码,并按源能力稳定声明音频 ES。
     let audio_codec = source.audio_codec();
     let audio_frame_duration = audio_codec.frame_duration_90k();

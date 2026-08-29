@@ -19,6 +19,12 @@ export interface RecvStats {
   level_pct: number;
   /** 距最近一次收包的毫秒数;尚未收到时为 null。 */
   idle_ms: number | null;
+  /** 到达间隔抖动,毫秒(RFC 3550 A.8,按 G.711 8 kHz 时钟换算)。 */
+  jitter_ms: number;
+  /** 设备已向平台回报的 RTCP RR 包数(设备是接收方,按 RFC 3550 应回报)。 */
+  rr_sent: number;
+  /** 是否收到过平台的 RTCP SR(收到才说明平台侧 RTCP 也通)。 */
+  peer_sr_seen: boolean;
 }
 
 /** 语音广播会话快照(对应 Rust 侧 BroadcastSnapshot)。 */

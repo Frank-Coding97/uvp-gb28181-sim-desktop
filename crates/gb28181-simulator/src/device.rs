@@ -325,6 +325,17 @@ pub struct DeviceSimulator {
     media_seq: AtomicU32,
     /// 平台经 DeviceConfig/BasicParam 改过的运行时参数(A.2.3.2.1)。
     runtime: parking_lot::Mutex<RuntimeParams>,
+    /// 待发送的目录变更缓冲(附录 N 的批量通知)。
+    ///
+    /// 附录 N:"被订阅域宜在累计一定数量(如 100)条目录变更或者一定时间间隔
+    /// (如 1 分钟)后,应将变更事件通知订阅域。" 逐条变更立刻发 NOTIFY 在批量
+    /// CRUD(比如换一次 16 通道模板)时会瞬间打出十几条 NOTIFY。
+    pending_catalog_changes: parking_lot::Mutex<PendingCatalogChanges>,
+    /// 对端(平台)在注册响应的 `X-GB-Ver` 里声明的协议版本(附录 I)。
+    ///
+    /// None = 平台没声明。附录 I 要求"协议版本更高一方应避免向对方发送不能识别的消息",
+    /// 所以这个值决定要不要发 2022 新增的通知(如 A.2.5.8 实时视音频回传通知)。
+    peer_version: parking_lot::Mutex<Option<common::GbVersion>>,
 }
 
 /// 从 `Contact` 头值里取出可连接的 `IP:端口`(302 重定向用)。
@@ -458,6 +469,81 @@ struct Subscription {
     stop_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+/// 附录 N 的批量通知条数阈值:累计这么多条变更就立刻通知。
+pub const CATALOG_NOTIFY_BATCH_ITEMS: usize = 100;
+/// 批量通知的去抖窗口:最后一条变更之后静默这么久就发出。
+///
+/// **有意偏离标准的示例值**:附录 N 举的例子是"一定时间间隔(如 1 分钟)",
+/// 那个量级对生产平台的目录同步是合适的,但本项目是**联调工具** ——
+/// 工程师在界面上改一个通道名,要能立刻在平台侧看到 NOTIFY,等一分钟没法排障。
+/// 去抖同样满足附录 N 的本意(避免大批量变更时逐条推送),只是窗口取秒级。
+pub const CATALOG_NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+/// 批量通知的硬上限:第一条待发变更之后最多攒这么久,与附录 N 的示例值一致。
+///
+/// 变更持续不断(去抖一直被重置)时靠它兜底,保证不会无限期攒着不发。
+pub const CATALOG_NOTIFY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 待发送的目录变更缓冲(附录 N)。
+#[derive(Debug, Default)]
+struct PendingCatalogChanges {
+    /// 已累计的变更项(按发生顺序;同一通道的后续变更会覆盖前一条)。
+    items: Vec<gb28181_protocol::manscdp::CatalogNotifyItem>,
+    /// 第一条待发变更的时刻,用于硬上限判定。
+    since: Option<std::time::Instant>,
+    /// 最后一条变更的时刻,用于去抖判定。
+    last: Option<std::time::Instant>,
+    /// 是否已安排了延迟发送任务,避免每条变更都 spawn 一个。
+    flush_scheduled: bool,
+}
+
+impl PendingCatalogChanges {
+    /// 合并新变更。同一 DeviceID 只保留最新一条 —— 平台关心的是终态,
+    /// 把"上线→下线→上线"三条都推过去只是噪声。
+    fn merge(&mut self, changes: Vec<gb28181_protocol::manscdp::CatalogNotifyItem>) {
+        for change in changes {
+            if let Some(slot) = self
+                .items
+                .iter_mut()
+                .find(|c| c.device_id == change.device_id)
+            {
+                *slot = change;
+            } else {
+                self.items.push(change);
+            }
+        }
+        if self.items.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.since.is_none() {
+            self.since = Some(now);
+        }
+        self.last = Some(now);
+    }
+
+    /// 是否到了该发的时候:攒够条数、去抖窗口已过、或已到硬上限。
+    fn should_flush(&self) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        self.items.len() >= CATALOG_NOTIFY_BATCH_ITEMS
+            || self
+                .last
+                .is_some_and(|t| t.elapsed() >= CATALOG_NOTIFY_DEBOUNCE)
+            || self
+                .since
+                .is_some_and(|t| t.elapsed() >= CATALOG_NOTIFY_MAX_DELAY)
+    }
+
+    /// 取走全部待发变更。
+    fn take(&mut self) -> Vec<gb28181_protocol::manscdp::CatalogNotifyItem> {
+        self.since = None;
+        self.last = None;
+        self.flush_scheduled = false;
+        std::mem::take(&mut self.items)
+    }
+}
+
 /// 平台可经 `DeviceConfig / BasicParam`(A.2.3.2.1)在运行中修改的参数。
 ///
 /// 之前这些字段只在配置里、命令来了只打一行日志就回 OK —— 平台以为改成功了,
@@ -511,7 +597,31 @@ struct BroadcastSession {
     _task: tokio::task::JoinHandle<()>,
 }
 
-/// 语音广播会话的对外快照(推给前端/日志)。
+/// 当前推流会话的媒体遥测快照(发送侧统计 + 平台 RTCP 反馈)。
+///
+/// 设备侧一直只能看到"我发了多少",看不到"平台收到了多少" ——
+/// 现场排"画面卡但设备说在发"这类问题时,平台回的 RTCP RR 才是关键证据。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaTelemetrySnapshot {
+    /// 会话是回放/下载(true)还是实时(false)。
+    pub is_history: bool,
+    /// 附录 K c) 的媒体源标识(平台带 Subject 时才有)。
+    pub media_source: Option<String>,
+    /// 本端 RTCP 端口;TCP 模式或未抢到 RTP+1 时为 None,此时收不到 RR。
+    pub local_rtcp_port: Option<u16>,
+    /// 已发送 RTP 包数。
+    pub sent_packets: u64,
+    /// 已发送字节数(含 RTP 头)。
+    pub sent_bytes: u64,
+    /// 已发送 RTCP SR 包数。
+    pub sent_rtcp: u64,
+    /// 本地发送失败次数。
+    pub send_errors: u64,
+    /// 平台回报的收流质量;从未收到 RR 时字段 `reports` 为 0。
+    pub feedback: media_rtp::RtcpFeedbackSnapshot,
+}
+
+/// 语音广播会话快照(给前端面板)。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BroadcastSnapshot {
     /// 语音流发送者 ID。
@@ -552,6 +662,8 @@ impl DeviceSimulator {
             broadcast: tokio::sync::Mutex::new(None),
             media_seq: AtomicU32::new(1),
             runtime: parking_lot::Mutex::new(runtime),
+            peer_version: parking_lot::Mutex::new(None),
+            pending_catalog_changes: parking_lot::Mutex::new(PendingCatalogChanges::default()),
         }
     }
 
@@ -582,6 +694,8 @@ impl DeviceSimulator {
             broadcast: tokio::sync::Mutex::new(None),
             media_seq: AtomicU32::new(1),
             runtime: parking_lot::Mutex::new(runtime),
+            peer_version: parking_lot::Mutex::new(None),
+            pending_catalog_changes: parking_lot::Mutex::new(PendingCatalogChanges::default()),
         }
     }
 
@@ -989,6 +1103,34 @@ impl DeviceSimulator {
         if previous != granted {
             tracing::info!(requested, granted, "平台授予注册有效期(续约周期以此为准)");
         }
+        // 附录 I:从注册响应的 X-GB-Ver 学到平台支持的协议版本。
+        let declared = resp.headers.get("X-GB-Ver");
+        let parsed = declared.and_then(common::GbVersion::from_x_gb_ver);
+        *self.peer_version.lock() = parsed;
+        match (declared, parsed) {
+            (Some(raw), Some(version)) => {
+                tracing::info!(x_gb_ver = %raw, peer = %version, "平台声明的协议版本")
+            }
+            (Some(raw), None) => {
+                tracing::warn!(x_gb_ver = %raw, "平台声明了无法识别的协议版本,按保守方式交互")
+            }
+            // 大量在网平台不发这个头,不值得每次注册都告警。
+            (None, _) => tracing::debug!("平台未声明 X-GB-Ver"),
+        }
+    }
+
+    /// 对端是否确定支持 GB/T 28181-2022 的新增消息(附录 I)。
+    ///
+    /// 平台没声明 `X-GB-Ver` 时返回 false:附录 I 要求高版本一方避免发对方不认识的消息,
+    /// "不知道"就该按不支持处理。本机自己配成 2016 时同样返回 false。
+    pub fn peer_supports_2022(&self) -> bool {
+        self.config.gb_version.is_2022()
+            && matches!(*self.peer_version.lock(), Some(common::GbVersion::V2022))
+    }
+
+    /// 平台声明的协议版本(附录 I);None 表示未声明或无法识别。
+    pub fn peer_protocol_version(&self) -> Option<common::GbVersion> {
+        *self.peer_version.lock()
     }
 
     /// 平台当前授予的注册有效期(秒)。未注册成功前为配置的请求值。
@@ -1287,6 +1429,15 @@ impl DeviceSimulator {
         local_host: &str,
         local_port: u16,
     ) -> Result<()> {
+        // A.2.5.8 是 2022 新增的通知。附录 I:协议版本更高的一方应避免向对方发送
+        // 不能识别的消息 —— 平台声明自己是 2016(或没声明)时就不该发过去。
+        if !self.peer_supports_2022() {
+            tracing::debug!(
+                peer = ?self.peer_protocol_version(),
+                "跳过实时视音频回传通知:对端未声明支持 GB/T 28181-2022"
+            );
+            return Ok(());
+        }
         let sn = self.next_cseq();
         let time = common::clock::synced_iso8601();
         let pos = Some(*self.position.lock());
@@ -1385,8 +1536,11 @@ impl DeviceSimulator {
     /// 计算当前目录相对上次快照的 diff(ADD/DEL/UPDATE/ON/OFF),若有变更且存在活跃目录订阅,
     /// 在订阅对话内发一条只含变更项的 Catalog NOTIFY,并刷新快照基线。无订阅/无变更时不发。
     /// CRUD(upsert_channel/remove_channel)或状态切换后调用。
-    pub async fn notify_catalog_changed(&self, transport: &Arc<dyn SipTransport>) -> Result<()> {
-        use gb28181_protocol::manscdp::{CatalogNotify, CatalogSnapshot};
+    pub async fn notify_catalog_changed(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+    ) -> Result<()> {
+        use gb28181_protocol::manscdp::CatalogSnapshot;
         let next = CatalogSnapshot::from_items(self.catalog_publishable());
         let changes = {
             let snap = self.catalog_snapshot.lock();
@@ -1398,13 +1552,67 @@ impl DeviceSimulator {
         // 刷新基线(无论有无订阅,快照都应跟上当前目录)。
         *self.catalog_snapshot.lock() = next;
 
+        // 附录 N:攒够 100 条或等满 1 分钟再通知。没到阈值就先缓冲,
+        // 由 `flush_catalog_changes`(CRUD 后与心跳节拍上各调一次)兜底发出。
+        let (ready, schedule) = {
+            let mut pending = self.pending_catalog_changes.lock();
+            pending.merge(changes);
+            let ready = pending.should_flush();
+            // 只在还没安排过延迟任务时安排一次。
+            let schedule = !ready && !pending.flush_scheduled;
+            if schedule {
+                pending.flush_scheduled = true;
+            }
+            (ready, schedule)
+        };
+        if ready {
+            return self.flush_catalog_changes(transport).await;
+        }
+        if schedule {
+            // 事件驱动而不是全局轮询:没有变更时零开销,压测万级设备也不会
+            // 因为一个"目录变更定时器"多出上万次无谓唤醒。
+            let dev = Arc::clone(self);
+            let tp = Arc::clone(transport);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(CATALOG_NOTIFY_DEBOUNCE).await;
+                    let ready = {
+                        let pending = dev.pending_catalog_changes.lock();
+                        if pending.items.is_empty() {
+                            return; // 已被别的路径发走
+                        }
+                        pending.should_flush()
+                    };
+                    if ready {
+                        if let Err(error) = dev.flush_catalog_changes(&tp).await {
+                            tracing::warn!(%error, "目录变更批量通知发送失败");
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// 把缓冲的目录变更立刻发出(附录 N 的批量通知落地)。
+    ///
+    /// 无目录订阅时只清空缓冲不发 —— 平台会在下次全量查询时同步。
+    pub async fn flush_catalog_changes(&self, transport: &Arc<dyn SipTransport>) -> Result<()> {
+        use gb28181_protocol::manscdp::CatalogNotify;
+        let changes = self.pending_catalog_changes.lock().take();
+        if changes.is_empty() {
+            return Ok(());
+        }
         let dialog = self.catalog_dialog.lock().await.clone();
         let Some((dialog, dst)) = dialog else {
             return Ok(()); // 无目录订阅,平台会在下次全量查询时同步
         };
+        let count = changes.len();
         let sn = self.next_cseq();
         let notify = CatalogNotify::new(self.config.device_id.as_str(), sn, changes);
         let xml = notify.to_xml()?;
+        tracing::info!(count, "目录变更批量通知(附录 N)");
         let cseq = self.next_cseq();
         let req = builder::notify_in_dialog(
             &self.config,
@@ -1834,10 +2042,13 @@ impl DeviceSimulator {
                             if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str) {
                                 let max_body = Self::max_body_for(transport.protocol());
                                 if let Ok(replies) = self.handle_query_replies(&query, max_body) {
-                                    for xml in &replies {
-                                        self.send_reply_message(transport, incoming_from, xml)
-                                            .await?;
-                                    }
+                                    // 附录 M:多条应答串行发送(收到上一条的响应再发下一条)。
+                                    self.send_reply_messages_serial(
+                                        transport,
+                                        incoming_from,
+                                        &replies,
+                                    )
+                                    .await?;
                                     // 平台命令时间线:上报语义摘要(查询类)。
                                     self.observer
                                         .on_event(common::DeviceEvent::PlatformCommand {
@@ -2213,50 +2424,239 @@ impl DeviceSimulator {
         }
     }
 
-    /// 构造目录应答条目(扁平通道或多通道目录树)。
+    /// 目录项列表(附录 A.2.1.9 + 附录 J)。
+    ///
+    /// 两条路径:配置里的扁平通道(单通道兼容)、或多通道目录树(FR-34)。
+    /// 必选字段一律补齐 —— 缺 `RegisterWay`/`Secrecy`/`Address` 这类必选元素时,
+    /// 严格校验 schema 的平台会拒收整条应答,现象是"平台一直同步不到目录"。
     fn catalog_items(&self) -> Vec<gb28181_protocol::manscdp::CatalogItem> {
-        use gb28181_protocol::manscdp::CatalogItem;
-        // GB-2022 输出新增字段(安全能力/IP/端口),GB-2016 置 None 不输出。
+        // 不带查询对象时等价于"按本设备编码查询"(附录 J b:整棵树)。
+        self.catalog_items_for(self.config.device_id.as_str())
+    }
+
+    /// 按**附录 J** 的返回范围规则生成目录项。
+    ///
+    /// `query_id` 是平台 `<Query>` 里的 `DeviceID`:可以是本设备编码(整树)、
+    /// 行政区域编码(前缀匹配)、业务分组/虚拟组织/通道编码(该节点及其后代)。
+    fn catalog_items_for(&self, query_id: &str) -> Vec<gb28181_protocol::manscdp::CatalogItem> {
+        use gb28181_protocol::id_codec::CatalogNodeType;
+        use gb28181_protocol::manscdp::{CatalogItem, CatalogItemInfo};
+
         let is_2022 = self.config.gb_version.is_2022();
+        let (longitude, latitude) = *self.position.lock();
+        let manufacturer = self.config.device_info.manufacturer.clone();
+        let model = self.config.device_info.model.clone();
+        let owner = self.runtime.lock().device_name.clone();
+        // Info 里的分辨率/编码格式按实际媒体能力填,不是随手编的常量。
+        let info_template = CatalogItemInfo::camera(
+            self.catalog_resolution_code(),
+            self.catalog_encode_type_code(),
+        );
+
+        /// 逐节点可覆写的目录项字段(界面上"目录项扩展"那一组)。
+        ///
+        /// 全为 None 时行为与之前完全一致:地址取默认、经纬度取设备位置、
+        /// Info 用按媒体能力推出的模板。
+        #[derive(Default)]
+        struct ItemOverrides<'a> {
+            address: Option<&'a str>,
+            longitude: Option<f64>,
+            latitude: Option<f64>,
+            ptz_type: Option<u8>,
+            capture_position_type: Option<&'a str>,
+        }
+
+        // 设备/通道项的公共装配:必选字段 + 版本差异字段 + Info。
+        let device_item = |id: &str,
+                           name: &str,
+                           parent: &str,
+                           status: &str,
+                           civil: Option<String>,
+                           parental: u8,
+                           with_info: bool,
+                           over: ItemOverrides<'_>| {
+            let mut item = CatalogItem::device(id, name, &manufacturer, &model, parent, status)
+                .with_civil_code(civil)
+                .with_parental(parental)
+                .with_position(
+                    over.longitude.unwrap_or(longitude),
+                    over.latitude.unwrap_or(latitude),
+                );
+            if let Some(address) = over.address.filter(|a| !a.is_empty()) {
+                item = item.with_address(address);
+            }
+            if is_2022 {
+                item = item.with_gb2022_fields("A");
+            } else {
+                // 2016 的 Owner 是必选;2022 已删除该字段。
+                item = item.with_gb2016_fields(&owner);
+            }
+            if with_info {
+                let mut info = if is_2022 {
+                    info_template.clone()
+                } else {
+                    info_template.to_gb2016()
+                };
+                if let Some(ptz) = over.ptz_type {
+                    info.ptz_type = Some(ptz);
+                }
+                // 采集部位类型是 2022 新增的 Info 字段,给 2016 平台发它没有意义。
+                if is_2022 {
+                    if let Some(code) = over
+                        .capture_position_type
+                        .filter(|c| gb28181_protocol::manscdp::capture_position::is_valid(c))
+                    {
+                        info.capture_position_type = Some(code.to_string());
+                    }
+                }
+                item = item.with_info(info);
+            }
+            item
+        };
+
         let tree = self.catalog_tree.lock();
         if tree.is_empty() {
-            // 扁平通道(单通道兼容路径)。
+            // 扁平通道(单通道兼容路径)。查的是本设备就给全部通道,
+            // 查具体通道就只给那一条(附录 J c)。
+            let root = self.config.device_id.as_str();
             self.config
                 .channels
                 .iter()
-                .map(|ch| CatalogItem {
-                    device_id: ch.channel_id.to_string(),
-                    name: ch.name.clone(),
-                    manufacturer: Some(self.config.device_info.manufacturer.clone()),
-                    model: Some(self.config.device_info.model.clone()),
-                    civil_code: None,
-                    parental: Some(0),
-                    parent_id: Some(self.config.device_id.to_string()),
-                    status: ch.status.clone(),
-                    security_level_code: is_2022.then(|| "A".to_string()),
-                    ip_address: None,
-                    port: None,
+                .filter(|ch| {
+                    query_id.is_empty() || query_id == root || query_id == ch.channel_id.as_str()
+                })
+                .map(|ch| {
+                    device_item(
+                        &ch.channel_id.to_string(),
+                        &ch.name,
+                        root,
+                        &ch.status,
+                        None,
+                        0,
+                        true,
+                        ItemOverrides::default(),
+                    )
                 })
                 .collect()
         } else {
-            // 多通道目录树(FR-34):根设备自引用节点不作为通道项。
-            tree.iter()
-                .filter(|n| n.id != n.parent_id)
-                .map(|n| CatalogItem {
-                    device_id: n.id.clone(),
-                    name: n.name.clone(),
-                    manufacturer: Some(self.config.device_info.manufacturer.clone()),
-                    model: Some(self.config.device_info.model.clone()),
-                    civil_code: n.civil_code.clone(),
-                    parental: Some(n.node_type.parental()),
-                    parent_id: Some(n.parent_id.clone()),
-                    status: n.status.clone(),
-                    security_level_code: is_2022.then(|| "A".to_string()),
-                    ip_address: None,
-                    port: None,
+            // 多通道目录树:按附录 J 的规则圈定返回范围。
+            let (scope, nodes) = gb28181_protocol::id_codec::catalog_query_scope(
+                &tree,
+                query_id,
+                self.config.device_id.as_str(),
+            );
+            if scope == gb28181_protocol::id_codec::CatalogQueryScope::Unknown {
+                tracing::warn!(
+                    query_id,
+                    "目录查询的对象不在本设备目录里,按附录 M 回 SumNum=0 空应答"
+                );
+            }
+            nodes
+                .into_iter()
+                .map(|n| match n.node_type {
+                    // 附录 J:行政区划/业务分组/虚拟组织等目录节点"各字段应按照示例固定填写",
+                    // 不带 Manufacturer/Model/Address 这些设备专属字段。
+                    CatalogNodeType::BusinessGroup => CatalogItem::folder(&n.id, &n.name)
+                        .with_civil_code(n.civil_code.clone())
+                        .with_parent(&n.parent_id),
+                    CatalogNodeType::VirtualOrg => {
+                        let mut item = CatalogItem::folder(&n.id, &n.name)
+                            .with_civil_code(n.civil_code.clone())
+                            .with_parent(&n.parent_id);
+                        // 虚拟组织要声明所属业务分组(2022 新增字段)。
+                        if is_2022 {
+                            if let Some(group) = self.business_group_of(&tree, &n.parent_id) {
+                                item.business_group_id = Some(group);
+                            }
+                        }
+                        item
+                    }
+                    _ => device_item(
+                        &n.id,
+                        &n.name,
+                        &n.parent_id,
+                        &n.status,
+                        n.civil_code.clone(),
+                        n.node_type.parental(),
+                        n.node_type == CatalogNodeType::VideoChannel,
+                        ItemOverrides {
+                            address: n.address.as_deref(),
+                            longitude: n.longitude,
+                            latitude: n.latitude,
+                            ptz_type: n.ptz_type,
+                            capture_position_type: n.capture_position_type.as_deref(),
+                        },
+                    ),
                 })
                 .collect()
         }
+    }
+
+    /// 目录项 Info 里的分辨率代码(附录 G `f=` 的分辨率取值)。
+    ///
+    /// 取当前实时源配置的分辨率;标准枚举里有的用枚举值,没有的按 `WxH` 表示。
+    fn catalog_resolution_code(&self) -> String {
+        let source = self.config.video_source.as_deref().unwrap_or("");
+        let profile = media_rtp::LiveSourceSpec::parse(source)
+            .ok()
+            .map(|spec| match spec {
+                media_rtp::LiveSourceSpec::Camera { profile, .. }
+                | media_rtp::LiveSourceSpec::Screen { profile, .. } => profile,
+            });
+        match profile {
+            Some(p) => match (p.width, p.height) {
+                (1280, 720) => "5".into(),  // 720P
+                (1920, 1080) => "6".into(), // 1080P/I
+                (352, 288) => "2".into(),   // CIF
+                (176, 144) => "1".into(),   // QCIF
+                (w, h) => format!("{w}x{h}"),
+            },
+            // 无实时源(文件/伪流)时不谎报具体分辨率,按最常见的 720P 声明能力。
+            None => "5".into(),
+        }
+    }
+
+    /// 目录项 Info 里的视频编码格式代码(附录 G `f=`:2-H.264、5-H.265)。
+    fn catalog_encode_type_code(&self) -> String {
+        let source = self.config.video_source.as_deref().unwrap_or("");
+        let is_h265 = media_rtp::LiveSourceSpec::parse(source)
+            .ok()
+            .map(|spec| match spec {
+                media_rtp::LiveSourceSpec::Camera { profile, .. }
+                | media_rtp::LiveSourceSpec::Screen { profile, .. } => {
+                    profile.codec == media_rtp::LiveVideoCodec::H265
+                }
+            })
+            .unwrap_or(false)
+            || source.ends_with(".h265")
+            || source.ends_with(".hevc");
+        if is_h265 {
+            "5".into()
+        } else {
+            "2".into()
+        }
+    }
+
+    /// 沿着父链找到虚拟组织所属的业务分组 ID(附录 J 的 `BusinessGroupID`)。
+    fn business_group_of(
+        &self,
+        tree: &[gb28181_protocol::id_codec::CatalogNode],
+        parent_id: &str,
+    ) -> Option<String> {
+        use gb28181_protocol::id_codec::CatalogNodeType;
+        let mut cursor = parent_id.to_string();
+        // 最多上溯树的深度次,避免配置成环时死循环。
+        for _ in 0..tree.len().max(1) {
+            let node = tree.iter().find(|n| n.id == cursor)?;
+            if node.node_type == CatalogNodeType::BusinessGroup {
+                return Some(node.id.clone());
+            }
+            if node.parent_id == node.id {
+                return None;
+            }
+            cursor = node.parent_id.clone();
+        }
+        None
     }
 
     /// 处理 Query,返回**一条或多条**应答 XML。
@@ -2291,7 +2691,8 @@ impl DeviceSimulator {
         max_body: usize,
     ) -> Result<Vec<String>> {
         use gb28181_protocol::manscdp::CatalogResponse;
-        let items = self.catalog_items();
+        // 附录 J:返回范围取决于被查询对象,不是一律整棵树。
+        let items = self.catalog_items_for(&query.device_id);
         let single = CatalogResponse::new(&query.device_id, query.sn, items.clone()).to_xml()?;
         if single.len() <= max_body || items.is_empty() {
             return Ok(vec![single]);
@@ -3051,6 +3452,29 @@ impl DeviceSimulator {
         })
     }
 
+    /// 当前推流会话的媒体遥测快照(发送统计 + 平台 RTCP 反馈)。
+    ///
+    /// 无活跃推流会话时返回 None;会话刚建立、发送通道还没就绪时也返回 None。
+    pub async fn media_telemetry(&self) -> Option<MediaTelemetrySnapshot> {
+        let guard = self.session.lock().await;
+        let session = guard.as_ref()?;
+        let telemetry = session.control.telemetry()?;
+        let (sent_packets, sent_bytes, sent_rtcp, send_errors) = telemetry.stats.full_snapshot();
+        Some(MediaTelemetrySnapshot {
+            is_history: session.is_history,
+            media_source: session.media_source.clone(),
+            local_rtcp_port: telemetry.local_rtcp_port,
+            sent_packets,
+            sent_bytes,
+            sent_rtcp,
+            send_errors,
+            // age 的原点必须是发送通道建立时刻(与 RtcpFeedback 内部同一刻度)。
+            feedback: telemetry
+                .feedback
+                .snapshot(telemetry.clock_hz, telemetry.elapsed_ms()),
+        })
+    }
+
     /// 设备侧主动挂断语音广播(界面上的"挂断"按钮)。
     ///
     /// 会按附录 K a) 发会话内 BYE 通知平台释放链路。返回是否确实挂断了一路会话。
@@ -3207,6 +3631,7 @@ impl DeviceSimulator {
     }
 
     /// 向平台发送一条应答/通知 MESSAGE(查询应答、控制应答、位置通知等复用)。
+    /// 不等响应 —— 单条应答不值得为它开一条独立 Call-ID 去等 200。
     async fn send_reply_message(
         &self,
         transport: &Arc<dyn SipTransport>,
@@ -3226,6 +3651,56 @@ impl DeviceSimulator {
         transport
             .send_to(&sip_core::SipMessage::Request(reply), to)
             .await
+    }
+
+    /// **串行**发送多条应答 MESSAGE(GB/T 28181-2022 附录 M)。
+    ///
+    /// 标准原文:"多条响应、通知消息发送时宜采用串行发送方式,记录发送方需收到上一条
+    /// SIP Message/Notify 消息的 SIP 响应后再进行后续发送处理。"
+    ///
+    /// 为什么这条要求是有意义的:UDP 下一次性把十几条目录应答喷出去,平台侧的接收
+    /// 缓冲很容易溢出,现象是"目录时多时少"。等上一条的 200 再发下一条,相当于用
+    /// 应答做流控。
+    ///
+    /// 单条应答不值得为它开一条独立 Call-ID 去等响应,直接发。
+    async fn send_reply_messages_serial(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        to: SocketAddr,
+        replies: &[String],
+    ) -> Result<()> {
+        if replies.len() <= 1 {
+            if let Some(xml) = replies.first() {
+                self.send_reply_message(transport, to, xml).await?;
+            }
+            return Ok(());
+        }
+        let (host, port) = (self.local_host(), self.local_port());
+        for (index, xml) in replies.iter().enumerate() {
+            // 用等响应的发送路径:它每条用独立 Call-ID,事务结束即注销路由。
+            match self.send_message_xml(transport, &host, port, xml).await {
+                Ok(status) => {
+                    if !(200..300).contains(&status) {
+                        tracing::warn!(
+                            index,
+                            total = replies.len(),
+                            status,
+                            "多响应传输:平台对某条应答回了非 2xx,继续发后续分片"
+                        );
+                    }
+                }
+                Err(error) => {
+                    // 平台不回 200 时不能就此放弃剩余分片:目录残缺比慢更糟。
+                    tracing::warn!(
+                        index,
+                        total = replies.len(),
+                        %error,
+                        "多响应传输:等上一条应答的响应失败,继续发后续分片"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 处理 INVITE:解析平台 SDP,启动推流,回 200 OK(带本端 SDP)。
@@ -4052,6 +4527,91 @@ mod tests {
     use super::*;
     use sip_core::{Headers, Method, Request, Response, SipMessage, UdpTransport};
 
+    fn change(id: &str, event: &str, status: &str) -> gb28181_protocol::manscdp::CatalogNotifyItem {
+        gb28181_protocol::manscdp::CatalogNotifyItem {
+            device_id: id.into(),
+            name: format!("Ch-{id}"),
+            event: event.into(),
+            status: status.into(),
+        }
+    }
+
+    #[test]
+    fn 附录n_同一通道的变更只保留最新一条() {
+        let mut pending = PendingCatalogChanges::default();
+        pending.merge(vec![change("1", "ADD", "ON")]);
+        pending.merge(vec![change("1", "OFF", "OFF")]);
+        pending.merge(vec![change("1", "ON", "ON")]);
+        assert_eq!(
+            pending.items.len(),
+            1,
+            "上线→下线→上线三条推给平台只是噪声,平台关心终态"
+        );
+        assert_eq!(pending.items[0].event, "ON");
+        // 不同通道各占一条,且保持发生顺序。
+        pending.merge(vec![change("2", "ADD", "ON"), change("3", "ADD", "ON")]);
+        let ids: Vec<&str> = pending.items.iter().map(|c| c.device_id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn 附录n_攒够条数立刻发出() {
+        let mut pending = PendingCatalogChanges::default();
+        // 空缓冲永远不发。
+        assert!(!pending.should_flush());
+        let batch: Vec<_> = (0..CATALOG_NOTIFY_BATCH_ITEMS - 1)
+            .map(|i| change(&i.to_string(), "ADD", "ON"))
+            .collect();
+        pending.merge(batch);
+        assert!(
+            !pending.should_flush(),
+            "差一条到阈值,且去抖窗口未过,应继续攒"
+        );
+        pending.merge(vec![change("999", "ADD", "ON")]);
+        assert_eq!(pending.items.len(), CATALOG_NOTIFY_BATCH_ITEMS);
+        assert!(pending.should_flush(), "到 100 条就该立刻通知");
+    }
+
+    #[test]
+    fn 附录n_去抖窗口过后发出并清空() {
+        let mut pending = PendingCatalogChanges::default();
+        pending.merge(vec![change("1", "UPDATE", "ON")]);
+        assert!(!pending.should_flush());
+        // 把"最后一条变更"的时刻往前拨到去抖窗口之外。
+        pending.last = Some(std::time::Instant::now() - CATALOG_NOTIFY_DEBOUNCE);
+        assert!(pending.should_flush());
+        let taken = pending.take();
+        assert_eq!(taken.len(), 1);
+        assert!(pending.items.is_empty());
+        assert!(pending.since.is_none() && pending.last.is_none());
+        assert!(
+            !pending.flush_scheduled,
+            "取走后要允许下一批变更重新安排延迟任务"
+        );
+        assert!(!pending.should_flush());
+    }
+
+    #[test]
+    fn 附录n_变更不断时靠硬上限兜底() {
+        let mut pending = PendingCatalogChanges::default();
+        pending.merge(vec![change("1", "ADD", "ON")]);
+        // 模拟"变更持续不断":第一条已等满上限,但去抖一直被最新变更重置。
+        pending.since = Some(std::time::Instant::now() - CATALOG_NOTIFY_MAX_DELAY);
+        pending.last = Some(std::time::Instant::now());
+        assert!(pending.items.len() < CATALOG_NOTIFY_BATCH_ITEMS);
+        assert!(pending.should_flush(), "去抖被反复重置也不能无限期攒着不发");
+    }
+
+    #[test]
+    fn 附录n_硬上限与附录n示例值一致() {
+        assert_eq!(CATALOG_NOTIFY_BATCH_ITEMS, 100);
+        assert_eq!(CATALOG_NOTIFY_MAX_DELAY, std::time::Duration::from_secs(60));
+        assert!(
+            CATALOG_NOTIFY_DEBOUNCE < CATALOG_NOTIFY_MAX_DELAY,
+            "去抖窗口必须小于硬上限,否则上限永远先到"
+        );
+    }
+
     fn test_cfg(host: &str, port: u16) -> DeviceConfig {
         DeviceConfig {
             device_id: DeviceId::new("34020000001320000001").unwrap(),
@@ -4335,6 +4895,106 @@ mod tests {
         assert!(
             !xml16.contains("SecurityLevelCode"),
             "2016 不应含 2022 新增字段"
+        );
+    }
+
+    #[test]
+    fn 目录项逐通道扩展字段生效() {
+        use gb28181_protocol::id_codec::{CatalogNode, CatalogNodeType};
+        use gb28181_protocol::manscdp::Query;
+
+        let query = Query {
+            cmd_type: "Catalog".into(),
+            sn: 1,
+            device_id: "34020000001320000001".into(),
+            ..Default::default()
+        };
+        let mut cfg = test_cfg("127.0.0.1", 5060);
+        cfg.gb_version = common::GbVersion::V2022;
+        let sim = DeviceSimulator::new(cfg);
+        let root = "34020000001320000001";
+        // 两路通道:一路填满扩展字段,一路完全不填(验证默认路径没被破坏)。
+        let mut custom = CatalogNode::new(
+            "34020000001320000011",
+            CatalogNodeType::VideoChannel,
+            "东门枪机",
+            root,
+        );
+        custom.address = Some("上海市浦东新区世纪大道 1 号东门".into());
+        custom.longitude = Some(121.500_123);
+        custom.latitude = Some(31.239_456);
+        custom.ptz_type = Some(3);
+        custom.capture_position_type =
+            Some(gb28181_protocol::manscdp::capture_position::CITY_ROAD.into());
+        sim.set_catalog_tree(vec![
+            CatalogNode::new(root, CatalogNodeType::Device, "本设备", root),
+            custom,
+            CatalogNode::new(
+                "34020000001320000012",
+                CatalogNodeType::VideoChannel,
+                "默认通道",
+                root,
+            ),
+        ]);
+
+        let xml = sim.handle_query(&query).unwrap();
+        assert!(
+            xml.contains("<Address>上海市浦东新区世纪大道 1 号东门</Address>"),
+            "逐通道安装地址应出现在目录项里,实际:{xml}"
+        );
+        assert!(xml.contains("121.500123"), "逐通道经度应生效");
+        assert!(xml.contains("31.239456"), "逐通道纬度应生效");
+        assert!(
+            xml.contains("<PTZType>3</PTZType>"),
+            "逐通道摄像机类型应生效"
+        );
+        assert!(
+            xml.contains("<CapturePositionType>0020100</CapturePositionType>"),
+            "附录 O 采集部位类型应生效"
+        );
+        // 没填扩展字段的那一路仍要有必选 Address(取设备级默认),不能变成空元素。
+        assert!(
+            !xml.contains("<Address></Address>") && !xml.contains("<Address/>"),
+            "留空不该产出空 Address 元素"
+        );
+    }
+
+    #[test]
+    fn 目录项采集部位类型仅2022输出() {
+        use gb28181_protocol::id_codec::{CatalogNode, CatalogNodeType};
+        use gb28181_protocol::manscdp::Query;
+
+        let query = Query {
+            cmd_type: "Catalog".into(),
+            sn: 1,
+            device_id: "34020000001320000001".into(),
+            ..Default::default()
+        };
+        let root = "34020000001320000001";
+        let mut node = CatalogNode::new(
+            "34020000001320000011",
+            CatalogNodeType::VideoChannel,
+            "枪机",
+            root,
+        );
+        node.capture_position_type = Some("0020100".into());
+        node.ptz_type = Some(1);
+
+        let mut cfg = test_cfg("127.0.0.1", 5060);
+        cfg.gb_version = common::GbVersion::V2016;
+        let sim = DeviceSimulator::new(cfg);
+        sim.set_catalog_tree(vec![
+            CatalogNode::new(root, CatalogNodeType::Device, "本设备", root),
+            node,
+        ]);
+        let xml = sim.handle_query(&query).unwrap();
+        assert!(
+            !xml.contains("CapturePositionType"),
+            "CapturePositionType 是 2022 新增字段,发给 2016 平台只会让它报解析错误"
+        );
+        assert!(
+            xml.contains("<PTZType>1</PTZType>"),
+            "PTZType 两版都有,应照常输出"
         );
     }
 

@@ -139,6 +139,9 @@ pub fn register(
     headers.append("Max-Forwards", "70");
     headers.append("Expires", expires.to_string());
     headers.append("User-Agent", "UVP-GB28181-Sim");
+    // 附录 I:注册及其响应消息头部应带 X-GB-Ver 声明支持的协议版本,
+    // 双方据此避免向对方发送不能识别的消息。
+    headers.append("X-GB-Ver", cfg.gb_version.x_gb_ver());
     if let Some(auth) = authorization {
         headers.append("Authorization", auth.to_string());
     }
@@ -508,7 +511,19 @@ mod tests {
         assert!(text.contains("branch=z9hG4bK"));
         assert!(text.contains("Expires: 3600"));
         assert!(text.contains("CSeq: 1 REGISTER"));
+        // 附录 I:注册消息头部应带 X-GB-Ver。cfg() 是 2022 版 → 3.0。
+        assert!(text.contains("X-GB-Ver: 3.0"), "缺 X-GB-Ver:{text}");
         assert!(!text.contains("Authorization"));
+    }
+
+    #[test]
+    fn register_的版本标识跟随配置() {
+        let ids = DialogIds::new();
+        let mut c = cfg();
+        c.gb_version = common::GbVersion::V2016;
+        let req = register(&c, &ids, 1, "5.6.7.8", 5070, None, 3600, Transport::Udp);
+        let text = String::from_utf8(req.to_bytes()).unwrap();
+        assert!(text.contains("X-GB-Ver: 2.0"), "2016 应声明 2.0:{text}");
     }
 
     #[test]

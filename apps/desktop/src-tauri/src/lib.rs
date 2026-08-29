@@ -1111,6 +1111,21 @@ async fn get_broadcast_status(
     }
 }
 
+/// 当前推流会话的媒体遥测(发送统计 + 平台回的 RTCP 接收报告)。
+///
+/// 无推流会话、或会话刚建立发送通道还没就绪时返回 null。
+/// 同样走轮询:RTCP RR 每 5 秒才来一条,但发送包数是每帧在变。
+#[tauri::command]
+async fn get_media_telemetry(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<gb28181_simulator::MediaTelemetrySnapshot>, String> {
+    let guard = state.device.lock().await;
+    match &*guard {
+        Some(h) => Ok(h.sim.media_telemetry().await),
+        None => Ok(None),
+    }
+}
+
 /// 设备侧主动挂断语音广播(按附录 K a) 发会话内 BYE)。
 #[tauri::command]
 async fn hangup_broadcast(state: tauri::State<'_, AppState>) -> Result<String, String> {
@@ -1191,6 +1206,24 @@ struct ChannelNodeDto {
     civil_code: Option<String>,
     #[serde(default = "default_on")]
     status: String,
+    // ── 以下是 A.2.1.9 的逐通道可选字段(留空即用设备级默认值)──
+    /// 安装地址(`Address`)。一台 NVR 下各路摄像机装在不同位置,
+    /// 全报同一个地址会让平台的地图与清单失去意义。
+    #[serde(default)]
+    address: Option<String>,
+    /// 经度(`Longitude`)。留空取设备当前位置。
+    #[serde(default)]
+    longitude: Option<f64>,
+    /// 纬度(`Latitude`)。留空取设备当前位置。
+    #[serde(default)]
+    latitude: Option<f64>,
+    /// 摄像机类型(`Info/PTZType`):1 球机 / 2 半球 / 3 固定枪机 / 4 遥控枪机。
+    /// 平台按它决定是否给这一路显示云台面板。
+    #[serde(default)]
+    ptz_type: Option<u8>,
+    /// 采集部位类型(`Info/CapturePositionType`,附录 O 的 7 位层次码)。
+    #[serde(default)]
+    capture_position_type: Option<String>,
 }
 
 fn default_on() -> String {
@@ -1253,6 +1286,50 @@ fn validate_channel_node(
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty());
     node.status = status;
+
+    // 逐通道扩展字段:空串等于"不填",不能写成 Some("")——
+    // 那会让目录项里出现一个空的 <Address/>,平台侧显示成空白而不是默认值。
+    node.address = dto
+        .address
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+    if let Some(lon) = dto.longitude {
+        if !(-180.0..=180.0).contains(&lon) {
+            return Err("经度必须在 -180..=180 之间".into());
+        }
+    }
+    if let Some(lat) = dto.latitude {
+        if !(-90.0..=90.0).contains(&lat) {
+            return Err("纬度必须在 -90..=90 之间".into());
+        }
+    }
+    // 经纬度要么都填要么都不填:只填一个会让平台把另一半当 0 度,
+    // 于是这一路通道被钉在几内亚湾。
+    match (dto.longitude, dto.latitude) {
+        (Some(lon), Some(lat)) => {
+            node.longitude = Some(lon);
+            node.latitude = Some(lat);
+        }
+        (None, None) => {}
+        _ => return Err("经度与纬度必须同时填写或同时留空".into()),
+    }
+    if let Some(ptz) = dto.ptz_type {
+        if !(1..=4).contains(&ptz) {
+            return Err("摄像机类型只能是 1(球机)/2(半球)/3(固定枪机)/4(遥控枪机)".into());
+        }
+        node.ptz_type = Some(ptz);
+    }
+    if let Some(code) = dto.capture_position_type.as_deref() {
+        let code = code.trim();
+        if !code.is_empty() {
+            if !gb28181_protocol::manscdp::capture_position::is_valid(code) {
+                return Err(
+                    "采集部位类型必须是附录 O 的 7 位数字层次码,如 0020100(城市道路)".into(),
+                );
+            }
+            node.capture_position_type = Some(code.to_string());
+        }
+    }
     Ok(node)
 }
 
@@ -1276,6 +1353,11 @@ impl From<&gb28181_protocol::id_codec::CatalogNode> for ChannelNodeDto {
             parent_id: n.parent_id.clone(),
             civil_code: n.civil_code.clone(),
             status: n.status.clone(),
+            address: n.address.clone(),
+            longitude: n.longitude,
+            latitude: n.latitude,
+            ptz_type: n.ptz_type,
+            capture_position_type: n.capture_position_type.clone(),
         }
     }
 }
@@ -1470,6 +1552,7 @@ pub fn run() {
             fire_alarm,
             fire_position,
             get_broadcast_status,
+            get_media_telemetry,
             hangup_broadcast,
             set_sip_trace,
             get_stress_status,

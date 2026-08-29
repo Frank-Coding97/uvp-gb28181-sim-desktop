@@ -105,6 +105,58 @@ pub fn build_rtcp_sr(
     b
 }
 
+/// 尝试绑定一对相邻端口:RTP 用 `p`,RTCP 用 `p+1`(RFC 3550 §11 的惯例)。
+///
+/// `local` 里端口写 0 时由内核挑,于是 `p+1` 可能已被占用 —— 那就整对重来,
+/// 试满 [`RTP_PAIR_ATTEMPTS`] 次仍不成就只返回 RTP socket:**收不到 RR 也
+/// 不能因此推不了流**,媒体通道本身比反馈统计重要得多。
+///
+/// `local` 指定了非 0 端口时不做重试(调用方明确要那个端口),
+/// `p+1` 占用就退化成无 RTCP 接收。
+async fn bind_rtp_pair(local: &str) -> Result<(UdpSocket, Option<Arc<UdpSocket>>)> {
+    let fixed_port = local
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .is_some_and(|p| p != 0);
+    let host = local.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0");
+    let attempts = if fixed_port { 1 } else { RTP_PAIR_ATTEMPTS };
+    let mut last_rtp = None;
+    for _ in 0..attempts {
+        let rtp = UdpSocket::bind(local).await.map_err(Error::Io)?;
+        let port = rtp.local_addr().map_err(Error::Io)?.port();
+        // 端口 65535 没有 +1 可用。
+        if let Some(next) = port.checked_add(1) {
+            if let Ok(rtcp) = UdpSocket::bind(format!("{host}:{next}")).await {
+                return Ok((rtp, Some(Arc::new(rtcp))));
+            }
+        }
+        last_rtp = Some(rtp);
+    }
+    let rtp = match last_rtp {
+        Some(sock) => sock,
+        None => UdpSocket::bind(local).await.map_err(Error::Io)?,
+    };
+    tracing::debug!(
+        port = rtp.local_addr().ok().map(|a| a.port()),
+        "未能绑定 RTP 端口 +1,本次会话只发 RTCP SR 不收 RR"
+    );
+    Ok((rtp, None))
+}
+
+/// 抢相邻端口对的重试次数。8 次足够:单次冲突概率本身就低,
+/// 连续 8 次都撞上说明本机端口紧张,这时退化成无 RR 比一直重试更合理。
+const RTP_PAIR_ATTEMPTS: usize = 8;
+
+fn udp_channel(socket: UdpSocket, rtcp_socket: Option<Arc<UdpSocket>>, dst: SocketAddr) -> Channel {
+    Channel::Udp {
+        socket,
+        dst,
+        rtcp_dst: SocketAddr::new(dst.ip(), dst.port().saturating_add(1)),
+        rtcp_socket,
+    }
+}
+
 /// 发送通道:UDP 数据报,或 TCP(RFC 4571,每包前置 2 字节大端长度)。
 enum Channel {
     Udp {
@@ -112,9 +164,16 @@ enum Channel {
         dst: SocketAddr,
         /// RTCP 目标端口(惯例为 RTP 端口 + 1)。
         rtcp_dst: SocketAddr,
+        /// 本端 RTCP socket(绑在本端 RTP 端口 +1),既用于发 SR 也用于收 RR。
+        ///
+        /// 之前 SR 是从 RTP socket 发出去的,源端口等于 RTP 端口 —— 严格实现的
+        /// 平台会按 RFC 3550 期望 RTCP 来自 RTP 端口 +1,更要紧的是平台的 RR
+        /// 会回到那个端口而我们没在听。为 None 表示端口对没抢到,退化成只发不收。
+        rtcp_socket: Option<Arc<UdpSocket>>,
     },
     Tcp {
-        stream: TcpStream,
+        /// 只留写端:读端交给后台任务收 RTCP(RFC 4571 下 RTP/RTCP 共用一条连接)。
+        writer: tokio::net::tcp::OwnedWriteHalf,
     },
 }
 
@@ -133,6 +192,21 @@ pub struct RtpSender {
     /// 本次会话起始的 RTP 时间戳偏移(随机初值,RFC 3550 §5.1)。
     ts_offset: u32,
     stats: Arc<SendStats>,
+    /// 平台回报的收流质量(RTCP RR)。
+    feedback: Arc<crate::rtcp::RtcpFeedback>,
+    /// 后台 RTCP 收报任务。随发送器一同销毁(见 `Drop`),
+    /// 否则会话结束后任务还抱着 socket 不放。
+    rtcp_reader: Option<tokio::task::JoinHandle<()>>,
+    /// 会话起点,用于把"最近一次报告"记成相对毫秒(免去每次取系统时间)。
+    started: std::time::Instant,
+}
+
+impl Drop for RtpSender {
+    fn drop(&mut self) {
+        if let Some(task) = self.rtcp_reader.take() {
+            task.abort();
+        }
+    }
 }
 
 impl RtpSender {
@@ -147,6 +221,72 @@ impl RtpSender {
             buf: Vec::with_capacity(1500),
             ts_offset: rand::random(),
             stats: Arc::new(SendStats::default()),
+            feedback: Arc::new(crate::rtcp::RtcpFeedback::default()),
+            rtcp_reader: None,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// 构造后立刻拉起 RTCP 收报任务(UDP 用独立 socket,TCP 复用同一条连接的读端)。
+    fn with_rtcp_reader(mut self, tcp_reader: Option<tokio::net::tcp::OwnedReadHalf>) -> Self {
+        let feedback = Arc::clone(&self.feedback);
+        let started = self.started;
+        let task = match (&self.channel, tcp_reader) {
+            (Channel::Udp { rtcp_socket, .. }, _) => rtcp_socket.as_ref().map(|sock| {
+                let sock = Arc::clone(sock);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1500];
+                    loop {
+                        match sock.recv_from(&mut buf).await {
+                            Ok((n, from)) => {
+                                Self::ingest_rtcp(&feedback, &buf[..n], started, Some(from));
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "RTCP 收报 socket 出错,停止收报");
+                                return;
+                            }
+                        }
+                    }
+                })
+            }),
+            (Channel::Tcp { .. }, Some(mut reader)) => Some(tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut len = [0u8; 2];
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    // RFC 4571:2 字节大端长度 + 包体。这条连接上本端只发不收 RTP,
+                    // 所以收到的帧要么是 RTCP,要么是平台实现有问题。
+                    if reader.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let n = usize::from(u16::from_be_bytes(len));
+                    if n > buf.len() {
+                        buf.resize(n, 0);
+                    }
+                    if reader.read_exact(&mut buf[..n]).await.is_err() {
+                        return;
+                    }
+                    if crate::rtcp::looks_like_rtcp(&buf[..n]) {
+                        Self::ingest_rtcp(&feedback, &buf[..n], started, None);
+                    }
+                }
+            })),
+            (Channel::Tcp { .. }, None) => None,
+        };
+        self.rtcp_reader = task;
+        self
+    }
+
+    fn ingest_rtcp(
+        feedback: &crate::rtcp::RtcpFeedback,
+        datagram: &[u8],
+        started: std::time::Instant,
+        from: Option<SocketAddr>,
+    ) {
+        let now_mid = crate::rtcp::ntp_mid32();
+        let elapsed = started.elapsed().as_millis() as u64;
+        if feedback.ingest(datagram, now_mid, elapsed) {
+            tracing::trace!(?from, bytes = datagram.len(), "收到 RTCP 反馈");
         }
     }
 
@@ -157,16 +297,8 @@ impl RtpSender {
 
     /// UDP 模式,指定本地绑定地址(便于把真实端口回填进 SDP)。
     pub async fn new_bound(local: &str, dst: SocketAddr, ssrc: u32) -> Result<Self> {
-        let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
-        let rtcp_dst = SocketAddr::new(dst.ip(), dst.port().saturating_add(1));
-        Ok(Self::make(
-            Channel::Udp {
-                socket,
-                dst,
-                rtcp_dst,
-            },
-            ssrc,
-        ))
+        let (socket, rtcp_socket) = bind_rtp_pair(local).await?;
+        Ok(Self::make(udp_channel(socket, rtcp_socket, dst), ssrc).with_rtcp_reader(None))
     }
 
     /// TCP-ACTIVE 模式:主动连接平台(WVP 的 TCP-PASSIVE 监听端),RFC 4571 分帧。
@@ -177,7 +309,7 @@ impl RtpSender {
         })?;
         tracing::info!(%dst, "TCP-ACTIVE 已连接平台收流端口");
         stream.set_nodelay(true).ok();
-        Ok(Self::make(Channel::Tcp { stream }, ssrc))
+        Ok(Self::from_tcp(stream, ssrc))
     }
 
     /// TCP-PASSIVE 模式:本端监听,等平台来连(平台 SDP 声明 `a=setup:active` 时需要)。
@@ -187,20 +319,48 @@ impl RtpSender {
         let (stream, peer) = listener.accept().await.map_err(Error::Io)?;
         tracing::info!(%peer, "TCP-PASSIVE 平台已连入设备收流端口");
         stream.set_nodelay(true).ok();
-        Ok(Self::make(Channel::Tcp { stream }, ssrc))
+        Ok(Self::from_tcp(stream, ssrc))
+    }
+
+    /// 由一条已建立的 TCP 连接构造发送器:读端交给 RTCP 收报任务。
+    fn from_tcp(stream: TcpStream, ssrc: u32) -> Self {
+        let (reader, writer) = stream.into_split();
+        Self::make(Channel::Tcp { writer }, ssrc).with_rtcp_reader(Some(reader))
     }
 
     /// 本端实际绑定地址(UDP 模式)。用于把真实 RTP 端口写进 SDP 的 `m=` 行。
     pub fn local_addr(&self) -> Option<SocketAddr> {
         match &self.channel {
             Channel::Udp { socket, .. } => socket.local_addr().ok(),
-            Channel::Tcp { stream } => stream.local_addr().ok(),
+            Channel::Tcp { writer } => writer.local_addr().ok(),
         }
     }
 
     /// 共享的发送统计句柄。
     pub fn stats(&self) -> Arc<SendStats> {
         self.stats.clone()
+    }
+
+    /// 共享的 RTCP 反馈句柄(平台回报的丢包/抖动/RTT)。
+    pub fn feedback(&self) -> Arc<crate::rtcp::RtcpFeedback> {
+        Arc::clone(&self.feedback)
+    }
+
+    /// 发送通道建立时刻(RTCP 反馈的"最近报告时间"以此为原点)。
+    pub fn started(&self) -> std::time::Instant {
+        self.started
+    }
+
+    /// 本端 RTCP 端口。为 None 表示没抢到 RTP 端口 +1,此时只发 SR 不收 RR。
+    pub fn local_rtcp_port(&self) -> Option<u16> {
+        match &self.channel {
+            Channel::Udp { rtcp_socket, .. } => rtcp_socket
+                .as_ref()
+                .and_then(|s| s.local_addr().ok())
+                .map(|a| a.port()),
+            // TCP 下 RTCP 与 RTP 共用连接,没有独立端口。
+            Channel::Tcp { .. } => None,
+        }
     }
 
     /// 发送一条 RTCP Sender Report,携带当前发送包数/字节数。
@@ -219,13 +379,21 @@ impl RtpSender {
         );
         let result = match &mut self.channel {
             Channel::Udp {
-                socket, rtcp_dst, ..
-            } => socket.send_to(&sr, *rtcp_dst).await.map(|_| ()),
-            Channel::Tcp { stream } => {
+                socket,
+                rtcp_dst,
+                rtcp_socket,
+                ..
+            } => match rtcp_socket {
+                // 有专用 RTCP socket 就用它发:源端口 = 本端 RTP 端口 +1,
+                // 平台按 RFC 3550 的期望回 RR 时才能落回我们在听的那个端口。
+                Some(sock) => sock.send_to(&sr, *rtcp_dst).await.map(|_| ()),
+                None => socket.send_to(&sr, *rtcp_dst).await.map(|_| ()),
+            },
+            Channel::Tcp { writer } => {
                 let mut framed = [0u8; 30];
                 framed[0..2].copy_from_slice(&(sr.len() as u16).to_be_bytes());
                 framed[2..].copy_from_slice(&sr);
-                stream.write_all(&framed).await
+                writer.write_all(&framed).await
             }
         };
         match result {
@@ -267,7 +435,7 @@ impl RtpSender {
 
         let sent = match &mut self.channel {
             Channel::Udp { socket, dst, .. } => socket.send_to(&self.buf, *dst).await.map(|_| ()),
-            Channel::Tcp { stream } => stream.write_all(&self.buf).await,
+            Channel::Tcp { writer } => writer.write_all(&self.buf).await,
         };
         if let Err(e) = sent {
             self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
@@ -326,7 +494,14 @@ impl RtpSender {
 /// 而实际连接/收流要等 200 之后再做(TCP-PASSIVE 下平台是收到 200 才来连的)。
 pub enum PreparedMedia {
     /// UDP:socket 已绑定,端口已确定。
-    Udp { socket: UdpSocket, dst: SocketAddr },
+    Udp {
+        /// 已绑定的 RTP socket。
+        socket: UdpSocket,
+        /// 平台收流地址。
+        dst: SocketAddr,
+        /// 已绑定的本端 RTCP socket(RTP 端口 +1);抢不到时为 None。
+        rtcp_socket: Option<Arc<UdpSocket>>,
+    },
     /// TCP-ACTIVE:本端 socket 已绑定(端口已确定),稍后主动连平台。
     TcpActive {
         socket: tokio::net::TcpSocket,
@@ -340,8 +515,12 @@ impl PreparedMedia {
     /// 绑定本端媒体端口。`tcp`=是否 RTP over TCP;`passive`=本端是否被动等连。
     pub async fn prepare(dst: SocketAddr, tcp: bool, passive: bool) -> Result<Self> {
         if !tcp {
-            let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(Error::Io)?;
-            return Ok(PreparedMedia::Udp { socket, dst });
+            let (socket, rtcp_socket) = bind_rtp_pair("0.0.0.0:0").await?;
+            return Ok(PreparedMedia::Udp {
+                socket,
+                dst,
+                rtcp_socket,
+            });
         }
         if passive {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
@@ -374,16 +553,13 @@ impl PreparedMedia {
     /// 完成连接/接受,得到可用的发送器。
     pub async fn into_sender(self, ssrc: u32) -> Result<RtpSender> {
         match self {
-            PreparedMedia::Udp { socket, dst } => {
-                let rtcp_dst = SocketAddr::new(dst.ip(), dst.port().saturating_add(1));
-                Ok(RtpSender::make(
-                    Channel::Udp {
-                        socket,
-                        dst,
-                        rtcp_dst,
-                    },
-                    ssrc,
-                ))
+            PreparedMedia::Udp {
+                socket,
+                dst,
+                rtcp_socket,
+            } => {
+                Ok(RtpSender::make(udp_channel(socket, rtcp_socket, dst), ssrc)
+                    .with_rtcp_reader(None))
             }
             PreparedMedia::TcpActive { socket, dst } => {
                 let stream = socket.connect(dst).await.map_err(|e| {
@@ -392,7 +568,7 @@ impl PreparedMedia {
                 })?;
                 tracing::info!(%dst, "TCP-ACTIVE 已连接平台收流端口");
                 stream.set_nodelay(true).ok();
-                Ok(RtpSender::make(Channel::Tcp { stream }, ssrc))
+                Ok(RtpSender::from_tcp(stream, ssrc))
             }
             PreparedMedia::TcpPassive { listener } => RtpSender::accept_tcp(listener, ssrc).await,
         }
@@ -426,6 +602,139 @@ mod tests {
         assert_eq!(&pkt[4..8], &[0xde, 0xad, 0xbe, 0xef]); // timestamp
         assert_eq!(&pkt[8..12], &[0xca, 0xfe, 0xba, 0xbe]); // ssrc
         assert_eq!(&pkt[12..], &[1, 2, 3]); // payload
+    }
+
+    #[tokio::test]
+    async fn udp_下绑定相邻端口对且sr从rtcp端口发出() {
+        // 扮演平台:RTP 收流端口 + RTCP 端口(RTP+1)。
+        let plat_rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let plat_rtp_port = plat_rtp.local_addr().unwrap().port();
+        let plat_rtcp = UdpSocket::bind(format!("127.0.0.1:{}", plat_rtp_port + 1))
+            .await
+            .expect("测试环境应能绑到 +1 端口");
+        let dst: SocketAddr = format!("127.0.0.1:{plat_rtp_port}").parse().unwrap();
+
+        let mut sender = RtpSender::new_bound("127.0.0.1:0", dst, 0x1234)
+            .await
+            .unwrap();
+        let rtp_port = sender.local_addr().unwrap().port();
+        assert_eq!(
+            sender.local_rtcp_port(),
+            Some(rtp_port + 1),
+            "RTCP 应绑在 RTP 端口 +1"
+        );
+
+        sender.send_rtcp_sr(0).await.unwrap();
+        let mut buf = [0u8; 256];
+        let (n, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plat_rtcp.recv_from(&mut buf),
+        )
+        .await
+        .expect("应在 2s 内收到 SR")
+        .unwrap();
+        assert!(crate::rtcp::looks_like_rtcp(&buf[..n]));
+        assert_eq!(
+            from.port(),
+            rtp_port + 1,
+            "SR 的源端口应是本端 RTCP 端口,平台才知道把 RR 回到哪"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_下收到平台rr后反馈可见() {
+        let plat = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = plat.local_addr().unwrap();
+        let sender = RtpSender::new_bound("127.0.0.1:0", dst, 0x0BEB_C201)
+            .await
+            .unwrap();
+        let feedback = sender.feedback();
+        let rtcp_port = sender.local_rtcp_port().expect("应拿到 RTCP 端口");
+        assert!(!feedback.has_feedback());
+
+        // 平台回一份 RR:10% 丢包、90kHz 下 15ms 抖动。
+        let report = crate::rtcp::ReceptionReport {
+            ssrc: 0x0BEB_C201,
+            fraction_lost: 26,
+            cumulative_lost: 42,
+            extended_highest_seq: 1000,
+            jitter: 1350,
+            last_sr: 0,
+            delay_since_last_sr: 0,
+        };
+        plat.send_to(
+            &crate::rtcp::build_rtcp_rr(0xABCD, &report),
+            format!("127.0.0.1:{rtcp_port}"),
+        )
+        .await
+        .unwrap();
+
+        // 收报是后台任务,给它一点时间。
+        for _ in 0..100 {
+            if feedback.has_feedback() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let snap = feedback.snapshot(CLOCK_HZ, 0);
+        assert_eq!(snap.reports, 1, "应收到并计入一份接收报告");
+        assert_eq!(snap.cumulative_lost, 42);
+        assert!((snap.loss_percent - 26.0 * 100.0 / 256.0).abs() < 1e-9);
+        assert!((snap.jitter_ms - 15.0).abs() < 1e-9);
+        assert_eq!(snap.reporter_ssrc, 0xABCD);
+
+        // 发送器销毁后收报任务应随之结束,不再抱着 socket。
+        drop(sender);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            UdpSocket::bind(format!("127.0.0.1:{rtcp_port}"))
+                .await
+                .is_ok(),
+            "RTCP 端口应已释放"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_下从同一连接收rr() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let sender = RtpSender::new_tcp(dst, 0x0BEB_C201).await.unwrap();
+        let feedback = sender.feedback();
+        let mut plat = accept.await.unwrap();
+        assert_eq!(
+            sender.local_rtcp_port(),
+            None,
+            "TCP 下 RTCP 与 RTP 共用连接,没有独立端口"
+        );
+
+        let report = crate::rtcp::ReceptionReport {
+            ssrc: 0x0BEB_C201,
+            fraction_lost: 128,
+            cumulative_lost: -2,
+            extended_highest_seq: 77,
+            jitter: 90,
+            last_sr: 0,
+            delay_since_last_sr: 0,
+        };
+        let rr = crate::rtcp::build_rtcp_rr(0x5555, &report);
+        // RFC 4571 分帧。
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(rr.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&rr);
+        plat.write_all(&framed).await.unwrap();
+
+        for _ in 0..100 {
+            if feedback.has_feedback() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let snap = feedback.snapshot(CLOCK_HZ, 0);
+        assert_eq!(snap.reports, 1);
+        assert_eq!(snap.cumulative_lost, -2);
+        assert_eq!(snap.reporter_ssrc, 0x5555);
+        assert!((snap.jitter_ms - 1.0).abs() < 1e-9);
     }
 
     #[test]

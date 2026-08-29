@@ -43,11 +43,34 @@ impl GbVersion {
         matches!(self, GbVersion::V2022)
     }
 
-    /// 协议版本标识字符串(附录 I,用于 SIP/XML 标注)。
+    /// 协议版本标识字符串(用于日志与界面展示)。
     pub fn tag(&self) -> &'static str {
         match self {
             GbVersion::V2016 => "GB/T 28181-2016",
             GbVersion::V2022 => "GB/T 28181-2022",
+        }
+    }
+
+    /// **附录 I 表 I.1** 的协议版本号,用于 SIP 注册消息的 `X-GB-Ver` 扩展头。
+    ///
+    /// 1.0=2011、1.1=2011 修改补充、2.0=2016、3.0=2022。
+    pub fn x_gb_ver(&self) -> &'static str {
+        match self {
+            GbVersion::V2016 => "2.0",
+            GbVersion::V2022 => "3.0",
+        }
+    }
+
+    /// 解析对端在 `X-GB-Ver` 里声明的版本号(附录 I 表 I.1)。
+    ///
+    /// 1.0 / 1.1(2011 及其补充)与 2.0 一并视为"2016 及更早",因为对它们都不能发
+    /// 2022 新增的消息。无法识别的取值返回 None —— 宁可当作"未知"按保守方式交互,
+    /// 也不要猜成高版本然后发过去一堆对方不认识的消息。
+    pub fn from_x_gb_ver(value: &str) -> Option<Self> {
+        match value.trim() {
+            "3.0" => Some(GbVersion::V2022),
+            "1.0" | "1.1" | "2.0" => Some(GbVersion::V2016),
+            _ => None,
         }
     }
 }
@@ -120,6 +143,24 @@ impl fmt::Display for DeviceId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 协议版本标识按附录i表i1() {
+        // 表 I.1:1.0=2011、1.1=2011 补充、2.0=2016、3.0=2022。
+        assert_eq!(GbVersion::V2016.x_gb_ver(), "2.0");
+        assert_eq!(GbVersion::V2022.x_gb_ver(), "3.0");
+        assert_eq!(GbVersion::from_x_gb_ver("3.0"), Some(GbVersion::V2022));
+        assert_eq!(GbVersion::from_x_gb_ver("2.0"), Some(GbVersion::V2016));
+        // 2011 及其补充都不能收 2022 新增消息,归到"2016 及更早"。
+        assert_eq!(GbVersion::from_x_gb_ver("1.0"), Some(GbVersion::V2016));
+        assert_eq!(GbVersion::from_x_gb_ver("1.1"), Some(GbVersion::V2016));
+        // 前后空白容错(SIP 头值常带空格)。
+        assert_eq!(GbVersion::from_x_gb_ver(" 3.0 "), Some(GbVersion::V2022));
+        // 无法识别时返回 None,由调用方按保守方式处理,而不是猜成高版本。
+        assert_eq!(GbVersion::from_x_gb_ver("4.0"), None);
+        assert_eq!(GbVersion::from_x_gb_ver(""), None);
+        assert_eq!(GbVersion::from_x_gb_ver("GB/T 28181-2022"), None);
+    }
 
     #[test]
     fn 合法_id_通过校验() {

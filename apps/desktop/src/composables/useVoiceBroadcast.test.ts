@@ -44,6 +44,9 @@ function session(overrides: Partial<BroadcastSession["recv"]> = {}): BroadcastSe
       payload_type: 8,
       level_pct: 40,
       idle_ms: 20,
+      jitter_ms: 1.5,
+      rr_sent: 2,
+      peer_sr_seen: true,
       ...overrides,
     },
   };

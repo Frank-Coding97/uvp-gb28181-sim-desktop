@@ -2,10 +2,10 @@
 // 多通道目录管理页(FR-34):模板选择 + 目录树 CRUD。
 // 通道操作需设备已在「单设备联调」页启动。
 // (OSD 是平台→设备的配置命令,展示在单设备页"OSD 设置(平台下发)",不在此页。)
-import { ref, onMounted, onActivated } from "vue";
+import { computed, ref, onMounted, onActivated } from "vue";
 import {
   NButton, NSpace, NSelect, NDataTable, NModal, NForm, NFormItem, NInput,
-  NTag, useDialog, useMessage, type DataTableColumns,
+  NInputNumber, NTag, useDialog, useMessage, type DataTableColumns,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -19,7 +19,42 @@ interface ChannelNode {
   parent_id: string;
   civil_code?: string | null;
   status: string;
+  // ── A.2.1.9 的逐通道可选字段(留空即用设备级默认值)──
+  /** 安装地址(Address)。 */
+  address?: string | null;
+  /** 经度(Longitude)。与纬度必须同时填写。 */
+  longitude?: number | null;
+  /** 纬度(Latitude)。 */
+  latitude?: number | null;
+  /** 摄像机类型(Info/PTZType):1 球机 / 2 半球 / 3 固定枪机 / 4 遥控枪机。 */
+  ptz_type?: number | null;
+  /** 采集部位类型(Info/CapturePositionType,附录 O 的 7 位层次码)。 */
+  capture_position_type?: string | null;
 }
+
+/** Info/PTZType 取值(A.2.1.9)。平台按它决定要不要显示云台面板。 */
+const ptzTypeOptions = [
+  { label: "1 · 球机", value: 1 },
+  { label: "2 · 半球", value: 2 },
+  { label: "3 · 固定枪机", value: 3 },
+  { label: "4 · 遥控枪机", value: 4 },
+];
+
+/**
+ * 采集部位类型常用取值(附录 O 表 O.1)。
+ *
+ * 只列常用几项 + 允许手填:表 O.1 会随行业规定扩充,把整张表钉进界面
+ * 反而会挡住合法的新代码。后端只校验"7 位数字且大类/中类不为全 0"。
+ */
+const capturePositionOptions = [
+  { label: "0010300 · 商业服务露天广场", value: "0010300" },
+  { label: "0020100 · 城市主要路段/路口/立交桥", value: "0020100" },
+  { label: "0030100 · 高速公路出入口/卡口/检查站", value: "0030100" },
+  { label: "0040100 · 大型桥梁主要通行区域", value: "0040100" },
+];
+
+/** 只有视频通道才有 Info 块(PTZType/采集部位类型),分组类节点没有。 */
+const isVideoChannel = computed(() => editing.value.node_type === "VideoChannel");
 
 const templateOptions = [
   { label: "单设备(1 视频 + 1 报警)", value: "single" },
@@ -66,7 +101,10 @@ const editing = ref<ChannelNode>(blankNode());
 const isNew = ref(true);
 
 function blankNode(): ChannelNode {
-  return { id: "", node_type: "VideoChannel", name: "", parent_id: "", civil_code: null, status: "ON" };
+  return {
+    id: "", node_type: "VideoChannel", name: "", parent_id: "", civil_code: null, status: "ON",
+    address: null, longitude: null, latitude: null, ptz_type: null, capture_position_type: null,
+  };
 }
 
 function openAdd() {
@@ -87,6 +125,13 @@ function openEdit(row: ChannelNode) {
 async function saveNode() {
   if (!editing.value.id || !editing.value.name) {
     message.warning("通道 ID 与名称必填");
+    return;
+  }
+  // 只填一个会让平台把另一半当 0 度,这一路通道就被钉在几内亚湾。
+  const hasLon = editing.value.longitude !== null && editing.value.longitude !== undefined;
+  const hasLat = editing.value.latitude !== null && editing.value.latitude !== undefined;
+  if (hasLon !== hasLat) {
+    message.warning("经度与纬度必须同时填写或同时留空");
     return;
   }
   try {
@@ -139,6 +184,22 @@ const columns: DataTableColumns<ChannelNode> = [
     render: (r) => h("span", { style: "font-family:monospace;font-size:12px;color:var(--text-tertiary);white-space:nowrap" }, r.parent_id),
   },
   { title: "区划码", key: "civil_code", width: 84, render: (r) => r.civil_code ?? "—" },
+  {
+    // 一眼看出哪些通道填了 A.2.1.9 的扩展字段,不用逐个点开编辑。
+    title: "扩展", key: "extended", width: 108,
+    render: (r) => {
+      const tags: string[] = [];
+      if (r.address) tags.push("地址");
+      if (r.longitude !== null && r.longitude !== undefined) tags.push("坐标");
+      if (r.ptz_type) tags.push(`PTZ${r.ptz_type}`);
+      if (r.capture_position_type) tags.push("部位");
+      if (tags.length === 0) return h("span", { style: "color:var(--text-tertiary)" }, "—");
+      return h(NSpace, { size: 2 }, {
+        default: () => tags.map((t) =>
+          h(NTag, { size: "tiny", bordered: false, type: "info" }, { default: () => t })),
+      });
+    },
+  },
   {
     title: "状态", key: "status", width: 72,
     render: (r) => h(NTag, { size: "small", type: r.status === "ON" ? "success" : "error", bordered: false }, { default: () => (r.status === "ON" ? "在线" : "离线") }),
@@ -210,6 +271,47 @@ onActivated(refresh);
         <n-form-item label="行政区划码(可选)">
           <n-input v-model:value="editing.civil_code" placeholder="如 310115" />
         </n-form-item>
+
+        <div class="ext-head">
+          <span class="ext-title">目录项扩展字段(A.2.1.9)</span>
+          <span class="ext-hint">留空即用设备级默认值</span>
+        </div>
+
+        <n-form-item label="安装地址 Address">
+          <n-input v-model:value="editing.address" placeholder="如 上海市浦东新区世纪大道 1 号东门" />
+        </n-form-item>
+        <n-form-item label="经纬度 Longitude / Latitude">
+          <n-space :size="6" style="width: 100%">
+            <n-input-number
+              v-model:value="editing.longitude"
+              placeholder="经度"
+              :precision="6" :min="-180" :max="180" style="width: 148px"
+            />
+            <n-input-number
+              v-model:value="editing.latitude"
+              placeholder="纬度"
+              :precision="6" :min="-90" :max="90" style="width: 148px"
+            />
+          </n-space>
+        </n-form-item>
+        <template v-if="isVideoChannel">
+          <n-form-item label="摄像机类型 Info/PTZType">
+            <n-select
+              v-model:value="editing.ptz_type"
+              :options="ptzTypeOptions"
+              clearable
+              placeholder="未指定(用设备默认)"
+            />
+          </n-form-item>
+          <n-form-item label="采集部位类型 Info/CapturePositionType(附录 O)">
+            <n-select
+              v-model:value="editing.capture_position_type"
+              :options="capturePositionOptions"
+              clearable filterable tag
+              placeholder="选择或直接填 7 位层次码"
+            />
+          </n-form-item>
+        </template>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -227,6 +329,15 @@ onActivated(refresh);
 .label { color: var(--text-secondary); font-size: 11.5px; }
 .empty { color: var(--text-tertiary); font-size: 11.5px; margin-top: 8px; text-align: center; padding: 14px; }
 .chan-summary { font-size: 11px; color: var(--text-tertiary); margin-left: auto; }
+
+/* 弹窗里把"必填基本信息"与"A.2.1.9 扩展字段"用一条分隔线分开 */
+.ext-head {
+  display: flex; align-items: baseline; gap: 6px;
+  margin: 4px 0 10px; padding-top: 10px;
+  border-top: 1px solid var(--border-default);
+}
+.ext-title { font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
+.ext-hint { font-size: 10.5px; color: var(--text-tertiary); }
 
 /* 表格半透明质感:去掉 naive-ui 默认白底,融入磨砂卡片 */
 :deep(.n-data-table),
