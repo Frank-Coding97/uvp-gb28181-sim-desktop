@@ -1254,6 +1254,7 @@ dependencies = [
  "media-rtp",
  "parking_lot",
  "rand",
+ "serde",
  "sip-core",
  "tokio",
  "tracing",
@@ -2172,6 +2173,7 @@ dependencies = [
  "openh264",
  "rand",
  "screencapturekit",
+ "serde",
  "tokio",
  "tracing",
 ]

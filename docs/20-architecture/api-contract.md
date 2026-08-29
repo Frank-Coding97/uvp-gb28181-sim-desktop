@@ -44,10 +44,32 @@
 | `get_device_status` | — | `{ running: bool }` | 查设备运行态(页面切换后与引擎对账) | ✅ |
 | `fire_alarm` | `{ description: string }` | `string` | 主动上报一条报警 | ✅ |
 | `fire_position` | `{ longitude: number, latitude: number }` | `string` | 主动上报一条 GPS 位置 | ✅ |
+| `get_broadcast_status` | — | `BroadcastSnapshot \| null` | 查当前语音广播会话(§9.12.1)。**设备未启动或无会话返回 `null` 而不是报错** —— 界面就该显示"空闲" | ✅ |
+| `hangup_broadcast` | — | `string` | 设备侧主动挂断语音广播,按附录 K a) 发会话内 BYE | ✅ |
 
 > 当前设备状态**只经 `device_state` 事件**推送(见 §3),没有同名查询命令。
+>
+> 广播状态反过来**只经命令轮询**(前端 500 ms 一次),不推事件:收流统计每 20 ms 变一次,
+> 推成事件等于给 webview 灌洪水。会话的建立/结束本身有 `platform_command` 事件。
 
-`DeviceCfg` JSON 字段:`server_host`/`server_port`/`server_domain`/`device_id`/`password`/`transport`("UDP"/"TCP")/`gb_version`("2016"/"2022")/`channel_name`/`video_source`(可空,C 档文件路径)。
+`DeviceCfg` JSON 字段:`server_host`/`server_port`/`server_domain`/`device_id`/`profile_id`/`transport`("UDP"/"TCP")/`gb_version`("2016"/"2022")/`channel_name`/`video_source`(可空,C 档文件路径或 `live:` URI)/`video_fps`(1–120,默认 25)。
+
+`BroadcastSnapshot` JSON 字段:
+
+```jsonc
+{
+  "source_id": "34020000002000000001",  // 语音流发送者 ID
+  "local_port": 41234,                  // 本端收流端口
+  "call_id": "…",                       // 会话 Call-ID
+  "recv": {
+    "packets": 250, "payload_bytes": 40000,
+    "lost": 0, "reordered": 0, "malformed": 0,
+    "payload_type": 8,                  // 8=PCMA、0=PCMU;尚未收到为 null
+    "level_pct": 37,                    // 音量百分比(G.711 解码后的峰值)
+    "idle_ms": 20                       // 距上次收包毫秒数;尚未收到为 null
+  }
+}
+```
 
 命令失败统一返回错误对象 `{ code: string, message: string }`(code 对应 `common::Error` 变体)。
 

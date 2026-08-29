@@ -27,6 +27,8 @@ pub struct PlaybackControl {
     /// 待处理的拖动(seek)请求:千分比位置+1(0=无请求,1=0‰,1001=1000‰=末尾)。
     /// 平台经 INFO PLAY Range 下发,推流循环消费后清零。回放拖动(§9.8)用。
     seek_permille_plus1: AtomicU32,
+    /// 待处理的强制关键帧请求(A.2.3.1.7 IFrameCmd)。推流循环消费后清零。
+    keyframe_requested: AtomicBool,
 }
 
 impl Default for PlaybackControl {
@@ -35,6 +37,7 @@ impl Default for PlaybackControl {
             speed_milli: AtomicU32::new(1000),
             paused: AtomicBool::new(false),
             seek_permille_plus1: AtomicU32::new(0),
+            keyframe_requested: AtomicBool::new(false),
         }
     }
 }
@@ -83,6 +86,20 @@ impl PlaybackControl {
     pub fn take_seek(&self) -> Option<u32> {
         let v = self.seek_permille_plus1.swap(0, Ordering::Relaxed);
         (v > 0).then(|| v - 1)
+    }
+
+    /// 请求下一帧强制为关键帧(GB/T 28181-2022 A.2.3.1.7 的 IFrameCmd)。
+    ///
+    /// 平台调这个命令是为了**立刻拿到一个能起解的画面**(新客户端接流、花屏恢复)。
+    /// 能不能真兑现取决于源:实时编码源可以让编码器立刻出 IDR;
+    /// 文件循环源只能等自带的周期 IDR(硬标关键帧会产出坏流)。
+    pub fn request_keyframe(&self) {
+        self.keyframe_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// 取出并清除待处理的强制关键帧请求。
+    pub fn take_keyframe_request(&self) -> bool {
+        self.keyframe_requested.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -210,6 +227,12 @@ pub async fn push_stream_prepared(
                 // 处理待定拖动请求(§9.8 回放 Range 定位):跳转源游标到目标位置。
                 if let Some(permille) = control.take_seek() {
                     source.seek(permille);
+                }
+                // 处理强制关键帧请求(A.2.3.1.7 IFrameCmd)。
+                // 只有实时编码源能兑现;文件源如实返回 false,上层据此如实上报。
+                if control.take_keyframe_request() {
+                    let honored = source.request_keyframe();
+                    tracing::info!(honored, "推流:收到强制关键帧请求");
                 }
                 if control.is_paused() {
                     continue; // 暂停中,不取帧。
@@ -423,6 +446,20 @@ mod tests {
     }
 
     #[test]
+    fn 强制关键帧_请求消费一次() {
+        let c = PlaybackControl::new();
+        assert!(!c.take_keyframe_request(), "无请求时应为 false");
+        c.request_keyframe();
+        assert!(c.take_keyframe_request(), "应取到一次请求");
+        assert!(!c.take_keyframe_request(), "取过之后应被清除");
+        // 连续多次请求合并成一次:平台连点 IFrameCmd 不该攒出一串 IDR。
+        c.request_keyframe();
+        c.request_keyframe();
+        assert!(c.take_keyframe_request());
+        assert!(!c.take_keyframe_request());
+    }
+
+    #[test]
     fn 回放拖动_seek请求消费一次() {
         let c = PlaybackControl::new();
         assert_eq!(c.take_seek(), None); // 无请求
@@ -471,5 +508,230 @@ mod tests {
 
         let _ = tx_stop.send(());
         let _ = handle.await;
+    }
+}
+
+/// G.711 的 RTP 时钟频率(Hz)。附录 C.2.4:8 kHz、单声道。
+pub const AUDIO_CLOCK_HZ: u32 = 8_000;
+/// 一个 20 ms 的 G.711 访问单元字节数(8000 Hz × 0.02 s × 1 字节)。
+pub const G711_PACKET_BYTES_20MS: usize = 160;
+/// A-law 的静音码字。设备没有音频输入时用它把通道撑起来 ——
+/// 一个没接麦克风的 IPC 在对讲上行方向本来就是这个行为。
+const ALAW_SILENCE: u8 = 0xD5;
+
+/// 纯音频上行推流(语音对讲的设备→平台方向,§9.12.2 a) + 附录 C.2.4)。
+///
+/// 与 [`push_stream_prepared`] 的关键区别:**不做 PS 封装**。附录 C.2.4 规定语音比特流
+/// 直接用 RTP 打包(PT=8 / PCMA / 8 kHz / 单声道),一个 RTP 包装整数个音频编码帧、
+/// 时长 20~180 ms。把音频塞进 PS 再发是视音频复合流的做法,纯音频会话这么做对端解不出。
+///
+/// 音频来源:优先取 `source` 的音频轨(与复合流同一条解析路径);源无音频时发 A-law 静音,
+/// 保证对讲通道能建起来 —— 但会在返回的统计里如实反映"发的是静音"。
+pub async fn push_audio_stream(
+    prepared: crate::rtp::PreparedMedia,
+    mut source: Option<Box<dyn VideoSource>>,
+    dst: SocketAddr,
+    ssrc: u32,
+    stop: impl Future<Output = ()>,
+) -> Result<AudioPushSummary> {
+    let mut sender = prepared.into_sender(ssrc).await?;
+    // 附录 C.2.4 a):G.711 A 律的负载类型固定 8。
+    sender.set_payload_type(crate::receiver::PT_PCMA);
+    let has_audio_source = source.as_ref().is_some_and(|s| s.has_audio());
+    tracing::info!(
+        %dst, ssrc = format!("{ssrc:#x}"), has_audio_source,
+        "音频上行推流开始(裸 G.711A / PT=8)"
+    );
+
+    let silence = vec![ALAW_SILENCE; G711_PACKET_BYTES_20MS];
+    let mut queue: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+    let mut timestamp: u32 = 0;
+    let mut summary = AudioPushSummary::default();
+    // 首包置 marker(RFC 3551 §4.1 的 talkspurt 起始)。
+    let mut first = true;
+
+    // 20 ms 绝对 deadline:与视频推流同样的理由 —— 用"上次 deadline + 20ms"而不是
+    // "干完活再睡 20ms",否则每拍的处理耗时会累积成时钟漂移。
+    let period = std::time::Duration::from_millis(20);
+    let mut deadline = tokio::time::Instant::now() + period;
+    let stop = std::pin::pin!(stop);
+    let mut stop = stop;
+
+    loop {
+        tokio::select! {
+            _ = &mut stop => break,
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+        deadline += period;
+
+        if queue.is_empty() {
+            if let Some(src) = source.as_mut() {
+                // 音频轨与视频帧同一条解复用路径:必须推进视频游标才能拿到下一窗音频。
+                let _ = src.next_frame();
+                for au in src.next_audio() {
+                    if !au.is_empty() {
+                        queue.push_back(au);
+                    }
+                }
+                if let Some(error) = src.take_error() {
+                    tracing::warn!(%error, "音频上行:采集后端报错,结束会话");
+                    summary.source_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let au = match queue.pop_front() {
+            Some(au) => {
+                summary.captured_packets += 1;
+                au
+            }
+            None => {
+                summary.silence_packets += 1;
+                silence.clone()
+            }
+        };
+        if let Err(error) = sender.send_audio(&au, timestamp, first).await {
+            tracing::warn!(%error, "音频上行发送失败,结束会话");
+            summary.source_error = Some(error.to_string());
+            break;
+        }
+        first = false;
+        summary.bytes += au.len() as u64;
+        // 时间戳按**采样数**递增(8 kHz 下 20 ms = 160),不是按 90 kHz 视频时钟。
+        timestamp = timestamp.wrapping_add(au.len() as u32);
+    }
+
+    tracing::info!(
+        captured = summary.captured_packets,
+        silence = summary.silence_packets,
+        bytes = summary.bytes,
+        "音频上行推流结束"
+    );
+    Ok(summary)
+}
+
+/// 音频上行推流的结果汇总。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioPushSummary {
+    /// 真实采集到的音频包数。
+    pub captured_packets: u64,
+    /// 填充静音的包数(源无音频或供不上时)。
+    pub silence_packets: u64,
+    /// 发出的音频负载字节数。
+    pub bytes: u64,
+    /// 提前结束的原因(采集后端错误 / 发送失败);正常停止为 None。
+    pub source_error: Option<String>,
+}
+
+impl AudioPushSummary {
+    /// 是否**全程只发了静音**(即"通道通了但没有真实音源")。
+    pub fn silence_only(&self) -> bool {
+        self.captured_packets == 0 && self.silence_packets > 0
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+    use crate::rtp::PreparedMedia;
+    use tokio::net::UdpSocket;
+
+    /// 只提供音频、不提供视频帧的测试源(模拟"对讲只要音频")。
+    struct AudioOnlySource {
+        au: Vec<u8>,
+        left: usize,
+    }
+
+    impl VideoSource for AudioOnlySource {
+        fn next_frame(&mut self) -> Option<crate::source::Frame> {
+            None
+        }
+        fn next_audio(&mut self) -> Vec<Vec<u8>> {
+            if self.left == 0 {
+                return Vec::new();
+            }
+            self.left -= 1;
+            vec![self.au.clone()]
+        }
+        fn has_audio(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn 纯音频上行_按pt8发裸g711并按采样数递增时间戳() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.expect("bind rx");
+        let dst = rx.local_addr().expect("addr");
+        let prepared = PreparedMedia::prepare(dst, false, false)
+            .await
+            .expect("prepare");
+        let source = Box::new(AudioOnlySource {
+            au: vec![0xAA; G711_PACKET_BYTES_20MS],
+            left: 3,
+        });
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            push_audio_stream(prepared, Some(source), dst, 0x1234, async {
+                let _ = stop_rx.await;
+            })
+            .await
+        });
+
+        let mut buf = [0u8; 512];
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv(&mut buf))
+                .await
+                .expect("应在 2s 内收到音频包")
+                .expect("recv");
+            seen.push(buf[..n].to_vec());
+        }
+        let _ = stop_tx.send(());
+        let summary = task.await.expect("join").expect("push");
+
+        // 每包 = 12 字节 RTP 头 + 160 字节 G.711。
+        for pkt in &seen {
+            assert_eq!(pkt.len(), 12 + G711_PACKET_BYTES_20MS);
+            assert_eq!(pkt[1] & 0x7F, crate::receiver::PT_PCMA, "负载类型应为 8");
+        }
+        // 首包 marker=1,后续 0(RFC 3551 §4.1)。
+        assert_eq!(seen[0][1] & 0x80, 0x80, "首包应置 marker");
+        assert_eq!(seen[1][1] & 0x80, 0x00, "后续包不应置 marker");
+        // 时间戳按 160 采样递增。
+        let ts = |p: &Vec<u8>| u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+        assert_eq!(
+            ts(&seen[1]).wrapping_sub(ts(&seen[0])),
+            G711_PACKET_BYTES_20MS as u32
+        );
+        assert!(summary.captured_packets >= 3, "应发出真实采集的音频包");
+    }
+
+    #[tokio::test]
+    async fn 无音频源时发静音并如实标记() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.expect("bind rx");
+        let dst = rx.local_addr().expect("addr");
+        let prepared = PreparedMedia::prepare(dst, false, false)
+            .await
+            .expect("prepare");
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            push_audio_stream(prepared, None, dst, 1, async {
+                let _ = stop_rx.await;
+            })
+            .await
+        });
+        let mut buf = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv(&mut buf))
+            .await
+            .expect("应收到静音包")
+            .expect("recv");
+        assert_eq!(n, 12 + G711_PACKET_BYTES_20MS);
+        assert!(
+            buf[12..n].iter().all(|&b| b == ALAW_SILENCE),
+            "无音源时负载应为 A-law 静音码字"
+        );
+        let _ = stop_tx.send(());
+        let summary = task.await.expect("join").expect("push");
+        assert!(summary.silence_only(), "应如实反映全程只发了静音");
     }
 }

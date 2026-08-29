@@ -319,6 +319,12 @@ pub struct DeviceSimulator {
     /// 少了这层会出现一个很具体的现场故障:平台 200 OK 丢包后重传 INVITE,
     /// 设备因"已有会话"回 486 Busy Here,点播直接失败。
     server_txns: sip_core::ServerTransactions,
+    /// 当前语音广播会话(§9.12.1)。设备是主叫,同一时刻只维持一路。
+    broadcast: tokio::sync::Mutex<Option<BroadcastSession>>,
+    /// 广播/对讲媒体流序列号计数器(附录 L 的"媒体流序列号")。
+    media_seq: AtomicU32,
+    /// 平台经 DeviceConfig/BasicParam 改过的运行时参数(A.2.3.2.1)。
+    runtime: parking_lot::Mutex<RuntimeParams>,
 }
 
 /// 从 `Contact` 头值里取出可连接的 `IP:端口`(302 重定向用)。
@@ -428,6 +434,11 @@ struct PushSession {
     control: Arc<media_rtp::PlaybackControl>,
     /// 是否为回放/下载会话(s=Playback/Download):结束时发 MediaStatus 121。
     is_history: bool,
+    /// 附录 K c) 的媒体源标识(`Subject` 的"发送者 ID:发送方序列号");
+    /// 平台不带 Subject 时为 None。
+    media_source: Option<String>,
+    /// 会话内主动发 BYE 所需的对话标识(附录 K a) 的媒体流丢失通知)。
+    dialog: builder::InboundDialog,
 }
 
 /// 报警订阅:对话标识 + 平台地址 + 筛选条件(A.2.4.6)。
@@ -447,9 +458,76 @@ struct Subscription {
     stop_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+/// 平台可经 `DeviceConfig / BasicParam`(A.2.3.2.1)在运行中修改的参数。
+///
+/// 之前这些字段只在配置里、命令来了只打一行日志就回 OK —— 平台以为改成功了,
+/// 设备行为却完全没变(心跳周期照旧、DeviceInfo 里还是老名字、再查配置也读不回来)。
+#[derive(Debug, Clone)]
+pub struct RuntimeParams {
+    /// 设备名称(DeviceInfo / Catalog / ConfigDownload 都读它)。
+    pub device_name: String,
+    /// 注册有效期(秒)。
+    pub expiration_secs: u32,
+    /// 心跳间隔(秒)。
+    pub heartbeat_interval_secs: u64,
+    /// 心跳超时次数(连续失败多少次判掉线并重注册)。
+    pub heartbeat_count: u32,
+}
+
+impl RuntimeParams {
+    /// 用启动配置初始化。心跳超时次数没有独立配置项,沿用文档里的重注册阈值 3
+    /// (见 docs/10-functional/device-simulation.md §3.2)。
+    fn from_config(config: &DeviceConfig) -> Self {
+        RuntimeParams {
+            device_name: config.device_info.device_name.clone(),
+            expiration_secs: config.register_expires_secs,
+            heartbeat_interval_secs: config.heartbeat_interval_secs,
+            heartbeat_count: DEFAULT_HEARTBEAT_COUNT,
+        }
+    }
+}
+
+/// 心跳连续失败多少次判定掉线并重注册。平台可经 BasicParam 的 HeartBeatCount 改。
+const DEFAULT_HEARTBEAT_COUNT: u32 = 3;
+
+/// 语音广播会话(GB/T 28181-2022 §9.12.1,设备是**语音流接收者**)。
+///
+/// 设备作主叫发出 INVITE、收 200 OK、发 ACK,然后在本端端口上收平台推来的
+/// G.711 音频 RTP(附录 C.2.4)。平台发 BYE 或设备主动挂断时结束。
+struct BroadcastSession {
+    /// 出站对话(Call-ID / from-tag / 学到的平台 to-tag)。
+    dialog: builder::OutboundDialog,
+    /// 平台地址(ACK/BYE 的目的地)。
+    peer: SocketAddr,
+    /// 语音流发送者 ID(SourceID)。
+    source_id: String,
+    /// 本端收流端口(诊断/前端展示)。
+    local_port: u16,
+    /// 收流统计(包数/字节/丢包/电平/空闲时长)。
+    stats: Arc<media_rtp::RecvStats>,
+    /// 停止信号:发送或丢弃即结束收流任务。
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    /// 收流任务。
+    _task: tokio::task::JoinHandle<()>,
+}
+
+/// 语音广播会话的对外快照(推给前端/日志)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BroadcastSnapshot {
+    /// 语音流发送者 ID。
+    pub source_id: String,
+    /// 本端收流端口。
+    pub local_port: u16,
+    /// 会话 Call-ID。
+    pub call_id: String,
+    /// 收流统计。
+    pub recv: media_rtp::RecvStatsSnapshot,
+}
+
 impl DeviceSimulator {
     /// 用配置创建一个待运行的设备仿真实例(无观察者)。
     pub fn new(config: DeviceConfig) -> Self {
+        let runtime = RuntimeParams::from_config(&config);
         Self {
             config,
             ids: DialogIds::new(),
@@ -471,11 +549,15 @@ impl DeviceSimulator {
             granted_expires: AtomicU32::new(0),
             online: std::sync::atomic::AtomicBool::new(false),
             server_txns: sip_core::ServerTransactions::default(),
+            broadcast: tokio::sync::Mutex::new(None),
+            media_seq: AtomicU32::new(1),
+            runtime: parking_lot::Mutex::new(runtime),
         }
     }
 
     /// 带事件观察者创建(压测时由编排器注入共享 Metrics)。
     pub fn with_observer(config: DeviceConfig, observer: Arc<dyn common::DeviceObserver>) -> Self {
+        let runtime = RuntimeParams::from_config(&config);
         Self {
             config,
             ids: DialogIds::new(),
@@ -497,6 +579,9 @@ impl DeviceSimulator {
             granted_expires: AtomicU32::new(0),
             online: std::sync::atomic::AtomicBool::new(false),
             server_txns: sip_core::ServerTransactions::default(),
+            broadcast: tokio::sync::Mutex::new(None),
+            media_seq: AtomicU32::new(1),
+            runtime: parking_lot::Mutex::new(runtime),
         }
     }
 
@@ -2301,7 +2386,9 @@ impl DeviceSimulator {
                     sn: query.sn,
                     device_id: query.device_id.clone(),
                     result: "OK".into(),
-                    device_name: self.config.device_info.device_name.clone(),
+                    // 名字读运行时值:平台改过 BasicParam/Name 后再查 DeviceInfo
+                    // 必须看到新名字,否则"改了没生效"发现不了。
+                    device_name: self.runtime.lock().device_name.clone(),
                     manufacturer: self.config.device_info.manufacturer.clone(),
                     model: self.config.device_info.model.clone(),
                     firmware: self.config.device_info.firmware.clone(),
@@ -2340,7 +2427,7 @@ impl DeviceSimulator {
                 let items = self.record_items_for(query);
                 RecordInfoResponse::with_name(
                     &query.device_id,
-                    self.config.device_info.device_name.clone(),
+                    self.runtime.lock().device_name.clone(),
                     query.sn,
                     items,
                 )
@@ -2348,15 +2435,17 @@ impl DeviceSimulator {
             }
             "ConfigDownload" => {
                 // 设备配置查询:按 ConfigType 返回基本参数(BasicParam)和/或视频参数(VideoParamOpt)。
-                // 心跳超时次数固定 3(与 device-simulation.md §3.2 重注册阈值一致)。
+                // 读的是**运行时参数**:平台刚用 DeviceConfig 改过的值必须能查回来,
+                // 否则"改了没生效"根本无法从平台侧发现。
+                let rt = self.runtime.lock().clone();
                 let resp = ConfigDownloadResponse::by_type(
                     &query.device_id,
                     query.sn,
                     query.config_type.as_deref().unwrap_or("BasicParam"),
-                    self.config.device_info.device_name.clone(),
-                    3600,
-                    self.config.heartbeat_interval_secs as u32,
-                    3,
+                    rt.device_name,
+                    rt.expiration_secs,
+                    rt.heartbeat_interval_secs as u32,
+                    rt.heartbeat_count,
                     "1920*1080",
                 );
                 resp.to_xml()
@@ -2555,7 +2644,29 @@ impl DeviceSimulator {
             tracing::info!(enabled = hp.enabled, preset = hp.preset_index, "看守位设置");
         }
         if ctrl.iframe_cmd.is_some() {
-            tracing::info!("强制关键帧(下一帧起带 IDR)");
+            // A.2.3.1.7:把请求交给推流循环。实时编码源(屏幕采集 H.264)会真的
+            // 让编码器立刻插一个 IDR;文件循环源无法兑现,只能等自带的周期 IDR。
+            let requested = match self.session.lock().await.as_ref() {
+                Some(session) => {
+                    session.control.request_keyframe();
+                    true
+                }
+                None => false,
+            };
+            if requested {
+                tracing::info!("强制关键帧:已下发到推流循环");
+            } else {
+                tracing::info!("强制关键帧:当前无活跃推流会话,忽略");
+            }
+            self.observer
+                .on_event(common::DeviceEvent::PlatformCommand {
+                    kind: "control".into(),
+                    summary: if requested {
+                        "平台请求强制关键帧:已下发到编码器".into()
+                    } else {
+                        "平台请求强制关键帧:当前无推流会话".to_string()
+                    },
+                });
         }
         // DeviceConfig 控制命令(GB28181-2022 A.2.3.2):设备配置修改。
         // 模拟器接受所有配置修改并回 OK,实际不改变设备行为(仅记录日志)。
@@ -2571,8 +2682,40 @@ impl DeviceSimulator {
             || ctrl.cfg_video_param_attribute.is_some()
             || ctrl.cfg_svac_encode.is_some()
             || ctrl.cfg_svac_decode.is_some();
-        if ctrl.cfg_basic_param.is_some() {
-            tracing::info!("设备配置:基本参数(模拟接受)");
+        if let Some(bp) = &ctrl.cfg_basic_param {
+            // A.2.3.2.1:配置修改命令可只带部分字段,空串/0 表示"这一项不改"。
+            let mut applied: Vec<String> = Vec::new();
+            {
+                let mut rt = self.runtime.lock();
+                if !bp.name.trim().is_empty() && bp.name != rt.device_name {
+                    applied.push(format!("Name={}", bp.name));
+                    rt.device_name = bp.name.trim().to_string();
+                }
+                if bp.expiration > 0 && bp.expiration != rt.expiration_secs {
+                    applied.push(format!("Expiration={}", bp.expiration));
+                    rt.expiration_secs = bp.expiration;
+                }
+                if bp.heartbeat_interval > 0
+                    && u64::from(bp.heartbeat_interval) != rt.heartbeat_interval_secs
+                {
+                    applied.push(format!("HeartBeatInterval={}", bp.heartbeat_interval));
+                    rt.heartbeat_interval_secs = u64::from(bp.heartbeat_interval);
+                }
+                if bp.heartbeat_count > 0 && bp.heartbeat_count != rt.heartbeat_count {
+                    applied.push(format!("HeartBeatCount={}", bp.heartbeat_count));
+                    rt.heartbeat_count = bp.heartbeat_count;
+                }
+            }
+            if applied.is_empty() {
+                tracing::info!("设备配置:基本参数无变化");
+            } else {
+                tracing::info!(changed = %applied.join(", "), "设备配置:基本参数已生效");
+                self.observer
+                    .on_event(common::DeviceEvent::PlatformCommand {
+                        kind: "control".into(),
+                        summary: format!("平台改设备配置已生效:{}", applied.join(", ")),
+                    });
+            }
         }
         if ctrl.cfg_video_record_plan.is_some() {
             tracing::info!("设备配置:录像计划(模拟接受)");
@@ -2676,11 +2819,8 @@ impl DeviceSimulator {
         }
     }
 
-    /// 处理语音广播(FR-36):校验 TargetID,回 Broadcast Response,接受则反向发 INVITE。
-    ///
-    /// 设备为**主叫 UAC**:向平台发 `m=audio ... a=recvonly` 的 INVITE 收 G.711A 下行。
-    /// ⚠️ 反向 INVITE 的完整音频接收/ACK/BYE 链路本 WVP 环境无法触发验证,当前实现
-    /// 到"发出带正确 SDP 的 INVITE"为止(记忆:不盲写无法验证的部分),已足以让平台侧建流。
+    /// 处理语音广播(§9.12.1 信令 1~4):校验 TargetID,回 Broadcast Response,
+    /// 接受则异步走完信令 5~16(设备主动 INVITE → 收流)。
     async fn handle_broadcast(
         self: &Arc<Self>,
         transport: &Arc<dyn SipTransport>,
@@ -2703,31 +2843,240 @@ impl DeviceSimulator {
                 "target mismatch",
             )
         };
-        // 先回 200 OK(入站已回),再以独立 MESSAGE 发 Broadcast Response。
+        // 先回 200 OK(入站已回),再以独立 MESSAGE 发 Broadcast Response(信令 3)。
         let xml = resp.to_xml()?;
         self.send_reply_message(transport, from, &xml).await?;
 
-        if owned {
-            // 构造反向 INVITE 的 SDP offer(设备收流)。真正的 client INVITE 事务
-            // 需音频 RTP 接收端,本环境无法验证,故此处仅生成 offer 并记录。
-            let local_ip = transport
-                .local_addr()
-                .map(|a| a.ip())
-                .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
-            let offer = sip_core::build_broadcast_offer(
-                &bc.target_id,
-                local_ip,
-                0, // 端口 0:占位(未实际开收流 socket)
-                rand::random::<u32>() & 0x00FF_FFFF,
-                false,
-            );
-            tracing::info!(source = %bc.source_id, target = %bc.target_id,
-                "语音广播接受,反向 INVITE offer 已构造(音频接收链路待真机验证)");
-            tracing::debug!(sdp = %offer, "广播 SDP offer");
-        } else {
+        if !owned {
             tracing::warn!(target = %bc.target_id, "语音广播 TargetID 不属本设备,拒绝");
+            return Ok(());
         }
+
+        // 信令 5 起是一次完整的 UAC 事务 + 收流,放后台跑:不能占住入站分派循环,
+        // 否则这段时间里平台的其它命令(含本次广播的 200 OK)都进不来。
+        let dev = Arc::clone(self);
+        let tp = Arc::clone(transport);
+        let source_id = bc.source_id.clone();
+        let target_id = bc.target_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = dev.start_broadcast(&tp, &source_id, &target_id, from).await {
+                tracing::warn!(%error, "语音广播建流失败");
+                dev.observer.on_event(common::DeviceEvent::RuntimeError {
+                    scope: "broadcast".into(),
+                    message: error.to_string(),
+                });
+            }
+        });
         Ok(())
+    }
+
+    /// 语音广播的设备侧主叫流程(§9.12.1 图27 信令 5、14、15)。
+    ///
+    /// 顺序很关键:**先绑收流端口,再发 INVITE**。SDP 的 `m=audio <port>` 必须是真实端口,
+    /// 之前的实现填 0 —— 等于告诉平台"往 0 端口发",链路永远建不起来。
+    async fn start_broadcast(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+        source_id: &str,
+        target_id: &str,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        // 同一时刻只维持一路广播:平台重复下发广播通知时,先拆掉旧的再建新的。
+        self.stop_broadcast(transport, "新的广播请求").await;
+
+        let local_ip: std::net::IpAddr = self
+            .local_host()
+            .parse()
+            .unwrap_or_else(|_| transport.local_addr().map(|a| a.ip()).unwrap_or(peer.ip()));
+        let receiver = media_rtp::AudioReceiver::bind(local_ip).await?;
+        let local_port = receiver.local_port()?;
+        let stats = receiver.stats();
+
+        let ssrc = rand::random::<u32>() & 0x00FF_FFFF;
+        let offer = sip_core::build_broadcast_offer(target_id, local_ip, local_port, ssrc, false);
+
+        // 附录 L:媒体流发送者是平台侧的语音流发送者(SourceID),接收者是本设备(TargetID)。
+        let seq = self.media_seq.fetch_add(1, Ordering::Relaxed);
+        let subject = sip_core::Subject::realtime(source_id, seq, target_id, seq);
+
+        let remote_uri = format!("sip:{}@{}", source_id, self.config.server_domain);
+        let dialog = builder::OutboundDialog::new(remote_uri, self.next_cseq());
+        let mut rx = transport.register(&dialog.call_id);
+        let req = builder::invite(
+            &self.config,
+            &dialog,
+            &self.local_host(),
+            self.local_port(),
+            &subject,
+            &offer,
+            transport.protocol(),
+        );
+        tracing::info!(%source_id, %target_id, local_port, subject = %subject,
+            "语音广播:发出 INVITE(信令 5)");
+
+        let resp = sip_core::client_transact(
+            transport.as_ref(),
+            peer,
+            &req,
+            &mut rx,
+            sip_core::Timing::default(),
+        )
+        .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                transport.unregister(&dialog.call_id);
+                return Err(e);
+            }
+        };
+        if resp.status != 200 {
+            transport.unregister(&dialog.call_id);
+            return Err(Error::Sip(format!(
+                "语音广播 INVITE 被拒:{} {}",
+                resp.status, resp.reason
+            )));
+        }
+
+        // 学到平台的 To-tag 后才能发合法的 ACK / 会话内 BYE。
+        let mut dialog = dialog;
+        dialog.remote_tag = resp.headers.to_tag().map(|t| t.to_string());
+        let ack = builder::ack(
+            &self.config,
+            &dialog,
+            &self.local_host(),
+            self.local_port(),
+            transport.protocol(),
+        );
+        transport
+            .send_to(&sip_core::SipMessage::Request(ack), peer)
+            .await?;
+
+        // 平台 200 OK 的 SDP 只用于诊断:UDP 下我们是被动收流方,不需要连对端。
+        if let Ok(text) = std::str::from_utf8(&resp.body) {
+            if let Ok(sdp) = sip_core::SessionDescription::parse(text) {
+                tracing::info!(
+                    sender = %sdp.connection.addr, port = sdp.media.port,
+                    ssrc = ?sdp.media.ssrc, "语音广播:平台应答 SDP"
+                );
+            }
+        }
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let dev = Arc::clone(self);
+        let watch_stats = Arc::clone(&stats);
+        let task = tokio::spawn(async move {
+            let result = receiver
+                .run(async {
+                    let _ = stop_rx.await;
+                })
+                .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "语音广播收流异常结束");
+            }
+            let snap = watch_stats.snapshot();
+            tracing::info!(
+                packets = snap.packets,
+                bytes = snap.payload_bytes,
+                lost = snap.lost,
+                "语音广播收流结束"
+            );
+            dev.observer.on_event(common::DeviceEvent::PlatformCommand {
+                kind: "broadcast".into(),
+                summary: format!(
+                    "语音广播结束:收 {} 包 / {} 字节,丢 {}",
+                    snap.packets, snap.payload_bytes, snap.lost
+                ),
+            });
+        });
+
+        let call_id = dialog.call_id.clone();
+        *self.broadcast.lock().await = Some(BroadcastSession {
+            dialog,
+            peer,
+            source_id: source_id.to_string(),
+            local_port,
+            stats,
+            stop_tx,
+            _task: task,
+        });
+        self.observer
+            .on_event(common::DeviceEvent::PlatformCommand {
+                kind: "broadcast".into(),
+                summary: format!("语音广播建流成功:本端 {local_port} 端口收 G.711 音频"),
+            });
+        tracing::info!(%call_id, local_port, "语音广播:ACK 已发,开始收音频");
+        Ok(())
+    }
+
+    /// 结束语音广播会话。`reason` 非空时发会话内 BYE 通知平台。
+    ///
+    /// 返回是否确实结束了一路会话。
+    async fn stop_broadcast(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+        reason: &str,
+    ) -> bool {
+        let Some(session) = self.broadcast.lock().await.take() else {
+            return false;
+        };
+        let _ = session.stop_tx.send(());
+        transport.unregister(&session.dialog.call_id);
+        // 设备主动挂断要发 BYE(附录 K a):否则平台侧那条媒体链路一直挂着。
+        let bye = builder::bye_outbound(
+            &self.config,
+            &session.dialog,
+            self.next_cseq(),
+            &self.local_host(),
+            self.local_port(),
+            transport.protocol(),
+        );
+        if let Err(error) = transport
+            .send_to(&sip_core::SipMessage::Request(bye), session.peer)
+            .await
+        {
+            tracing::warn!(%error, "语音广播 BYE 发送失败");
+        }
+        tracing::info!(reason, source = %session.source_id, "语音广播已结束并发出 BYE");
+        true
+    }
+
+    /// 当前语音广播会话快照(供前端展示收流统计与电平)。
+    pub async fn broadcast_snapshot(&self) -> Option<BroadcastSnapshot> {
+        let guard = self.broadcast.lock().await;
+        guard.as_ref().map(|s| BroadcastSnapshot {
+            source_id: s.source_id.clone(),
+            local_port: s.local_port,
+            call_id: s.dialog.call_id.clone(),
+            recv: s.stats.snapshot(),
+        })
+    }
+
+    /// 设备侧主动挂断语音广播(界面上的"挂断"按钮)。
+    ///
+    /// 会按附录 K a) 发会话内 BYE 通知平台释放链路。返回是否确实挂断了一路会话。
+    pub async fn hangup_broadcast(self: &Arc<Self>, transport: &Arc<dyn SipTransport>) -> bool {
+        let stopped = self.stop_broadcast(transport, "设备侧主动挂断").await;
+        if stopped {
+            self.observer
+                .on_event(common::DeviceEvent::PlatformCommand {
+                    kind: "broadcast".into(),
+                    summary: "设备主动挂断语音广播并已发 BYE".into(),
+                });
+        }
+        stopped
+    }
+
+    /// 平台发来的 BYE 是否属于当前广播会话;是则结束收流并返回 true。
+    async fn stop_broadcast_if_matches(&self, call_id: &str) -> bool {
+        let mut guard = self.broadcast.lock().await;
+        let matches = guard.as_ref().is_some_and(|s| s.dialog.call_id == call_id);
+        if matches {
+            if let Some(session) = guard.take() {
+                let _ = session.stop_tx.send(());
+                tracing::info!(%call_id, "平台 BYE 结束语音广播会话");
+            }
+        }
+        matches
     }
 
     /// 触发需设备主动 NOTIFY/上报的控制副作用(在线升级 4 步进度、抓拍上传)。
@@ -2915,20 +3264,53 @@ impl DeviceSimulator {
         });
         tracing::info!(%rtp_dst, ssrc, "INVITE:开始向平台推流");
 
-        // 会话互斥:只在这段临界区里判重,**不在持锁期间做网络/阻塞操作**。
-        // 之前 session 锁从判重一直持到推流任务写入槽位,期间跨越两次 send_to().await
-        // 和同步的视频源构建(容器转封装最长数秒),高并发点播会互相排队。
+        // 附录 K c):用 Subject 的"媒体流发送者 ID:发送方媒体流序列号"作媒体源标识,
+        // 判断自己是否已在发同一路码流。**已在发就应释放旧链路、按新请求重建**,
+        // 而不是回 486 —— 早先"有会话就 486 Busy Here"的实现会让平台重启后
+        // 永远拉不到流:旧会话在设备侧还挂着,新请求一律被拒。
+        let subject = req
+            .headers
+            .get("Subject")
+            .and_then(sip_core::Subject::parse);
+        let media_source = subject.as_ref().map(|s| s.media_source());
         {
-            let busy = self.session.lock().await.is_some();
-            if busy {
-                self.respond(
-                    transport,
-                    from,
-                    token,
-                    builder::response_status(req, 486, "Busy Here"),
-                )
-                .await?;
-                return Ok(true);
+            let mut guard = self.session.lock().await;
+            match guard.as_ref() {
+                None => {}
+                Some(active) => {
+                    let same_source = match (&media_source, &active.media_source) {
+                        // Subject 都在且媒体源标识相同 → 同一路码流的重新请求。
+                        (Some(new), Some(old)) => new == old,
+                        // 任一侧没有 Subject:退化为"同一通道的重新点播即视为同源"。
+                        // 平台不带 Subject 时(不合标准但现网存在)也要能恢复,
+                        // 否则一次丢包就把这个通道永久锁死。
+                        _ => true,
+                    };
+                    if same_source {
+                        tracing::info!(
+                            ?media_source,
+                            "附录 K c):同一媒体源的重新请求,释放旧链路后按新请求重建"
+                        );
+                        let old = guard.take();
+                        drop(guard);
+                        if let Some(old) = old {
+                            let _ = old.stop_tx.send(());
+                        }
+                        self.observer.on_event(common::DeviceEvent::StreamStop);
+                    } else {
+                        // 真的是另一路码流:模拟器同时只维持一路,按 SIP 语义回 486。
+                        drop(guard);
+                        tracing::info!(?media_source, "已有其它媒体源的会话,回 486 Busy Here");
+                        self.respond(
+                            transport,
+                            from,
+                            token,
+                            builder::response_status(req, 486, "Busy Here"),
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                }
             }
         }
         // 实时设备启动可能涉及 TCC 授权和最多 5 秒首帧等待,先发 100 防止
@@ -2941,6 +3323,26 @@ impl DeviceSimulator {
         let use_tcp = platform_sdp.is_tcp();
         let local_setup = platform_sdp.local_tcp_setup();
         let local_passive = use_tcp && local_setup == sip_core::Setup::Passive;
+
+        // 语音对讲的上行方向:平台只请求 `m=audio`(§9.12.2 a))。
+        // 这条流按附录 C.2.4 走**裸 G.711 而非 PS**,和视频点播是两套封装,
+        // 继续沿用视频路径会把音频塞进 PS,平台侧解不出来。
+        if platform_sdp.is_audio_only() {
+            return self
+                .handle_audio_invite(
+                    transport,
+                    req,
+                    from,
+                    token,
+                    rtp_dst,
+                    ssrc,
+                    use_tcp,
+                    local_setup,
+                    local_passive,
+                    media_source,
+                )
+                .await;
+        }
 
         // 按配置选择视频源:实时采集(live:) > 文件(C档) > 轻量伪流(B档) > 不推流(A档)。
         let fps = self.config.video_fps;
@@ -3041,6 +3443,20 @@ impl DeviceSimulator {
         let mut resp = builder::response_ok(req);
         resp.headers.set("Content-Type", "application/sdp");
         resp.body = sdp_body.as_bytes().to_vec();
+        // 会话内主动发 BYE 需要本端 To-tag:必须取自实际发出的那条 200 OK,
+        // 自己另生成一个的话平台会认不出这条对话。
+        let local_tag = resp
+            .headers
+            .to_tag()
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        let dialog = builder::InboundDialog {
+            call_id: req.headers.get("Call-ID").unwrap_or_default().trim().into(),
+            local_tag,
+            remote_from: req.headers.get("From").unwrap_or_default().trim().into(),
+            peer: from,
+            request_uri: req.uri.clone(),
+        };
         self.respond(transport, from, token, resp).await?;
 
         // 200 OK 已发,启动推流(TCP 模式给平台一点时间建监听 + 收 ACK)。
@@ -3058,6 +3474,8 @@ impl DeviceSimulator {
             }
             let control_task = Arc::clone(&control);
             let simulator = Arc::clone(self);
+            let transport_task = Arc::clone(transport);
+            let dialog_task = dialog.clone();
             let marker = Arc::new(());
             let task_marker = Arc::clone(&marker);
             let task = tokio::spawn(async move {
@@ -3089,6 +3507,11 @@ impl DeviceSimulator {
                             scope: "stream".into(),
                             message: error.to_string(),
                         });
+                    // 附录 K a):监测到媒体流丢失应释放链路,并**通过会话内 BYE 通知**对端。
+                    // 只发事件不发 BYE 的话,平台侧那条链路会一直挂着等流。
+                    simulator
+                        .notify_media_loss(&transport_task, &dialog_task)
+                        .await;
                 }
                 let mut session = simulator.session.lock().await;
                 let owns_slot = session
@@ -3108,6 +3531,8 @@ impl DeviceSimulator {
                 stop_tx,
                 control,
                 is_history: platform_sdp.is_playback() || platform_sdp.is_download(),
+                media_source,
+                dialog,
             });
             self.observer.on_event(common::DeviceEvent::StreamStart);
             let _ = start_tx.send(());
@@ -3127,7 +3552,235 @@ impl DeviceSimulator {
         Ok(true)
     }
 
-    /// 处理 BYE:停止推流,回 200 OK。回放/下载会话结束后补发 MediaStatus 121。
+    /// 处理**纯音频** INVITE:语音对讲的设备→平台上行(§9.12.2 a) + 附录 C.2.4)。
+    ///
+    /// 与视频点播的区别:SDP 回 `m=audio ... 8` + `a=rtpmap:8 PCMA/8000`,
+    /// 媒体走裸 G.711A RTP(PT=8),不做 PS 封装。
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_audio_invite(
+        self: &Arc<Self>,
+        transport: &Arc<dyn SipTransport>,
+        req: &sip_core::Request,
+        from: SocketAddr,
+        token: &sip_core::TxToken,
+        rtp_dst: SocketAddr,
+        ssrc: u32,
+        use_tcp: bool,
+        local_setup: sip_core::Setup,
+        local_passive: bool,
+        media_source: Option<String>,
+    ) -> Result<bool> {
+        // 音源:复用已配置的媒体源(文件音轨 / 摄像头麦克风)。没有音源时
+        // push_audio_stream 会发 A-law 静音并在统计里如实标注。
+        let fps = self.config.video_fps;
+        let source: Option<Box<dyn media_rtp::VideoSource>> = if let Some(ref path) =
+            self.config.video_source
+        {
+            let path = path.clone();
+            let built =
+                tokio::task::spawn_blocking(move || -> Result<Box<dyn media_rtp::VideoSource>> {
+                    if path.starts_with("live:") {
+                        media_rtp::LiveSource::capture(&path, fps)
+                            .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
+                            .map_err(|e| Error::Media(format!("实时采集失败: {e}")))
+                    } else {
+                        media_rtp::FileSource::from_path_av(&path, fps)
+                            .map(|s| Box::new(s) as Box<dyn media_rtp::VideoSource>)
+                            .map_err(|e| Error::Media(format!("加载音频源失败: {e}")))
+                    }
+                })
+                .await
+                .map_err(|e| Error::Media(format!("音频源构建任务异常: {e}")))?;
+            match built {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    // 音源起不来不该让对讲整体失败:仍建流发静音,但把原因报上去。
+                    tracing::warn!(error = %e, "对讲上行音源构建失败,将发送静音");
+                    self.observer.on_event(common::DeviceEvent::RuntimeError {
+                        scope: "capture".into(),
+                        message: format!("对讲音源不可用,已发送静音: {e}"),
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let prepared =
+            match media_rtp::PreparedMedia::prepare(rtp_dst, use_tcp, local_passive).await {
+                Ok(p) => p,
+                Err(e) => {
+                    self.observer.on_event(common::DeviceEvent::RuntimeError {
+                        scope: "stream".into(),
+                        message: format!("对讲媒体端口绑定失败: {e}"),
+                    });
+                    self.respond(
+                        transport,
+                        from,
+                        token,
+                        builder::response_status(req, 500, "Server Internal Error"),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+        let local_rtp_port = prepared.local_port();
+        let local_ip: std::net::IpAddr = self.local_host().parse().unwrap_or_else(|_| {
+            transport
+                .local_addr()
+                .map(|a| a.ip())
+                .unwrap_or(rtp_dst.ip())
+        });
+        let channel = req
+            .uri
+            .strip_prefix("sip:")
+            .and_then(|s| s.split('@').next())
+            .unwrap_or(self.config.device_id.as_str());
+        let local_sdp = sip_core::SessionDescription::new_device_audio_response(
+            channel,
+            local_ip,
+            local_rtp_port,
+            ssrc,
+            use_tcp,
+            use_tcp.then_some(local_setup),
+        );
+
+        let mut resp = builder::response_ok(req);
+        resp.headers.set("Content-Type", "application/sdp");
+        resp.body = local_sdp.to_string().as_bytes().to_vec();
+        let local_tag = resp
+            .headers
+            .to_tag()
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        let dialog = builder::InboundDialog {
+            call_id: req.headers.get("Call-ID").unwrap_or_default().trim().into(),
+            local_tag,
+            remote_from: req.headers.get("From").unwrap_or_default().trim().into(),
+            peer: from,
+            request_uri: req.uri.clone(),
+        };
+        self.respond(transport, from, token, resp).await?;
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let simulator = Arc::clone(self);
+        let transport_task = Arc::clone(transport);
+        let dialog_task = dialog.clone();
+        let marker = Arc::new(());
+        let task_marker = Arc::clone(&marker);
+        let task = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            if use_tcp && !local_passive {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let result = media_rtp::push_audio_stream(prepared, source, rtp_dst, ssrc, async {
+                let _ = stop_rx.await;
+            })
+            .await;
+            match &result {
+                Ok(summary) => {
+                    if summary.silence_only() {
+                        // 说清楚"通道通了、但没有真实音源",避免误判为对讲正常。
+                        simulator
+                            .observer
+                            .on_event(common::DeviceEvent::PlatformCommand {
+                                kind: "invite".into(),
+                                summary: format!(
+                                    "对讲上行结束:全程静音({} 包),设备未配置音源",
+                                    summary.silence_packets
+                                ),
+                            });
+                    }
+                    if let Some(error) = &summary.source_error {
+                        simulator
+                            .observer
+                            .on_event(common::DeviceEvent::RuntimeError {
+                                scope: "stream".into(),
+                                message: error.clone(),
+                            });
+                        simulator
+                            .notify_media_loss(&transport_task, &dialog_task)
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    simulator
+                        .observer
+                        .on_event(common::DeviceEvent::RuntimeError {
+                            scope: "stream".into(),
+                            message: error.to_string(),
+                        });
+                    simulator
+                        .notify_media_loss(&transport_task, &dialog_task)
+                        .await;
+                }
+            }
+            let mut session = simulator.session.lock().await;
+            let owns_slot = session
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.marker, &task_marker));
+            if owns_slot {
+                *session = None;
+            }
+            drop(session);
+            if owns_slot {
+                simulator.observer.on_event(common::DeviceEvent::StreamStop);
+            }
+        });
+        *self.session.lock().await = Some(PushSession {
+            marker,
+            _task: task,
+            stop_tx,
+            control: media_rtp::PlaybackControl::new(),
+            is_history: false,
+            media_source,
+            dialog,
+        });
+        self.observer.on_event(common::DeviceEvent::StreamStart);
+        let _ = start_tx.send(());
+        self.observer
+            .on_event(common::DeviceEvent::PlatformCommand {
+                kind: "invite".into(),
+                summary: format!(
+                    "平台对讲 INVITE(纯音频)→ 200 OK,本端 {local_rtp_port} 端口发 G.711A"
+                ),
+            });
+        Ok(true)
+    }
+
+    /// 附录 K a):媒体流丢失后释放链路并通过**会话内 BYE** 通知平台。
+    ///
+    /// 设备是被叫,From/To 相对原 INVITE 反转(见 [`builder::bye_inbound`])。
+    async fn notify_media_loss(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        dialog: &builder::InboundDialog,
+    ) {
+        let bye = builder::bye_inbound(
+            &self.config,
+            dialog,
+            self.next_cseq(),
+            &self.local_host(),
+            self.local_port(),
+            transport.protocol(),
+        );
+        match transport
+            .send_to(&sip_core::SipMessage::Request(bye), dialog.peer)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                call_id = %dialog.call_id,
+                "附录 K a):媒体流丢失,已发会话内 BYE 通知平台释放链路"
+            ),
+            Err(error) => tracing::warn!(%error, "媒体流丢失通知 BYE 发送失败"),
+        }
+    }
+
+    /// 处理 BYE:停止推流或语音广播收流,回 200 OK。回放/下载会话结束后补发 MediaStatus 121。
     async fn handle_bye(
         self: &Arc<Self>,
         transport: &Arc<dyn SipTransport>,
@@ -3135,6 +3788,20 @@ impl DeviceSimulator {
         from: SocketAddr,
         token: &sip_core::TxToken,
     ) -> Result<bool> {
+        // 先看这条 BYE 是不是在拆语音广播会话(§9.12.1 信令 17/18):
+        // 广播的 Call-ID 是设备自己生成的,和点播会话不是同一条对话,不能混着停。
+        let call_id = req.headers.get("Call-ID").unwrap_or_default().trim();
+        if self.stop_broadcast_if_matches(call_id).await {
+            self.respond(transport, from, token, builder::response_ok(req))
+                .await?;
+            self.observer
+                .on_event(common::DeviceEvent::PlatformCommand {
+                    kind: "broadcast".into(),
+                    summary: "平台 BYE 结束语音广播".into(),
+                });
+            return Ok(true);
+        }
+
         let (was_history, had_session) = self.stop_active_session().await;
         if had_session {
             self.observer.on_event(common::DeviceEvent::StreamStop);
@@ -3174,6 +3841,28 @@ impl DeviceSimulator {
             false
         };
         (was_history, had_session)
+    }
+
+    /// 设备下线时释放所有媒体链路并**通知平台**(附录 K b))。
+    ///
+    /// 标准要求:监测到媒体流接收方/发送方故障或离线时应主动释放媒体链路。设备自己
+    /// 主动下线就是"发送方离线"这一种,只停本地推流是不够的 —— 平台那条链路会一直
+    /// 挂着等流,直到它自己的丢流监测超时。
+    async fn release_media_on_shutdown(self: &Arc<Self>, transport: &Arc<dyn SipTransport>) {
+        // 点播/回放会话:设备是被叫,发反转的会话内 BYE。
+        let dialog = {
+            let mut guard = self.session.lock().await;
+            guard.take().map(|session| {
+                let _ = session.stop_tx.send(());
+                session.dialog
+            })
+        };
+        if let Some(dialog) = dialog {
+            self.observer.on_event(common::DeviceEvent::StreamStop);
+            self.notify_media_loss(transport, &dialog).await;
+        }
+        // 语音广播:设备是主叫,发正向的会话内 BYE。
+        self.stop_broadcast(transport, "设备下线").await;
     }
 
     /// 处理 CANCEL(RFC 3261 §9.2)。
@@ -3281,11 +3970,12 @@ impl DeviceSimulator {
         // 心跳主循环 + 注册续约(FR-32)。
         // 续约周期以**平台授予的 Expires** 为准(取其 80%),而不是硬编码 3600×80%。
         // 平台只给 120s 时,按 2880s 续约会被判掉线。
-        let interval = Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
+        let mut heartbeat_interval =
+            Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
         let mut current_expires = self.granted_expires();
         let mut renew_ticker = tokio::time::interval(renew_interval(current_expires));
         renew_ticker.reset(); // 跳过启动即触发
-        let max_hb_fail = 3u32;
+        let mut max_hb_fail;
         let mut hb_fail = 0u32;
         loop {
             tokio::select! {
@@ -3306,7 +3996,14 @@ impl DeviceSimulator {
                         renew_ticker.reset();
                     }
                 }
-                _ = tokio::time::sleep(interval) => {
+                _ = tokio::time::sleep(heartbeat_interval) => {
+                    // 每拍重读:平台经 DeviceConfig/BasicParam 改过的心跳周期与
+                    // 超时次数要真的生效,而不是沿用启动时的快照。
+                    {
+                        let rt = self.runtime.lock();
+                        heartbeat_interval = Duration::from_secs(rt.heartbeat_interval_secs.max(1));
+                        max_hb_fail = rt.heartbeat_count.max(1);
+                    }
                     match self.send_keepalive(&transport, &local_host, local_port).await {
                         Ok(200) => hb_fail = 0,
                         _ => {
@@ -3338,6 +4035,8 @@ impl DeviceSimulator {
         inbound_task.abort();
         self.set_online(false);
         self.stop_subscriptions().await;
+        // 附录 K b):设备下线前先释放媒体链路并发会话内 BYE,别让平台干等着收流。
+        self.release_media_on_shutdown(&transport).await;
         // 主动向平台注销(REGISTER Expires=0,§9.1.2.2):平台立即置离线,不等心跳超时。
         if let Err(e) = self.unregister(&transport, &local_host, local_port).await {
             tracing::warn!(device=%self.config.device_id, error=%e, "注销失败(下线仍继续)");
@@ -4111,6 +4810,14 @@ mod tests {
             stop_tx,
             control: control.clone(),
             is_history: false,
+            media_source: None,
+            dialog: builder::InboundDialog {
+                call_id: "info-call-1".into(),
+                local_tag: "devtag".into(),
+                remote_from: "<sip:platform@test>;tag=ptag".into(),
+                peer: platform_addr,
+                request_uri: "sip:34020000001320000001@127.0.0.1".into(),
+            },
         });
 
         // 构造 INFO 请求的辅助闭包。每条用独立 CSeq 与 branch —— 真实平台就是这样,

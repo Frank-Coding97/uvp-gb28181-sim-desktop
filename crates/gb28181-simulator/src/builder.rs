@@ -295,6 +295,177 @@ pub fn notify_in_dialog(
     }
 }
 
+/// 设备主动发起的 INVITE 会话所需的对话标识。
+///
+/// 语音广播里设备是**主叫**(§9.12.1 图27 信令 5),对话由设备侧创建:
+/// Call-ID / From-tag 自己生成,平台的 To-tag 从 200 OK 里学到之后回填。
+#[derive(Debug, Clone)]
+pub struct OutboundDialog {
+    /// 本端生成的 Call-ID。
+    pub call_id: String,
+    /// 本端 From-tag。
+    pub from_tag: String,
+    /// 对端 AOR(To 头的 URI 部分,如 `sip:34020000002000000001@域`)。
+    pub remote_uri: String,
+    /// 对端 To-tag,收到 200 OK 后回填;ACK/BYE 必须带上。
+    pub remote_tag: Option<String>,
+    /// 会话内 CSeq 基准(INVITE 用的那个;ACK 复用同一个,BYE 用新的)。
+    pub invite_cseq: u32,
+}
+
+impl OutboundDialog {
+    /// 新建一个待发起的出站对话。
+    pub fn new(remote_uri: String, invite_cseq: u32) -> Self {
+        OutboundDialog {
+            call_id: rand_token(""),
+            from_tag: rand_token(""),
+            remote_uri,
+            remote_tag: None,
+            invite_cseq,
+        }
+    }
+
+    /// To 头值(带上已学到的对端 tag)。
+    fn to_header(&self) -> String {
+        match &self.remote_tag {
+            Some(tag) => format!("<{}>;tag={tag}", self.remote_uri),
+            None => format!("<{}>", self.remote_uri),
+        }
+    }
+}
+
+/// 构造设备主动发起的 INVITE(语音广播的信令 5)。
+///
+/// `subject` 是附录 L 的 Subject 头域,标准 §9.2.3 c) 要求携带;
+/// `sdp` 为 offer 正文(`build_broadcast_offer` 生成)。
+#[allow(clippy::too_many_arguments)]
+pub fn invite(
+    cfg: &DeviceConfig,
+    dialog: &OutboundDialog,
+    local_host: &str,
+    local_port: u16,
+    subject: &sip_core::Subject,
+    sdp: &str,
+    protocol: common::Transport,
+) -> Request {
+    let aor = device_aor(cfg);
+    let mut headers = Headers::new();
+    headers.append("Via", via(protocol, local_host, local_port));
+    headers.append("From", format!("<{aor}>;tag={}", dialog.from_tag));
+    headers.append("To", dialog.to_header());
+    headers.append("Call-ID", dialog.call_id.clone());
+    headers.append("CSeq", format!("{} INVITE", dialog.invite_cseq));
+    headers.append(
+        "Contact",
+        format!("<sip:{}@{}:{}>", cfg.device_id, local_host, local_port),
+    );
+    headers.append("Subject", subject.to_string());
+    headers.append("Max-Forwards", "70");
+    headers.append("User-Agent", "UVP-GB28181-Sim");
+    headers.append("Content-Type", "application/sdp");
+    Request {
+        method: Method::Invite,
+        uri: dialog.remote_uri.clone(),
+        headers,
+        body: sdp.as_bytes().to_vec(),
+    }
+}
+
+/// 构造 ACK(确认平台的 200 OK,完成 INVITE 会话建立)。
+///
+/// ACK 与 INVITE **共用同一个 CSeq 序号**(RFC 3261 §13.2.2.4),
+/// 但 Via branch 必须是新的(它是一个独立事务)。
+pub fn ack(
+    cfg: &DeviceConfig,
+    dialog: &OutboundDialog,
+    local_host: &str,
+    local_port: u16,
+    protocol: common::Transport,
+) -> Request {
+    let aor = device_aor(cfg);
+    let mut headers = Headers::new();
+    headers.append("Via", via(protocol, local_host, local_port));
+    headers.append("From", format!("<{aor}>;tag={}", dialog.from_tag));
+    headers.append("To", dialog.to_header());
+    headers.append("Call-ID", dialog.call_id.clone());
+    headers.append("CSeq", format!("{} ACK", dialog.invite_cseq));
+    headers.append("Max-Forwards", "70");
+    Request {
+        method: Method::Ack,
+        uri: dialog.remote_uri.clone(),
+        headers,
+        body: Vec::new(),
+    }
+}
+
+/// 构造设备主动发起的 BYE(挂断自己发起的会话)。
+pub fn bye_outbound(
+    cfg: &DeviceConfig,
+    dialog: &OutboundDialog,
+    cseq: u32,
+    local_host: &str,
+    local_port: u16,
+    protocol: common::Transport,
+) -> Request {
+    let aor = device_aor(cfg);
+    let mut headers = Headers::new();
+    headers.append("Via", via(protocol, local_host, local_port));
+    headers.append("From", format!("<{aor}>;tag={}", dialog.from_tag));
+    headers.append("To", dialog.to_header());
+    headers.append("Call-ID", dialog.call_id.clone());
+    headers.append("CSeq", format!("{cseq} BYE"));
+    headers.append("Max-Forwards", "70");
+    Request {
+        method: Method::Bye,
+        uri: dialog.remote_uri.clone(),
+        headers,
+        body: Vec::new(),
+    }
+}
+
+/// 平台发起的会话里,设备侧主动发 BYE 所需的对话标识。
+///
+/// 附录 K a) 要求监测到媒体流丢失后**通过会话内 BYE 通知**对端。设备是被叫,
+/// 所以 From/To 相对原 INVITE 反转:本端是原 To(带本端 tag),平台是原 From。
+#[derive(Debug, Clone)]
+pub struct InboundDialog {
+    /// 会话 Call-ID(沿用 INVITE 的)。
+    pub call_id: String,
+    /// 本端在 200 OK 里给出的 To-tag,作 BYE 的 From-tag。
+    pub local_tag: String,
+    /// 平台侧完整 From 头值(含其 tag),作 BYE 的 To。
+    pub remote_from: String,
+    /// 平台地址(BYE 的目的地)。
+    pub peer: std::net::SocketAddr,
+    /// 原 INVITE 的 Request-URI,作为 BYE 的 Request-URI 兜底。
+    pub request_uri: String,
+}
+
+/// 构造被叫侧主动挂断的 BYE(附录 K a) 的媒体流丢失通知)。
+pub fn bye_inbound(
+    cfg: &DeviceConfig,
+    dialog: &InboundDialog,
+    cseq: u32,
+    local_host: &str,
+    local_port: u16,
+    protocol: common::Transport,
+) -> Request {
+    let aor = device_aor(cfg);
+    let mut headers = Headers::new();
+    headers.append("Via", via(protocol, local_host, local_port));
+    headers.append("From", format!("<{aor}>;tag={}", dialog.local_tag));
+    headers.append("To", dialog.remote_from.clone());
+    headers.append("Call-ID", dialog.call_id.clone());
+    headers.append("CSeq", format!("{cseq} BYE"));
+    headers.append("Max-Forwards", "70");
+    Request {
+        method: Method::Bye,
+        uri: dialog.request_uri.clone(),
+        headers,
+        body: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -428,7 +428,7 @@ const themeOverrides = {
 .top-toast {
   position: absolute; top: 50px; left: 50%; transform: translateX(-50%);
   z-index: 50; padding: 5px 14px; border-radius: 999px; font-size: 11.5px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.1); backdrop-filter: var(--blur-light);
+  box-shadow: var(--shadow-elevated); backdrop-filter: var(--blur-light);
 }
 .top-toast.ok { background: color-mix(in srgb, var(--success) 16%, var(--bg-base)); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
 .top-toast.err { background: color-mix(in srgb, var(--error) 16%, var(--bg-base)); color: var(--error); border: 1px solid color-mix(in srgb, var(--error) 40%, transparent); }

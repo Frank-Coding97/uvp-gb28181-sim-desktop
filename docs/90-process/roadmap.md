@@ -24,7 +24,8 @@
 | P4 通知健壮 | MediaStatus / Expires 续约 / RTCP SR / Catalog 增量 NOTIFY | FR-31, FR-32 | ✅ 单测 |
 | P5 媒体 | H.265 / AAC | FR-33 | ✅ PSM 单测(音轨抽取/真机推流待 ffmpeg) |
 | P6 多通道+OSD | 虚拟通道 CRUD+模板 / 报警通道节点 / OSD 叠加 | FR-34, FR-35 | ✅ 单测 + headless Chrome 渲染;OSD 配置面对齐 |
-| P7 语音广播 | Broadcast 应答 + 反向 INVITE UAC + 音频接收 | FR-36 | 🟡 握手+SDP offer 单测;反向 INVITE/收流本环境无法触发未实装 |
+| P7 语音广播 | Broadcast 应答 + 反向 INVITE UAC + 音频接收 | FR-36 | ✅ §9.12.1 信令 1~5/14/15/17/18 全通,端到端集成测试(含真实收 RTP 并校验电平);对讲上行走裸 G.711A(附录 C.2.4) |
+| P8 媒体保活 | 附录 L Subject 头域 + 附录 K 同源替换/丢流 BYE/离线释放 | — | ✅ 集成测试锁定"同源重建而非 486" |
 
 ---
 

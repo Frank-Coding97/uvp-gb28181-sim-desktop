@@ -237,6 +237,67 @@ impl RtpSender {
         }
     }
 
+    /// 设置 RTP 负载类型。
+    ///
+    /// 默认 96(PS 封装,`PT_PS`)。语音广播/对讲的音频流按附录 C.2.4 走
+    /// **裸 G.711 而非 PS**,负载类型固定 8(PCMA)。
+    pub fn set_payload_type(&mut self, pt: u8) {
+        self.payload_type = pt;
+    }
+
+    /// 组一个 RTP 包并发出(不切片)。`send_frame` 与 `send_audio` 共用。
+    async fn send_packet(&mut self, payload: &[u8], ts: u32, marker: bool) -> Result<()> {
+        let is_tcp = matches!(self.channel, Channel::Tcp { .. });
+        self.buf.clear();
+        if is_tcp {
+            self.buf.extend_from_slice(&[0, 0]); // RFC 4571 长度前缀占位
+        }
+        self.buf.extend_from_slice(&rtp_header(
+            self.payload_type,
+            marker,
+            self.seq,
+            ts,
+            self.ssrc,
+        ));
+        self.buf.extend_from_slice(payload);
+        if is_tcp {
+            let rtp_len = (self.buf.len() - 2) as u16;
+            self.buf[0..2].copy_from_slice(&rtp_len.to_be_bytes());
+        }
+
+        let sent = match &mut self.channel {
+            Channel::Udp { socket, dst, .. } => socket.send_to(&self.buf, *dst).await.map(|_| ()),
+            Channel::Tcp { stream } => stream.write_all(&self.buf).await,
+        };
+        if let Err(e) = sent {
+            self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Io(e));
+        }
+
+        self.seq = self.seq.wrapping_add(1);
+        self.stats.packets.fetch_add(1, Ordering::Relaxed);
+        let counted = if is_tcp {
+            self.buf.len() as u64 - 2
+        } else {
+            self.buf.len() as u64
+        };
+        self.stats.bytes.fetch_add(counted, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 发送一个音频访问单元(一个 RTP 包,**不切片**)。
+    ///
+    /// 附录 C.2.4:一个 RTP 包的音频载荷应为整数个音频编码帧、时长 20~180 ms,
+    /// 所以音频从不跨包切分 —— 切了对端就解不出帧。
+    /// marker 按 RFC 3551 §4.1 只在 talkspurt 首包置 1。
+    pub async fn send_audio(&mut self, au: &[u8], timestamp: u32, marker: bool) -> Result<()> {
+        if au.is_empty() {
+            return Ok(());
+        }
+        let ts = timestamp.wrapping_add(self.ts_offset);
+        self.send_packet(au, ts, marker).await
+    }
+
     /// 发送一个 PS 访问单元(一帧):按 max_payload 切片成多个 RTP 包,
     /// 同一 timestamp,最后一包置 marker。
     pub async fn send_frame(&mut self, ps: &[u8], timestamp: u32) -> Result<()> {
@@ -244,52 +305,14 @@ impl RtpSender {
             return Ok(());
         }
         let ts = timestamp.wrapping_add(self.ts_offset);
-        let is_tcp = matches!(self.channel, Channel::Tcp { .. });
         let total = ps.len();
         let step = self.max_payload.max(1);
         let mut offset = 0usize;
         while offset < total {
             let end = (offset + step).min(total);
             let marker = end == total;
-            let payload = &ps[offset..end];
-
-            // 组包进复用缓冲:一次分配都不做,TCP 也只需一次 write_all。
-            self.buf.clear();
-            if is_tcp {
-                self.buf.extend_from_slice(&[0, 0]); // RFC 4571 长度前缀占位
-            }
-            self.buf.extend_from_slice(&rtp_header(
-                self.payload_type,
-                marker,
-                self.seq,
-                ts,
-                self.ssrc,
-            ));
-            self.buf.extend_from_slice(payload);
-            if is_tcp {
-                let rtp_len = (self.buf.len() - 2) as u16;
-                self.buf[0..2].copy_from_slice(&rtp_len.to_be_bytes());
-            }
-
-            let sent = match &mut self.channel {
-                Channel::Udp { socket, dst, .. } => {
-                    socket.send_to(&self.buf, *dst).await.map(|_| ())
-                }
-                Channel::Tcp { stream } => stream.write_all(&self.buf).await,
-            };
-            if let Err(e) = sent {
-                self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(Error::Io(e));
-            }
-
-            self.seq = self.seq.wrapping_add(1);
-            self.stats.packets.fetch_add(1, Ordering::Relaxed);
-            let counted = if is_tcp {
-                self.buf.len() as u64 - 2
-            } else {
-                self.buf.len() as u64
-            };
-            self.stats.bytes.fetch_add(counted, Ordering::Relaxed);
+            // chunk 借的是入参 ps(不是 self),与 &mut self 不冲突。
+            self.send_packet(&ps[offset..end], ts, marker).await?;
             offset = end;
         }
         Ok(())

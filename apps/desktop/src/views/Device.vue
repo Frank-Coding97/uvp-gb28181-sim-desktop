@@ -15,11 +15,13 @@ import DevicePreview from "../components/DevicePreview.vue";
 import PlatformRuntimePanel from "../components/PlatformRuntimePanel.vue";
 import PtzConsole from "../components/PtzConsole.vue";
 import SipTracePanel from "../components/SipTracePanel.vue";
+import VoiceBroadcastPanel from "../components/VoiceBroadcastPanel.vue";
 import { useDevice } from "../device";
 import { useLiveSources } from "../composables/useLiveSources";
 import { useMediaPreview } from "../composables/useMediaPreview";
 import { usePlatformRuntime } from "../composables/usePlatformRuntime";
 import { useSipTrace } from "../composables/useSipTrace";
+import { useVoiceBroadcast } from "../composables/useVoiceBroadcast";
 
 const { reconcile } = useDevice();
 const { refreshLiveSources } = useLiveSources();
@@ -28,9 +30,11 @@ const { refreshVideoPreview, stopPreviewStream } = useMediaPreview();
 // 避免任一组件卸载时把另一个组件的数据源一起摘掉。
 const { startPlatformRuntime, stopPlatformRuntime } = usePlatformRuntime();
 const { startSipTrace, stopSipTrace } = useSipTrace();
+const { startBroadcastPolling, stopBroadcastPolling } = useVoiceBroadcast();
 
 onMounted(async () => {
   await Promise.all([startPlatformRuntime(), startSipTrace()]);
+  startBroadcastPolling();
   // 首次进入静默枚举采集设备(不弹提示),再拉起本地预览。
   await refreshLiveSources();
   refreshVideoPreview(true);
@@ -39,6 +43,7 @@ onMounted(async () => {
 onUnmounted(() => {
   stopPlatformRuntime();
   stopSipTrace();
+  stopBroadcastPolling();
   stopPreviewStream();
 });
 
@@ -64,10 +69,13 @@ onActivated(reconcile);
       <DeviceIdentityPanel />
     </section>
 
-    <!-- 3. 下方工作区:平台实时状态与命令时间线并排,最下方是 SIP 信令追踪 -->
+    <!-- 3. 下方工作区:左列平台实时状态 + 语音广播,右列命令时间线;最下方 SIP 信令追踪 -->
     <div class="workspace">
       <div class="runtime-timeline-grid">
-        <PlatformRuntimePanel />
+        <div class="runtime-column">
+          <PlatformRuntimePanel />
+          <VoiceBroadcastPanel />
+        </div>
         <CommandTimeline />
       </div>
       <SipTracePanel />
@@ -85,7 +93,12 @@ onActivated(reconcile);
 }
 .device-identity-section { margin-bottom: 10px; }
 .workspace { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
-.runtime-timeline-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.runtime-timeline-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px; align-items: start;
+}
+/* 左列纵向堆两张卡,保持与上方视频预览同宽的 50% 对齐。 */
+.runtime-column { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 
 @media (max-width: 1080px) {
   .top-media-ptz-grid, .runtime-timeline-grid { grid-template-columns: 1fr; }

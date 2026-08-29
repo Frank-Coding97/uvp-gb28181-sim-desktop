@@ -15,7 +15,8 @@ pub mod message;      // SIP 消息解析/构造
 pub mod transaction;  // 事务状态机 + 重传
 pub mod transport;    // UDP/TCP 传输
 pub mod auth;         // Digest MD5
-pub mod sdp;          // SDP 协商(点播/回放)
+pub mod sdp;          // SDP 协商(点播/回放/语音广播)+ 附录 G 的 f= 媒体参数
+pub mod subject;      // 附录 L Subject 头域(媒体流标识,附录 K 的同源判断依据)
 ```
 
 ### message
@@ -25,6 +26,20 @@ pub mod sdp;          // SDP 协商(点播/回放)
 
 ### transaction
 - 客户端/服务端事务状态机;UDP 超时重传(T1 起,指数退避到 T2);事务与响应按 branch/CSeq 匹配。
+- `client_transact()` 也用于**设备作主叫**的场景(语音广播的 INVITE):INVITE 收到 1xx 后停止
+  重传、一路等到 Timer B。ACK 不由它发 —— ACK 是独立事务,由调用方在学到对端 To-tag 后自己发。
+
+### sdp
+- `SessionDescription`:解析/生成;`is_audio_only()` 区分纯音频会话(语音对讲上行)。
+- `MediaFormat`:附录 G 的 `f=v/编码格式/分辨率/帧率/码率类型/码率大小a/编码格式/码率大小/采样率`。
+  视频段与音频段之间没有分隔符,音频段直接以 `a` 开头(如 `f=v/////a/1/8/1`)。
+- `build_broadcast_offer()`:语音广播的 offer(`s=Play` + `m=audio` + `a=recvonly` + `y=` + `f=`)。
+- `new_device_audio_response()`:纯音频会话的应答(PCMA / PT=8 / `a=sendonly`)。
+
+### subject
+- 附录 L:`媒体流发送者ID:发送方媒体流序列号,媒体流接收者ID:接收方媒体流序列号`。
+- `media_source()` 给出附录 K c) 用来判断"是否已在发送同一路码流"的标识。
+- 实时流序列号首位取 0、历史流首位取 1。
 
 ### transport
 - `UdpTransport`:共享 socket,后台接收循环解析后分发。

@@ -800,6 +800,12 @@ pub struct LiveSource {
     screen_stream: Option<screencapturekit::stream::SCStream>,
     last_key: Option<Frame>,
     consecutive_empty: u32,
+    /// 强制关键帧请求标志(A.2.3.1.7 IFrameCmd)。
+    ///
+    /// 只有自带编码器的路径能兑现:屏幕采集的 H.264 分支走 OpenH264,
+    /// 编码线程每拍检查这个标志并调 `force_intra_frame()`。
+    /// ffmpeg 子进程路径(摄像头、H.265 屏幕)没有运行中改 GOP 的接口,故为 None。
+    force_keyframe: Option<Arc<AtomicBool>>,
 }
 
 impl LiveSource {
@@ -1112,6 +1118,8 @@ impl LiveSource {
             screen_stream: None,
             last_key: None,
             consecutive_empty: 0,
+            // 摄像头走 ffmpeg 子进程编码,没有运行中强制 IDR 的接口。
+            force_keyframe: None,
         })
     }
 
@@ -1181,6 +1189,9 @@ impl LiveSource {
         let encoder_stop = Arc::clone(&stop_flag);
         let encoder_alive = Arc::clone(&producer_alive);
         let mut screen_startup = StartupChildren::empty();
+        // 只有 OpenH264 分支能在运行中强制 IDR(A.2.3.1.7 IFrameCmd);
+        // H.265 走 ffmpeg 子进程,没有运行中改 GOP 的接口。
+        let mut force_keyframe: Option<Arc<AtomicBool>> = None;
         match profile.codec {
             LiveVideoCodec::H264 => {
                 let encoder_config = EncoderConfig::new()
@@ -1195,6 +1206,8 @@ impl LiveSource {
                 .map_err(|e| {
                     Error::Media(format!("failed to initialize OpenH264 screen encoder: {e}"))
                 })?;
+                let force_flag = Arc::new(AtomicBool::new(false));
+                force_keyframe = Some(Arc::clone(&force_flag));
                 std::thread::spawn(move || {
                     // OpenH264 的 EncoderConfig 不提供 IDR 周期,只能在编码循环里
                     // 每 gop 帧显式 force_intra_frame(),否则只有第一帧是关键帧,
@@ -1213,7 +1226,13 @@ impl LiveSource {
                             out[1] = pixel[1];
                             out[2] = pixel[0];
                         }
-                        if encoded % gop == 0 {
+                        // 平台下发 IFrameCmd 时立刻插一个 IDR,并把 GOP 计数归零 ——
+                        // 不归零的话下一个周期性 IDR 会紧跟着来,白费一次码率。
+                        if force_flag.swap(false, Ordering::AcqRel) {
+                            encoder.force_intra_frame();
+                            encoded = 0;
+                            tracing::info!("屏幕编码器:按 IFrameCmd 强制插入 IDR");
+                        } else if encoded % gop == 0 {
                             encoder.force_intra_frame();
                         }
                         encoded = encoded.wrapping_add(1);
@@ -1688,6 +1707,7 @@ impl LiveSource {
             screen_stream: Some(stream),
             last_key: None,
             consecutive_empty: 0,
+            force_keyframe,
         })
     }
 }
@@ -2150,6 +2170,18 @@ impl Drop for LiveSource {
 }
 
 impl VideoSource for LiveSource {
+    /// 强制关键帧(A.2.3.1.7):屏幕采集的 H.264 分支自带 OpenH264 编码器,
+    /// 置个标志让编码线程下一帧插 IDR;ffmpeg 子进程路径无法运行中干预,返回 false。
+    fn request_keyframe(&mut self) -> bool {
+        match &self.force_keyframe {
+            Some(flag) => {
+                flag.store(true, Ordering::Release);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn next_frame(&mut self) -> Option<Frame> {
         while let Ok(frame) = self.rx.try_recv() {
             self.buf.push_back(frame);

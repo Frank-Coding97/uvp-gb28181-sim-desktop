@@ -20,7 +20,8 @@
 | 媒体源 | 四种模式:视频文件 / 屏幕(ScreenCaptureKit)/ 摄像头(AVFoundation,含 iPhone 连续互通)/ 无媒体;实时源可「刷新设备」枚举、「测试采集」自检 |
 | 主动上报 | 「上报报警」「上报 GPS」按钮(注册后可用) |
 | 平台实时状态 | 活跃订阅(目录/报警/位置及其 NOTIFY 计数)、平台下发的 OSD 配置、长任务(抓拍/升级)进度 |
-| 平台命令时间线 | 后端每收到一条平台命令推一条语义事件(查询/控制/点播/广播…) |
+| 语音广播 | 平台下发语音广播(§9.12.1)后显示会话状态:语音流发送者 ID、本端收流端口、负载类型、收包/字节、丢包/乱序、距上次收包,以及**音量条**;可主动挂断(发会话内 BYE) |
+| 平台命令时间线 | 后端每收到一条平台命令推一条语义事件(查询/控制/点播/广播…),含"强制关键帧已下发到编码器""平台改设备配置已生效:HeartBeatInterval=15"这类结果 |
 | SIP 信令追踪(FR-43) | 实时滚动收发报文(方向/摘要/CSeq),可按方向与方法过滤、点开看原始报文;默认开,可开关/清空 |
 
 ### 2.1 编码参数与实际生效路径
@@ -51,7 +52,11 @@ live:screen:<display_id>?audio=<none|system|microphone:N>&audio_codec=<g711a|g71
 4. 「上报报警」→ `fire_alarm({description})` → 设备发 Alarm Notify;「上报 GPS」→ `fire_position({longitude, latitude})` → 发 MobilePosition。
 5. 平台下发 PTZ/预置位 → 后端 emit `ptz_action`/`ptz_preset` → 前端云台动画。
 6. 信令追踪开关 → `set_sip_trace({enabled})`;开启时后端 emit `sip_trace` 事件流。
-7. 「注销」→ `stop_device()` → 停止 run 循环。
+7. 平台下发语音广播 → 设备回广播应答后**主动发 INVITE** 收音频;前端 500 ms 轮询 `get_broadcast_status` 刷新统计,`hangup_broadcast` 可主动挂断。
+8. 「注销」→ `stop_device()` → 按附录 K b) 先拆媒体链路(发会话内 BYE)再 REGISTER Expires=0。
+
+> 广播状态用轮询而不是事件推送:收流统计每 20 ms 就变一次,推成事件等于给 webview 灌洪水。
+> 会话的建立与结束本身有 `platform_command` 事件进命令时间线,轮询只补统计与电平。
 
 ## 4. 前端结构
 
@@ -66,12 +71,14 @@ live:screen:<display_id>?audio=<none|system|microphone:N>&audio_codec=<g711a|g71
 | `components/MediaSourcePanel.vue` | 媒体模式、采集自检、主动上报;视频/音频参数列复用 `MediaVideoFields.vue`、`MediaAudioFields.vue` |
 | `components/PlatformRuntimePanel.vue` | 活跃订阅 / OSD / 长任务进度 |
 | `components/CommandTimeline.vue` | 平台命令时间线 |
+| `components/VoiceBroadcastPanel.vue` | 语音广播会话状态与音量条 |
 | `components/SipTracePanel.vue` | SIP 信令追踪 |
 | `composables/useLiveSources.ts` | 媒体源状态与 `live:` URI 组装、设备枚举、采集自检 |
 | `composables/useMediaPreview.ts` | 本地预览(asset 协议 / WebView 媒体流) |
 | `composables/usePtzPose.ts` | PTZ 姿态积分与预置位巡航 |
 | `composables/usePlatformRuntime.ts` | 命令时间线 / 订阅 / 进度 / OSD |
 | `composables/useSipTrace.ts` | 信令追踪缓冲与过滤 |
+| `composables/useVoiceBroadcast.ts` | 语音广播状态轮询(500 ms)、丢流判定、挂断 |
 
 跨面板复用的页头、表单与面板原语放在全局 `src/theme.css`(scoped 样式不跨组件边界),各页面若需微调用 scoped 规则覆盖。
 
@@ -85,3 +92,5 @@ live:screen:<display_id>?audio=<none|system|microphone:N>&audio_codec=<g711a|g71
 - 点「上报报警」→ WVP 收到报警(平台侧可见)。
 - 配置视频源后,平台点播 → 状态灯变「推流中」→ 平台出画面。
 - 改分辨率/码率/编码/GOP/帧率后重新点播,平台侧码流参数随之变化(可用 `ffprobe` 抓平台侧转发流确认)。
+- 平台下发语音广播 → 「语音广播」卡片出现会话、收包数持续上涨、说话时音量条跟着动;点「挂断」平台侧会话结束。
+- 平台改设备配置(心跳周期)→ 命令时间线出现"已生效",且后续心跳间隔按新值。

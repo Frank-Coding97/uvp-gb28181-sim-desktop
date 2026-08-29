@@ -1095,6 +1095,38 @@ async fn fire_alarm(
     }
 }
 
+/// 当前语音广播会话状态(§9.12.1)。无会话时返回 null。
+///
+/// 走轮询而不是事件流:收流统计每 20ms 就变一次,推事件等于给 webview 灌洪水;
+/// 会话的开始/结束本身有 `platform_command` 事件,轮询只补统计与电平。
+#[tauri::command]
+async fn get_broadcast_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<gb28181_simulator::BroadcastSnapshot>, String> {
+    let guard = state.device.lock().await;
+    match &*guard {
+        Some(h) => Ok(h.sim.broadcast_snapshot().await),
+        // 设备没启动不是错误:界面就该显示"空闲"。
+        None => Ok(None),
+    }
+}
+
+/// 设备侧主动挂断语音广播(按附录 K a) 发会话内 BYE)。
+#[tauri::command]
+async fn hangup_broadcast(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let guard = state.device.lock().await;
+    match &*guard {
+        Some(h) => {
+            if h.sim.hangup_broadcast(&h.transport).await {
+                Ok("已挂断语音广播并通知平台".into())
+            } else {
+                Ok("当前没有进行中的语音广播".into())
+            }
+        }
+        None => Err("设备未启动".into()),
+    }
+}
+
 /// 主动上报一条 GPS 位置。
 #[tauri::command]
 async fn fire_position(
@@ -1437,6 +1469,8 @@ pub fn run() {
             stop_device,
             fire_alarm,
             fire_position,
+            get_broadcast_status,
+            hangup_broadcast,
             set_sip_trace,
             get_stress_status,
             get_device_status,

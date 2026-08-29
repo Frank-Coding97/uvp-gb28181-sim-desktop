@@ -156,7 +156,8 @@ const capabilities = [
 
 <style scoped>
 .page { width: min(1200px, 100%); margin: 0 auto; padding-top: 6px; }
-.hero { position: relative; display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(220px, .6fr); min-height: 190px; overflow: hidden; border: 1px solid rgba(255,255,255,.68); border-radius: var(--radius-lg); background: linear-gradient(125deg, rgba(255,255,255,.76), rgba(229,239,255,.54)); box-shadow: var(--shadow-card); }
+/* 用主题令牌而不是写死的白色渐变:暗色下写死白色会变成一整块亮斑。 */
+.hero { position: relative; display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(220px, .6fr); min-height: 190px; overflow: hidden; border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); background: linear-gradient(125deg, var(--bg-elevated), color-mix(in srgb, var(--accent) 8%, var(--bg-card))); box-shadow: var(--shadow-card); }
 .hero::before { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 55%, rgba(56,132,255,.07)); pointer-events: none; }
 .hero-copy { position: relative; z-index: 2; padding: 22px 26px; }
 .eyebrow { color: var(--accent); font-size: 9.5px; font-weight: 800; letter-spacing: 1.5px; }
@@ -172,14 +173,14 @@ h1 { max-width: 600px; margin: 6px 0 0; color: var(--text-primary); font-size: c
 .radar-ring::before { left: 50%; top: 0; width: 1px; height: 100%; }
 .radar-ring::after { top: 50%; left: 0; height: 1px; width: 100%; }
 .radar-core { position: relative; z-index: 2; display: grid; place-items: center; width: 38px; height: 38px; border-radius: 10px; background: linear-gradient(145deg, #4f93ff, #266bdc); color: #fff; font: 800 11px/1 "SF Mono", Menlo, monospace; box-shadow: 0 8px 24px rgba(56,132,255,.3); }
-.node { position: absolute; width: 7px; height: 7px; border: 2px solid rgba(255,255,255,.9); border-radius: 50%; background: var(--cyan); box-shadow: 0 2px 8px rgba(0,185,214,.35); }
+.node { position: absolute; width: 7px; height: 7px; border: 2px solid var(--bg-base); border-radius: 50%; background: var(--cyan); box-shadow: 0 2px 8px rgba(0,185,214,.35); }
 .n1 { transform: translate(-60px, -40px); }.n2 { transform: translate(64px, -24px); }.n3 { transform: translate(-42px, 62px); }.n4 { transform: translate(54px, 50px); background: var(--violet); }
 .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
 .status-card { padding: 10px 14px; border-radius: var(--radius-md); }
 .status-label { color: var(--text-tertiary); font-size: 10.5px; }
 .status-value { display: flex; align-items: center; gap: 6px; min-height: 20px; margin-top: 3px; color: var(--text-primary); font-size: 13.5px; font-weight: 700; }
 .status-value i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
-.status-value i.online { background: var(--success); box-shadow: 0 0 0 3px rgba(8,179,136,.11); }
+.status-value i.online { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent); }
 .status-value.mono { font-family: "SF Mono", Menlo, monospace; font-size: 12.5px; }
 .status-card small { display: block; overflow: hidden; margin-top: 2px; color: var(--text-tertiary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .section-head { display: flex; align-items: flex-end; justify-content: space-between; margin: 18px 2px 8px; }
@@ -190,9 +191,9 @@ h1 { max-width: 600px; margin: 6px 0 0; color: var(--text-primary); font-size: c
 .feature { display: flex; min-width: 0; padding: 12px 14px; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); text-align: left; cursor: pointer; flex-direction: column; transition: transform var(--transition), box-shadow var(--transition), border-color var(--transition); }
 .feature:hover { transform: translateY(-2px); border-color: var(--border-accent); box-shadow: var(--shadow-elevated); }
 .feature:focus-visible { outline: 2px solid var(--accent-dim); outline-offset: 1px; }
-.feature.highlight { background: linear-gradient(150deg, rgba(255,255,255,.72), rgba(122,108,255,.09)); border-color: rgba(122,108,255,.25); }
+.feature.highlight { background: linear-gradient(150deg, var(--bg-elevated), color-mix(in srgb, var(--violet) 10%, transparent)); border-color: color-mix(in srgb, var(--violet) 28%, transparent); }
 .feature-top { display: flex; align-items: center; justify-content: space-between; }
-.feature-top > span { color: rgba(76,99,133,.35); font: 700 11px/1 "SF Mono", Menlo, monospace; }
+.feature-top > span { color: var(--text-tertiary); opacity: .6; font: 700 11px/1 ui-monospace, "SF Mono", Menlo, monospace; }
 .feature-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 8px; }
 .feature h3 { display: flex; align-items: center; gap: 5px; margin: 10px 0 0; color: var(--text-primary); font-size: 12.5px; font-weight: 650; }
 .feature h3 em { padding: 1px 5px; border-radius: 999px; background: var(--violet); color: #fff; font-size: 8.5px; font-style: normal; }

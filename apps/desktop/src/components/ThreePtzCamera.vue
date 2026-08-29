@@ -401,7 +401,7 @@ onUnmounted(disposeScene);
   border: 1px solid rgba(229, 72, 92, 0.25);
   border-radius: 10px;
   color: #b4233b;
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--glass-fallback);
   font-size: 11px;
   text-align: center;
 }

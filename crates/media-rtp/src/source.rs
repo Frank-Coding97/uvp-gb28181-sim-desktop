@@ -274,6 +274,15 @@ pub trait VideoSource: Send {
     /// 默认忽略(不支持定位的源如空媒体/循环灯);FileSource 覆盖为跳转帧游标。
     fn seek(&mut self, _permille: u32) {}
 
+    /// 请求编码器立刻产出一个关键帧(A.2.3.1.7 IFrameCmd)。
+    ///
+    /// 返回是否**真的能兑现**。默认 false:文件循环源只能等自带的周期 IDR,
+    /// 把某个非关键帧硬标成关键帧会产出对端解不开的坏流。
+    /// 实时编码源(屏幕采集走 OpenH264)覆盖此方法,让编码器立刻插入 IDR。
+    fn request_keyframe(&mut self) -> bool {
+        false
+    }
+
     /// 是否为实时采集源(持续产帧,无"结束"概念)。
     ///
     /// **关键**:pusher 用 `next_frame()` 返回 `None` 表示"有限源已耗尽"→停流。

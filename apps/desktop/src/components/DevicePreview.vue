@@ -128,7 +128,7 @@ function bindPreviewEl(el: unknown) {
   background:
     radial-gradient(circle at 50% 35%, rgba(56,132,255,.18), transparent 32%),
     linear-gradient(145deg, #0f1b2e, #14243a 58%, #0d1727);
-  border: 1px solid rgba(255,255,255,.45); box-shadow: inset 0 1px 0 rgba(255,255,255,.15), 0 6px 16px rgba(15,23,42,.08);
+  border: 1px solid var(--border-subtle); box-shadow: inset 0 1px 0 rgba(255,255,255,.15), 0 6px 16px rgba(15,23,42,.08);
 }
 .video-frame::after {
   content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .18;

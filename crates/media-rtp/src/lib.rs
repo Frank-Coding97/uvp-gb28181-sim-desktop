@@ -7,14 +7,20 @@
 //! - `ps`:PS(Program Stream)封装,复用 H.264
 //! - `source`:视频源抽象(空媒体 / 真实文件循环)
 //! - `pusher`:把视频源→PS→RTP 按帧率推流的驱动
+//! - `receiver`:RTP 音频**接收**(语音广播/对讲的下行方向)
 
 pub mod ps;
 pub mod pusher;
+pub mod receiver;
 pub mod rtp;
 pub mod source;
 
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};
-pub use pusher::{push_stream, push_stream_controlled, push_stream_prepared, PlaybackControl};
+pub use pusher::{
+    push_audio_stream, push_stream, push_stream_controlled, push_stream_prepared, AudioPushSummary,
+    PlaybackControl, AUDIO_CLOCK_HZ, G711_PACKET_BYTES_20MS,
+};
+pub use receiver::{AudioReceiver, RecvStats, RecvStatsSnapshot, PT_PCMA, PT_PCMU};
 pub use rtp::{build_rtcp_sr, PreparedMedia, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
     list_live_sources, prepare_video_source, FileSource, Frame, LightSource, LiveAudioCodec,

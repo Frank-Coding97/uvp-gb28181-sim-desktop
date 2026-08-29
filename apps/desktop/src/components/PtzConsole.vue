@@ -93,7 +93,9 @@ onUnmounted(stopPtzTracking);
 </template>
 
 <style scoped>
-.ptz-panel { box-sizing: border-box; display: flex; flex-direction: column; }
+/* 3D 舞台的高光强度随主题走:暗色下 35% 白会在深底上拉出一道亮边。 */
+.ptz-panel { --stage-gloss: rgba(255, 255, 255, 0.35); box-sizing: border-box; display: flex; flex-direction: column; }
+:root[data-theme="dark"] .ptz-panel { --stage-gloss: rgba(255, 255, 255, 0.06); }
 .ptz-head {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 8px; margin-bottom: 6px; flex: 0 0 auto;
@@ -110,7 +112,7 @@ onUnmounted(stopPtzTracking);
     radial-gradient(circle at 50% 38%, var(--accent-glow), transparent 31%),
     linear-gradient(155deg, var(--bg-elevated), var(--bg-card));
   border: 1px solid var(--border-default);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.35), inset 0 -16px 32px rgba(57,87,126,.07);
+  box-shadow: inset 0 1px 0 var(--stage-gloss), inset 0 -16px 32px rgba(57,87,126,.07);
 }
 .stage-grid {
   position: absolute; inset: 54% -12% -36%; transform: rotateX(65deg); transform-origin: center top;
@@ -136,7 +138,7 @@ onUnmounted(stopPtzTracking);
 .compass-ring {
   position: absolute; z-index: 2; left: 50%; top: 64%; width: 170px; height: 58px;
   margin-left: -85px; border-radius: 50%; transform: rotateX(68deg);
-  border: 1.5px solid var(--border-accent); box-shadow: 0 0 0 5px rgba(255,255,255,.12), inset 0 0 14px var(--accent-dim);
+  border: 1.5px solid var(--border-accent); box-shadow: 0 0 0 5px var(--stage-gloss), inset 0 0 14px var(--accent-dim);
 }
 .compass-dial {
   position: absolute; inset: 3px; border-radius: 50%; transition: transform .12s linear;
@@ -187,10 +189,10 @@ onUnmounted(stopPtzTracking);
 .axis-label { position: absolute; z-index: 8; color: var(--text-tertiary); font: 700 7px/1 "SF Mono", Menlo, monospace; letter-spacing: .3px; }
 .pan-axis { left: 8px; bottom: 8px; }
 .tilt-axis { right: 8px; bottom: 8px; }
-.ptz-stage.active { box-shadow: inset 0 1px 0 rgba(255,255,255,.35), inset 0 -16px 32px rgba(57,87,126,.07), 0 0 0 2px var(--accent-dim); }
+.ptz-stage.active { box-shadow: inset 0 1px 0 var(--stage-gloss), inset 0 -16px 32px rgba(57,87,126,.07), 0 0 0 2px var(--accent-dim); }
 .ptz-stage.seeking { animation: stageSeekPulse 1.15s ease-in-out infinite; }
 @keyframes stageSeekPulse {
-  50% { box-shadow: inset 0 1px 0 rgba(255,255,255,.35), inset 0 -16px 32px rgba(57,87,126,.07), 0 0 16px var(--accent-glow); }
+  50% { box-shadow: inset 0 1px 0 var(--stage-gloss), inset 0 -16px 32px rgba(57,87,126,.07), 0 0 16px var(--accent-glow); }
 }
 
 /* 云台右侧参数信息:顶部对齐、2x2 指标卡、下部预置位卡片占满剩余空间 */

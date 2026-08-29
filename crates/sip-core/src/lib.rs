@@ -6,13 +6,18 @@
 pub mod auth;
 pub mod message;
 pub mod sdp;
+pub mod subject;
 pub mod transaction;
 pub mod transport;
 
 // 常用类型再导出,方便上层 `use sip_core::{...}`。
 pub use auth::{authorization, authorization_with_body, Algorithm, Challenge, Qop};
 pub use message::{Headers, Method, Request, Response, SipMessage};
-pub use sdp::{build_broadcast_offer, Direction, SessionDescription, Setup};
+pub use sdp::{
+    build_broadcast_offer, Direction, MediaFormat, SessionDescription, Setup, F_AUDIO_G711,
+    F_VIDEO_H264, F_VIDEO_H265,
+};
+pub use subject::Subject;
 pub use transaction::{client_transact, Admit, ServerTransactions, Timing, TxToken};
 pub use transport::{
     Incoming, SipTrace, SipTransport, TcpTransport, TraceDir, TraceObserver, TransportStats,

@@ -2,14 +2,17 @@
 
 **状态:核心已实现并真机验证** · 本项目实现 GB/T 28181-2022 **下级设备(IPC)侧**协议。协议流程参考开源项目 uvp-gb28181-sim(Android 版),桌面端用 Rust 独立重写。
 
-> **对标 uvp-gb28181-sim 结论(2026-07-04 更新)**:上游 Android 版的核心能力(注册/心跳/目录/点播/PTZ 及设备控制/**预置位 CRUD**/**看守位**/GPS 上报/报警)本项目均已覆盖并真机验证,且**额外**具备上游没有的**万级压测引擎**(差异化核心)、**GB-2016/2022 双版本**、**订阅通知全套**(目录/报警对话内 NOTIFY + 位置周期)、**回放倍速/下载**、**音视频复合流(H.264+G.711A)**、**MP4/FLV/MKV 容器源**、**网络校时**、**SIP 信令实时追踪**。仍缺:**语音广播的音频收流 / 双向对讲**(需反向 INVITE + 音频上行,本 WVP 环境无法触发验证);GB35114、附录 A.4 联网系统扩展应用、上级侧为明确不做/不适用。巡航轨迹控制与摄像头实时采集已实现。
+> **对标 uvp-gb28181-sim 结论(2026-08-30 更新)**:上游 Android 版的核心能力(注册/心跳/目录/点播/PTZ 及设备控制/**预置位 CRUD**/**看守位**/GPS 上报/报警)本项目均已覆盖并真机验证,且**额外**具备上游没有的**万级压测引擎**(差异化核心)、**GB-2016/2022 双版本**、**订阅通知全套**(目录/报警对话内 NOTIFY + 位置周期)、**回放倍速/下载**、**音视频复合流(H.264+G.711A)**、**MP4/FLV/MKV 容器源**、**网络校时**、**SIP 信令实时追踪**、**语音广播完整收流链路**、**附录 K 媒体流保活 + 附录 L Subject 头域**。GB35114、附录 A.4 联网系统扩展应用、上级侧为明确不做/不适用。
 
-图例:✅ 已实现并对真实 WVP 验证 · 🟢 已实现(单测,未逐一真机) · 🚧 部分 · ⬜ 规划 · 🚫 明确不做
+图例:✅ 已实现并对真实 WVP 验证 · 🟢 已实现(单测/集成测,未逐一真机) · 🚧 部分 · ⬜ 规划 · 🚫 明确不做
 
 > **2026-08 逐条对标标准原文的复核结论**(依据 `GB/T 28181-2022` 与 `GB/T 28181-2016` PDF 正文):
 > 命令集覆盖是完整的 —— 2022 附录 A 的控制(A.2.3)、查询(A.2.4)、通知(A.2.5)、
 > 应答(A.2.6)全部命令都有实现,2016 是 2022 的子集因此一并覆盖。复核**发现并修正了
-> 6 处与标准原文不一致**,详见下面「与标准原文的差异修正」一节。
+> 6 处与标准原文不一致**,详见「与标准原文的差异修正」一节。
+>
+> **第二轮复核(§9.12 语音广播 / 附录 C.2.4 / 附录 G / 附录 K / 附录 L)又发现 5 处实现缺口,
+> 已全部补齐**,详见「第二轮复核:§9.12 与附录 G/K/L」一节。
 
 > 真机验证平台:WVP-Pro `<WVP_SERVER_HOST>:<WVP_SERVER_PORT>`(SIP 域 `<WVP_SERVER_DOMAIN>`),设备 `<WVP_DEVICE_ID>`。
 
@@ -42,6 +45,41 @@
 
 ---
 
+## 第二轮复核:§9.12 与附录 G/K/L(2026-08-30)
+
+前一轮只对了附录 A 的命令集。这一轮把**媒体链路的信令与保活**也逐条对了一遍
+(§9.12 语音广播/对讲、附录 C.2.4 音频 RTP 封装、附录 G SDP 定义、附录 K 媒体流保活、
+附录 L Subject 头域),发现 5 处缺口,全部补齐:
+
+| # | 条款 | 原实现 | 问题 | 现状 |
+|---|---|---|---|---|
+| 1 | **§9.12.1 图27 信令 5~15** 语音广播 | 只构造 SDP offer 并打日志,**SDP 里端口写死 0** | 反向 INVITE 从未发出,链路从来没建起来过。端口 0 在 SDP 里意味着"该媒体被禁用",即使发出去平台也无处推流 | ✅ 完整实现:**先绑收流端口再发 INVITE** → 收 200 → 学到 To-tag 发 ACK → 收 G.711 音频 → 平台 BYE 或设备挂断。端到端回归见 `tests/voice_broadcast.rs` |
+| 2 | **附录 L** Subject 头域 | 完全没有 | §9.2.3 c) 要求"发送给媒体服务器的消息头**应**包括 Subject 字段";没有它就无法做附录 K c) 的同源判断 | ✅ 新增 `sip_core::Subject`(解析/生成/`media_source()`,实时流序列号首位 0、历史流首位 1),出站 INVITE 携带,入站 INVITE 解析 |
+| 3 | **附录 K c)** 同源码流替换 | 有会话就回 `486 Busy Here` | **与标准相反**。标准要求"若已经在发送以此媒体源标识的码流,则应释放现有媒体流发送链路并按照请求建立新的媒体流发送链路"。旧行为下平台重启或丢一次 200 OK,这个通道就永久拉不到流 | ✅ 按 Subject 的媒体源标识判定:同源→释放旧链路重建;确为另一路码流→仍回 486 |
+| 4 | **附录 K a) / b)** 媒体流丢失通知 | 设备**从不发 BYE**,推流失败只推一个前端事件 | 平台侧那条媒体链路会一直挂着等流,直到它自己的丢流监测超时 | ✅ 推流异常 → 会话内 BYE(`notify_media_loss`);设备下线 → 先拆链路再注销(`release_media_on_shutdown`) |
+| 5 | **附录 C.2.4** 音频流 RTP 封装 | 纯音频 INVITE 会走视频路径,把音频塞进 PS | 标准规定语音比特流**直接用 RTP 打包**(PT=8 / PCMA / 8 kHz / 单声道、一包装整数个编码帧且时长 20~180 ms),塞进 PS 对端解不出 | ✅ 新增 `handle_audio_invite` + `push_audio_stream`:裸 G.711A、PT=8、20 ms 一包、时间戳按采样数递增 |
+
+同一轮修正的两处 SDP 字段问题:
+
+| 条款 | 问题 | 现状 |
+|---|---|---|
+| **附录 G** s 字段 | 广播 offer 写 `s=Broadcast` —— s 字段只有 `Play`/`Playback`/`Download` 三种合法取值 | ✅ 改为 `s=Play`(与 §9.12.1.3.2 示例一致) |
+| **附录 G** f 字段 | 完全没有 `f=`(媒体参数描述) | ✅ 新增 `MediaFormat` 解析/渲染;广播 offer 与纯音频应答输出 `f=v/////a/1/8/1` |
+
+---
+
+## 媒体流保活与会话标识(附录 K / L)
+
+| 功能 | 条款 | 状态 |
+|---|---|---|
+| Subject 头域(生成 + 解析) | 附录 L、§9.2.3 c) | 🟢 `媒体流发送者ID:发送方序列号,媒体流接收者ID:接收方序列号`;实时流序列号首位 0、历史流首位 1;设备发起的 INVITE 必带 |
+| 同源码流请求 → 释放旧链路重建 | 附录 K c) | 🟢 按媒体源标识判定;平台不带 Subject 时退化为"同通道重新点播即同源"(现网存在不带 Subject 的平台,一次丢包不该把通道永久锁死) |
+| 媒体流丢失 → 会话内 BYE | 附录 K a) | 🟢 推流后端异常/发送失败即发 BYE 并释放链路 |
+| 设备离线 → 主动释放媒体链路 | 附录 K b) | 🟢 下线序列:停订阅 → 拆媒体链路(点播发反向 BYE、广播发正向 BYE)→ REGISTER Expires=0 |
+| 收流侧丢流监测 | 附录 K a) | 🟢 `RecvStats::idle_for()` 给出"多久没收到包",界面在 >3s 时标记"链路可疑"并提供挂断 |
+
+---
+
 ## 注册与信令
 
 | 功能 | 需求 | 状态 |
@@ -71,7 +109,7 @@
 | 功能 | 需求 | 状态 |
 |---|---|---|
 | INVITE 点播 / ACK / BYE 停流 / CANCEL 取消 | FR-7 | ✅ WVP 点播成功出流;CANCEL 停未决点播 |
-| SDP 协商(PS/90000,y=ssrc,TCP/UDP proto) | FR-7 | ✅ |
+| SDP 协商(PS/90000,y=ssrc,TCP/UDP proto,附录 G `f=` 媒体参数) | FR-7 | ✅ `f=` 字段(附录 G)可解析与生成;`s=` 只用 Play/Playback/Download 三种合法取值 |
 | RTP over UDP 推流 | FR-8 | ✅ |
 | RTP over TCP(RFC 4571) | FR-8 | ✅ WVP TCP-PASSIVE 收流 |
 | PS 封装 H.264(Pack/System/PSM/PES) | FR-8 | ✅ WVP 转 FLV 出画面 |
@@ -82,7 +120,22 @@
 | 历史回放流推送 | FR-10 | 🟢 复用点播 INVITE 推流路径 |
 | 回放控制(会话内 INFO/MANSRTSP:PLAY/PAUSE/Scale 倍速/Range 拖动) | FR-10 | 🟢 INFO 回 200 + 运行时调速/暂停/恢复;§9.8 Range 拖动:解析 npt 起点折算千分比,PlaybackControl.seek + FileSource 跳最近关键帧(单测+真机 INFO 注入回 200) |
 | 下载(INVITE s=Download + a=downloadspeed:N) | FR-10 | ✅ 按 N 倍速推流(实测:4× → 100 包/s = 4×25fps,1× → ~29/s) |
-| 强制关键帧(IFrameCmd) | FR-8 | 🚧 见设备控制 |
+| 强制关键帧(IFrameCmd) | FR-8 | 🟢 见设备控制:实时编码源真的插 IDR,文件源如实不兑现 |
+
+## 语音广播与语音对讲(§9.12)
+
+标准把对讲拆成两个独立流程的组合(§9.12.2):a) 用 §9.2 实时点播拿设备的音频;
+b) 用 §9.12.1 语音广播把中心的音频送到设备。所以下表两行合起来就是完整的双向对讲。
+
+| 功能 | 条款 | 状态 |
+|---|---|---|
+| 语音广播下行(平台 → 设备,设备收音频) | §9.12.1 | 🟢 完整链路,细节见「其它设备能力」表的「语音广播」行。设备是**语音流接收者**,主动发 INVITE |
+| 对讲上行(设备 → 平台,纯音频会话) | §9.12.2 a) + 附录 C.2.4 | 🟢 平台只请求 `m=audio` 时回纯音频 SDP(PCMA / `a=sendonly` / `f=v/////a/1/8/1`),媒体走**裸 G.711A RTP(PT=8)而非 PS**;有配置音源就送真实音频,没有则送 A-law 静音并在统计里如实标注"全程静音" |
+| 双向对讲 | §9.12.2 | 🟢 上述两条组合即可;两个方向是独立会话,可同时存在 |
+| 广播会话可视化 | — | 🟢 前端「语音广播」卡片:状态灯 / 音量条 / 收包与丢包统计 / 距上次收包 / 挂断按钮 |
+
+> 音量条不是装饰:平台推静音流时包数照样涨,只有把 G.711 解成线性 PCM 算电平
+> 才能区分"链路通了"与"对面真的在讲话"。
 
 ## 设备控制(平台 → 设备,MANSCDP Control)
 
@@ -94,7 +147,7 @@
 | 预置位设置/调用/删除 | DeviceControl / PTZCmd 指令码 81/82/83 | P1 | ✅ 解析 8 字节码预置位操作,有状态增删,实 SIP 注入验证(设置/删除后 PresetQuery 反映) |
 | 看守位设置 | DeviceControl / HomePosition | P1 | 🟢 解析 Enabled/ResetTime/PresetIndex + 应答;更新看守位启用/已设标志供 HomePositionQuery 读回(FR-18) |
 | 拉框放大/缩小 | DeviceControl / DragZoomIn / DragZoomOut(`Control::kind()`=拉框放大/缩小) | P1 | 🟢 解析 DragZoom 参数 + 应答 |
-| 强制关键帧 | DeviceControl / IFameCmd | P0 | ✅ 命令解析+应答;文件回放源自带周期 IDR,无法"强制"再生成一帧(硬标关键帧会产出坏流),故仅应答,符合回放模拟器语义 |
+| 强制关键帧 | DeviceControl / IFrameCmd(2016 拼写 IFameCmd) | P0 | 🟢 **实时采集源真的生效**:屏幕采集(OpenH264)收到命令后让编码器立刻插 IDR 并重置 GOP 计数;摄像头与 H.265 走 ffmpeg 子进程,无运行中改 GOP 的接口,如实返回"未兑现";文件循环源自带周期 IDR(硬标关键帧会产出坏流)。命令结果进平台命令时间线 |
 | 录像控制(录制/停止) | DeviceControl / RecordCmd | P1 | ✅ 同一 Control 链路 |
 | 布防/撤防 | DeviceControl / GuardCmd | P1 | ✅ 同一 Control 链路;更新报警值守态供 AlarmStatus 读回(FR-18) |
 | 报警复位 | DeviceControl / AlarmCmd | P1 | ✅ 同一 Control 链路 |
@@ -106,7 +159,7 @@
 | 聚焦/光圈 | DeviceControl / PTZCmd byte3 聚焦位 | P2 | 🟢 最小识别(0x40 近/0x80 远)+ 应答;⚠️ 未真机核对字节位(FR-18) |
 | 目标跟踪 | DeviceControl / TargetTrack(Mode/ObjectID/Speed) | P2 | 🟢 白名单模式解析+应答,模式外忽略仍 200(FR-18,单测) |
 | 格式化 SD 卡 | DeviceControl / FormatSDCard + DiskNum | P2 | 🟢 解析+应答(模拟设备无实际存储)(FR-18,单测) |
-| 设备配置(基本参数) | DeviceConfig / BasicParam | P2 | ⬜ 修改暂未做(查询见 ConfigDownload) |
+| 设备配置(基本参数) | DeviceConfig / BasicParam | P2 | 🟢 **真实生效**:Name / Expiration / HeartBeatInterval / HeartBeatCount 写入运行时参数,心跳主循环每拍重读(周期与超时次数立即变化),DeviceInfo 与 ConfigDownload 读回新值;空串/0 表示"该项不改"。回归见 `tests/media_keepalive.rs` |
 
 ## 订阅与通知(平台订阅 → 设备周期 NOTIFY)
 
@@ -123,10 +176,10 @@
 | 功能 | CmdType | 优先级 | 状态 |
 |---|---|---|---|
 | 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
-| 语音广播 | Broadcast | P2 | 🟡 握手已实现:解析 Broadcast Notify(SourceID/TargetID)→ 回 Broadcast Response(TargetID 属本设备 OK,否则 ERROR+Reason);接受后构造反向 INVITE 的 SDP offer(a=recvonly / PCMA+PCMU / y=ssrc)。**反向 INVITE 事务与音频 RTP 接收/ACK/BYE 链路本 WVP 环境无法触发验证,未实装收流**(FR-36,握手+SDP 单测) |
+| 语音广播(完整收流链路) | Broadcast + INVITE/ACK/BYE | P2 | 🟢 §9.12.1 图27 信令 1~5、14、15、17、18 全通:解析广播通知 → 回广播应答 → **设备作主叫**发带 Subject 的 INVITE(`s=Play` / `m=audio` / `a=recvonly` / `f=v/////a/1/8/1`,端口是真实绑定端口)→ 收 200 学 To-tag → 发 ACK → 收 G.711 音频(统计包数/字节/丢包/乱序/电平)→ 平台 BYE 或设备挂断。端到端回归 `tests/voice_broadcast.rs`(含真实收到 RTP 并校验电平)(FR-36) |
 | 设备配置查询 | ConfigDownload / BasicParam + VideoParamOpt | P2 | 🟢 回 200 + ConfigDownload Response,支持 BasicParam(Name/Expiration/HeartBeat*)与 VideoParamOpt(DownloadSpeed/Resolution)按 ConfigType 组合输出(FR-17) |
 | 设备配置查询扩展 | ConfigDownload / 全 ConfigType | P2 | 🟢 GB28181-2022 A.2.4.7 全部 ConfigType:BasicParam/VideoParamOpt/VideoParamAttribute/VideoRecordPlan/VideoAlarmRecord/PictureMask/FrameMirror/AlarmReport/OSDConfig/SnapShotConfig 完整;SVACEncodeConfig/SVACDecodeConfig 最小合规占位(FR-37,单测) |
-| 设备配置修改 | DeviceConfig / 全配置项 | P2 | 🟢 A.2.3.2 全部配置命令接受回 DeviceConfig 应答(A.2.6.8);含 SVAC/VideoParamAttribute(FR-37) |
+| 设备配置修改 | DeviceConfig / 全配置项 | P2 | 🟢 A.2.3.2 全部配置命令接受回 DeviceConfig 应答(A.2.6.8);含 SVAC/VideoParamAttribute。**BasicParam 真实改变设备行为**,其余配置项接受并应答但不改变模拟行为(FR-37) |
 | 预置位查询 | PresetQuery | P2 | ✅ 返回有状态预置位表(随预置位设置/删除动态变),实 SIP 注入验证 |
 | 报警状态查询 | AlarmStatus | P1 | 🟢 GB-2022 每报警通道 DutyStatus(ALARM/OFFDUTY)/ GB-2016 NotNumber,随布防态动态(FR-17,单测) |
 | 看守位查询 | HomePositionQuery | P1 | 🟢 Enabled/ResetTime(固定30)/PresetIndex(有无看守位标志)(FR-17,单测) |
@@ -149,7 +202,8 @@
 | 录像完成/异常通知(MediaStatus) | FR-31 | 🟢 回放/下载会话 BYE 后发 MediaStatus NotifyType=121(历史媒体发送结束);122/123(异常/存储满)类型已备(FR-31) |
 | 实时视音频回传通知(VideoUploadNotify) | FR-37 | 🟢 GB28181-2022 A.2.5.8:report_video_upload 主动发独立 MESSAGE(Time+可选经纬度)(FR-37,单测) |
 | 注册续约 | FR-32 | 🟢 注册有效期 3600s,到期前 80%(2880s)主动重注册,不等心跳失败被动重注册(FR-32) |
-| RTCP SR 反馈 | FR-32 | 🟢 build_rtcp_sr 按 RFC3550 §6.4.1 构造 SR 包(SSRC/NTP/RTP-TS/包数/字节数),单测;周期发送待接入 RTCP 端口(需真机反馈校准,暂不盲发) |
+| RTCP SR 发送 | FR-32 | 🟢 按 RFC 3550 §6.4.1 构造并**每 5 秒周期发送**(UDP 走 RTP 端口+1,TCP 复用同一条 RFC 4571 连接)。满足 §4.3.6"应支持 RTP/RTCP" |
+| RTCP RR 接收(读平台反馈的丢包/抖动) | — | 🟡 未做。标准只到"**宜**采用 RFC 3550 的 RTCP"这一级,没有要求设备处理接收报告;实现它需要额外占用 `本端RTP端口+1`(不保证可用)。作为加分项待排期,不影响任何一条"应"级要求 |
 | Catalog 增量 NOTIFY | FR-32 | 🟢 diff 引擎(CatalogSnapshot::diff,ADD/DEL/UPDATE/ON/OFF)+ 设备侧 catalog_dialog 记录订阅,CRUD 后 notify_catalog_changed 发对话内增量 NOTIFY;全量 NOTIFY 刷新快照基线(FR-32/34,单测) |
 | 多通道虚拟通道 CRUD + 模板 | FR-34 | 🟢 引擎 CatalogNode 树 + 4 模板(single/nvr-8ch/civil-3x2/large-16ch,据上游核对)+ 载入/增删改;报警通道独立节点 typeCode 134;多通道 Catalog 应答按层级出 ParentID/Parental/CivilCode。前端「多通道目录」页:模板选择器 + 目录树表格 + 通道增删改弹窗(headless Chrome 渲染核对)(FR-34,单测) |
 | OSD 叠加 | FR-35 | 🟡 配置面对齐上游(时间戳/通道名/水印开关+位置+字号,本地持久化)。**与上游一致 OSD 为本地渲染,不进 GB28181 协议、不影响平台收流**;我方文件推流模型不逐帧烧入(逐帧重编码破坏轻量循环模型,压测不可用),故仅配置面(FR-35) |
@@ -171,14 +225,12 @@
 
 | 功能 | 条款 | 说明 |
 |---|---|---|
-| 双向语音对讲 | §9.12.2 | 🚫 排期外(需音频上行 + 回声处理) |
-| 语音广播的音频收流 | §9.12.1 | 🟡 握手与 SDP offer 已实现,反向 INVITE 的音频 RTP 接收未实装(本 WVP 环境无法触发验证) |
 | GB35114 国密扩展 | §8 高安全级别 | 🚫 后续评估。数字证书认证、SIP 信令签名、媒体加密都在该标准里,当前只做数字摘要认证 |
 | 联网系统扩展应用 | 附录 A **A.4** | 🚫 不适用。停车场/门禁/道闸/车辆抓拍机等扩展目录类型(detectorType / pmsHostType / dmsHostType / barrierType …)不属于视频 IPC 的能力域 |
 | SVAC 编码/解码配置 | A.2.3.2.3 / A.2.3.2.4 | 🚧 最小合规占位(接受并回应答,不真的做 SVAC 编码)。SVAC 是国密视频编码,模拟器不实现编码器 |
 | 上级平台(SU)侧 | 全篇 | 🚫 本项目只做下级设备(SIP 设备/网关侧) |
 | OSD 烧入画面 | A.2.3.2.11 | 🟡 接受并应用配置命令,但不逐帧烧入图像 —— 逐帧重编码会破坏"轻量循环推流"模型,压测不可用 |
-| 强制关键帧真的生成 IDR | A.2.3.1.7 | 🟡 命令解析 + 应答。文件循环源自带周期 IDR,硬标关键帧会产出坏流,故只应答 |
+| 强制关键帧对**文件源**生成 IDR | A.2.3.1.7 | 🟡 实时采集源已真的插 IDR;文件循环源只应答 —— 它自带周期 IDR,把某个非关键帧硬标成关键帧会产出对端解不开的坏流 |
 
 ---
 

@@ -158,18 +158,18 @@ onUnmounted(() => unlisten?.());
 }
 .mini-select {
   height: 24px; padding: 0 6px; border: 1px solid var(--border-default);
-  border-radius: var(--radius-xs); background: rgba(255,255,255,0.7); font-size: 11px; color: var(--text-primary);
+  border-radius: var(--radius-xs); background: var(--bg-elevated); font-size: 11px; color: var(--text-primary);
 }
 .log-search {
   flex: 1 1 180px; min-width: 140px; height: 24px; padding: 0 8px;
   border: 1px solid var(--border-default); border-radius: var(--radius-xs);
-  background: rgba(255,255,255,0.7); font-size: 11px; color: var(--text-primary); outline: none;
+  background: var(--bg-elevated); font-size: 11px; color: var(--text-primary); outline: none;
 }
 .log-search:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 .ctl-right { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
 .ck { font-size: 11px; color: var(--text-secondary); cursor: pointer; user-select: none; }
 .mini-btn {
-  border: 1px solid var(--border-default); background: rgba(255,255,255,0.6);
+  border: 1px solid var(--border-default); background: var(--bg-elevated);
   border-radius: 4px; padding: 2px 8px; font-size: 11px; color: var(--text-secondary); cursor: pointer; height: 24px;
 }
 .mini-btn:hover { border-color: var(--accent); color: var(--accent); }

@@ -8,6 +8,7 @@ import {
   onUnmounted,
   ref,
   shallowRef,
+  watch,
 } from "vue";
 import {
   NAlert,
@@ -35,6 +36,7 @@ import {
 import { init, use as useECharts, type ECharts } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 import { usePlatform } from "../platform";
+import { useTheme } from "../theme";
 import { buildScenarioToml } from "../lib/scenarioToml";
 
 useECharts([
@@ -394,6 +396,7 @@ const regRates: number[] = [];
 const hbFails: number[] = [];
 const onlineCounts: number[] = [];
 const p95Latency: number[] = [];
+const { isDark } = useTheme();
 const chartEl = ref<HTMLElement | null>(null);
 const chart = shallowRef<ECharts | null>(null);
 let resizeObserver: ResizeObserver | null = null;
@@ -425,42 +428,86 @@ function updateChart() {
   });
 }
 
+/// ECharts 画在 canvas 上,拿不到 CSS 变量,配色只能显式给。
+/// 暗色下沿用浅色的轴文字(#8fa1bd 对深底对比度不足)会让坐标轴几乎看不见,
+/// 所以按主题切一套。
+const chartPalette = computed(() => {
+  const dark = isDark.value;
+  return {
+    series: dark
+      ? ["#5a9bff", "#2ed3a5", "#9b8fff", "#f0a93c"]
+      : ["#3884ff", "#08b388", "#8b5cf6", "#e89320"],
+    axisLabel: dark ? "#a9bcd6" : "#8fa1bd",
+    legend: dark ? "#a9bcd6" : "#627797",
+    axisLine: dark ? "rgba(169,188,214,.28)" : "rgba(76,99,133,.2)",
+    splitLine: dark ? "rgba(169,188,214,.12)" : "rgba(76,99,133,.08)",
+    tooltipBg: dark ? "rgba(10,18,30,.94)" : "rgba(14,39,71,.92)",
+    zoomFiller: dark ? "rgba(90,155,255,.18)" : "rgba(56,132,255,.12)",
+  };
+});
+
+/// 只含配色的 option 片段。初始化与主题切换共用一份,避免两处写法漂移。
+function paletteOption() {
+  const c = chartPalette.value;
+  return {
+    color: c.series,
+    tooltip: {
+      trigger: "axis" as const,
+      backgroundColor: c.tooltipBg,
+      borderWidth: 0,
+      textStyle: { color: "#fff" },
+    },
+    legend: { right: 4, top: 0, textStyle: { color: c.legend } },
+    dataZoom: [
+      { type: "inside" as const, throttle: 60 },
+      {
+        type: "slider" as const,
+        height: 14,
+        bottom: 6,
+        borderColor: "transparent",
+        fillerColor: c.zoomFiller,
+        handleSize: "70%",
+        textStyle: { color: c.axisLabel, fontSize: 9 },
+      },
+    ],
+    xAxis: {
+      axisLine: { lineStyle: { color: c.axisLine } },
+      axisLabel: { color: c.axisLabel },
+    },
+    yAxis: [
+      {
+        axisLabel: { formatter: "{value}%", color: c.axisLabel },
+        splitLine: { lineStyle: { color: c.splitLine } },
+      },
+      { axisLabel: { color: c.axisLabel }, splitLine: { show: false } },
+    ],
+  };
+}
+
 function initChart() {
   if (!chartEl.value || chart.value) return;
   const instance = init(chartEl.value, undefined, { renderer: "canvas" });
   instance.setOption({
     animationDuration: 300,
-    color: ["#3884ff", "#08b388", "#8b5cf6", "#e89320"],
-    tooltip: { trigger: "axis", backgroundColor: "rgba(14,39,71,.92)", borderWidth: 0, textStyle: { color: "#fff" } },
-    legend: { right: 4, top: 0, textStyle: { color: "#627797" } },
+    ...paletteOption(),
     grid: { left: 44, right: 52, top: 46, bottom: 44 },
-    // 全量数据 + 缩放:长跑也能回看任意时段。
-    dataZoom: [
-      { type: "inside", throttle: 60 },
-      { type: "slider", height: 14, bottom: 6, borderColor: "transparent",
-        fillerColor: "rgba(56,132,255,.12)", handleSize: "70%",
-        textStyle: { color: "#8fa1bd", fontSize: 9 } },
-    ],
     xAxis: {
       type: "category",
       boundaryGap: false,
       data: [],
-      axisLine: { lineStyle: { color: "rgba(76,99,133,.2)" } },
-      axisLabel: { color: "#8fa1bd" },
+      ...paletteOption().xAxis,
     },
     yAxis: [
       {
         type: "value",
         min: 0,
         max: 100,
-        axisLabel: { formatter: "{value}%", color: "#8fa1bd" },
-        splitLine: { lineStyle: { color: "rgba(76,99,133,.08)" } },
+        ...paletteOption().yAxis[0],
       },
       {
         type: "value",
         min: 0,
-        axisLabel: { color: "#8fa1bd" },
-        splitLine: { show: false },
+        ...paletteOption().yAxis[1],
       },
     ],
     series: [
@@ -567,6 +614,12 @@ onUnmounted(() => {
   unlistenState?.();
   resizeObserver?.disconnect();
   chart.value?.dispose();
+});
+
+// 主题切换时把配色重刷到图表上。ECharts 画在 canvas 里,不会跟着 CSS 变量走,
+// 少了这一步暗色下坐标轴文字几乎看不见。
+watch(isDark, () => {
+  chart.value?.setOption(paletteOption());
 });
 </script>
 
@@ -761,7 +814,7 @@ onUnmounted(() => {
 h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22px); letter-spacing: -0.4px; }
 .page-header p { margin: 4px 0 0; color: var(--text-tertiary); font-size: 11.5px; line-height: 1.45; }
 .header-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-.status-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; padding: 0 10px; border: 1px solid var(--border-default); border-radius: 999px; background: rgba(255,255,255,.55); color: var(--text-secondary); font-size: 11px; font-weight: 650; }
+.status-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; padding: 0 10px; border: 1px solid var(--border-default); border-radius: 999px; background: var(--bg-surface); color: var(--text-secondary); font-size: 11px; font-weight: 650; }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
 .status-chip.running { color: var(--success); border-color: rgba(8,179,136,.25); background: rgba(8,179,136,.08); }
 .status-chip.running .status-dot { background: var(--success); box-shadow: 0 0 0 3px rgba(8,179,136,.12); animation: pulse 1.8s infinite; }
@@ -776,7 +829,7 @@ h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22
 .config-panel { margin-bottom: 0; transition: opacity var(--transition), transform var(--transition); }
 .stress-sections.running .config-panel { opacity: .86; }
 .scenario-summary { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 8px; margin-bottom: 8px; }
-.scenario-summary div { padding: 8px 10px; border-radius: var(--radius-sm); background: rgba(255,255,255,.38); border: 1px solid var(--border-default); min-width: 0; }
+.scenario-summary div { padding: 8px 10px; border-radius: var(--radius-sm); background: var(--bg-card); border: 1px solid var(--border-default); min-width: 0; }
 .scenario-summary span { display: block; color: var(--text-tertiary); font-size: 10px; margin-bottom: 2px; }
 .scenario-summary b { display: block; color: var(--text-primary); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
@@ -789,7 +842,7 @@ h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22
 .section-divider span { color: var(--text-secondary); font-size: 11.5px; font-weight: 700; }
 .section-divider small { color: var(--text-tertiary); font-size: 10.5px; }
 .report-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.report-option { display: grid; grid-template-columns: minmax(100px, 1fr) auto 90px auto; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: rgba(255,255,255,.32); }
+.report-option { display: grid; grid-template-columns: minmax(100px, 1fr) auto 90px auto; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-card); }
 .report-option div { display: flex; flex-direction: column; gap: 1px; }
 .report-option b { color: var(--text-primary); font-size: 11.5px; }
 .report-option span, .report-option em { color: var(--text-tertiary); font-size: 10px; font-style: normal; }
@@ -798,7 +851,7 @@ h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22
 .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 0; }
 .metric { position: relative; overflow: hidden; padding: 10px 14px; border-radius: var(--radius-md); }
 .metric::after { content: ""; position: absolute; width: 64px; height: 64px; right: -20px; top: -25px; border-radius: 50%; background: var(--accent-dim); }
-.metric.primary { border-color: rgba(56,132,255,.28); background: linear-gradient(145deg, rgba(255,255,255,.72), rgba(217,231,255,.46)); }
+.metric.primary { border-color: var(--border-accent); background: linear-gradient(145deg, var(--bg-elevated), color-mix(in srgb, var(--accent) 10%, transparent)); }
 .metric > span { display: block; color: var(--text-tertiary); font-size: 10.5px; }
 .metric strong { display: block; margin-top: 4px; color: var(--text-primary); font-size: 18px; line-height: 1; font-variant-numeric: tabular-nums; }
 .metric.primary strong { color: var(--accent-deep); }
