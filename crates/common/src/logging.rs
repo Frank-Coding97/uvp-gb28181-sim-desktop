@@ -5,10 +5,13 @@
 //! - 自定义 [`SinkLayer`] 把每条日志格式化后写入环形缓冲(供 UI 打开时拉历史)
 //!   并推给注册的实时回调(desktop 层据此发 Tauri 事件给前端日志页)。
 
+use std::io::{self, Write};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Layer, Registry};
 
@@ -34,14 +37,111 @@ static RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 static BUFFER: OnceLock<Mutex<std::collections::VecDeque<LogLine>>> = OnceLock::new();
 /// 全局:实时回调(可后注册)。
 static CALLBACK: OnceLock<RwLock<Option<Arc<LogCallback>>>> = OnceLock::new();
+/// 实时回调的有界异步入口；日志生产线程永不直接执行 UI/文件回调。
+static CALLBACK_TX: OnceLock<SyncSender<LogLine>> = OnceLock::new();
 
 const BUFFER_CAP: usize = 2000;
+const CONSOLE_QUEUE_CAP: usize = 1024;
+const CALLBACK_QUEUE_CAP: usize = 2048;
+
+/// `tracing_subscriber::fmt` 的非阻塞控制台出口。
+///
+/// GUI 的采集、注销和 IPC 线程绝不能直接等待终端消费 stdout。终端暂停或消费过慢时，
+/// 只丢控制台副本；结构化环形缓冲和 desktop 文件回调仍由 [`SinkLayer`] 处理。
+#[derive(Clone)]
+struct NonBlockingConsole {
+    tx: SyncSender<Vec<u8>>,
+}
+
+impl NonBlockingConsole {
+    fn spawn() -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(CONSOLE_QUEUE_CAP);
+        let _ = std::thread::Builder::new()
+            .name("uvp-log-console".into())
+            .spawn(move || {
+                let stdout = io::stdout();
+                let mut stdout = stdout.lock();
+                while let Ok(bytes) = rx.recv() {
+                    let _ = stdout.write_all(&bytes);
+                    let _ = stdout.flush();
+                }
+            });
+        Self { tx }
+    }
+
+    #[cfg(test)]
+    fn from_sender(tx: SyncSender<Vec<u8>>) -> Self {
+        Self { tx }
+    }
+}
+
+struct NonBlockingConsoleWriter {
+    tx: SyncSender<Vec<u8>>,
+    bytes: Vec<u8>,
+}
+
+impl NonBlockingConsoleWriter {
+    fn submit(&mut self) {
+        if !self.bytes.is_empty() {
+            let _ = self.tx.try_send(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
+impl Write for NonBlockingConsoleWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.submit();
+        Ok(())
+    }
+}
+
+impl Drop for NonBlockingConsoleWriter {
+    fn drop(&mut self) {
+        self.submit();
+    }
+}
+
+impl<'a> MakeWriter<'a> for NonBlockingConsole {
+    type Writer = NonBlockingConsoleWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        NonBlockingConsoleWriter {
+            tx: self.tx.clone(),
+            bytes: Vec::with_capacity(256),
+        }
+    }
+}
 
 fn buffer() -> &'static Mutex<std::collections::VecDeque<LogLine>> {
     BUFFER.get_or_init(|| Mutex::new(std::collections::VecDeque::with_capacity(BUFFER_CAP)))
 }
 fn callback_slot() -> &'static RwLock<Option<Arc<LogCallback>>> {
     CALLBACK.get_or_init(|| RwLock::new(None))
+}
+
+fn callback_dispatcher() -> &'static SyncSender<LogLine> {
+    CALLBACK_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<LogLine>(CALLBACK_QUEUE_CAP);
+        let _ = std::thread::Builder::new()
+            .name("uvp-log-callback".into())
+            .spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    let callback = callback_slot()
+                        .read()
+                        .ok()
+                        .and_then(|slot| slot.as_ref().cloned());
+                    if let Some(callback) = callback {
+                        callback(&line);
+                    }
+                }
+            });
+        tx
+    })
 }
 
 /// 从 Event 提取 message 字段(及其它字段拼接)。
@@ -98,11 +198,7 @@ impl<S: Subscriber> Layer<S> for SinkLayer {
             }
             buf.push_back(line.clone());
         }
-        if let Ok(slot) = callback_slot().read() {
-            if let Some(cb) = slot.as_ref() {
-                cb(&line);
-            }
-        }
+        let _ = callback_dispatcher().try_send(line);
     }
 }
 
@@ -113,7 +209,11 @@ pub fn init() {
     let _ = RELOAD.set(handle);
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_target(false))
+        .with(
+            fmt::layer()
+                .with_target(false)
+                .with_writer(NonBlockingConsole::spawn()),
+        )
         .with(SinkLayer)
         .try_init();
 }
@@ -165,5 +265,72 @@ pub fn parse_level(s: &str) -> Option<Level> {
         "debug" => Some(Level::DEBUG),
         "trace" => Some(Level::TRACE),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{callback_dispatcher, set_callback, LogLine, NonBlockingConsole};
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn 控制台背压时产生日志的线程不能被阻塞() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let console = NonBlockingConsole::from_sender(tx);
+
+        let mut first = console.make_writer();
+        first.write_all(b"first").unwrap();
+        drop(first);
+
+        let started = Instant::now();
+        for _ in 0..10_000 {
+            let mut writer = console.make_writer();
+            writer.write_all(b"overflow").unwrap();
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "日志队列满载时 write/drop 必须立即返回"
+        );
+        assert_eq!(rx.try_recv().unwrap(), b"first");
+    }
+
+    #[test]
+    fn 实时回调阻塞时产生日志的线程不能被阻塞() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        set_callback(move |_| {
+            if first.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+        });
+        let line = LogLine {
+            ts_ms: 1,
+            level: "INFO".into(),
+            target: "test".into(),
+            message: "blocked callback".into(),
+        };
+        callback_dispatcher().try_send(line.clone()).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("回调线程应收到首条日志");
+
+        let started = Instant::now();
+        for _ in 0..10_000 {
+            let _ = callback_dispatcher().try_send(line.clone());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "回调队列满载时日志生产线程必须立即返回"
+        );
+
+        release_tx.send(()).unwrap();
+        set_callback(|_| {});
     }
 }

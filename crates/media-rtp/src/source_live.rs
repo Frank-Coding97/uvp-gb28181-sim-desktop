@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use common::{Error, Result};
@@ -22,6 +23,7 @@ const MAX_SCREEN_SHORT_SIDE: u32 = 2160;
 const MIN_SCREEN_BITRATE_KBPS: u32 = 128;
 const MAX_SCREEN_BITRATE_KBPS: u32 = 20_000;
 const STDERR_TAIL_LINES: usize = 32;
+type StderrCapture = (Arc<Mutex<VecDeque<String>>>, JoinHandle<()>);
 static NEXT_CAMERA_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Video codec actually available for native live-screen capture.
@@ -745,6 +747,7 @@ pub struct LiveSource {
     fps: u32,
     codec: LiveVideoCodec,
     children: Vec<Child>,
+    worker_threads: Vec<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
     producer_alive: Arc<AtomicBool>,
     terminal_error: Arc<Mutex<Option<String>>>,
@@ -939,7 +942,9 @@ impl LiveSource {
         let video_tail = if audio_index.is_some() {
             Arc::new(Mutex::new(VecDeque::new()))
         } else {
-            capture_stderr_tail(&mut startup.children[0], &video_label)?
+            let (tail, join) = capture_stderr_tail(&mut startup.children[0], &video_label)?;
+            startup.track(join);
+            tail
         };
         let video_ready = Arc::new(AtomicBool::new(false));
         let producer_alive = Arc::new(AtomicBool::new(true));
@@ -964,7 +969,7 @@ impl LiveSource {
         let alive = Arc::clone(&producer_alive);
         let video_stop = Arc::clone(&stop_flag);
         let video_error = Arc::clone(&terminal_error);
-        std::thread::spawn(move || {
+        let video_reader = std::thread::spawn(move || {
             let mut pending = Vec::with_capacity(256 * 1024);
             let mut chunk = [0_u8; 32 * 1024];
             let mut total_bytes = 0_u64;
@@ -1004,6 +1009,7 @@ impl LiveSource {
             }
             alive.store(false, Ordering::Release);
         });
+        startup.track(video_reader);
 
         let mut audio_rx = None;
         let mut audio_ready = None;
@@ -1022,7 +1028,7 @@ impl LiveSource {
             let ready_thread = Arc::clone(&ready);
             let audio_stop = Arc::clone(&stop_flag);
             let audio_error = Arc::clone(&terminal_error);
-            std::thread::spawn(move || {
+            let audio_reader = std::thread::spawn(move || {
                 let mut parser = EncodedAudioParser::new(audio_codec);
                 let mut chunk = [0_u8; 4096];
                 loop {
@@ -1045,6 +1051,7 @@ impl LiveSource {
                     }
                 }
             });
+            startup.track(audio_reader);
             audio_rx = Some(receiver);
             audio_ready = Some(ready);
             audio_tail = Some(Arc::new(Mutex::new(VecDeque::new())));
@@ -1062,7 +1069,7 @@ impl LiveSource {
                 input_fps,
             },
         )?;
-        let children = startup.disarm();
+        let (children, worker_threads) = startup.disarm();
 
         Ok(Self {
             rx,
@@ -1075,6 +1082,7 @@ impl LiveSource {
             fps,
             codec: LiveVideoCodec::H264,
             children,
+            worker_threads,
             stop_flag,
             producer_alive,
             terminal_error,
@@ -1168,7 +1176,7 @@ impl LiveSource {
                 .map_err(|e| {
                     Error::Media(format!("failed to initialize OpenH264 screen encoder: {e}"))
                 })?;
-                std::thread::spawn(move || {
+                let encoder_thread = std::thread::spawn(move || {
                     while !encoder_stop.load(Ordering::Acquire) {
                         let bgra = match raw_rx.recv_timeout(Duration::from_millis(100)) {
                             Ok(frame) => frame,
@@ -1197,6 +1205,7 @@ impl LiveSource {
                     }
                     encoder_alive.store(false, Ordering::Release);
                 });
+                screen_startup.track(encoder_thread);
             }
             LiveVideoCodec::H265 => {
                 let ffmpeg = ffmpeg_bin().ok_or_else(|| {
@@ -1249,12 +1258,14 @@ impl LiveSource {
                     .stdout
                     .take()
                     .ok_or_else(|| Error::Media("failed to open H.265 encoder stdout".into()))?;
-                let stderr_tail = capture_stderr_tail(&mut child, "H.265 screen encoder")?;
+                let (stderr_tail, stderr_thread) =
+                    capture_stderr_tail(&mut child, "H.265 screen encoder")?;
+                screen_startup.track(stderr_thread);
                 let writer_tail = Arc::clone(&stderr_tail);
                 let reader_tail = Arc::clone(&stderr_tail);
                 let writer_stop = Arc::clone(&stop_flag);
                 let writer_error = Arc::clone(&terminal_error);
-                std::thread::spawn(move || {
+                let writer_thread = std::thread::spawn(move || {
                     while !writer_stop.load(Ordering::Acquire) {
                         let frame = match raw_rx.recv_timeout(Duration::from_millis(100)) {
                             Ok(frame) => frame,
@@ -1272,9 +1283,10 @@ impl LiveSource {
                         }
                     }
                 });
+                screen_startup.track(writer_thread);
                 let reader_stop = Arc::clone(&stop_flag);
                 let reader_error = Arc::clone(&terminal_error);
-                std::thread::spawn(move || {
+                let reader_thread = std::thread::spawn(move || {
                     let mut pending = Vec::with_capacity(512 * 1024);
                     let mut chunk = [0_u8; 64 * 1024];
                     loop {
@@ -1297,6 +1309,7 @@ impl LiveSource {
                     }
                     encoder_alive.store(false, Ordering::Release);
                 });
+                screen_startup.track(reader_thread);
                 screen_startup.children.push(child);
             }
         }
@@ -1430,7 +1443,8 @@ impl LiveSource {
                         let mut stdout = encoder.stdout.take().ok_or_else(|| {
                             Error::Media(format!("failed to open {label} stdout"))
                         })?;
-                        let tail = capture_stderr_tail(&mut encoder, &label)?;
+                        let (tail, stderr_thread) = capture_stderr_tail(&mut encoder, &label)?;
+                        screen_startup.track(stderr_thread);
                         let input = Arc::new(Mutex::new(stdin));
                         let callback_input = Arc::clone(&input);
                         if stream
@@ -1462,7 +1476,7 @@ impl LiveSource {
                         let audio_stop = Arc::clone(&stop_flag);
                         let audio_error = Arc::clone(&terminal_error);
                         let reader_tail = Arc::clone(&tail);
-                        std::thread::spawn(move || {
+                        let reader_thread = std::thread::spawn(move || {
                             let mut parser = EncodedAudioParser::new(audio_codec);
                             let mut chunk = [0_u8; 4096];
                             loop {
@@ -1488,6 +1502,7 @@ impl LiveSource {
                                 }
                             }
                         });
+                        screen_startup.track(reader_thread);
                         screen_startup.children.push(encoder);
                         microphone_ready = Some(ready);
                         microphone_tail = Some(tail);
@@ -1520,7 +1535,9 @@ impl LiveSource {
                     .map_err(|error| Error::Media(format!("failed to start {label}: {error}")))?;
                 screen_startup.children.push(microphone);
                 let child_index = screen_startup.children.len() - 1;
-                let tail = capture_stderr_tail(&mut screen_startup.children[child_index], &label)?;
+                let (tail, stderr_thread) =
+                    capture_stderr_tail(&mut screen_startup.children[child_index], &label)?;
+                screen_startup.track(stderr_thread);
                 let ready = Arc::new(AtomicBool::new(false));
                 let (audio_tx, receiver) = mpsc::sync_channel(50);
                 let mut stdout = screen_startup.children[child_index]
@@ -1530,7 +1547,7 @@ impl LiveSource {
                 let ready_thread = Arc::clone(&ready);
                 let audio_stop = Arc::clone(&stop_flag);
                 let audio_error = Arc::clone(&terminal_error);
-                std::thread::spawn(move || {
+                let reader_thread = std::thread::spawn(move || {
                     let mut parser = EncodedAudioParser::new(audio_codec);
                     let mut chunk = [0_u8; 4096];
                     loop {
@@ -1553,6 +1570,7 @@ impl LiveSource {
                         }
                     }
                 });
+                screen_startup.track(reader_thread);
                 audio_rx = Some(receiver);
                 microphone_ready = Some(ready);
                 microphone_tail = Some(tail);
@@ -1621,7 +1639,7 @@ impl LiveSource {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let children = screen_startup.disarm();
+        let (children, worker_threads) = screen_startup.disarm();
         Ok(Self {
             rx,
             buf: VecDeque::new(),
@@ -1633,6 +1651,7 @@ impl LiveSource {
             fps,
             codec: profile.codec,
             children,
+            worker_threads,
             stop_flag,
             producer_alive,
             terminal_error,
@@ -1754,6 +1773,7 @@ struct CameraStartup {
 #[cfg(target_os = "macos")]
 struct StartupChildren {
     children: Vec<Child>,
+    worker_threads: Vec<JoinHandle<()>>,
     armed: bool,
 }
 
@@ -1762,6 +1782,7 @@ impl StartupChildren {
     fn empty() -> Self {
         Self {
             children: Vec::new(),
+            worker_threads: Vec::new(),
             armed: true,
         }
     }
@@ -1769,13 +1790,21 @@ impl StartupChildren {
     fn new(child: Child) -> Self {
         Self {
             children: vec![child],
+            worker_threads: Vec::new(),
             armed: true,
         }
     }
 
-    fn disarm(mut self) -> Vec<Child> {
+    fn track(&mut self, thread: JoinHandle<()>) {
+        self.worker_threads.push(thread);
+    }
+
+    fn disarm(mut self) -> (Vec<Child>, Vec<JoinHandle<()>>) {
         self.armed = false;
-        std::mem::take(&mut self.children)
+        (
+            std::mem::take(&mut self.children),
+            std::mem::take(&mut self.worker_threads),
+        )
     }
 }
 
@@ -1783,12 +1812,16 @@ impl StartupChildren {
 impl Drop for StartupChildren {
     fn drop(&mut self) {
         if self.armed {
-            kill_children(&mut self.children);
+            let _ = stop_owned_children_and_threads(
+                &mut self.children,
+                &mut self.worker_threads,
+                Duration::from_secs(1),
+            );
         }
     }
 }
 
-fn capture_stderr_tail(child: &mut Child, label: &str) -> Result<Arc<Mutex<VecDeque<String>>>> {
+fn capture_stderr_tail(child: &mut Child, label: &str) -> Result<StderrCapture> {
     let stderr = child
         .stderr
         .take()
@@ -1796,7 +1829,7 @@ fn capture_stderr_tail(child: &mut Child, label: &str) -> Result<Arc<Mutex<VecDe
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
     let output = Arc::clone(&tail);
     let owned_label = label.to_string();
-    std::thread::spawn(move || {
+    let join = std::thread::spawn(move || {
         for line in BufReader::new(stderr)
             .lines()
             .map_while(std::result::Result::ok)
@@ -1812,7 +1845,7 @@ fn capture_stderr_tail(child: &mut Child, label: &str) -> Result<Arc<Mutex<VecDe
             }
         }
     });
-    Ok(tail)
+    Ok((tail, join))
 }
 
 #[cfg(target_os = "macos")]
@@ -1878,6 +1911,70 @@ fn kill_children(children: &mut [Child]) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// 停止本采集会话显式持有的进程，并在同一截止时间内回收其 I/O/编码线程。
+///
+/// 顺序必须是 child first、reader second：reader 可能正阻塞在 pipe read，只有先关闭
+/// 子进程端管道才会得到 EOF。任何超过截止时间的进程交给独立 reaper，调用方不再等待。
+fn stop_owned_children_and_threads(
+    children: &mut Vec<Child>,
+    worker_threads: &mut Vec<JoinHandle<()>>,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut pending_children = std::mem::take(children);
+    for child in &mut pending_children {
+        let _ = child.kill();
+    }
+
+    while !pending_children.is_empty() && Instant::now() < deadline {
+        let mut index = 0;
+        while index < pending_children.len() {
+            match pending_children[index].try_wait() {
+                Ok(Some(_)) => {
+                    let mut child = pending_children.swap_remove(index);
+                    let _ = child.wait();
+                }
+                Ok(None) => index += 1,
+                Err(_) => {
+                    let child = pending_children.swap_remove(index);
+                    reap_child_in_background(child);
+                }
+            }
+        }
+        if !pending_children.is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let mut all_stopped = pending_children.is_empty();
+    for child in pending_children.drain(..) {
+        reap_child_in_background(child);
+    }
+
+    let pending_threads = std::mem::take(worker_threads);
+    while pending_threads.iter().any(|thread| !thread.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for thread in pending_threads {
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            all_stopped = false;
+            // JoinHandle drop 只 detach；线程持有的 pipe 已随 owned child 终止，通常会立即 EOF。
+        }
+    }
+    all_stopped
+}
+
+fn reap_child_in_background(mut child: Child) {
+    let _ = std::thread::Builder::new()
+        .name("uvp-owned-child-reaper".into())
+        .spawn(move || {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
 }
 
 fn locked_tail(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
@@ -2162,17 +2259,18 @@ fn linear_to_ulaw(sample: i16) -> u8 {
 impl Drop for LiveSource {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
-        self.producer_alive.store(false, Ordering::Release);
-        if let Some(mut worker) = self.preview_worker.take() {
-            worker.stop();
-        }
         #[cfg(target_os = "macos")]
         if let Some(stream) = self.screen_stream.take() {
             let _ = stream.stop_capture();
         }
-        for child in &mut self.children {
-            let _ = child.kill();
-            let _ = child.wait();
+        let _ = stop_owned_children_and_threads(
+            &mut self.children,
+            &mut self.worker_threads,
+            Duration::from_secs(1),
+        );
+        self.producer_alive.store(false, Ordering::Release);
+        if let Some(mut worker) = self.preview_worker.take() {
+            worker.stop();
         }
     }
 }
@@ -2574,5 +2672,36 @@ mod tests {
         assert!(queue.take_dropped());
         assert_eq!(queue.pop().expect("最新帧应存在").data, vec![3]);
         assert!(queue.pop().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned子进程必须先终止再有界等待reader() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("应能启动 fake owned child");
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+        });
+        let mut children = vec![child];
+        let mut threads = vec![reader];
+
+        let started = Instant::now();
+        assert!(stop_owned_children_and_threads(
+            &mut children,
+            &mut threads,
+            Duration::from_secs(1),
+        ));
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(threads.is_empty(), "reader JoinHandle 必须被显式回收");
+        assert!(
+            children.is_empty(),
+            "owned child 必须被回收并移出所有权集合"
+        );
     }
 }
