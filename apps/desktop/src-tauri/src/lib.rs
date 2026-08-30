@@ -5,12 +5,12 @@
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 
-use common::{DeviceEvent, DeviceId, DeviceObserver, GbVersion, Transport};
+use common::{DeviceEvent, DeviceId, DeviceObserver, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sip_core::UdpTransport;
 use stress_engine::{Metrics, Orchestrator};
 use tauri::{
@@ -24,11 +24,18 @@ mod config_store;
 mod preview_channel;
 mod preview_manager;
 use camera_lease::{CameraLease, CameraLeaseError, CameraLeaseGrant, CameraLeaseOwner};
+use config_store::{
+    BindMode, ConfigStore, DesktopConfigV1, EffectiveDeviceConfig, StartDeviceInput,
+};
 use preview_channel::DesktopPreviewBus;
 use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
 
 /// 应用全局状态（托管在 Tauri managed state）。
 struct AppState {
+    /// Rust 端非敏感配置真相源；路径在首次 Tauri 命令时由 app_data_dir 初始化。
+    config_store: OnceLock<ConfigStore>,
+    /// 配置文件读写串行化，避免并发保存与读取看到半次操作。
+    config_io: Mutex<()>,
     /// 当前压测句柄；任务完全退出前始终占用槽位。
     stress: Mutex<Option<StressHandle>>,
     /// 分配单调递增的压测 ID,防止旧任务事件污染新任务状态。
@@ -65,6 +72,7 @@ struct DeviceHandle {
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
     camera_lease_token: Option<u64>,
+    effective_config: EffectiveDeviceConfig,
 }
 
 impl AppState {
@@ -72,6 +80,8 @@ impl AppState {
         let preview_bus = Arc::new(DesktopPreviewBus::new());
         let preview_manager = Arc::new(PreviewManager::new(Arc::clone(&preview_bus)));
         AppState {
+            config_store: OnceLock::new(),
+            config_io: Mutex::new(()),
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
             metrics: Mutex::new(None),
@@ -83,6 +93,23 @@ impl AppState {
             camera_lease: Arc::new(CameraLease::new()),
         }
     }
+}
+
+fn app_config_store(state: &AppState, app: &AppHandle) -> Result<ConfigStore, String> {
+    if let Some(store) = state.config_store.get() {
+        return Ok(store.clone());
+    }
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用配置目录: {error}"))?;
+    let store = ConfigStore::new(directory.join("desktop-config-v1.json"));
+    let _ = state.config_store.set(store);
+    Ok(state
+        .config_store
+        .get()
+        .expect("ConfigStore 初始化后必须存在")
+        .clone())
 }
 
 /// 把设备事件映射成 `device_state` 字符串,通过 Tauri 事件推给前端(状态灯)。
@@ -246,6 +273,31 @@ struct TraceEmitter {
     app: AppHandle,
 }
 
+fn redact_sip_secrets(raw: &str) -> String {
+    let mut lines = raw
+        .lines()
+        .map(|line| {
+            let header = line
+                .split_once(':')
+                .map(|(name, _)| name.trim().to_ascii_lowercase());
+            if matches!(
+                header.as_deref(),
+                Some("authorization") | Some("proxy-authorization")
+            ) {
+                let name = line.split_once(':').map(|(name, _)| name).unwrap_or(line);
+                format!("{name}: <redacted>")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    if raw.ends_with('\n') {
+        lines.push_str("\r\n");
+    }
+    lines
+}
+
 impl sip_core::TraceObserver for TraceEmitter {
     fn on_trace(&self, trace: sip_core::SipTrace<'_>) {
         let (method, status, cseq, call_id, summary) = match trace.message {
@@ -272,7 +324,7 @@ impl sip_core::TraceObserver for TraceEmitter {
             };
             // GB18030 兼容 ASCII 头;中文 body 用 GB18030 解码更可读。
             let (text, _, _) = encoding_rs::GB18030.decode(&bytes);
-            text.into_owned()
+            redact_sip_secrets(&text)
         };
         let entry = serde_json::json!({
             "ts_ms": std::time::SystemTime::now()
@@ -297,6 +349,51 @@ impl sip_core::TraceObserver for TraceEmitter {
 #[tauri::command]
 fn engine_version() -> String {
     format!("stress-engine v{} 就绪", env!("CARGO_PKG_VERSION"))
+}
+
+#[tauri::command]
+async fn get_desktop_config(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopConfigV1, String> {
+    let store = app_config_store(&state, &app)?;
+    let _io = state.config_io.lock().await;
+    tokio::task::spawn_blocking(move || store.load())
+        .await
+        .map_err(|error| format!("读取配置任务异常: {error}"))?
+}
+
+#[tauri::command]
+async fn save_desktop_config(
+    config: DesktopConfigV1,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopConfigV1, String> {
+    let device = state.device.lock().await;
+    if device.is_some() {
+        return Err("设备运行中，不能修改配置；请先停止设备".into());
+    }
+    let store = app_config_store(&state, &app)?;
+    let _io = state.config_io.lock().await;
+    tokio::task::spawn_blocking(move || store.save(&config))
+        .await
+        .map_err(|error| format!("保存配置任务异常: {error}"))?
+}
+
+#[tauri::command]
+async fn reset_desktop_config(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopConfigV1, String> {
+    let device = state.device.lock().await;
+    if device.is_some() {
+        return Err("设备运行中，不能重置配置；请先停止设备".into());
+    }
+    let store = app_config_store(&state, &app)?;
+    let _io = state.config_io.lock().await;
+    tokio::task::spawn_blocking(move || store.reset())
+        .await
+        .map_err(|error| format!("重置配置任务异常: {error}"))?
 }
 
 /// 校验场景 TOML 并返回摘要，不启动压测。
@@ -532,14 +629,22 @@ async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_js
 #[tauri::command]
 async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
     let device = state.device.lock().await;
-    let (running, capture_state) = match device.as_ref() {
+    let (running, capture_state, effective_config) = match device.as_ref() {
         Some(handle) => {
             let ready = handle.sim.capture_ready().await;
-            (true, if ready { "ready" } else { "starting" })
+            (
+                true,
+                if ready { "ready" } else { "starting" },
+                Some(handle.effective_config.clone()),
+            )
         }
-        None => (false, "stopped"),
+        None => (false, "stopped", None),
     };
-    Ok(serde_json::json!({ "running": running, "capture_state": capture_state }))
+    Ok(serde_json::json!({
+        "running": running,
+        "capture_state": capture_state,
+        "effective_config": effective_config,
+    }))
 }
 
 /// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
@@ -808,30 +913,6 @@ fn get_camera_lease(state: tauri::State<'_, AppState>) -> Option<CameraLeaseGran
     state.camera_lease.current()
 }
 
-/// 前端传入的单设备配置。
-#[derive(Deserialize)]
-struct DeviceCfg {
-    server_host: String,
-    server_port: u16,
-    server_domain: String,
-    device_id: String,
-    password: String,
-    #[serde(default)]
-    transport: String, // "UDP" / "TCP"
-    #[serde(default)]
-    gb_version: String, // "2016" / "2022"
-    #[serde(default)]
-    channel_name: String,
-    #[serde(default)]
-    video_source: Option<String>,
-    /// 目录模板(single/nvr-8ch/civil-3x2/large-16ch);空则用默认单通道。
-    #[serde(default)]
-    catalog_template: String,
-    /// 信令字符集编码(GB18030/UTF-8);空则默认 GB18030。
-    #[serde(default)]
-    signaling_encoding: String,
-}
-
 /// 通过"向平台发起 UDP connect"发现本机对外 IP(不真正发包)。
 fn discover_local_ip(server: &str) -> String {
     std::net::UdpSocket::bind("0.0.0.0:0")
@@ -845,7 +926,7 @@ fn discover_local_ip(server: &str) -> String {
 /// 启动一台设备:注册 + 心跳 + 入站应答,后台常驻。状态经 `device_state` 事件推送。
 #[tauri::command]
 async fn start_device(
-    mut config: DeviceCfg,
+    input: StartDeviceInput,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
@@ -854,26 +935,20 @@ async fn start_device(
         return Err("已有设备在运行,请先停止".into());
     }
 
-    if config.transport.eq_ignore_ascii_case("TCP") {
+    let store = app_config_store(&state, &app)?;
+    let persisted = {
+        let _io = state.config_io.lock().await;
+        tokio::task::spawn_blocking(move || store.load())
+            .await
+            .map_err(|error| format!("读取配置任务异常: {error}"))??
+    };
+    let mut resolved = persisted.resolve_start(input)?;
+    if resolved.profile.transport == Transport::Tcp {
         return Err("当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into());
     }
-    if config.server_port == 0
-        || format!("{}:{}", config.server_host, config.server_port)
-            .parse::<std::net::SocketAddr>()
-            .is_err()
-    {
-        return Err("平台地址必须是有效的 IP:端口（当前不支持域名）".into());
-    }
-    if config.password.is_empty() {
-        return Err("SIP 认证密码不能为空".into());
-    }
     let mut uses_physical_camera = false;
-    if let Some(source) = config.video_source.take() {
-        let source = source.trim().to_string();
-        if source.is_empty() {
-            config.video_source = None;
-        } else {
-            if source.starts_with("live:") {
+    if let Some(source) = resolved.video_source.take() {
+        if source.starts_with("live:") {
                 let spec = media_rtp::LiveSourceSpec::parse(&source)
                     .map_err(|error| format!("实时媒体源配置无效: {error}"))?;
                 uses_physical_camera = matches!(&spec, media_rtp::LiveSourceSpec::Camera { .. });
@@ -951,62 +1026,50 @@ async fn start_device(
                     }
                     _ => {}
                 }
-            }
-            config.video_source = Some(source);
         }
+        resolved.video_source = Some(source);
     }
 
-    let device_id = DeviceId::new(config.device_id.clone()).map_err(|e| e.to_string())?;
+    let device_id = DeviceId::new(resolved.device.device_id.clone()).map_err(|e| e.to_string())?;
     // 通道 ID:设备 ID 前 17 位 + 132(视频通道类型码)。
-    let channel_id_str = format!("{}132", &config.device_id[..17]);
+    let channel_id_str = format!("{}132", &resolved.device.device_id[..17]);
     let channel_id = DeviceId::new(channel_id_str).map_err(|e| e.to_string())?;
-    let gb_version = if config.gb_version == "2016" {
-        GbVersion::V2016
-    } else {
-        GbVersion::V2022
-    };
-    let transport = Transport::Udp;
-    let channel_name = if config.channel_name.is_empty() {
-        "Camera-1".to_string()
-    } else {
-        config.channel_name.clone()
-    };
 
     let cfg = DeviceConfig {
         device_id: device_id.clone(),
-        username: config.device_id.clone(),
-        password: config.password.clone(),
-        server_host: config.server_host.clone(),
-        server_port: config.server_port,
-        server_id: config.server_domain.clone(),
-        server_domain: config.server_domain.clone(),
-        transport,
-        register_expires_secs: 3_600,
-        heartbeat_interval_secs: 60,
-        heartbeat_fail_threshold: 3,
+        username: resolved.device.device_id.clone(),
+        password: resolved.password.clone(),
+        server_host: resolved.profile.server_host.clone(),
+        server_port: resolved.profile.server_port,
+        server_id: resolved.profile.server_id.clone(),
+        server_domain: resolved.profile.server_domain.clone(),
+        transport: resolved.profile.transport,
+        register_expires_secs: resolved.device.register_expires_secs,
+        heartbeat_interval_secs: resolved.device.heartbeat_interval_secs,
+        heartbeat_fail_threshold: resolved.device.heartbeat_fail_threshold,
         channels: vec![ChannelConfig {
             channel_id,
-            name: channel_name,
+            name: resolved.device.channel_name.clone(),
             status: "ON".into(),
         }],
         device_info: DeviceInfo {
-            device_name: "UVP-Sim-Desktop".into(),
-            manufacturer: "UVP".into(),
-            model: "Desktop-Sim".into(),
-            firmware: "0.1.0".into(),
+            device_name: resolved.device.device_name.clone(),
+            manufacturer: resolved.device.manufacturer.clone(),
+            model: resolved.device.model.clone(),
+            firmware: resolved.device.firmware.clone(),
         },
-        video_source: config.video_source.clone(),
-        video_fps: 30,
+        video_source: resolved.video_source.clone(),
+        video_fps: resolved.device.video_fps,
         light_bitrate_kbps: None,
-        gb_version,
-        signaling_encoding: common::SignalingEncoding::from_str_lenient(&config.signaling_encoding),
+        gb_version: resolved.profile.gb_version,
+        signaling_encoding: resolved.profile.signaling_encoding,
     };
 
     // 预热视频源:容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会阻塞
     // 200 OK 与首包推流,导致平台收流超时。这里在设备上线前先转好、缓存,
     // INVITE 时命中缓存瞬时加载。ffmpeg 是阻塞调用,放 spawn_blocking。
     // 实时采集(live:)无文件可预热,跳过;仅对文件源(C 档容器)做转封装预热。
-    if let Some(ref vs) = config.video_source {
+    if let Some(ref vs) = resolved.video_source {
         if !vs.trim().is_empty() && !vs.trim().starts_with("live:") {
             let vs = vs.clone();
             let prepared =
@@ -1020,14 +1083,25 @@ async fn start_device(
     }
 
     // 共享 UDP 传输 + 本端地址发现。
-    let udp = UdpTransport::bind("0.0.0.0:0")
+    let bind_host = match resolved.network.bind_mode {
+        BindMode::Auto => "0.0.0.0".to_string(),
+        BindMode::Specific => resolved.network.bind_address.clone(),
+    };
+    let udp = UdpTransport::bind(&format!("{bind_host}:0"))
         .await
         .map_err(|e| e.to_string())?;
     let local_port = udp.local_addr().map_err(|e| e.to_string())?.port();
-    let local_host = discover_local_ip(&format!("{}:{}", config.server_host, config.server_port));
+    let local_host = match resolved.network.bind_mode {
+        BindMode::Auto => discover_local_ip(&format!(
+            "{}:{}",
+            resolved.profile.server_host, resolved.profile.server_port
+        )),
+        BindMode::Specific => resolved.network.bind_address.clone(),
+    };
 
-    // 单设备联调默认开启 SIP 信令追踪(FR-43),把收发报文推给前端。
-    udp.set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
+    if resolved.network.sip_trace {
+        udp.set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
+    }
 
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
@@ -1037,11 +1111,10 @@ async fn start_device(
     ));
 
     // 若指定了目录模板,在注册前载入(平台注册后会立即同步目录,需在这之前准备好)。
-    if !config.catalog_template.is_empty() {
-        sim.load_catalog_template(&config.catalog_template);
+    if !resolved.catalog_template.is_empty() {
+        sim.load_catalog_template(&resolved.catalog_template);
     }
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let camera_lease_token = if uses_physical_camera {
         Some(
             state
@@ -1053,6 +1126,19 @@ async fn start_device(
     } else {
         None
     };
+
+    let effective_config = EffectiveDeviceConfig {
+        profile: resolved.profile.clone(),
+        device: resolved.device.clone(),
+        network: resolved.network.clone(),
+        local_host: local_host.clone(),
+        local_port,
+        video_source: resolved.video_source.clone(),
+        catalog_template: resolved.catalog_template.clone(),
+        capabilities: Default::default(),
+    };
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let sim_run = sim.clone();
     let tp_run = udp.clone();
     let host_run = local_host.clone();
@@ -1071,6 +1157,7 @@ async fn start_device(
         local_port,
         stop_tx,
         camera_lease_token,
+        effective_config,
     });
     Ok("设备已启动".into())
 }
@@ -1383,6 +1470,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             engine_version,
+            get_desktop_config,
+            save_desktop_config,
+            reset_desktop_config,
             validate_scenario,
             start_stress,
             stop_stress,
@@ -1458,5 +1548,15 @@ mod tests {
     fn 普通媒体错误不伪装成权限错误() {
         let original = "preview FFmpeg produced no JPEG within 2000 ms";
         assert_eq!(camera_capture_guidance(original), original);
+    }
+
+    #[test]
+    fn sip_trace脱敏authorization() {
+        let raw = "REGISTER sip:test SIP/2.0\r\nAuthorization: Digest username=\"dev\", response=\"secret\"\r\nCall-ID: 1\r\n\r\n";
+        let redacted = redact_sip_secrets(raw);
+        assert!(!redacted.contains("response=\"secret\""));
+        assert!(!redacted.contains("username=\"dev\""));
+        assert!(redacted.contains("Authorization: <redacted>"));
+        assert!(redacted.contains("Call-ID: 1"));
     }
 }
