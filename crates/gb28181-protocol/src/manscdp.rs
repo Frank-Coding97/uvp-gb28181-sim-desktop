@@ -881,6 +881,62 @@ impl MobilePositionNotify {
     }
 }
 
+/// 移动位置单次查询应答(设备 → 平台,Query + MobilePosition)。
+///
+/// 与周期 [`MobilePositionNotify`] 使用同一位置字段，但根元素和结果语义不同：
+/// 单次查询必须回 `Response` 并携带 `Result=OK`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "Response")]
+pub struct MobilePositionResponse {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "Result")]
+    pub result: String,
+    #[serde(rename = "Time")]
+    pub time: String,
+    #[serde(rename = "Longitude")]
+    pub longitude: f64,
+    #[serde(rename = "Latitude")]
+    pub latitude: f64,
+    #[serde(rename = "Speed")]
+    pub speed: f64,
+    #[serde(rename = "Direction")]
+    pub direction: f64,
+    #[serde(rename = "Altitude")]
+    pub altitude: f64,
+}
+
+impl MobilePositionResponse {
+    pub fn new(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        longitude: f64,
+        latitude: f64,
+    ) -> Self {
+        Self {
+            cmd_type: "MobilePosition".into(),
+            sn,
+            device_id: device_id.into(),
+            result: "OK".into(),
+            time: time.into(),
+            longitude,
+            latitude,
+            speed: 0.0,
+            direction: 0.0,
+            altitude: 0.0,
+        }
+    }
+
+    pub fn to_xml(&self) -> Result<String> {
+        manscdp_to_xml(self)
+    }
+}
+
 /// 在线升级进度通知(DeviceUpgradeResult,设备 → 平台)。
 ///
 /// 4 步进度 percent [0,30,60,100]。percent<100 → Result=0(进行中),
@@ -2936,5 +2992,27 @@ mod tests {
         .unwrap();
         assert!(svac.contains("<SVACEncodeConfig>"));
         assert!(svac.contains("<Result>OK</Result>"));
+    }
+
+    #[test]
+    fn 移动位置单次查询应答_使用response并保留完整位置字段() {
+        let xml = MobilePositionResponse::new(
+            "34020000001320000001",
+            7,
+            "2026-08-30T12:50:00",
+            116.397_428,
+            39.909_230,
+        )
+        .to_xml()
+        .unwrap();
+        assert!(xml.contains("<Response>"));
+        assert!(xml.contains("<CmdType>MobilePosition</CmdType>"));
+        assert!(xml.contains("<SN>7</SN>"));
+        assert!(xml.contains("<Result>OK</Result>"));
+        assert!(xml.contains("<Longitude>116.397428</Longitude>"));
+        assert!(xml.contains("<Latitude>39.90923</Latitude>"));
+        assert!(xml.contains("<Speed>0</Speed>"));
+        assert!(xml.contains("<Direction>0</Direction>"));
+        assert!(xml.contains("<Altitude>0</Altitude>"));
     }
 }
