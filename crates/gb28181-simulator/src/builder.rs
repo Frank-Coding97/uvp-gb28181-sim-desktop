@@ -317,9 +317,12 @@ mod tests {
             password: "12345678".into(),
             server_host: "1.2.3.4".into(),
             server_port: 5060,
+            server_id: "34020000002000000001".into(),
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
+            register_expires_secs: 3_600,
             heartbeat_interval_secs: 60,
+            heartbeat_fail_threshold: 3,
             channels: vec![],
             device_info: DeviceInfo {
                 device_name: "Test".into(),

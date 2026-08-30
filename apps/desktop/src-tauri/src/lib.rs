@@ -20,6 +20,7 @@ use tauri::{
 use tokio::sync::{broadcast, Mutex};
 
 mod camera_lease;
+mod config_store;
 mod preview_channel;
 mod preview_manager;
 use camera_lease::{CameraLease, CameraLeaseError, CameraLeaseGrant, CameraLeaseOwner};
@@ -977,9 +978,12 @@ async fn start_device(
         password: config.password.clone(),
         server_host: config.server_host.clone(),
         server_port: config.server_port,
+        server_id: config.server_domain.clone(),
         server_domain: config.server_domain.clone(),
         transport,
+        register_expires_secs: 3_600,
         heartbeat_interval_secs: 60,
+        heartbeat_fail_threshold: 3,
         channels: vec![ChannelConfig {
             channel_id,
             name: channel_name,

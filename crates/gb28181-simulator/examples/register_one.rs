@@ -61,9 +61,12 @@ async fn main() {
         password,
         server_host: server_host.clone(),
         server_port,
+        server_id: server_domain.clone(),
         server_domain,
         transport: Transport::Udp,
+        register_expires_secs: 3_600,
         heartbeat_interval_secs: 60,
+        heartbeat_fail_threshold: 3,
         channels,
         device_info: DeviceInfo {
             device_name: "UVP-Sim-Desktop".into(),

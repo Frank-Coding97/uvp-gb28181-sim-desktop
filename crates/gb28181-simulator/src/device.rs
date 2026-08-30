@@ -135,12 +135,18 @@ pub struct DeviceConfig {
     pub server_host: String,
     /// 上级平台 SIP 服务端口。
     pub server_port: u16,
+    /// 上级平台国标 ID；为空时为兼容旧配置而回退到 server_domain。
+    pub server_id: String,
     /// 上级平台域(SIP domain / 服务器 ID 中心编码)。
     pub server_domain: String,
     /// 信令传输方式。
     pub transport: Transport,
+    /// 注册有效期(秒)，不得短于 3600。
+    pub register_expires_secs: u32,
     /// 心跳间隔(秒)。
     pub heartbeat_interval_secs: u64,
+    /// 连续心跳失败多少次后触发重注册。
+    pub heartbeat_fail_threshold: u32,
     /// 通道列表(目录查询应答用)。
     pub channels: Vec<ChannelConfig>,
     /// 设备信息(DeviceInfo 查询应答用)。
@@ -2435,9 +2441,12 @@ mod tests {
             password: "12345678".into(),
             server_host: host.into(),
             server_port: port,
+            server_id: "34020000002000000001".into(),
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
+            register_expires_secs: 3_600,
             heartbeat_interval_secs: 60,
+            heartbeat_fail_threshold: 3,
             channels: vec![],
             device_info: DeviceInfo {
                 device_name: "Test Device".into(),

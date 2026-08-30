@@ -48,6 +48,14 @@ impl GbVersion {
             GbVersion::V2022 => "GB/T 28181-2022",
         }
     }
+
+    /// 2022 版规范性附录 I 定义的 SIP 注册协议版本标识。
+    pub fn x_gb_ver(&self) -> &'static str {
+        match self {
+            GbVersion::V2016 => "2.0",
+            GbVersion::V2022 => "3.0",
+        }
+    }
 }
 
 impl fmt::Display for GbVersion {
@@ -143,5 +151,7 @@ mod tests {
         assert!(GbVersion::V2022.is_2022());
         assert!(!GbVersion::V2016.is_2022());
         assert_eq!(GbVersion::V2016.tag(), "GB/T 28181-2016");
+        assert_eq!(GbVersion::V2016.x_gb_ver(), "2.0");
+        assert_eq!(GbVersion::V2022.x_gb_ver(), "3.0");
     }
 }

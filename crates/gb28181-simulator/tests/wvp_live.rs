@@ -20,11 +20,15 @@ fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
         server_port: required_env("WVP_SERVER_PORT")
             .parse()
             .expect("WVP_SERVER_PORT 非法"),
+        server_id: std::env::var("WVP_SERVER_ID")
+            .unwrap_or_else(|_| required_env("WVP_SERVER_DOMAIN")),
         server_domain: required_env("WVP_SERVER_DOMAIN"),
         transport: Transport::Udp,
         gb_version: GbVersion::V2022,
         signaling_encoding: common::SignalingEncoding::Gb18030,
+        register_expires_secs: 3_600,
         heartbeat_interval_secs: 30,
+        heartbeat_fail_threshold: 3,
         channels: template_channels,
         device_info: DeviceInfo {
             device_name: "UVP-Sim-Desktop".into(),

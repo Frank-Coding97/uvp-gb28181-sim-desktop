@@ -203,9 +203,12 @@ impl Scenario for LinearScenario {
                 password: self.password.clone(),
                 server_host: self.server_host.clone(),
                 server_port: self.server_port,
+                server_id: self.server_domain.clone(),
                 server_domain: self.server_domain.clone(),
                 transport: self.transport,
+                register_expires_secs: 3_600,
                 heartbeat_interval_secs: self.heartbeat_interval_secs,
+                heartbeat_fail_threshold: 3,
                 channels,
                 device_info: DeviceInfo {
                     device_name: format!("{}-{}", self.device_info.device_name, i),
