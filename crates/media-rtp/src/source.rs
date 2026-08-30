@@ -579,6 +579,8 @@ pub struct FileSource {
     audio_cursor: usize,
     /// 每个视频帧对应几个音频包(按帧率折算:25fps→40ms/帧→2 包)。
     audio_per_frame: usize,
+    /// true=循环直播文件，false=有限历史文件。
+    looping: bool,
 }
 
 impl FileSource {
@@ -590,6 +592,31 @@ impl FileSource {
         let annexb = prepare_video_source(path)?;
         let bytes = std::fs::read(&annexb).map_err(Error::Io)?;
         Self::from_bytes(&bytes)
+    }
+
+    /// 从一个或多个历史文件创建有限播放源，末帧后返回 `None`。
+    pub fn from_paths_once(paths: &[std::path::PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(Error::Media("历史录像文件列表为空".into()));
+        }
+        let mut bytes = Vec::new();
+        for path in paths {
+            let path = path
+                .to_str()
+                .ok_or_else(|| Error::Media("历史录像路径非 UTF-8".into()))?;
+            let annexb = prepare_video_source(path)?;
+            bytes.extend_from_slice(&std::fs::read(annexb)?);
+        }
+        let mut source = Self::from_bytes(&bytes)?;
+        source.looping = false;
+        Ok(source)
+    }
+
+    /// 从内存 Annex B 创建有限源，主要用于回放契约测试。
+    pub fn from_bytes_once(bytes: &[u8]) -> Result<Self> {
+        let mut source = Self::from_bytes(bytes)?;
+        source.looping = false;
+        Ok(source)
     }
 
     /// 从视频文件加载视频 + 音频(音视频复合流)。`fps` 用于折算每帧音频包数。
@@ -626,6 +653,7 @@ impl FileSource {
             audio: Vec::new(),
             audio_cursor: 0,
             audio_per_frame: 0,
+            looping: true,
         })
     }
 
@@ -645,8 +673,14 @@ impl VideoSource for FileSource {
         if self.frames.is_empty() {
             return None;
         }
+        if !self.looping && self.cursor >= self.frames.len() {
+            return None;
+        }
         let f = self.frames[self.cursor].clone();
-        self.cursor = (self.cursor + 1) % self.frames.len(); // 循环
+        self.cursor += 1;
+        if self.looping {
+            self.cursor %= self.frames.len();
+        }
         Some(f)
     }
 
@@ -1321,6 +1355,21 @@ mod tests {
         // 取 2*total+1 帧不 panic,且回到起点。
         for _ in 0..(total * 2 + 1) {
             assert!(s.next_frame().is_some());
+        }
+    }
+
+    #[test]
+    fn 有限文件源末帧后结束且循环构造不回归() {
+        let mut once = FileSource::from_bytes_once(&sample_h264()).unwrap();
+        let total = once.len();
+        for _ in 0..total {
+            assert!(once.next_frame().is_some());
+        }
+        assert!(once.next_frame().is_none());
+
+        let mut looping = FileSource::from_bytes(&sample_h264()).unwrap();
+        for _ in 0..(looping.len() * 2 + 1) {
+            assert!(looping.next_frame().is_some());
         }
     }
 

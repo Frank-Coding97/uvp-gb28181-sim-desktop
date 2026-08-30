@@ -381,6 +381,8 @@ struct PushSession {
     control: Arc<media_rtp::PlaybackControl>,
     /// 是否为回放/下载会话(s=Playback/Download):结束时发 MediaStatus 121。
     is_history: bool,
+    /// INVITE `t=` 描述的历史时间窗，供 Range 精确折算。
+    history_duration_secs: u64,
 }
 
 /// 一条活跃订阅(周期 NOTIFY 任务句柄 + 停止信号)。
@@ -1787,8 +1789,17 @@ impl DeviceSimulator {
     ) -> Result<bool> {
         if let Ok(body) = std::str::from_utf8(&req.body) {
             let head = body.trim_start();
-            let guard = self.session.lock().await;
-            if let Some(session) = guard.as_ref() {
+            let mut guard = self.session.lock().await;
+            let teardown = head.starts_with("TEARDOWN");
+            let mut notify_finished = false;
+            if teardown {
+                if let Some(session) = guard.take() {
+                    notify_finished = session.is_history;
+                    let _ = session.stop_tx.send(());
+                    self.observer.on_event(common::DeviceEvent::StreamStop);
+                    tracing::info!("回放控制:结束");
+                }
+            } else if let Some(session) = guard.as_ref() {
                 if head.starts_with("PAUSE") {
                     session.control.pause();
                     tracing::info!("回放控制:暂停");
@@ -1804,7 +1815,9 @@ impl DeviceSimulator {
                         .unwrap_or(1.0);
                     // 取 Range 行(拖动定位,§9.8):`Range: npt=<start>-<end>`。
                     // start 为回放起点秒偏移;按 INVITE t= 时间段折算千分比位置。
-                    if let Some(permille) = Self::parse_range_permille(body) {
+                    if let Some(permille) =
+                        Self::parse_range_permille_for(body, session.history_duration_secs)
+                    {
                         session.control.seek_permille(permille);
                         tracing::info!(permille, "回放控制:拖动定位");
                     }
@@ -1812,6 +1825,10 @@ impl DeviceSimulator {
                     session.control.resume();
                     tracing::info!(scale, "回放控制:播放/倍速");
                 }
+            }
+            drop(guard);
+            if notify_finished {
+                self.notify_media_finished(transport).await;
             }
         }
         let resp = sip_core::SipMessage::Response(builder::response_ok(req));
@@ -1824,7 +1841,12 @@ impl DeviceSimulator {
     /// GB28181 回放拖动:npt 为回放起点秒偏移。模拟器循环推短文件,无真实录像时间轴,
     /// 故把 start 对一个名义 3600s 时间窗取模折算千分比(保证拖动可见地改变起播位置)。
     /// 返回 None 表示无 Range 或无法解析。
+    #[cfg(test)]
     fn parse_range_permille(body: &str) -> Option<u32> {
+        Self::parse_range_permille_for(body, 3600)
+    }
+
+    fn parse_range_permille_for(body: &str, duration_secs: u64) -> Option<u32> {
         let range = body.lines().find_map(|l| {
             l.split_once(':')
                 .filter(|(k, _)| k.trim().eq_ignore_ascii_case("Range"))
@@ -1837,9 +1859,23 @@ impl DeviceSimulator {
             return None; // now 表示从当前继续,不定位。
         }
         let secs: f64 = start.parse().ok()?;
-        // 名义 3600s 窗口取模 → 千分比。
-        let permille = ((secs.rem_euclid(3600.0) / 3600.0) * 1000.0) as u32;
+        let duration = duration_secs.max(1) as f64;
+        let permille = ((secs.clamp(0.0, duration) / duration) * 1000.0) as u32;
         Some(permille.min(1000))
+    }
+
+    async fn notify_media_finished(&self, transport: &Arc<UdpTransport>) {
+        let (host, port) = (self.local_host(), self.local_port());
+        let sn = self.next_cseq();
+        if let Ok(xml) = gb28181_protocol::manscdp::MediaStatusNotify::finished(
+            self.config.device_id.as_str(),
+            sn,
+        )
+        .to_xml()
+        {
+            let _ = self.send_message_xml(transport, &host, port, &xml).await;
+        }
+        tracing::info!("回放/下载结束,发 MediaStatus 121");
     }
 
     /// 控制命令的详细人类可读摘要(供 UI 命令时间线):方向/变倍/预置位/巡航/辅助等。
@@ -2971,14 +3007,65 @@ impl DeviceSimulator {
         // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 TCP-ACTIVE(RFC 4571)。
         let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
 
-        // 媒体源在注册成功后已启动；点播这里只创建一个独立读取端。
+        // o= 用户名/索引通道均取 INVITE Request-URI 的 user 部分。
+        let channel = req
+            .uri
+            .strip_prefix("sip:")
+            .and_then(|s| s.split('@').next())
+            .unwrap_or(self.config.device_id.as_str());
+
+        // 直播订阅共享媒体；回放/下载只能从录像索引创建有限文件源。
         let fps = self.config.video_fps;
-        let source = self
-            .shared_media
-            .lock()
-            .await
-            .as_ref()
-            .map(|media| Box::new(media.subscribe()) as Box<dyn media_rtp::VideoSource>);
+        let is_history = platform_sdp.is_playback() || platform_sdp.is_download();
+        let source: Option<Box<dyn media_rtp::VideoSource>> = if is_history {
+            let service = self.recording_service();
+            let entries = service
+                .as_ref()
+                .map(|service| {
+                    service.store().query(&crate::recording::RecordingQuery {
+                        start_time_ms: (platform_sdp.timing.start > 0)
+                            .then(|| platform_sdp.timing.start.saturating_mul(1_000)),
+                        end_time_ms: (platform_sdp.timing.stop > 0)
+                            .then(|| platform_sdp.timing.stop.saturating_mul(1_000)),
+                        channel_id: Some(channel.to_owned()),
+                        kind: None,
+                    })
+                })
+                .unwrap_or_default();
+            if entries.is_empty() {
+                let not_found = sip_core::SipMessage::Response(builder::response_status(
+                    req,
+                    404,
+                    "Recording Not Found",
+                ));
+                transport.send_to(&not_found, from).await?;
+                self.observer.on_event(common::DeviceEvent::RuntimeError {
+                    scope: "history".into(),
+                    message: "回放/下载时间窗内无完成录像".into(),
+                });
+                return Ok(true);
+            }
+            let paths: Vec<_> = entries.into_iter().map(|entry| entry.path).collect();
+            match media_rtp::FileSource::from_paths_once(&paths) {
+                Ok(source) => Some(Box::new(source)),
+                Err(error) => {
+                    tracing::warn!(%error, "历史录像文件加载失败");
+                    let unavailable = sip_core::SipMessage::Response(builder::response_status(
+                        req,
+                        480,
+                        "Recording Unavailable",
+                    ));
+                    transport.send_to(&unavailable, from).await?;
+                    return Ok(true);
+                }
+            }
+        } else {
+            self.shared_media
+                .lock()
+                .await
+                .as_ref()
+                .map(|media| Box::new(media.subscribe()) as Box<dyn media_rtp::VideoSource>)
+        };
         if source.is_none()
             && (self.config.video_source.is_some() || self.config.light_bitrate_kbps.is_some())
         {
@@ -3001,12 +3088,6 @@ impl DeviceSimulator {
             .local_host()
             .parse()
             .unwrap_or_else(|_| transport.local_addr().map(|a| a.ip()).unwrap_or(rtp_host));
-        // o= 用户名填被点播的通道 ID(取 INVITE Request-URI 的 user 部分)。
-        let channel = req
-            .uri
-            .strip_prefix("sip:")
-            .and_then(|s| s.split('@').next())
-            .unwrap_or(self.config.device_id.as_str());
         let local_sdp =
             sip_core::SessionDescription::new_device_response(channel, local_ip, 0, ssrc, use_tcp);
         let sdp_body = local_sdp.to_string();
@@ -3033,6 +3114,7 @@ impl DeviceSimulator {
             }
             let control_task = Arc::clone(&control);
             let simulator = Arc::clone(self);
+            let completion_transport = Arc::clone(transport);
             let marker = Arc::new(());
             let task_marker = Arc::clone(&marker);
             let task = tokio::spawn(async move {
@@ -3074,6 +3156,9 @@ impl DeviceSimulator {
                 drop(session);
                 if owns_slot {
                     simulator.observer.on_event(common::DeviceEvent::StreamStop);
+                    if is_history {
+                        simulator.notify_media_finished(&completion_transport).await;
+                    }
                 }
             });
             *sess_guard = Some(PushSession {
@@ -3081,7 +3166,11 @@ impl DeviceSimulator {
                 _task: task,
                 stop_tx,
                 control,
-                is_history: platform_sdp.is_playback() || platform_sdp.is_download(),
+                is_history,
+                history_duration_secs: platform_sdp
+                    .timing
+                    .stop
+                    .saturating_sub(platform_sdp.timing.start),
             });
             self.observer.on_event(common::DeviceEvent::StreamStart);
             let _ = start_tx.send(());
@@ -3127,17 +3216,7 @@ impl DeviceSimulator {
 
         // 回放/下载会话结束:补发 MediaStatus 121(历史媒体文件发送结束)。
         if was_history {
-            let (h, p) = (self.local_host(), self.local_port());
-            let sn = self.next_cseq();
-            if let Ok(xml) = gb28181_protocol::manscdp::MediaStatusNotify::finished(
-                self.config.device_id.as_str(),
-                sn,
-            )
-            .to_xml()
-            {
-                let _ = self.send_message_xml(transport, &h, p, &xml).await;
-            }
-            tracing::info!("回放/下载结束,发 MediaStatus 121");
+            self.notify_media_finished(transport).await;
         }
         Ok(true)
     }
@@ -4478,6 +4557,7 @@ mod tests {
             stop_tx,
             control: control.clone(),
             is_history: false,
+            history_duration_secs: 3_600,
         });
 
         // 构造 INFO 请求的辅助闭包。
