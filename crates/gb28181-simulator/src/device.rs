@@ -2858,8 +2858,7 @@ impl DeviceSimulator {
         }
     }
 
-    /// 抓拍上传(GB-2022):串行拍 N 张,每张 HTTP PUT 上传后发完成 NOTIFY。
-    /// 模拟设备无摄像头,上传一段占位 JPEG 字节。
+    /// 抓拍上传(GB-2022):串行拍 N 张，从共享采集流的最近可解码关键帧生成 JPEG。
     async fn run_snapshot_upload(
         &self,
         transport: &Arc<UdpTransport>,
@@ -2867,8 +2866,6 @@ impl DeviceSimulator {
     ) {
         let (h, p) = (self.local_host(), self.local_port());
         let num = cfg.clamped_num();
-        // 占位 JPEG(SOI + EOI),真实设备为编码帧。
-        let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xD9];
         for idx in 1..=num {
             let ts = common::clock::synced_iso8601();
             let snap_id = format!("{}_{idx}", ts.replace([':', '-'], "").replace('.', ""));
@@ -2877,23 +2874,50 @@ impl DeviceSimulator {
             } else {
                 cfg.upload_url.clone()
             };
-            match http_put_jpeg(&url, jpeg).await {
-                Ok(()) => {
-                    let sn = self.next_cseq();
-                    let notify = gb28181_protocol::manscdp::SnapShotNotify::new(
-                        self.config.device_id.as_str(),
-                        sn,
-                        &cfg.session_id,
-                        &snap_id,
-                        &ts,
-                        &url,
-                    );
-                    if let Ok(xml) = notify.to_xml() {
-                        let _ = self.send_message_xml(transport, &h, p, &xml).await;
+            let current = self
+                .shared_media
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|media| media.latest_config_frame());
+            let jpeg = if let Some((frame, codec)) = current {
+                match tokio::task::spawn_blocking(move || media_rtp::frame_to_jpeg(&frame, codec))
+                    .await
+                {
+                    Ok(Ok(jpeg)) => Some(jpeg),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "当前帧转 JPEG 失败");
+                        None
                     }
-                    tracing::info!(snap_id, "抓拍上传成功");
+                    Err(error) => {
+                        tracing::warn!(%error, "抓拍转码任务回收失败");
+                        None
+                    }
                 }
-                Err(e) => tracing::warn!(error = %e, url, "抓拍上传失败"),
+            } else {
+                tracing::warn!("尚无可解码当前关键帧，本张抓拍跳过");
+                None
+            };
+            match jpeg {
+                Some(jpeg) => match http_put_jpeg(&url, &jpeg).await {
+                    Ok(()) => {
+                        let sn = self.next_cseq();
+                        let notify = gb28181_protocol::manscdp::SnapShotNotify::new(
+                            self.config.device_id.as_str(),
+                            sn,
+                            &cfg.session_id,
+                            &snap_id,
+                            &ts,
+                            &url,
+                        );
+                        if let Ok(xml) = notify.to_xml() {
+                            let _ = self.send_message_xml(transport, &h, p, &xml).await;
+                        }
+                        tracing::info!(snap_id, "抓拍上传成功");
+                    }
+                    Err(e) => tracing::warn!(error = %e, url, "抓拍上传失败"),
+                },
+                None => {}
             }
             self.observer.on_event(common::DeviceEvent::Progress {
                 kind: "snapshot".into(),

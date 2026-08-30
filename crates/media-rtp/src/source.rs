@@ -430,10 +430,61 @@ impl SharedMedia {
         self.error.lock().ok().and_then(|error| error.clone())
     }
 
+    /// 返回最近一帧可独立解码的关键帧与编码，供录像启动和当前帧抓拍共用。
+    pub fn latest_config_frame(&self) -> Option<(Frame, crate::ps::VideoCodec)> {
+        self.latest_config_keyframe
+            .lock()
+            .ok()
+            .and_then(|frame| frame.clone())
+            .map(|frame| (frame.frame, self.video_codec))
+    }
+
     fn seek(&self, permille: u32) {
         self.seek_permille_plus1
             .store(permille.min(1000) + 1, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// 把可独立解码的 Annex B 关键帧转为真实 JPEG。
+pub fn frame_to_jpeg(frame: &Frame, codec: crate::ps::VideoCodec) -> Result<Vec<u8>> {
+    if !frame.key_frame || !crate::pusher::contains_codec_config(&frame.data, codec) {
+        return Err(Error::Media("当前帧不含完整编码参数集".into()));
+    }
+    let ffmpeg = ffmpeg_bin().ok_or_else(|| Error::Media("未找到 ffmpeg，无法生成 JPEG".into()))?;
+    let nonce = now_ms().wrapping_add(u64::from(rand::random::<u32>()));
+    let (suffix, input_format) = if codec == crate::ps::VideoCodec::H265 {
+        ("h265", "hevc")
+    } else {
+        ("h264", "h264")
+    };
+    let input = std::env::temp_dir().join(format!("uvp-snapshot-{nonce}.{suffix}"));
+    let output = std::env::temp_dir().join(format!("uvp-snapshot-{nonce}.jpg"));
+    std::fs::write(&input, &frame.data)?;
+    let result = std::process::Command::new(ffmpeg)
+        .args(["-y", "-f", input_format, "-i"])
+        .arg(&input)
+        .args(["-frames:v", "1", "-f", "image2"])
+        .arg(&output)
+        .output()
+        .map_err(|error| Error::Media(format!("ffmpeg 抓拍启动失败: {error}")));
+    let jpeg = match result {
+        Ok(result) if result.status.success() => std::fs::read(&output).map_err(Error::Io),
+        Ok(result) => Err(Error::Media(format!(
+            "ffmpeg 抓拍失败: {}",
+            String::from_utf8_lossy(&result.stderr)
+                .lines()
+                .last()
+                .unwrap_or("未知错误")
+        ))),
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+    let jpeg = jpeg?;
+    if jpeg.len() <= 4 || !jpeg.starts_with(&[0xFF, 0xD8]) || !jpeg.ends_with(&[0xFF, 0xD9]) {
+        return Err(Error::Media("ffmpeg 未生成有效 JPEG".into()));
+    }
+    Ok(jpeg)
 }
 
 impl Drop for SharedMedia {
@@ -1371,6 +1422,26 @@ mod tests {
         for _ in 0..(looping.len() * 2 + 1) {
             assert!(looping.next_frame().is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn shared_media只在有完整参数集时提供抓拍帧() {
+        let empty = start_shared_media(Box::new(NoneSource), 25);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(empty.latest_config_frame().is_none());
+
+        let source = FileSource::from_bytes(&sample_h264()).unwrap();
+        let media = start_shared_media(Box::new(source), 25);
+        for _ in 0..100 {
+            if let Some((frame, codec)) = media.latest_config_frame() {
+                assert!(frame.key_frame);
+                assert!(crate::pusher::contains_codec_config(&frame.data, codec));
+                media.stop();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("共享媒体未保存可解码关键帧");
     }
 
     #[test]
