@@ -16,6 +16,7 @@ import PulseOutline from "@vicons/ionicons5/es/PulseOutline.js";
 import GitNetworkOutline from "@vicons/ionicons5/es/GitNetworkOutline.js";
 import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
 import VideocamOutline from "@vicons/ionicons5/es/VideocamOutline.js";
+import SettingsOutline from "@vicons/ionicons5/es/SettingsOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
 import { useDevice } from "./device";
@@ -35,6 +36,7 @@ const menuOptions: MenuOption[] = [
   { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
   { label: "系统信息",   key: "/system",    icon: icon(TerminalOutline) },
   { label: "视频采集demo", key: "/camera-demo", icon: icon(VideocamOutline) },
+  { label: "设置",       key: "/settings",  icon: icon(SettingsOutline) },
 ];
 
 // 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
