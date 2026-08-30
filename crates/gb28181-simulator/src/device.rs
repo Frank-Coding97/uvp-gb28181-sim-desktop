@@ -3112,8 +3112,16 @@ impl DeviceSimulator {
             .local_host()
             .parse()
             .unwrap_or_else(|_| transport.local_addr().map(|a| a.ip()).unwrap_or(rtp_host));
-        let local_sdp =
-            sip_core::SessionDescription::new_device_response(channel, local_ip, 0, ssrc, use_tcp);
+        // RFC 4145:TCP passive offer 的 active answer 使用 discard port 9，
+        // 实际媒体目标仍为平台 offer 中的 c=/m= 地址。
+        let answer_port = if use_tcp { 9 } else { 0 };
+        let local_sdp = sip_core::SessionDescription::new_device_answer(
+            channel,
+            local_ip,
+            answer_port,
+            ssrc,
+            &platform_sdp,
+        );
         let sdp_body = local_sdp.to_string();
 
         let mut resp = builder::response_ok(req);

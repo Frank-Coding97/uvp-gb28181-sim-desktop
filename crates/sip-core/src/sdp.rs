@@ -24,6 +24,10 @@ pub struct SessionDescription {
     pub media: MediaDescription,
     /// 下载倍速(GB28181 录像下载 `a=downloadspeed:N`;仅下载模式携带)。
     pub download_speed: Option<u32>,
+    /// TCP 媒体连接角色(`a=setup:active/passive`)。
+    pub setup: Option<String>,
+    /// TCP 媒体连接复用方式(`a=connection:new/existing`)。
+    pub connection_mode: Option<String>,
 }
 
 impl SessionDescription {
@@ -88,6 +92,8 @@ impl SessionDescription {
         let mut rtpmap = None;
         let mut ssrc = None;
         let mut download_speed = None;
+        let mut setup = None;
+        let mut connection_mode = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -110,6 +116,10 @@ impl SessionDescription {
                 } else if let Some(spd) = rest.strip_prefix("downloadspeed:") {
                     // 下载倍速可能写成 "4" 或 "4:1",取首段。
                     download_speed = spd.split(':').next().and_then(|s| s.trim().parse().ok());
+                } else if let Some(value) = rest.strip_prefix("setup:") {
+                    setup = Some(value.trim().to_string());
+                } else if let Some(value) = rest.strip_prefix("connection:") {
+                    connection_mode = Some(value.trim().to_string());
                 }
             } else if let Some(rest) = line.strip_prefix("y=") {
                 ssrc = rest.trim().parse::<u32>().ok();
@@ -127,6 +137,8 @@ impl SessionDescription {
             timing: timing.unwrap_or(Timing { start: 0, stop: 0 }),
             media,
             download_speed,
+            setup,
+            connection_mode,
         })
     }
 
@@ -172,7 +184,27 @@ impl SessionDescription {
                 ssrc: Some(ssrc),
             },
             download_speed: None,
+            setup: tcp.then(|| "active".into()),
+            connection_mode: tcp.then(|| "new".into()),
         }
+    }
+
+    /// 根据平台 offer 构造设备侧 SDP answer。
+    ///
+    /// 回放/下载必须保留 offer 的业务会话名和时间窗；TCP passive offer
+    /// 由设备主动建连，answer 声明 `setup:active` 和 `connection:new`。
+    pub fn new_device_answer(
+        username: &str,
+        local_ip: IpAddr,
+        rtp_port: u16,
+        ssrc: u32,
+        offer: &SessionDescription,
+    ) -> Self {
+        let tcp = offer.media.proto.to_ascii_uppercase().contains("TCP");
+        let mut answer = Self::new_device_response(username, local_ip, rtp_port, ssrc, tcp);
+        answer.session_name = offer.session_name.clone();
+        answer.timing = offer.timing.clone();
+        answer
     }
 }
 
@@ -207,6 +239,12 @@ impl fmt::Display for SessionDescription {
         )?;
         if let Some(ref rm) = self.media.rtpmap {
             write!(f, "a=rtpmap:{}\r\n", rm)?;
+        }
+        if let Some(ref setup) = self.setup {
+            write!(f, "a=setup:{}\r\n", setup)?;
+        }
+        if let Some(ref connection_mode) = self.connection_mode {
+            write!(f, "a=connection:{}\r\n", connection_mode)?;
         }
         if let Some(ssrc) = self.media.ssrc {
             write!(f, "y={}\r\n", ssrc)?;
@@ -360,6 +398,72 @@ y=1234567890\r
         // TCP 模式 proto 应为 TCP/RTP/AVP。
         let sdp_tcp = SessionDescription::new_device_response("dev", ip, 8000, 1, true);
         assert!(sdp_tcp.to_string().contains("m=video 8000 TCP/RTP/AVP 96"));
+    }
+
+    #[test]
+    fn tcp_回放应答保留业务时间窗并声明主动连接() {
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+o=34020000002000000002 0 0 IN IP4 192.168.10.220\r\n\
+s=Playback\r\n\
+u=35020000001310000132:0\r\n\
+c=IN IP4 192.168.10.220\r\n\
+t=1788099767 1788099787\r\n\
+m=video 40020 TCP/RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+a=setup:passive\r\n\
+a=connection:new\r\n\
+y=1031889862\r\n",
+        )
+        .unwrap();
+
+        let answer = SessionDescription::new_device_answer(
+            "35020000001310000132",
+            "127.0.0.1".parse().unwrap(),
+            9,
+            1_031_889_862,
+            &offer,
+        )
+        .to_string();
+
+        assert!(answer.contains("s=Playback\r\n"));
+        assert!(answer.contains("t=1788099767 1788099787\r\n"));
+        assert!(answer.contains("m=video 9 TCP/RTP/AVP 96\r\n"));
+        assert!(answer.contains("a=setup:active\r\n"));
+        assert!(answer.contains("a=connection:new\r\n"));
+        assert!(answer.contains("y=1031889862\r\n"));
+    }
+
+    #[test]
+    fn tcp_下载应答保留下载会话类型() {
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+o=34020000002000000002 0 0 IN IP4 192.168.10.220\r\n\
+s=Download\r\n\
+c=IN IP4 192.168.10.220\r\n\
+t=1788099767 1788099787\r\n\
+m=video 40020 TCP/RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+a=setup:passive\r\n\
+a=connection:new\r\n\
+a=downloadspeed:4\r\n\
+y=1031889862\r\n",
+        )
+        .unwrap();
+
+        let answer = SessionDescription::new_device_answer(
+            "35020000001310000132",
+            "127.0.0.1".parse().unwrap(),
+            9,
+            1_031_889_862,
+            &offer,
+        )
+        .to_string();
+
+        assert!(answer.contains("s=Download\r\n"));
+        assert!(answer.contains("t=1788099767 1788099787\r\n"));
+        assert!(answer.contains("a=setup:active\r\n"));
+        assert!(answer.contains("a=connection:new\r\n"));
     }
 
     #[test]
