@@ -115,7 +115,7 @@ const draft = reactive({
   server_domain: "",
   password: "",
   device_id: "",
-  transport: "Udp" as "Udp" | "Tcp",
+  transport: "UDP" as "UDP" | "TCP",
 });
 const serverDomainManuallyEdited = ref(false);
 
@@ -146,8 +146,8 @@ const mediaModes = [
   { value: "file", label: "视频文件", icon: DocumentOutline },
 ] as const;
 const signalingTransportOptions = [
-  { label: "UDP（当前支持）", value: "Udp" },
-  { label: "TCP（信令层尚未实现）", value: "Tcp" },
+  { label: "UDP（当前支持）", value: "UDP" },
+  { label: "TCP（信令层尚未实现）", value: "TCP" },
 ];
 const sipProfileOptions = computed(() =>
   profiles.value.map((profile) => ({ label: profile.name, value: profile.id })),
@@ -242,7 +242,7 @@ async function addSipProfile() {
       server_port: source?.server_port ?? 5060,
       server_id: source?.server_id ?? "34020000002000000001",
       server_domain: source?.server_domain ?? "3402000000",
-      transport: source?.transport ?? "Udp",
+      transport: source?.transport ?? "UDP",
       gb_version: source?.gb_version ?? "V2022",
       signaling_encoding: source?.signaling_encoding ?? "Gb18030",
     });
@@ -406,7 +406,7 @@ async function registerDevice() {
 async function toggleRegistration() {
   if (registrationBusy.value || editing.value) return;
   if (!deviceLive.value && !mediaSourceReady.value) return;
-  if (!deviceLive.value && active.value?.transport === "Tcp") {
+  if (!deviceLive.value && active.value?.transport === "TCP") {
     message.error("信令 TCP 尚未实现，请改用 UDP");
     return;
   }
@@ -727,7 +727,7 @@ onUnmounted(() => {
         </div>
 
         <div class="primary-actions">
-          <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy || editing || (!deviceLive && !mediaSourceReady) || (!deviceLive && active?.transport === 'Tcp')" @click="toggleRegistration">
+          <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy || editing || (!deviceLive && !mediaSourceReady) || (!deviceLive && active?.transport === 'TCP')" @click="toggleRegistration">
             <template #icon><n-icon><RadioOutline /></n-icon></template>
             {{ deviceLive ? "注销设备" : "注册设备" }}
           </n-button>

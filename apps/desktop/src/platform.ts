@@ -3,7 +3,7 @@
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
-export type SignalingTransport = "Udp" | "Tcp";
+export type SignalingTransport = "UDP" | "TCP";
 export type GbVersion = "V2016" | "V2022";
 export type SignalingEncoding = "Gb18030" | "Utf8";
 export type BindMode = "auto" | "specific";
@@ -146,7 +146,7 @@ function migrateLegacy(base: DesktopConfigV1): { next: DesktopConfigV1; password
         server_port: positiveInt(raw.server_port, base.profiles[0].server_port),
         server_id: serverId,
         server_domain: oldDomain.length === 10 ? oldDomain : serverId.slice(0, 10),
-        transport: raw.transport === "TCP" || raw.transport === "Tcp" ? "Tcp" : "Udp",
+        transport: raw.transport === "TCP" || raw.transport === "Tcp" ? "TCP" : "UDP",
         gb_version: raw.gb_version === "2016" || raw.gb_version === "V2016" ? "V2016" : "V2022",
         signaling_encoding: raw.signaling_encoding === "UTF-8" || raw.signaling_encoding === "Utf8"
           ? "Utf8"

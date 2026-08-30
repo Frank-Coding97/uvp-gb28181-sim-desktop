@@ -5,6 +5,7 @@ const platform = await readFile(new URL("./platform.ts", import.meta.url), "utf8
 const device = await readFile(new URL("./device.ts", import.meta.url), "utf8");
 
 const profile = platform.match(/export interface PlatformProfile \{([\s\S]*?)\n\}/)?.[1] ?? "";
+assert.match(platform, /SignalingTransport = "UDP" \| "TCP"/, "传输枚举必须匹配 Rust UPPERCASE serde 契约");
 assert.match(profile, /server_id:\s*string;/, "平台档案应保留 20 位平台 ID");
 assert.match(profile, /server_domain:\s*string;/, "平台档案应独立保留 10 位平台域");
 assert.doesNotMatch(profile, /password:/, "密码不得进入持久化平台档案 DTO");

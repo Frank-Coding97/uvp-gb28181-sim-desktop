@@ -58,7 +58,7 @@ const editForm = ref({
   server_id: "",
   server_domain: "",
   password: "",
-  transport: "Udp" as "Udp" | "Tcp",
+  transport: "UDP" as "UDP" | "TCP",
   gb_version: "V2022" as "V2016" | "V2022",
   signaling_encoding: "Gb18030" as "Gb18030" | "Utf8",
 });
@@ -92,7 +92,7 @@ async function addNew() {
   try {
     const id = await addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
     server_id: "34020000002000000001", server_domain: "3402000000",
-      transport: "Udp", gb_version: "V2022", signaling_encoding: "Gb18030" });
+      transport: "UDP", gb_version: "V2022", signaling_encoding: "Gb18030" });
     setSessionPassword(id, "");
     openEdit();
   } catch (cause) {
@@ -100,8 +100,8 @@ async function addNew() {
   }
 }
 const transportOptions = [
-  { label: "UDP（当前支持）", value: "Udp" },
-  { label: "TCP（信令层尚未实现）", value: "Tcp" },
+  { label: "UDP（当前支持）", value: "UDP" },
+  { label: "TCP（信令层尚未实现）", value: "TCP" },
 ];
 const versionOptions = [
   { label: "GB/T 28181-2022", value: "V2022" },
@@ -306,7 +306,7 @@ const themeOverrides = {
                     </div>
                   </div>
                   <div class="reg-btns">
-                    <n-button size="small" :type="deviceLive ? 'error' : 'primary'" :loading="registrationBusy" :disabled="registrationBusy || (!deviceLive && active?.transport === 'Tcp')" @click="toggleRegistration">
+                    <n-button size="small" :type="deviceLive ? 'error' : 'primary'" :loading="registrationBusy" :disabled="registrationBusy || (!deviceLive && active?.transport === 'TCP')" @click="toggleRegistration">
                       {{ deviceLive ? "注销" : "注册" }}
                     </n-button>
                   </div>

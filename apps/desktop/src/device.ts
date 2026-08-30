@@ -70,7 +70,7 @@ export function useDevice() {
     password = "",
   ): Promise<{ ok: boolean; msg: string }> {
     if (!platform) return { ok: false, msg: "请先配置目标平台" };
-    if (platform.transport === "Tcp") return { ok: false, msg: "信令 TCP 尚未实现，请改用 UDP" };
+    if (platform.transport === "TCP") return { ok: false, msg: "信令 TCP 尚未实现，请改用 UDP" };
     const input: StartDeviceInput = {
       profile_id: platform.id,
       password,

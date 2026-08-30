@@ -482,7 +482,7 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <n-alert v-if="activePlatform?.transport === 'Tcp'" type="warning" :show-icon="false" class="notice">
+    <n-alert v-if="activePlatform?.transport === 'TCP'" type="warning" :show-icon="false" class="notice">
       当前 SIP 信令层仅支持 UDP。请在顶栏将目标平台传输模式改为 UDP 后再启动。
     </n-alert>
 

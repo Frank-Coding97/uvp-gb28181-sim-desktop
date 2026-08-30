@@ -15,10 +15,10 @@ assert.match(
 assert.ok(button, "应存在首页注册/注销按钮");
 assert.match(
   button,
-  /:disabled="registrationBusy \|\| editing \|\| \(!deviceLive && !mediaSourceReady\) \|\| \(!deviceLive && active\?\.transport === 'Tcp'\)"/,
+  /:disabled="registrationBusy \|\| editing \|\| \(!deviceLive && !mediaSourceReady\) \|\| \(!deviceLive && active\?\.transport === 'TCP'\)"/,
   "编辑配置、媒体未就绪或选择 TCP 时，注册按钮必须显示为禁用",
 );
-assert.match(handler, /active\.value\?\.transport === "Tcp"/, "处理函数也必须 fail-closed 拒绝 TCP 注册");
+assert.match(handler, /active\.value\?\.transport === "TCP"/, "处理函数也必须 fail-closed 拒绝 TCP 注册");
 assert.match(source, /effectiveConfig\.value\?\.device \?\? config\.value\?\.device/, "运行时状态卡应优先展示 Rust 有效配置");
 assert.match(source, /await saveDesktopConfig\(/, "配置保存必须等待 Rust 返回");
 assert.match(source, /setSessionPassword\(profileId, draft\.password\)/, "密码只能写入当前会话状态");

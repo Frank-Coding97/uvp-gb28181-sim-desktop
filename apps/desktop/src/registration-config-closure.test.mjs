@@ -8,6 +8,6 @@ assert.match(app, /await loadDesktopConfig\(\)/, "应用启动必须先读取 Ru
 assert.match(app, /await updateProfile\(/, "顶栏保存必须等待 Rust 返回");
 assert.match(app, /passwordFor\(active\.value\.id\)/, "注册密码应从当前会话状态读取");
 assert.match(app, /startDevice\(active\.value,[\s\S]*passwordFor/, "顶栏注册只传本次会话密码");
-assert.match(app, /active\?\.transport === 'Tcp'/, "顶栏 TCP 注册按钮必须禁用");
+assert.match(app, /active\?\.transport === 'TCP'/, "顶栏 TCP 注册按钮必须禁用");
 assert.match(topbarEdit, /:disabled="deviceLive"/, "设备运行中必须锁定顶栏平台编辑入口");
 assert.match(app, /resetDesktopConfig\(\)/, "配置损坏错误应提供显式重置入口");
