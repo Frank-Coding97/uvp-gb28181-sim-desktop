@@ -19,8 +19,8 @@ pub enum DeviceEvent {
     CaptureStopped,
     /// 视频采集源初始化失败。
     CaptureFailure(String),
-    /// 注册失败(带归因)。
-    RegisterFailure(FailureKind),
+    /// 注册失败，携带统计归因与人类可读的原始错误。
+    RegisterFailure { kind: FailureKind, message: String },
     /// 心跳成功。
     HeartbeatOk,
     /// 心跳失败。

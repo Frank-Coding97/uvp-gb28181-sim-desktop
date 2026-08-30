@@ -101,7 +101,9 @@ fn platform_id(cfg: &DeviceConfig) -> &str {
 fn platform_uri(cfg: &DeviceConfig) -> String {
     format!(
         "sip:{}@{}:{}",
-        platform_id(cfg), cfg.server_host, cfg.server_port
+        platform_id(cfg),
+        cfg.server_host,
+        cfg.server_port
     )
 }
 

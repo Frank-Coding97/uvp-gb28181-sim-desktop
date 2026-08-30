@@ -244,7 +244,8 @@ mod tests {
             password: "12345678".into(),
             server_host: "127.0.0.1".into(),
             server_port: 15060,
-            server_domain: "34020000002000000001".into(),
+            server_id: "34020000002000000001".into(),
+            server_domain: "3402000000".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 3600, // 长心跳避免测试中发送
             channels_per_device: 1,

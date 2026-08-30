@@ -19,20 +19,19 @@ use tauri::{
 }; // Tauri 2 emit/state 需要对应 trait
 use tokio::sync::{broadcast, Mutex};
 
-mod camera_lease;
 mod config_store;
 mod preview_channel;
 mod preview_manager;
-use camera_lease::{CameraLease, CameraLeaseError, CameraLeaseGrant, CameraLeaseOwner};
 use config_store::{
-    BindMode, ConfigStore, DesktopConfigV1, EffectiveDeviceConfig, StartDeviceInput,
+    BindMode, CatalogNodeConfig, ConfigStore, DesktopConfigV1, EffectiveDeviceConfig,
+    StartDeviceInput,
 };
 use preview_channel::DesktopPreviewBus;
 use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
 
 /// 应用全局状态（托管在 Tauri managed state）。
 struct AppState {
-    /// Rust 端非敏感配置真相源；路径在首次 Tauri 命令时由 app_data_dir 初始化。
+    /// Rust 端配置真相源；路径在首次 Tauri 命令时由 app_data_dir 初始化。
     config_store: OnceLock<ConfigStore>,
     /// 配置文件读写串行化，避免并发保存与读取看到半次操作。
     config_io: Mutex<()>,
@@ -52,8 +51,6 @@ struct AppState {
     preview_bus: Arc<DesktopPreviewBus>,
     /// 应用级唯一预览 Channel 管理器；页面只 attach/detach。
     preview_manager: Arc<PreviewManager>,
-    /// 物理摄像头在设备采集与浏览器 Demo 之间的唯一租约。
-    camera_lease: Arc<CameraLease>,
 }
 
 /// 压测运行句柄。收到停止请求后仅标记 `stopping`，由后台任务退出时释放。
@@ -71,7 +68,6 @@ struct DeviceHandle {
     local_host: String,
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
-    camera_lease_token: Option<u64>,
     effective_config: EffectiveDeviceConfig,
 }
 
@@ -90,7 +86,6 @@ impl AppState {
             device: Mutex::new(None),
             preview_bus,
             preview_manager,
-            camera_lease: Arc::new(CameraLease::new()),
         }
     }
 }
@@ -133,7 +128,7 @@ fn camera_capture_guidance(message: &str) -> String {
         || normalized.contains("cannot use device")
     {
         return format!(
-            "[camera_in_use] 摄像头正被其他采集会话占用，请先停止视频采集 Demo 或其他相机应用后重试。原始错误：{message}"
+            "[camera_in_use] 摄像头正被其他采集会话占用，请先停止其他相机应用后重试。原始错误：{message}"
         );
     }
     message.to_string()
@@ -144,7 +139,17 @@ impl DeviceObserver for StateEmitter {
         let state = match event {
             DeviceEvent::RegisterAttempt => "Registering",
             DeviceEvent::RegisterSuccess => "Registered",
-            DeviceEvent::RegisterFailure(_) => "Failed",
+            DeviceEvent::RegisterFailure { message, .. } => {
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = self.app.emit(
+                    "device_error",
+                    serde_json::json!({ "scope": "register", "message": message, "ts_ms": ts_ms }),
+                );
+                "Failed"
+            }
             DeviceEvent::CaptureStarting => {
                 let _ = self.app.emit("capture_state", "starting");
                 return;
@@ -273,29 +278,8 @@ struct TraceEmitter {
     app: AppHandle,
 }
 
-fn redact_sip_secrets(raw: &str) -> String {
-    let mut lines = raw
-        .lines()
-        .map(|line| {
-            let header = line
-                .split_once(':')
-                .map(|(name, _)| name.trim().to_ascii_lowercase());
-            if matches!(
-                header.as_deref(),
-                Some("authorization") | Some("proxy-authorization")
-            ) {
-                let name = line.split_once(':').map(|(name, _)| name).unwrap_or(line);
-                format!("{name}: <redacted>")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\r\n");
-    if raw.ends_with('\n') {
-        lines.push_str("\r\n");
-    }
-    lines
+fn format_sip_trace_log(direction: &str, peer: &str, raw: &str) -> String {
+    format!("SIP {direction} {peer}\n{raw}")
 }
 
 impl sip_core::TraceObserver for TraceEmitter {
@@ -324,18 +308,25 @@ impl sip_core::TraceObserver for TraceEmitter {
             };
             // GB18030 兼容 ASCII 头;中文 body 用 GB18030 解码更可读。
             let (text, _, _) = encoding_rs::GB18030.decode(&bytes);
-            redact_sip_secrets(&text)
+            text.into_owned()
         };
+        let direction = if matches!(trace.dir, sip_core::TraceDir::In) {
+            "in"
+        } else {
+            "out"
+        };
+        let peer = trace.peer.to_string();
+        tracing::info!(target: "sip_trace", "{}", format_sip_trace_log(direction, &peer, &raw));
         let entry = serde_json::json!({
             "ts_ms": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64).unwrap_or(0),
-            "direction": if matches!(trace.dir, sip_core::TraceDir::In) { "in" } else { "out" },
+            "direction": direction,
             "method": method,
             "status": status,
             "cseq": cseq,
             "call_id": call_id,
-            "peer": trace.peer.to_string(),
+            "peer": peer,
             "summary": summary,
             "raw": raw,
         });
@@ -984,23 +975,6 @@ async fn retry_binary_preview(state: tauri::State<'_, AppState>) -> Result<Strin
     }
 }
 
-#[tauri::command]
-fn acquire_camera_demo(
-    state: tauri::State<'_, AppState>,
-) -> Result<CameraLeaseGrant, CameraLeaseError> {
-    state.camera_lease.acquire(CameraLeaseOwner::Demo)
-}
-
-#[tauri::command]
-fn release_camera_demo(token: u64, state: tauri::State<'_, AppState>) -> bool {
-    state.camera_lease.release(token)
-}
-
-#[tauri::command]
-fn get_camera_lease(state: tauri::State<'_, AppState>) -> Option<CameraLeaseGrant> {
-    state.camera_lease.current()
-}
-
 /// 通过"向平台发起 UDP connect"发现本机对外 IP(不真正发包)。
 fn discover_local_ip(server: &str) -> String {
     std::net::UdpSocket::bind("0.0.0.0:0")
@@ -1034,86 +1008,82 @@ async fn start_device(
     if resolved.profile.transport == Transport::Tcp {
         return Err("当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into());
     }
-    let mut uses_physical_camera = false;
     if let Some(source) = resolved.video_source.take() {
         if source.starts_with("live:") {
-                let spec = media_rtp::LiveSourceSpec::parse(&source)
-                    .map_err(|error| format!("实时媒体源配置无效: {error}"))?;
-                uses_physical_camera = matches!(&spec, media_rtp::LiveSourceSpec::Camera { .. });
-                let catalog = tokio::task::spawn_blocking(media_rtp::list_live_sources)
-                    .await
-                    .map_err(|error| format!("实时设备枚举任务异常: {error}"))?
-                    .map_err(|error| format!("实时设备枚举失败: {error}"))?;
-                let requested_audio_codec = match &spec {
-                    media_rtp::LiveSourceSpec::Camera {
-                        audio_index: Some(_),
-                        audio_codec,
-                        ..
-                    } => Some(*audio_codec),
-                    media_rtp::LiveSourceSpec::Screen {
-                        audio, audio_codec, ..
-                    } if audio.is_enabled() => Some(*audio_codec),
-                    _ => None,
-                };
-                match requested_audio_codec {
-                    Some(media_rtp::LiveAudioCodec::Aac) if !catalog.aac_available => {
-                        return Err("当前内嵌 FFmpeg 不支持 AAC 编码，请改用 G.711A/G.711U".into());
-                    }
-                    Some(media_rtp::LiveAudioCodec::Opus) if !catalog.opus_available => {
-                        return Err(
-                            "当前内嵌 FFmpeg 不支持 libopus 编码，请改用 G.711A/G.711U".into()
-                        );
-                    }
-                    _ => {}
+            let spec = media_rtp::LiveSourceSpec::parse(&source)
+                .map_err(|error| format!("实时媒体源配置无效: {error}"))?;
+            let catalog = tokio::task::spawn_blocking(media_rtp::list_live_sources)
+                .await
+                .map_err(|error| format!("实时设备枚举任务异常: {error}"))?
+                .map_err(|error| format!("实时设备枚举失败: {error}"))?;
+            let requested_audio_codec = match &spec {
+                media_rtp::LiveSourceSpec::Camera {
+                    audio_index: Some(_),
+                    audio_codec,
+                    ..
+                } => Some(*audio_codec),
+                media_rtp::LiveSourceSpec::Screen {
+                    audio, audio_codec, ..
+                } if audio.is_enabled() => Some(*audio_codec),
+                _ => None,
+            };
+            match requested_audio_codec {
+                Some(media_rtp::LiveAudioCodec::Aac) if !catalog.aac_available => {
+                    return Err("当前内嵌 FFmpeg 不支持 AAC 编码，请改用 G.711A/G.711U".into());
                 }
-                match spec {
-                    media_rtp::LiveSourceSpec::Camera { video_index, .. }
-                        if !catalog
-                            .cameras
+                Some(media_rtp::LiveAudioCodec::Opus) if !catalog.opus_available => {
+                    return Err("当前内嵌 FFmpeg 不支持 libopus 编码，请改用 G.711A/G.711U".into());
+                }
+                _ => {}
+            }
+            match spec {
+                media_rtp::LiveSourceSpec::Camera { video_index, .. }
+                    if !catalog
+                        .cameras
+                        .iter()
+                        .any(|camera| camera.index == video_index) =>
+                {
+                    return Err(catalog.avfoundation_error.unwrap_or_else(|| {
+                        format!("未找到 AVFoundation 摄像头索引 {video_index}")
+                    }));
+                }
+                media_rtp::LiveSourceSpec::Camera {
+                    audio_index: Some(index),
+                    ..
+                } if !catalog
+                    .microphones
+                    .iter()
+                    .any(|microphone| microphone.index == index) =>
+                {
+                    return Err(catalog
+                        .avfoundation_error
+                        .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                }
+                media_rtp::LiveSourceSpec::Screen {
+                    audio: media_rtp::LiveAudioSource::Microphone(index),
+                    ..
+                } if !catalog
+                    .microphones
+                    .iter()
+                    .any(|microphone| microphone.index == index) =>
+                {
+                    return Err(catalog
+                        .avfoundation_error
+                        .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                }
+                media_rtp::LiveSourceSpec::Screen { display_id, .. }
+                    if display_id != 0
+                        && !catalog
+                            .screens
                             .iter()
-                            .any(|camera| camera.index == video_index) =>
-                    {
-                        return Err(catalog.avfoundation_error.unwrap_or_else(|| {
-                            format!("未找到 AVFoundation 摄像头索引 {video_index}")
-                        }));
-                    }
-                    media_rtp::LiveSourceSpec::Camera {
-                        audio_index: Some(index),
-                        ..
-                    } if !catalog
-                        .microphones
-                        .iter()
-                        .any(|microphone| microphone.index == index) =>
-                    {
-                        return Err(catalog
-                            .avfoundation_error
-                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
-                    }
-                    media_rtp::LiveSourceSpec::Screen {
-                        audio: media_rtp::LiveAudioSource::Microphone(index),
-                        ..
-                    } if !catalog
-                        .microphones
-                        .iter()
-                        .any(|microphone| microphone.index == index) =>
-                    {
-                        return Err(catalog
-                            .avfoundation_error
-                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
-                    }
-                    media_rtp::LiveSourceSpec::Screen { display_id, .. }
-                        if display_id != 0
-                            && !catalog
-                                .screens
-                                .iter()
-                                .any(|screen| screen.display_id == display_id) =>
-                    {
-                        return Err(catalog.screen_error.unwrap_or_else(|| {
-                            format!("未找到 ScreenCaptureKit 显示器 {display_id}")
-                        }));
-                    }
-                    _ => {}
+                            .any(|screen| screen.display_id == display_id) =>
+                {
+                    return Err(catalog.screen_error.unwrap_or_else(|| {
+                        format!("未找到 ScreenCaptureKit 显示器 {display_id}")
+                    }));
                 }
+                _ => {}
+            }
         }
         resolved.video_source = Some(source);
     }
@@ -1198,22 +1168,18 @@ async fn start_device(
         state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
     ));
 
-    // 若指定了目录模板,在注册前载入(平台注册后会立即同步目录,需在这之前准备好)。
-    if !resolved.catalog_template.is_empty() {
+    // 持久化目录树优先；首次使用时才回退到启动表单指定模板。
+    // 平台注册后可能立即查询目录，必须在 run() 前准备好。
+    if !resolved.catalog_tree.is_empty() {
+        let nodes: Vec<_> = resolved
+            .catalog_tree
+            .iter()
+            .map(CatalogNodeConfig::to_protocol_node)
+            .collect::<Result<_, _>>()?;
+        sim.set_catalog_tree(nodes)?;
+    } else if !resolved.catalog_template.is_empty() {
         sim.load_catalog_template(&resolved.catalog_template);
     }
-
-    let camera_lease_token = if uses_physical_camera {
-        Some(
-            state
-                .camera_lease
-                .acquire(CameraLeaseOwner::Device)
-                .map_err(|error| format!("[{}] {}", error.code, error.message))?
-                .token,
-        )
-    } else {
-        None
-    };
 
     let effective_config = EffectiveDeviceConfig {
         profile: resolved.profile.clone(),
@@ -1244,7 +1210,6 @@ async fn start_device(
         local_host,
         local_port,
         stop_tx,
-        camera_lease_token,
         effective_config,
     });
     Ok("设备已启动".into())
@@ -1257,9 +1222,6 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
     match guard.take() {
         Some(h) => {
             h.sim.stop_shared_media().await;
-            if let Some(token) = h.camera_lease_token {
-                state.camera_lease.release(token);
-            }
             let _ = h.stop_tx.send(());
             let _ = app.emit("device_state", "Disconnected");
             Ok("设备已停止".into())
@@ -1355,6 +1317,8 @@ struct ChannelNodeDto {
     parent_id: String,
     #[serde(default)]
     civil_code: Option<String>,
+    #[serde(default)]
+    business_group_id: Option<String>,
     #[serde(default = "default_on")]
     status: String,
 }
@@ -1363,20 +1327,25 @@ fn default_on() -> String {
     "ON".into()
 }
 
-fn node_type_from_str(s: &str) -> gb28181_protocol::id_codec::CatalogNodeType {
+fn node_type_from_str(s: &str) -> Result<gb28181_protocol::id_codec::CatalogNodeType, String> {
     use gb28181_protocol::id_codec::CatalogNodeType::*;
-    match s {
+    Ok(match s {
+        "AdministrativeRegion" => AdministrativeRegion,
+        "System" => System,
         "BusinessGroup" => BusinessGroup,
         "VirtualOrg" => VirtualOrg,
         "AlarmChannel" => AlarmChannel,
         "Device" => Device,
-        _ => VideoChannel,
-    }
+        "VideoChannel" => VideoChannel,
+        other => return Err(format!("未知目录节点类型: {other}")),
+    })
 }
 
 fn node_type_to_str(t: gb28181_protocol::id_codec::CatalogNodeType) -> &'static str {
     use gb28181_protocol::id_codec::CatalogNodeType::*;
     match t {
+        AdministrativeRegion => "AdministrativeRegion",
+        System => "System",
         Device => "Device",
         BusinessGroup => "BusinessGroup",
         VirtualOrg => "VirtualOrg",
@@ -1393,77 +1362,245 @@ impl From<&gb28181_protocol::id_codec::CatalogNode> for ChannelNodeDto {
             name: n.name.clone(),
             parent_id: n.parent_id.clone(),
             civil_code: n.civil_code.clone(),
+            business_group_id: n.business_group_id.clone(),
             status: n.status.clone(),
         }
     }
 }
 
-impl From<ChannelNodeDto> for gb28181_protocol::id_codec::CatalogNode {
-    fn from(d: ChannelNodeDto) -> Self {
+impl TryFrom<ChannelNodeDto> for gb28181_protocol::id_codec::CatalogNode {
+    type Error = String;
+
+    fn try_from(d: ChannelNodeDto) -> Result<Self, Self::Error> {
         let mut node = gb28181_protocol::id_codec::CatalogNode::new(
             d.id,
-            node_type_from_str(&d.node_type),
+            node_type_from_str(&d.node_type)?,
             d.name,
             d.parent_id,
         );
         node.civil_code = d.civil_code;
+        node.business_group_id = d.business_group_id;
         node.status = d.status;
-        node
+        Ok(node)
     }
 }
 
-/// 载入内置目录模板(single/nvr-8ch/civil-3x2/large-16ch),返回加载后的节点列表(FR-34)。
+fn protocol_to_config(node: &gb28181_protocol::id_codec::CatalogNode) -> CatalogNodeConfig {
+    CatalogNodeConfig {
+        id: node.id.clone(),
+        node_type: node_type_to_str(node.node_type).into(),
+        name: node.name.clone(),
+        parent_id: node.parent_id.clone(),
+        civil_code: node.civil_code.clone(),
+        business_group_id: node.business_group_id.clone(),
+        status: node.status.clone(),
+    }
+}
+
+async fn load_catalog_config(state: &AppState, app: &AppHandle) -> Result<DesktopConfigV1, String> {
+    let store = app_config_store(state, app)?;
+    let _io = state.config_io.lock().await;
+    tokio::task::spawn_blocking(move || store.load())
+        .await
+        .map_err(|error| format!("读取目录配置任务异常: {error}"))?
+}
+
+fn catalog_nodes_from_config(
+    config: &DesktopConfigV1,
+) -> Result<Vec<gb28181_protocol::id_codec::CatalogNode>, String> {
+    if !config.catalog_tree.is_empty() {
+        return config
+            .catalog_tree
+            .iter()
+            .map(CatalogNodeConfig::to_protocol_node)
+            .collect();
+    }
+    let profile = config.active_profile().ok_or("活动平台档案不存在")?;
+    Ok(gb28181_protocol::id_codec::catalog_template(
+        "single",
+        &config.device.device_id,
+        &config.device.device_name,
+        &profile.server_domain,
+    ))
+}
+
+async fn save_catalog_config(
+    state: &AppState,
+    app: &AppHandle,
+    nodes: &[gb28181_protocol::id_codec::CatalogNode],
+) -> Result<(), String> {
+    gb28181_protocol::id_codec::validate_catalog_tree(nodes)?;
+    let store = app_config_store(state, app)?;
+    let _io = state.config_io.lock().await;
+    let nodes: Vec<_> = nodes.iter().map(protocol_to_config).collect();
+    tokio::task::spawn_blocking(move || {
+        let mut config = store.load()?;
+        config.catalog_tree = nodes;
+        store.save(&config).map(|_| ())
+    })
+    .await
+    .map_err(|error| format!("保存目录配置任务异常: {error}"))?
+}
+
+async fn apply_runtime_catalog(
+    state: &AppState,
+    nodes: &[gb28181_protocol::id_codec::CatalogNode],
+) -> Result<(), String> {
+    let guard = state.device.lock().await;
+    if let Some(handle) = guard.as_ref() {
+        handle.sim.set_catalog_tree(nodes.to_vec())?;
+        spawn_catalog_notify(handle);
+    }
+    Ok(())
+}
+
+/// 载入内置目录模板并持久化；设备运行中同步更新并触发增量通知。
 #[tauri::command]
 async fn load_catalog_template(
     template: String,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Vec<ChannelNodeDto>, String> {
-    let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动,请先在单设备页启动设备")?;
-    h.sim.load_catalog_template(&template);
-    // 增量 NOTIFY 推送是副作用,后台发送不阻塞 UI 返回(平台不及时回 200 时事务会退避重传数秒)。
-    spawn_catalog_notify(h);
-    Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
+    let config = load_catalog_config(&state, &app).await?;
+    let profile = config.active_profile().ok_or("活动平台档案不存在")?;
+    let nodes = gb28181_protocol::id_codec::catalog_template(
+        &template,
+        &config.device.device_id,
+        &config.device.device_name,
+        &profile.server_domain,
+    );
+    gb28181_protocol::id_codec::validate_catalog_tree(&nodes)?;
+    save_catalog_config(&state, &app, &nodes).await?;
+    apply_runtime_catalog(&state, &nodes).await?;
+    Ok(nodes.iter().map(Into::into).collect())
 }
 
-/// 获取当前目录树节点(FR-34)。
+/// 获取持久化目录树；设备运行中优先返回当前实例快照。
 #[tauri::command]
 async fn get_catalog_tree(
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Vec<ChannelNodeDto>, String> {
     let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
-    Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
+    if let Some(handle) = guard.as_ref() {
+        let nodes = handle.sim.catalog_tree();
+        if !nodes.is_empty() {
+            return Ok(nodes.iter().map(Into::into).collect());
+        }
+    }
+    drop(guard);
+    let config = load_catalog_config(&state, &app).await?;
+    let nodes = catalog_nodes_from_config(&config)?;
+    Ok(nodes.iter().map(Into::into).collect())
 }
 
-/// 新增/更新一个目录通道节点,触发增量 NOTIFY(FR-34)。
+/// 用完整目录树替换持久化真相；用于 JSON 导入和批量移动。
+#[tauri::command]
+async fn replace_catalog_tree(
+    nodes: Vec<ChannelNodeDto>,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Vec<ChannelNodeDto>, String> {
+    let nodes: Vec<gb28181_protocol::id_codec::CatalogNode> = nodes
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<_, _>>()?;
+    gb28181_protocol::id_codec::validate_catalog_tree(&nodes)?;
+    save_catalog_config(&state, &app, &nodes).await?;
+    apply_runtime_catalog(&state, &nodes).await?;
+    Ok(nodes.iter().map(Into::into).collect())
+}
+
+/// 新增/更新目录节点，先在完整候选树上校验，再持久化并通知。
 #[tauri::command]
 async fn upsert_channel(
     node: ChannelNodeDto,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
-    let added = h.sim.upsert_channel(node.into());
-    spawn_catalog_notify(h);
-    Ok(if added {
-        "已新增通道".into()
+    let node: gb28181_protocol::id_codec::CatalogNode = node.try_into()?;
+    let config = load_catalog_config(&state, &app).await?;
+    let mut nodes = catalog_nodes_from_config(&config)?;
+    let added = if let Some(existing) = nodes.iter_mut().find(|item| item.id == node.id) {
+        *existing = node;
+        false
     } else {
-        "已更新通道".into()
+        nodes.push(node);
+        true
+    };
+    gb28181_protocol::id_codec::validate_catalog_tree(&nodes)?;
+    save_catalog_config(&state, &app, &nodes).await?;
+    apply_runtime_catalog(&state, &nodes).await?;
+    Ok(if added {
+        "已新增目录节点".into()
+    } else {
+        "已更新目录节点".into()
     })
 }
 
-/// 删除一个目录通道节点,触发增量 NOTIFY(FR-34)。
+/// 删除目录节点及其全部后代。
 #[tauri::command]
-async fn remove_channel(id: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
-    if h.sim.remove_channel(&id) {
-        spawn_catalog_notify(h);
-        Ok("已删除通道".into())
-    } else {
-        Err("通道不存在".into())
+async fn remove_channel(
+    id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let config = load_catalog_config(&state, &app).await?;
+    let nodes = catalog_nodes_from_config(&config)?;
+    let target = nodes
+        .iter()
+        .find(|node| node.id == id)
+        .ok_or("目录节点不存在")?;
+    if target.id == target.parent_id {
+        return Err("不能删除目录根节点".into());
     }
+    let mut removed = std::collections::HashSet::from([id]);
+    loop {
+        let before = removed.len();
+        for node in &nodes {
+            if removed.contains(&node.parent_id) {
+                removed.insert(node.id.clone());
+            }
+        }
+        if removed.len() == before {
+            break;
+        }
+    }
+    let next: Vec<_> = nodes
+        .into_iter()
+        .filter(|node| !removed.contains(&node.id))
+        .collect();
+    gb28181_protocol::id_codec::validate_catalog_tree(&next)?;
+    save_catalog_config(&state, &app, &next).await?;
+    apply_runtime_catalog(&state, &next).await?;
+    Ok(format!("已删除 {} 个目录节点", removed.len()))
+}
+
+#[derive(Serialize)]
+struct CatalogActivityDto {
+    target_id: String,
+    result_count: usize,
+    packet_count: usize,
+    updated_at_ms: u64,
+}
+
+/// 回读最近一次平台 Catalog Query 活动。
+#[tauri::command]
+async fn get_catalog_activity(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<CatalogActivityDto>, String> {
+    let guard = state.device.lock().await;
+    Ok(guard.as_ref().and_then(|handle| {
+        handle
+            .sim
+            .catalog_activity()
+            .map(|activity| CatalogActivityDto {
+                target_id: activity.target_id,
+                result_count: activity.result_count,
+                packet_count: activity.packet_count,
+                updated_at_ms: activity.updated_at_ms,
+            })
+    }))
 }
 
 /// 后台推送目录增量 NOTIFY(fire-and-forget)。
@@ -1512,6 +1649,13 @@ fn get_recent_logs(max: Option<usize>) -> Vec<common::logging::LogLine> {
     common::logging::recent(max.unwrap_or(500))
 }
 
+fn open_desktop_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 // ── 应用入口 ──────────────────────────────────────────────
 
 /// 初始化日志、注册命令、启动 Tauri 事件循环。
@@ -1527,19 +1671,9 @@ pub fn run() {
                 let _ = std::fs::create_dir_all(&dir);
                 dir.join("desktop.log")
             });
-            if let Some(path) = &log_path {
-                // 每次启动截断，只保留本次运行，避免翻历史噪音。
-                let _ = std::fs::write(path, b"");
-                tracing::info!(path = %path.display(), "日志文件已就绪");
-            }
-            let file = log_path.as_ref().and_then(|path| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-                    .map(std::sync::Mutex::new)
-            });
+            let file = log_path
+                .as_ref()
+                .and_then(|path| open_desktop_log(path).ok().map(std::sync::Mutex::new));
             let handle = app.handle().clone();
             common::logging::set_callback(move |line| {
                 let _ = handle.emit("log_line", line);
@@ -1554,6 +1688,9 @@ pub fn run() {
                     }
                 }
             });
+            if let Some(path) = &log_path {
+                tracing::info!(path = %path.display(), "日志文件已接续");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1571,9 +1708,6 @@ pub fn run() {
             start_binary_preview,
             stop_binary_preview,
             retry_binary_preview,
-            acquire_camera_demo,
-            release_camera_demo,
-            get_camera_lease,
             start_device,
             stop_device,
             fire_alarm,
@@ -1584,8 +1718,10 @@ pub fn run() {
             get_device_runtime_state,
             load_catalog_template,
             get_catalog_tree,
+            replace_catalog_tree,
             upsert_channel,
             remove_channel,
+            get_catalog_activity,
             set_log_level,
             get_log_level,
             get_recent_logs,
@@ -1599,7 +1735,7 @@ pub fn run() {
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
-                let (device, preview_manager, camera_lease) = {
+                let (device, preview_manager) = {
                     let state = app_handle.state::<AppState>();
                     (
                         state
@@ -1608,14 +1744,10 @@ pub fn run() {
                             .ok()
                             .and_then(|mut guard| guard.take()),
                         Arc::clone(&state.preview_manager),
-                        Arc::clone(&state.camera_lease),
                     )
                 };
                 if let Some(handle) = device {
                     tauri::async_runtime::block_on(handle.sim.stop_shared_media());
-                    if let Some(token) = handle.camera_lease_token {
-                        camera_lease.release(token);
-                    }
                 }
                 tauri::async_runtime::block_on(preview_manager.shutdown());
             }
@@ -1640,12 +1772,31 @@ mod tests {
     }
 
     #[test]
-    fn sip_trace脱敏authorization() {
+    fn sip_trace日志保留完整authorization() {
         let raw = "REGISTER sip:test SIP/2.0\r\nAuthorization: Digest username=\"dev\", response=\"secret\"\r\nCall-ID: 1\r\n\r\n";
-        let redacted = redact_sip_secrets(raw);
-        assert!(!redacted.contains("response=\"secret\""));
-        assert!(!redacted.contains("username=\"dev\""));
-        assert!(redacted.contains("Authorization: <redacted>"));
-        assert!(redacted.contains("Call-ID: 1"));
+        let log = format_sip_trace_log("out", "127.0.0.1:5062", raw);
+        assert!(log.contains("response=\"secret\""));
+        assert!(log.contains("username=\"dev\""));
+        assert!(log.contains("Call-ID: 1"));
+    }
+
+    #[test]
+    fn 日志文件跨重启追加而不是截断() {
+        let path = std::env::temp_dir().join(format!(
+            "uvp-desktop-log-test-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"before\n").unwrap();
+        {
+            let mut file = open_desktop_log(&path).unwrap();
+            use std::io::Write;
+            writeln!(file, "after").unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\nafter\n");
+        std::fs::remove_file(path).unwrap();
     }
 }

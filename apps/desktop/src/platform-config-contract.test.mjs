@@ -8,7 +8,7 @@ const profile = platform.match(/export interface PlatformProfile \{([\s\S]*?)\n\
 assert.match(platform, /SignalingTransport = "UDP" \| "TCP"/, "传输枚举必须匹配 Rust UPPERCASE serde 契约");
 assert.match(profile, /server_id:\s*string;/, "平台档案应保留 20 位平台 ID");
 assert.match(profile, /server_domain:\s*string;/, "平台档案应独立保留 10 位平台域");
-assert.doesNotMatch(profile, /password:/, "密码不得进入持久化平台档案 DTO");
+assert.match(profile, /password:\s*string;/, "模拟器平台密码应进入持久化档案 DTO");
 
 assert.match(platform, /invoke<DesktopConfigV1>\("get_desktop_config"\)/, "配置必须从 Rust 真相源加载");
 assert.match(platform, /invoke<DesktopConfigV1>\("save_desktop_config"/, "平台保存必须写入 Rust ConfigStore");
@@ -22,6 +22,6 @@ assert.ok(migratedSave >= 0 && legacyDelete > migratedSave, "旧 key 只能在 R
 
 assert.match(device, /invoke<string>\("start_device",\s*\{ input \}\)/, "启动命令只应提交 StartDeviceInput");
 assert.match(device, /profile_id:\s*platform\.id/, "启动输入应引用已保存的平台档案 ID");
-assert.match(device, /password:/, "密码应只在本次启动输入中提交");
+assert.match(device, /password:/, "启动输入应使用已保存的平台密码");
 assert.doesNotMatch(device, /server_host:\s*platform\.server_host/, "前端不得再拼装完整 DeviceConfig");
 assert.doesNotMatch(device, /localStorage\.setItem\(/, "设备配置不得再写 localStorage");

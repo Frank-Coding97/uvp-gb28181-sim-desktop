@@ -246,7 +246,7 @@ async function startStress() {
     if (state?.running) {
       message.success(result);
     } else {
-      message.warning("启动请求已提交，但任务已结束，请查看运行日志");
+      message.warning("启动请求已提交，但任务已结束，请查看日志");
     }
   } catch (error) {
     await reconcile();

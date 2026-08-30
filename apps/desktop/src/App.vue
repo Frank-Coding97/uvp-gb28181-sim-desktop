@@ -33,13 +33,13 @@ function icon(comp: any) {
 
 const menuOptions: MenuOption[] = [
   { label: "首页",       key: "/dashboard",        icon: icon(HomeOutline) },
-  { label: "设备联调",   key: "/device",           icon: icon(HardwareChipOutline) },
+  { label: "云台控制",   key: "/ptz",              icon: icon(HardwareChipOutline) },
   { label: "目录管理",   key: "/channels",         icon: icon(GitNetworkOutline) },
   { label: "压力测试",   key: "/scenario",         icon: icon(PulseOutline) },
   { label: "设备配置",   key: "/device-settings",  icon: icon(SettingsOutline) },
   { label: "音视频配置", key: "/media-settings",   icon: icon(VideocamOutline) },
   { label: "网络配置",   key: "/network-settings", icon: icon(WifiOutline) },
-  { label: "运行日志",   key: "/system",           icon: icon(TerminalOutline) },
+  { label: "日志",       key: "/logs",             icon: icon(TerminalOutline) },
   { label: "关于",       key: "/about",            icon: icon(InformationCircleOutline) },
 ];
 
@@ -48,7 +48,7 @@ const {
   profiles, activeId, active, error: configError,
   loadDesktopConfig, resetDesktopConfig,
   setActive, addProfile, updateProfile, removeProfile,
-  passwordFor, setSessionPassword,
+  passwordFor,
 } = usePlatform();
 provide("platform", { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile });
 const profileOptions = computed(() =>
@@ -81,11 +81,11 @@ async function saveEdit() {
       server_port: editForm.value.server_port,
       server_id: editForm.value.server_id.trim(),
       server_domain: editForm.value.server_domain.trim(),
+      password: editForm.value.password,
       transport: editForm.value.transport,
       gb_version: editForm.value.gb_version,
       signaling_encoding: editForm.value.signaling_encoding,
     });
-    setSessionPassword(activeId.value, editForm.value.password);
     topMessage.value = { text: "平台配置已保存", ok: true };
   } catch (cause) {
     lastError.value = { scope: "config", message: String(cause), ts_ms: Date.now() };
@@ -94,10 +94,10 @@ async function saveEdit() {
 async function addNew() {
   if (deviceLive.value) return;
   try {
-    const id = await addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
+    await addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
     server_id: "34020000002000000001", server_domain: "3402000000",
+      password: "",
       transport: "UDP", gb_version: "V2022", signaling_encoding: "Gb18030" });
-    setSessionPassword(id, "");
     openEdit();
   } catch (cause) {
     lastError.value = { scope: "config", message: String(cause), ts_ms: Date.now() };
@@ -117,7 +117,7 @@ const encodingOptions = [
 ];
 
 const activeKey = computed(() => route.path);
-const showTopbar = computed(() => !["/dashboard", "/camera-demo"].includes(route.path));
+const showTopbar = computed(() => route.path !== "/dashboard");
 function onMenuSelect(key: string) {
   router.push(key);
 }
@@ -129,6 +129,9 @@ const {
   startDevice, stopDevice, reconcile,
 } = useDevice();
 const registrationBusy = ref(false);
+const registrationActionLabel = computed(() =>
+  deviceState.value === "Failed" && deviceLive.value ? "停止重试" : deviceLive.value ? "注销" : "注册",
+);
 
 const uptime = ref("--:--:--");
 let uptimeTimer: number | undefined;
@@ -312,7 +315,7 @@ const themeOverrides = {
                   </div>
                   <div class="reg-btns">
                     <n-button size="small" :type="deviceLive ? 'error' : 'primary'" :loading="registrationBusy" :disabled="registrationBusy || (!deviceLive && active?.transport === 'TCP')" @click="toggleRegistration">
-                      {{ deviceLive ? "注销" : "注册" }}
+                      {{ registrationActionLabel }}
                     </n-button>
                   </div>
                 </div>

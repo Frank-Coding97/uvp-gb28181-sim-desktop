@@ -26,12 +26,10 @@ impl ConfigStore {
         if !self.path.exists() {
             return Ok(DesktopConfigV1::default());
         }
-        let bytes = fs::read(&self.path).map_err(|error| {
-            format!("读取配置失败 {}: {error}", self.path.display())
-        })?;
-        let config: DesktopConfigV1 = serde_json::from_slice(&bytes).map_err(|error| {
-            format!("配置 JSON 损坏 {}: {error}", self.path.display())
-        })?;
+        let bytes = fs::read(&self.path)
+            .map_err(|error| format!("读取配置失败 {}: {error}", self.path.display()))?;
+        let config: DesktopConfigV1 = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("配置 JSON 损坏 {}: {error}", self.path.display()))?;
         config
             .validate()
             .map_err(|error| format!("配置校验失败 {}: {error}", self.path.display()))?;
@@ -53,12 +51,12 @@ impl ConfigStore {
     }
 
     fn atomic_write(&self, bytes: &[u8]) -> Result<(), String> {
-        let parent = self.path.parent().ok_or_else(|| {
-            format!("配置路径缺少父目录: {}", self.path.display())
-        })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            format!("创建配置目录失败 {}: {error}", parent.display())
-        })?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| format!("配置路径缺少父目录: {}", self.path.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建配置目录失败 {}: {error}", parent.display()))?;
 
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -69,10 +67,7 @@ impl ConfigStore {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("desktop-config-v1.json");
-        let temp_path = parent.join(format!(
-            ".{file_name}.tmp-{}-{nonce}",
-            std::process::id()
-        ));
+        let temp_path = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
 
         let write_result = (|| -> Result<(), String> {
             let mut file = OpenOptions::new()
@@ -97,12 +92,11 @@ impl ConfigStore {
             })?;
             #[cfg(unix)]
             {
-                let directory = fs::File::open(parent).map_err(|error| {
-                    format!("打开配置目录失败 {}: {error}", parent.display())
-                })?;
-                directory.sync_all().map_err(|error| {
-                    format!("同步配置目录失败 {}: {error}", parent.display())
-                })?;
+                let directory = fs::File::open(parent)
+                    .map_err(|error| format!("打开配置目录失败 {}: {error}", parent.display()))?;
+                directory
+                    .sync_all()
+                    .map_err(|error| format!("同步配置目录失败 {}: {error}", parent.display()))?;
             }
             Ok(())
         })();
@@ -121,6 +115,53 @@ pub struct DesktopConfigV1 {
     pub profiles: Vec<PlatformProfileConfig>,
     pub device: DeviceSettings,
     pub network: NetworkSettings,
+    /// 目录树持久化真相；空表示启动时生成默认目录。
+    #[serde(default)]
+    pub catalog_tree: Vec<CatalogNodeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogNodeConfig {
+    pub id: String,
+    pub node_type: String,
+    pub name: String,
+    pub parent_id: String,
+    #[serde(default)]
+    pub civil_code: Option<String>,
+    #[serde(default)]
+    pub business_group_id: Option<String>,
+    #[serde(default = "default_catalog_status")]
+    pub status: String,
+}
+
+fn default_catalog_status() -> String {
+    "ON".into()
+}
+
+impl CatalogNodeConfig {
+    pub fn to_protocol_node(&self) -> Result<gb28181_protocol::id_codec::CatalogNode, String> {
+        use gb28181_protocol::id_codec::CatalogNodeType;
+        let node_type = match self.node_type.as_str() {
+            "AdministrativeRegion" => CatalogNodeType::AdministrativeRegion,
+            "System" => CatalogNodeType::System,
+            "Device" => CatalogNodeType::Device,
+            "BusinessGroup" => CatalogNodeType::BusinessGroup,
+            "VirtualOrg" => CatalogNodeType::VirtualOrg,
+            "VideoChannel" => CatalogNodeType::VideoChannel,
+            "AlarmChannel" => CatalogNodeType::AlarmChannel,
+            other => return Err(format!("未知目录节点类型: {other}")),
+        };
+        let mut node = gb28181_protocol::id_codec::CatalogNode::new(
+            &self.id,
+            node_type,
+            &self.name,
+            &self.parent_id,
+        );
+        node.civil_code = self.civil_code.clone();
+        node.business_group_id = self.business_group_id.clone();
+        node.status = self.status.clone();
+        Ok(node)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +172,8 @@ pub struct PlatformProfileConfig {
     pub server_port: u16,
     pub server_id: String,
     pub server_domain: String,
+    #[serde(default)]
+    pub password: String,
     pub transport: Transport,
     pub gb_version: GbVersion,
     pub signaling_encoding: SignalingEncoding,
@@ -182,6 +225,7 @@ pub struct ResolvedStartConfig {
     pub password: String,
     pub video_source: Option<String>,
     pub catalog_template: String,
+    pub catalog_tree: Vec<CatalogNodeConfig>,
 }
 
 impl fmt::Debug for StartDeviceInput {
@@ -234,6 +278,7 @@ impl Default for DesktopConfigV1 {
                 server_port: 5060,
                 server_id: "34020000002000000001".into(),
                 server_domain: "3402000000".into(),
+                password: String::new(),
                 transport: Transport::Udp,
                 gb_version: GbVersion::V2022,
                 signaling_encoding: SignalingEncoding::Gb18030,
@@ -255,6 +300,7 @@ impl Default for DesktopConfigV1 {
                 bind_address: String::new(),
                 sip_trace: true,
             },
+            catalog_tree: Vec::new(),
         }
     }
 }
@@ -299,10 +345,7 @@ impl DesktopConfigV1 {
             }
         }
         if self.active_profile().is_none() {
-            return Err(format!(
-                "活动平台档案不存在: {}",
-                self.active_profile_id
-            ));
+            return Err(format!("活动平台档案不存在: {}", self.active_profile_id));
         }
 
         DeviceId::new(self.device.device_id.clone())
@@ -332,10 +375,19 @@ impl DesktopConfigV1 {
         {
             return Err("指定绑定地址必须是有效 IP".into());
         }
+        let catalog_tree: Vec<_> = self
+            .catalog_tree
+            .iter()
+            .map(CatalogNodeConfig::to_protocol_node)
+            .collect::<Result<_, _>>()?;
+        gb28181_protocol::id_codec::validate_catalog_tree(&catalog_tree)?;
         Ok(())
     }
 
-    pub fn resolve_start(&self, mut input: StartDeviceInput) -> Result<ResolvedStartConfig, String> {
+    pub fn resolve_start(
+        &self,
+        mut input: StartDeviceInput,
+    ) -> Result<ResolvedStartConfig, String> {
         self.validate()?;
         if input.password.trim().is_empty() {
             return Err("SIP 认证密码不能为空".into());
@@ -358,6 +410,7 @@ impl DesktopConfigV1 {
             password: input.password,
             video_source: input.video_source,
             catalog_template: input.catalog_template.trim().to_string(),
+            catalog_tree: self.catalog_tree.clone(),
         })
     }
 }
@@ -373,20 +426,44 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir()
-            .join(format!("uvp-desktop-config-test-{}-{nonce}", std::process::id()))
+            .join(format!(
+                "uvp-desktop-config-test-{}-{nonce}",
+                std::process::id()
+            ))
             .join(name)
     }
 
     #[test]
-    fn 默认配置通过校验且不包含秘密字段() {
+    fn 默认配置通过校验且平台密码可持久化() {
         let config = DesktopConfigV1::default();
         config.validate().unwrap();
 
         let json = serde_json::to_string(&config).unwrap().to_ascii_lowercase();
-        assert!(!json.contains("password"));
+        assert!(json.contains("password"));
         assert!(!json.contains("authorization"));
+        assert_eq!(config.profiles[0].password, "");
         assert_eq!(config.schema_version, 1);
         assert_eq!(config.device.register_expires_secs, 86_400);
+    }
+
+    #[test]
+    fn 平台密码round_trip且旧配置缺字段时兼容() {
+        let path = temp_config_path("desktop-config-v1.json");
+        let store = ConfigStore::new(path.clone());
+        let mut config = DesktopConfigV1::default();
+        config.profiles[0].password = "remember-me".into();
+
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap().profiles[0].password, "remember-me");
+
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy["profiles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("password");
+        let loaded: DesktopConfigV1 = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.profiles[0].password, "");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -543,5 +620,25 @@ mod tests {
             catalog_template: String::new(),
         });
         assert!(empty_password.err().unwrap().contains("密码不能为空"));
+    }
+
+    #[test]
+    fn 目录树随桌面配置持久化且旧配置缺字段兼容() {
+        let mut config = DesktopConfigV1::default();
+        config.catalog_tree.push(CatalogNodeConfig {
+            id: config.device.device_id.clone(),
+            node_type: "Device".into(),
+            name: config.device.device_name.clone(),
+            parent_id: config.device.device_id.clone(),
+            civil_code: None,
+            business_group_id: None,
+            status: "ON".into(),
+        });
+        assert!(config.validate().is_ok());
+
+        let mut value = serde_json::to_value(config).unwrap();
+        value.as_object_mut().unwrap().remove("catalog_tree");
+        let decoded: DesktopConfigV1 = serde_json::from_value(value).unwrap();
+        assert!(decoded.catalog_tree.is_empty());
     }
 }

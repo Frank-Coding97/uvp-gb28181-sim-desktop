@@ -1,5 +1,5 @@
 // 桌面端配置的唯一持久化真相位于 Rust ConfigStore。
-// 此模块只保留响应式视图状态、当前会话密码，以及一次性 localStorage 迁移。
+// 平台密码与其它联调参数一并保存在 Rust ConfigStore；localStorage 只用于一次性迁移。
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -15,6 +15,7 @@ export interface PlatformProfile {
   server_port: number;
   server_id: string;
   server_domain: string;
+  password: string;
   transport: SignalingTransport;
   gb_version: GbVersion;
   signaling_encoding: SignalingEncoding;
@@ -39,12 +40,23 @@ export interface NetworkSettings {
   sip_trace: boolean;
 }
 
+export interface CatalogNodeConfig {
+  id: string;
+  node_type: "AdministrativeRegion" | "System" | "Device" | "BusinessGroup" | "VirtualOrg" | "VideoChannel" | "AlarmChannel";
+  name: string;
+  parent_id: string;
+  civil_code?: string | null;
+  business_group_id?: string | null;
+  status: "ON" | "OFF";
+}
+
 export interface DesktopConfigV1 {
   schema_version: 1;
   active_profile_id: string;
   profiles: PlatformProfile[];
   device: DeviceSettings;
   network: NetworkSettings;
+  catalog_tree: CatalogNodeConfig[];
 }
 
 export interface CapabilitySnapshot {
@@ -95,7 +107,6 @@ const OWNED_LEGACY_KEYS = [
 const config = ref<DesktopConfigV1 | null>(null);
 const loading = ref(false);
 const error = ref("");
-const sessionPasswords = ref<Record<string, string>>({});
 
 function readJson(key: string): Record<string, unknown> | null {
   const raw = localStorage.getItem(key);
@@ -114,7 +125,7 @@ function positiveInt(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function migrateLegacy(base: DesktopConfigV1): { next: DesktopConfigV1; passwords: Record<string, string> } | null {
+function migrateLegacy(base: DesktopConfigV1): DesktopConfigV1 | null {
   const rawProfiles = localStorage.getItem(LEGACY_PROFILE_KEY);
   const rawDevice = localStorage.getItem(LEGACY_DEVICE_KEY);
   const hasLegacy = rawProfiles !== null
@@ -130,7 +141,6 @@ function migrateLegacy(base: DesktopConfigV1): { next: DesktopConfigV1; password
     // 损坏的单个旧 key 不阻止其余可用字段迁移；保存失败时全部 key 仍保留。
   }
 
-  const passwords: Record<string, string> = {};
   const profiles = legacyProfiles.length
     ? legacyProfiles.map((raw, index): PlatformProfile => {
       const oldDomain = stringValue(raw.server_domain, "");
@@ -138,7 +148,6 @@ function migrateLegacy(base: DesktopConfigV1): { next: DesktopConfigV1; password
         ? oldDomain
         : base.profiles[0].server_id);
       const id = stringValue(raw.id, `profile-${index + 1}`);
-      if (typeof raw.password === "string") passwords[id] = raw.password;
       return {
         id,
         name: stringValue(raw.name, `平台 ${index + 1}`),
@@ -146,6 +155,7 @@ function migrateLegacy(base: DesktopConfigV1): { next: DesktopConfigV1; password
         server_port: positiveInt(raw.server_port, base.profiles[0].server_port),
         server_id: serverId,
         server_domain: oldDomain.length === 10 ? oldDomain : serverId.slice(0, 10),
+        password: typeof raw.password === "string" ? raw.password : "",
         transport: raw.transport === "TCP" || raw.transport === "Tcp" ? "TCP" : "UDP",
         gb_version: raw.gb_version === "2016" || raw.gb_version === "V2016" ? "V2016" : "V2022",
         signaling_encoding: raw.signaling_encoding === "UTF-8" || raw.signaling_encoding === "Utf8"
@@ -169,8 +179,6 @@ function migrateLegacy(base: DesktopConfigV1): { next: DesktopConfigV1; password
   const firstLegacyProfile = legacyProfiles[0];
 
   return {
-    passwords,
-    next: {
       schema_version: 1,
       active_profile_id: activeProfileId,
       profiles,
@@ -196,7 +204,7 @@ function migrateLegacy(base: DesktopConfigV1): { next: DesktopConfigV1; password
           ? legacyNetwork.sip_trace
           : base.network.sip_trace,
       },
-    },
+      catalog_tree: base.catalog_tree ?? [],
   };
 }
 
@@ -214,8 +222,7 @@ export async function loadDesktopConfig(): Promise<DesktopConfigV1> {
     if (!migration) return applyConfig(loaded);
 
     // 保存成功是迁移提交点；异常时不会执行下面的删除，旧数据可继续重试。
-    const saved = await invoke<DesktopConfigV1>("save_desktop_config", { config: migration.next });
-    sessionPasswords.value = migration.passwords;
+    const saved = await invoke<DesktopConfigV1>("save_desktop_config", { config: migration });
     for (const key of OWNED_LEGACY_KEYS) localStorage.removeItem(key);
     return applyConfig(saved);
   } catch (cause) {
@@ -239,7 +246,6 @@ export async function saveDesktopConfig(next: DesktopConfigV1): Promise<DesktopC
 export async function resetDesktopConfig(): Promise<DesktopConfigV1> {
   try {
     const reset = await invoke<DesktopConfigV1>("reset_desktop_config");
-    sessionPasswords.value = {};
     return applyConfig(reset);
   } catch (cause) {
     error.value = String(cause);
@@ -286,22 +292,15 @@ export function usePlatform() {
       profiles,
       active_profile_id: config.value.active_profile_id === id ? profiles[0].id : config.value.active_profile_id,
     });
-    const nextPasswords = { ...sessionPasswords.value };
-    delete nextPasswords[id];
-    sessionPasswords.value = nextPasswords;
   }
 
   function passwordFor(profileId: string): string {
-    return sessionPasswords.value[profileId] ?? "";
-  }
-
-  function setSessionPassword(profileId: string, password: string) {
-    sessionPasswords.value = { ...sessionPasswords.value, [profileId]: password };
+    return profiles.value.find((profile) => profile.id === profileId)?.password ?? "";
   }
 
   return {
-    config, profiles, activeId, active, loading, error, sessionPasswords,
+    config, profiles, activeId, active, loading, error,
     loadDesktopConfig, saveDesktopConfig, resetDesktopConfig,
-    setActive, addProfile, updateProfile, removeProfile, passwordFor, setSessionPassword,
+    setActive, addProfile, updateProfile, removeProfile, passwordFor,
   };
 }

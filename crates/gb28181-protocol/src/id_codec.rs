@@ -62,11 +62,15 @@ pub fn gen_device_ids(prefix: &str, start_index: u32, count: u32) -> Result<Vec<
 /// 据上游 uvp-gb28181-sim CatalogNodeType 核对。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogNodeType {
+    /// 行政区划(2/4/6/8 位编码),parental=1。
+    AdministrativeRegion,
+    /// 联网系统,typeCode 200,parental=1。
+    System,
     /// 设备(根),typeCode 111,parental=1。
     Device,
-    /// 业务分组,typeCode 137,parental=1。
+    /// 业务分组,typeCode 215,parental=1。
     BusinessGroup,
-    /// 虚拟组织(行政区划),typeCode 138,parental=1。
+    /// 虚拟组织,typeCode 216,parental=1。
     VirtualOrg,
     /// 视频通道,typeCode 132,parental=0。
     VideoChannel,
@@ -78,9 +82,11 @@ impl CatalogNodeType {
     /// 类型码(ID 第 11-13 位)。
     pub fn type_code(&self) -> &'static str {
         match self {
+            CatalogNodeType::AdministrativeRegion => "",
+            CatalogNodeType::System => "200",
             CatalogNodeType::Device => "111",
-            CatalogNodeType::BusinessGroup => "137",
-            CatalogNodeType::VirtualOrg => "138",
+            CatalogNodeType::BusinessGroup => "215",
+            CatalogNodeType::VirtualOrg => "216",
             CatalogNodeType::VideoChannel => "132",
             CatalogNodeType::AlarmChannel => "134",
         }
@@ -89,7 +95,9 @@ impl CatalogNodeType {
     /// 是否为目录节点(有子)。1=目录,0=叶子通道。
     pub fn parental(&self) -> u8 {
         match self {
-            CatalogNodeType::Device
+            CatalogNodeType::AdministrativeRegion
+            | CatalogNodeType::System
+            | CatalogNodeType::Device
             | CatalogNodeType::BusinessGroup
             | CatalogNodeType::VirtualOrg => 1,
             CatalogNodeType::VideoChannel | CatalogNodeType::AlarmChannel => 0,
@@ -118,6 +126,8 @@ pub struct CatalogNode {
     pub parent_id: String,
     /// 行政区划(仅虚拟组织/其下通道携带)。
     pub civil_code: Option<String>,
+    /// 所属业务分组；虚拟组织及其设备节点可携带。
+    pub business_group_id: Option<String>,
     /// 状态:ON / OFF。
     pub status: String,
 }
@@ -136,6 +146,7 @@ impl CatalogNode {
             name: name.into(),
             parent_id: parent_id.into(),
             civil_code: None,
+            business_group_id: None,
             status: "ON".into(),
         }
     }
@@ -145,6 +156,173 @@ impl CatalogNode {
         self.civil_code = Some(civil_code.into());
         self
     }
+
+    /// 指定所属业务分组。
+    pub fn with_business_group_id(mut self, id: impl Into<String>) -> Self {
+        self.business_group_id = Some(id.into());
+        self
+    }
+}
+
+/// 按 GB/T 28181-2022 附录 J 选择目录查询目标及范围。
+///
+/// 精确命中节点时返回该节点与全部后代；2/4/6/8 位行政区划编码按节点 ID
+/// 或 `CivilCode` 前缀选择；未知目标返回空集合。
+pub fn select_catalog_nodes(tree: &[CatalogNode], target_id: &str) -> Vec<CatalogNode> {
+    if let Some(target) = tree.iter().find(|node| node.id == target_id) {
+        let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        fn visit(
+            tree: &[CatalogNode],
+            id: &str,
+            visited: &mut std::collections::HashSet<String>,
+            result: &mut Vec<CatalogNode>,
+        ) {
+            if !visited.insert(id.to_string()) {
+                return;
+            }
+            if let Some(node) = tree.iter().find(|node| node.id == id) {
+                result.push(node.clone());
+            }
+            for child in tree
+                .iter()
+                .filter(|node| node.parent_id == id && node.id != id)
+            {
+                visit(tree, &child.id, visited, result);
+            }
+        }
+        visit(tree, &target.id, &mut visited, &mut result);
+        return result;
+    }
+
+    let administrative = matches!(target_id.len(), 2 | 4 | 6 | 8)
+        && target_id.bytes().all(|byte| byte.is_ascii_digit());
+    if administrative {
+        return tree
+            .iter()
+            .filter(|node| {
+                node.id.starts_with(target_id)
+                    || node
+                        .civil_code
+                        .as_deref()
+                        .is_some_and(|code| code.starts_with(target_id))
+            })
+            .cloned()
+            .collect();
+    }
+    Vec::new()
+}
+
+/// 校验目录树的 ID、唯一根、父子关系、目录/叶子约束与循环引用。
+pub fn validate_catalog_tree(tree: &[CatalogNode]) -> std::result::Result<(), String> {
+    if tree.is_empty() {
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    for node in tree {
+        if node.name.trim().is_empty() {
+            errors.push(format!("节点 {} 名称不能为空", node.id));
+        }
+        let twenty_digit = node.id.len() == 20 && node.id.bytes().all(|byte| byte.is_ascii_digit());
+        let id_valid = match node.node_type {
+            CatalogNodeType::AdministrativeRegion => {
+                matches!(node.id.len(), 2 | 4 | 6 | 8)
+                    && node.id.bytes().all(|byte| byte.is_ascii_digit())
+            }
+            // 根设备允许使用标准定义的不同设备类型码；其余明确类型必须与 ID 一致。
+            CatalogNodeType::Device => twenty_digit,
+            _ => twenty_digit && &node.id[10..13] == node.node_type.type_code(),
+        };
+        if !id_valid {
+            errors.push(format!("节点 {} 的国标 ID 与类型不匹配", node.id));
+        }
+        if !ids.insert(node.id.as_str()) {
+            errors.push(format!("节点 ID 重复: {}", node.id));
+        }
+        if node.status != "ON" && node.status != "OFF" {
+            errors.push(format!("节点 {} 状态必须是 ON 或 OFF", node.id));
+        }
+    }
+
+    let roots: Vec<&CatalogNode> = tree
+        .iter()
+        .filter(|node| node.id == node.parent_id)
+        .collect();
+    if roots.len() != 1
+        || roots
+            .first()
+            .is_some_and(|root| root.node_type.parental() == 0)
+    {
+        errors.push(format!(
+            "目录树必须有且仅有一个目录根节点，当前 {} 个",
+            roots.len()
+        ));
+    }
+
+    let by_id: std::collections::HashMap<&str, &CatalogNode> =
+        tree.iter().map(|node| (node.id.as_str(), node)).collect();
+    for node in tree.iter().filter(|node| node.id != node.parent_id) {
+        match by_id.get(node.parent_id.as_str()) {
+            None => errors.push(format!(
+                "节点 {} 的父节点 {} 不存在",
+                node.id, node.parent_id
+            )),
+            Some(parent) if parent.node_type.parental() == 0 => {
+                errors.push(format!("叶子节点 {} 不能承载子节点 {}", parent.id, node.id))
+            }
+            _ => {}
+        }
+        if let Some(group_id) = node.business_group_id.as_deref() {
+            if !matches!(
+                by_id.get(group_id).map(|group| group.node_type),
+                Some(CatalogNodeType::BusinessGroup)
+            ) {
+                errors.push(format!("节点 {} 的业务分组 {} 不存在", node.id, group_id));
+            }
+        }
+
+        let mut current = node;
+        let mut visited = std::collections::HashSet::new();
+        while current.id != current.parent_id {
+            if !visited.insert(current.id.as_str()) {
+                errors.push(format!("节点 {} 存在循环引用", node.id));
+                break;
+            }
+            let Some(parent) = by_id.get(current.parent_id.as_str()) else {
+                break;
+            };
+            current = parent;
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+/// 返回节点显式或从祖先推导出的业务分组 ID。
+pub fn catalog_business_group_id(tree: &[CatalogNode], node: &CatalogNode) -> Option<String> {
+    if node.node_type == CatalogNodeType::BusinessGroup {
+        return None;
+    }
+    if let Some(id) = &node.business_group_id {
+        return Some(id.clone());
+    }
+    let by_id: std::collections::HashMap<&str, &CatalogNode> =
+        tree.iter().map(|item| (item.id.as_str(), item)).collect();
+    let mut current = node;
+    let mut visited = std::collections::HashSet::new();
+    while current.id != current.parent_id && visited.insert(current.id.as_str()) {
+        let parent = *by_id.get(current.parent_id.as_str())?;
+        if parent.node_type == CatalogNodeType::BusinessGroup {
+            return Some(parent.id.clone());
+        }
+        current = parent;
+    }
+    None
 }
 
 /// 内置目录模板。据上游 CatalogTreeStore.templates 核对(single/nvr-8ch/civil-3x2/large-16ch)。
@@ -162,10 +340,38 @@ pub fn catalog_template(
     domain: &str,
 ) -> Vec<CatalogNode> {
     let root = || CatalogNode::new(device_id, CatalogNodeType::Device, device_name, device_id);
-    let vid = |seq: u32| gen_child_id(domain, CatalogNodeType::VideoChannel, seq);
-    let alarm = |seq: u32| gen_child_id(domain, CatalogNodeType::AlarmChannel, seq);
-    let group = |seq: u32| gen_child_id(domain, CatalogNodeType::BusinessGroup, seq);
-    let org = |seq: u32| gen_child_id(domain, CatalogNodeType::VirtualOrg, seq);
+    // 部分实际设备编码本身就是 132/134 等类型码。模板从序号 1 生成子节点时
+    // 必须整体跳过根设备占用的序号，避免根与首个子节点 ID 冲突。
+    let offset_for =
+        |node_type: CatalogNodeType| u32::from(gen_child_id(domain, node_type, 1) == device_id);
+    let vid = |seq: u32| {
+        gen_child_id(
+            domain,
+            CatalogNodeType::VideoChannel,
+            seq + offset_for(CatalogNodeType::VideoChannel),
+        )
+    };
+    let alarm = |seq: u32| {
+        gen_child_id(
+            domain,
+            CatalogNodeType::AlarmChannel,
+            seq + offset_for(CatalogNodeType::AlarmChannel),
+        )
+    };
+    let group = |seq: u32| {
+        gen_child_id(
+            domain,
+            CatalogNodeType::BusinessGroup,
+            seq + offset_for(CatalogNodeType::BusinessGroup),
+        )
+    };
+    let org = |seq: u32| {
+        gen_child_id(
+            domain,
+            CatalogNodeType::VirtualOrg,
+            seq + offset_for(CatalogNodeType::VirtualOrg),
+        )
+    };
 
     match template {
         "nvr-8ch" => {
@@ -304,9 +510,86 @@ mod tests {
             gen_child_id("3402000000", CatalogNodeType::AlarmChannel, 1),
             "34020000001340000001"
         );
-        assert_eq!(CatalogNodeType::BusinessGroup.type_code(), "137");
+        assert_eq!(CatalogNodeType::System.type_code(), "200");
+        assert_eq!(CatalogNodeType::BusinessGroup.type_code(), "215");
+        assert_eq!(CatalogNodeType::VirtualOrg.type_code(), "216");
         assert_eq!(CatalogNodeType::VirtualOrg.parental(), 1);
         assert_eq!(CatalogNodeType::VideoChannel.parental(), 0);
+    }
+
+    #[test]
+    fn 目录目标只返回目标及其后代() {
+        let tree = catalog_template("large-16ch", "34020000001110000001", "Cam", "3402000000");
+        let indoor = tree.iter().find(|node| node.name == "室内监控").unwrap();
+        let selected = select_catalog_nodes(&tree, &indoor.id);
+        assert_eq!(selected.len(), 9);
+        assert_eq!(selected[0].id, indoor.id);
+        assert!(selected
+            .iter()
+            .all(|node| node.id == indoor.id || node.parent_id == indoor.id));
+        assert!(select_catalog_nodes(&tree, "99999999999999999999").is_empty());
+    }
+
+    #[test]
+    fn 行政区划查询按id与civilcode选取() {
+        let tree = catalog_template("civil-3x2", "34020000001110000001", "Cam", "3402000000");
+        let selected = select_catalog_nodes(&tree, "310115");
+        assert_eq!(selected.len(), 3);
+        assert!(selected.iter().all(|node| {
+            node.id.starts_with("310115")
+                || node
+                    .civil_code
+                    .as_deref()
+                    .is_some_and(|code| code.starts_with("310115"))
+        }));
+    }
+
+    #[test]
+    fn 目录树拒绝孤儿循环与叶子挂子节点() {
+        let root = CatalogNode::new(
+            "34020000001110000001",
+            CatalogNodeType::Device,
+            "root",
+            "34020000001110000001",
+        );
+        let leaf = CatalogNode::new(
+            "34020000001320000001",
+            CatalogNodeType::VideoChannel,
+            "leaf",
+            &root.id,
+        );
+        assert!(validate_catalog_tree(&[root.clone(), leaf.clone()]).is_ok());
+
+        let orphan = CatalogNode {
+            parent_id: "34020000002150000999".into(),
+            ..leaf.clone()
+        };
+        assert!(validate_catalog_tree(&[root.clone(), orphan]).is_err());
+
+        let child_of_leaf = CatalogNode::new(
+            "34020000001340000001",
+            CatalogNodeType::AlarmChannel,
+            "alarm",
+            &leaf.id,
+        );
+        assert!(validate_catalog_tree(&[root, leaf, child_of_leaf]).is_err());
+    }
+
+    #[test]
+    fn 目录树拒绝旧业务分组类型码() {
+        let root = CatalogNode::new(
+            "34020000001320000001",
+            CatalogNodeType::Device,
+            "根设备",
+            "34020000001320000001",
+        );
+        let legacy_group = CatalogNode::new(
+            "34020000001370000001",
+            CatalogNodeType::BusinessGroup,
+            "旧类型码分组",
+            &root.id,
+        );
+        assert!(validate_catalog_tree(&[root, legacy_group]).is_err());
     }
 
     #[test]

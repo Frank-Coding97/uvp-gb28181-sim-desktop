@@ -21,8 +21,11 @@ assert.match(
 assert.match(handler, /active\.value\?\.transport === "TCP"/, "处理函数也必须 fail-closed 拒绝 TCP 注册");
 assert.match(source, /effectiveConfig\.value\?\.device \?\? config\.value\?\.device/, "运行时状态卡应优先展示 Rust 有效配置");
 assert.match(source, /await saveDesktopConfig\(/, "配置保存必须等待 Rust 返回");
-assert.match(source, /setSessionPassword\(profileId, draft\.password\)/, "密码只能写入当前会话状态");
-assert.doesNotMatch(source, /active\.value\.password/, "不得从持久化平台档案回填密码");
+assert.match(source, /password:\s*draft\.password/, "密码必须随平台档案持久化");
+assert.match(source, /draft\.password = active\.value\.password/, "重启后应从持久化档案回填密码");
+assert.match(source, /deviceState\.value === "Failed" && deviceLive\.value/, "注册失败但后台重试时必须识别可停止状态");
+assert.match(source, /停止重试/, "注册失败但后台重试时按钮必须显示停止重试");
+assert.match(source, /event\.payload\.scope === "register"[\s\S]*message\.error/, "注册失败原因必须通过 message 展示");
 assert.ok(configPanelStyles, "应存在 SIP 配置面板样式");
 assert.match(
   configPanelStyles,

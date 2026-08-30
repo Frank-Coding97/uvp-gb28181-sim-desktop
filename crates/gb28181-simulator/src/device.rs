@@ -186,6 +186,12 @@ pub struct DeviceInfo {
 
 const REGISTER_RETRY_MIN_SECS: u64 = 60;
 const REGISTER_RETRY_MAX_SECS: u64 = 300;
+/// UDP Catalog XML 体工程预算。为 SIP 头和 IP/UDP 头预留约 500 字节，
+/// 避免完整 SIP datagram 超过常见 1500 字节 MTU。
+const CATALOG_UDP_BODY_MAX_BYTES: usize = 1000;
+/// 完整 SIP UDP payload 的互操作预算。1200B 低于 IPv6 最小 MTU 扣除头部后的
+/// 1232B，也兼容部分对较大 UDP SIP 报文处理不完整的平台。
+const CATALOG_UDP_PAYLOAD_MAX_BYTES: usize = 1200;
 
 fn register_retry_base() -> std::time::Duration {
     std::time::Duration::from_secs(REGISTER_RETRY_MIN_SECS)
@@ -193,6 +199,15 @@ fn register_retry_base() -> std::time::Duration {
 
 fn next_register_retry(current: std::time::Duration) -> std::time::Duration {
     (current * 2).min(std::time::Duration::from_secs(REGISTER_RETRY_MAX_SECS))
+}
+
+fn query_response_timing() -> sip_core::Timing {
+    // 0.4 + 0.8 + 1.6 + 1.6 = 4.4s，满足查询 Response 5 秒确认窗口。
+    sip_core::Timing {
+        t1: std::time::Duration::from_millis(400),
+        t2: std::time::Duration::from_millis(1600),
+        max_retransmits: 3,
+    }
 }
 
 fn register_renew_after(expires_secs: u32) -> std::time::Duration {
@@ -217,6 +232,15 @@ pub enum DeviceState {
     InCall,
     /// 注册失败。
     Failed,
+}
+
+/// 最近一次平台目录查询活动，供桌面端在切页后回读。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogQueryActivity {
+    pub target_id: String,
+    pub result_count: usize,
+    pub packet_count: usize,
+    pub updated_at_ms: u64,
 }
 
 /// 设备仿真运行时状态机。持有配置 + 会话标识 + CSeq 计数 + 会话状态 + 事件观察者。
@@ -257,6 +281,8 @@ pub struct DeviceSimulator {
     catalog_tree: std::sync::Mutex<Vec<gb28181_protocol::id_codec::CatalogNode>>,
     /// 上次推给平台的目录快照(用于计算增量 NOTIFY 的 diff)。
     catalog_snapshot: std::sync::Mutex<gb28181_protocol::manscdp::CatalogSnapshot>,
+    /// 最近一次 Catalog Query 的目标、结果数和分包数。
+    catalog_activity: std::sync::Mutex<Option<CatalogQueryActivity>>,
 }
 
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
@@ -391,6 +417,7 @@ impl DeviceSimulator {
             catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
             }),
+            catalog_activity: std::sync::Mutex::new(None),
         }
     }
 
@@ -421,6 +448,7 @@ impl DeviceSimulator {
             catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
             }),
+            catalog_activity: std::sync::Mutex::new(None),
         }
     }
 
@@ -762,8 +790,13 @@ impl DeviceSimulator {
     }
 
     /// 直接设置目录树节点(FR-34)。首节点应为根设备。
-    pub fn set_catalog_tree(&self, nodes: Vec<gb28181_protocol::id_codec::CatalogNode>) {
+    pub fn set_catalog_tree(
+        &self,
+        nodes: Vec<gb28181_protocol::id_codec::CatalogNode>,
+    ) -> std::result::Result<(), String> {
+        gb28181_protocol::id_codec::validate_catalog_tree(&nodes)?;
         *self.catalog_tree.lock().unwrap() = nodes;
+        Ok(())
     }
 
     /// 当前目录树快照(空表示用 config.channels 扁平列表)。
@@ -772,47 +805,77 @@ impl DeviceSimulator {
     }
 
     /// 新增/更新一个目录通道节点(按 id 覆盖)。返回是否为新增。
-    pub fn upsert_channel(&self, node: gb28181_protocol::id_codec::CatalogNode) -> bool {
+    pub fn upsert_channel(
+        &self,
+        node: gb28181_protocol::id_codec::CatalogNode,
+    ) -> std::result::Result<bool, String> {
         let mut tree = self.catalog_tree.lock().unwrap();
-        if let Some(existing) = tree.iter_mut().find(|n| n.id == node.id) {
+        let mut candidate = tree.clone();
+        let added = if let Some(existing) = candidate.iter_mut().find(|n| n.id == node.id) {
             *existing = node;
             false
         } else {
-            tree.push(node);
+            candidate.push(node);
             true
-        }
+        };
+        gb28181_protocol::id_codec::validate_catalog_tree(&candidate)?;
+        *tree = candidate;
+        Ok(added)
     }
 
-    /// 删除一个目录通道节点(按 id)。返回是否删除了节点。
-    pub fn remove_channel(&self, id: &str) -> bool {
+    /// 删除一个目录节点及其全部后代。返回删除节点数。
+    pub fn remove_channel(&self, id: &str) -> std::result::Result<usize, String> {
         let mut tree = self.catalog_tree.lock().unwrap();
+        let Some(target) = tree.iter().find(|node| node.id == id) else {
+            return Ok(0);
+        };
+        if target.id == target.parent_id {
+            return Err("不能删除目录根节点".into());
+        }
+        let mut removed = std::collections::HashSet::from([id.to_string()]);
+        loop {
+            let before = removed.len();
+            for node in tree.iter() {
+                if removed.contains(&node.parent_id) {
+                    removed.insert(node.id.clone());
+                }
+            }
+            if removed.len() == before {
+                break;
+            }
+        }
         let before = tree.len();
-        tree.retain(|n| n.id != id);
-        tree.len() != before
+        let candidate: Vec<_> = tree
+            .iter()
+            .filter(|node| !removed.contains(&node.id))
+            .cloned()
+            .collect();
+        gb28181_protocol::id_codec::validate_catalog_tree(&candidate)?;
+        let count = before - candidate.len();
+        *tree = candidate;
+        Ok(count)
     }
 
-    /// 目录节点(树非空时)或扁平通道(树空时)映射为 (id, name, status) 快照三元组,
-    /// 供目录应答与增量 diff 复用。根设备节点(parent==self)不作为通道项。
-    fn catalog_publishable(&self) -> Vec<(String, String, String)> {
-        let tree = self.catalog_tree.lock().unwrap();
-        if tree.is_empty() {
-            self.config
-                .channels
-                .iter()
-                .map(|c| {
-                    (
-                        c.channel_id.as_str().to_string(),
-                        c.name.clone(),
-                        c.status.clone(),
-                    )
-                })
-                .collect()
-        } else {
-            tree.iter()
-                .filter(|n| n.id != n.parent_id) // 过滤根设备自引用
-                .map(|n| (n.id.clone(), n.name.clone(), n.status.clone()))
-                .collect()
-        }
+    /// 最近一次平台目录查询活动。
+    pub fn catalog_activity(&self) -> Option<CatalogQueryActivity> {
+        self.catalog_activity
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+    }
+
+    /// 返回可发布的完整目录节点。根设备节点(parent==self)不作为订阅通道项。
+    fn catalog_publishable(&self) -> Vec<gb28181_protocol::id_codec::CatalogNode> {
+        use gb28181_protocol::id_codec::catalog_business_group_id;
+        let tree = self.effective_catalog_tree();
+        tree.iter()
+            .filter(|node| node.id != node.parent_id)
+            .map(|node| {
+                let mut item = node.clone();
+                item.business_group_id = catalog_business_group_id(&tree, node);
+                item
+            })
+            .collect()
     }
 
     /// 本设备注册用的 Call-ID(用于在共享传输上注册接收路由)。
@@ -864,7 +927,10 @@ impl DeviceSimulator {
                     Error::Sip(msg) if msg.contains("被拒") => FailureKind::Rejected,
                     _ => FailureKind::Other,
                 };
-                self.observer.on_event(DeviceEvent::RegisterFailure(kind));
+                self.observer.on_event(DeviceEvent::RegisterFailure {
+                    kind,
+                    message: e.to_string(),
+                });
             }
         }
         result
@@ -1202,39 +1268,33 @@ impl DeviceSimulator {
         dialog: &builder::NotifyDialog,
         sn: u32,
     ) -> Result<u16> {
-        use gb28181_protocol::manscdp::{CatalogNotify, CatalogNotifyItem, CatalogSnapshot};
+        use gb28181_protocol::manscdp::{CatalogNotifyItem, CatalogSnapshot};
         // 全量目录:多通道树优先,否则扁平通道。全量后刷新快照基线供后续增量 diff。
         let publishable = self.catalog_publishable();
         let items: Vec<CatalogNotifyItem> = publishable
             .iter()
-            .map(|(id, name, status)| CatalogNotifyItem {
-                device_id: id.clone(),
-                name: name.clone(),
+            .map(|node| CatalogNotifyItem {
+                device_id: node.id.clone(),
+                name: node.name.clone(),
+                civil_code: node.civil_code.clone(),
+                parental: Some(node.node_type.parental()),
+                parent_id: Some(node.parent_id.clone()),
+                business_group_id: node.business_group_id.clone(),
                 event: "ON".into(),
-                status: status.clone(),
+                status: node.status.clone(),
             })
             .collect();
         *self.catalog_snapshot.lock().unwrap() =
-            CatalogSnapshot::from_items(publishable.iter().cloned());
-        let notify = CatalogNotify::new(self.config.device_id.as_str(), sn, items);
-        let xml = notify.to_xml()?;
-
-        let cseq = self.next_cseq();
-        let req = builder::notify_in_dialog(
-            &self.config,
+            CatalogSnapshot::from_nodes(publishable.iter().cloned());
+        let pages = self.catalog_notifies_by_udp_budget(
+            sn,
+            items,
             dialog,
-            cseq,
-            &self.local_host(),
-            self.local_port(),
-            &xml,
-        );
-        // 对话内 NOTIFY 的响应按订阅 Call-ID 回来;注册该路由收 200,收完注销。
-        let mut rx = transport.register(dialog.call_id.clone());
-        let result =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await;
-        transport.unregister(&dialog.call_id);
-        Ok(result?.status)
+            CATALOG_UDP_BODY_MAX_BYTES,
+            CATALOG_UDP_PAYLOAD_MAX_BYTES,
+        )?;
+        self.send_catalog_notify_pages(transport, dst, dialog, pages)
+            .await
     }
 
     /// 目录变更后推送增量 NOTIFY(FR-32/34)。
@@ -1243,8 +1303,8 @@ impl DeviceSimulator {
     /// 在订阅对话内发一条只含变更项的 Catalog NOTIFY,并刷新快照基线。无订阅/无变更时不发。
     /// CRUD(upsert_channel/remove_channel)或状态切换后调用。
     pub async fn notify_catalog_changed(&self, transport: &Arc<UdpTransport>) -> Result<()> {
-        use gb28181_protocol::manscdp::{CatalogNotify, CatalogSnapshot};
-        let next = CatalogSnapshot::from_items(self.catalog_publishable());
+        use gb28181_protocol::manscdp::CatalogSnapshot;
+        let next = CatalogSnapshot::from_nodes(self.catalog_publishable());
         let changes = {
             let snap = self.catalog_snapshot.lock().unwrap();
             snap.diff(&next)
@@ -1260,24 +1320,62 @@ impl DeviceSimulator {
             return Ok(()); // 无目录订阅,平台会在下次全量查询时同步
         };
         let sn = self.next_cseq();
-        let notify = CatalogNotify::new(self.config.device_id.as_str(), sn, changes);
-        let xml = notify.to_xml()?;
-        let cseq = self.next_cseq();
-        let req = builder::notify_in_dialog(
-            &self.config,
+        let pages = self.catalog_notifies_by_udp_budget(
+            sn,
+            changes,
             &dialog,
-            cseq,
-            &self.local_host(),
-            self.local_port(),
-            &xml,
-        );
-        let mut rx = transport.register(dialog.call_id.clone());
-        let result =
-            sip_core::client_transact(transport, dst, &req, &mut rx, sip_core::Timing::default())
-                .await;
-        transport.unregister(&dialog.call_id);
-        result?;
+            CATALOG_UDP_BODY_MAX_BYTES,
+            CATALOG_UDP_PAYLOAD_MAX_BYTES,
+        )?;
+        self.send_catalog_notify_pages(transport, dst, &dialog, pages)
+            .await?;
         Ok(())
+    }
+
+    /// 串行发送目录 NOTIFY 分片；每片等待事务确认，失败时记录并继续剩余分片。
+    async fn send_catalog_notify_pages(
+        &self,
+        transport: &Arc<UdpTransport>,
+        dst: SocketAddr,
+        dialog: &builder::NotifyDialog,
+        pages: Vec<gb28181_protocol::manscdp::CatalogNotify>,
+    ) -> Result<u16> {
+        let mut last_status = None;
+        let mut last_error = None;
+        for page in pages {
+            let xml = page.to_xml()?;
+            let cseq = self.next_cseq();
+            let request = builder::notify_in_dialog(
+                &self.config,
+                dialog,
+                cseq,
+                &self.local_host(),
+                self.local_port(),
+                &xml,
+            );
+            let mut rx = transport.register(dialog.call_id.clone());
+            let result = sip_core::client_transact(
+                transport,
+                dst,
+                &request,
+                &mut rx,
+                query_response_timing(),
+            )
+            .await;
+            transport.unregister(&dialog.call_id);
+            match result {
+                Ok(response) => last_status = Some(response.status),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Catalog NOTIFY 分片事务失败，继续发送后续分片");
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+        match (last_status, last_error) {
+            (Some(status), _) => Ok(status),
+            (None, Some(error)) => Err(Error::Sip(error)),
+            (None, None) => Err(Error::Gb28181("Catalog NOTIFY 未生成分片".into())),
+        }
     }
 
     /// 启动(或重建)移动位置订阅的周期上报任务。
@@ -1486,15 +1584,46 @@ impl DeviceSimulator {
                             }
                         } else if let Ok(query) = gb28181_protocol::manscdp::Query::parse(body_str)
                         {
-                            if let Ok(xml) = self.handle_query(&query) {
-                                self.send_reply_message(transport, incoming.from, &xml)
-                                    .await?;
-                                // 平台命令时间线:上报语义摘要(查询类)。
-                                self.observer
-                                    .on_event(common::DeviceEvent::PlatformCommand {
-                                        kind: "query".into(),
-                                        summary: self.query_summary(&query.cmd_type),
-                                    });
+                            if let Ok(packets) = self.handle_query_packets(&query) {
+                                // 查询 SIP 200 已回；业务 Response 在后台串行发送，避免某片平台
+                                // 确认缓慢时阻塞同一入站循环里的后续 Query/INVITE/BYE。
+                                let simulator = Arc::clone(self);
+                                let reply_transport = Arc::clone(transport);
+                                let reply_to = incoming.from;
+                                let cmd_type = query.cmd_type.clone();
+                                let summary = self.query_summary(&cmd_type);
+                                tokio::spawn(async move {
+                                    // 附录 M:同 SN 多响应串行发送，每包等待上一条 MESSAGE 的 SIP 响应。
+                                    for xml in packets {
+                                        match simulator
+                                            .send_query_response_message(
+                                                &reply_transport,
+                                                reply_to,
+                                                &xml,
+                                            )
+                                            .await
+                                        {
+                                            Ok(200..=299) => {}
+                                            Ok(status) => tracing::warn!(
+                                                status,
+                                                cmd_type = %cmd_type,
+                                                "查询 Response MESSAGE 未获平台 2xx 确认，继续发送后续分片"
+                                            ),
+                                            Err(error) => tracing::warn!(
+                                                error = %error,
+                                                cmd_type = %cmd_type,
+                                                "查询 Response MESSAGE 事务失败，继续发送后续分片"
+                                            ),
+                                        }
+                                    }
+                                    // 平台命令时间线:上报语义摘要(查询类)。
+                                    simulator.observer.on_event(
+                                        common::DeviceEvent::PlatformCommand {
+                                            kind: "query".into(),
+                                            summary,
+                                        },
+                                    );
+                                });
                             }
                         }
                     }
@@ -1785,55 +1914,294 @@ impl DeviceSimulator {
         }
     }
 
+    fn effective_catalog_tree(&self) -> Vec<gb28181_protocol::id_codec::CatalogNode> {
+        use gb28181_protocol::id_codec::{CatalogNode, CatalogNodeType};
+        let tree = self.catalog_tree.lock().unwrap();
+        if !tree.is_empty() {
+            return tree.clone();
+        }
+        let root_id = self.config.device_id.as_str();
+        let mut nodes = vec![CatalogNode::new(
+            root_id,
+            CatalogNodeType::Device,
+            &self.config.device_info.device_name,
+            root_id,
+        )];
+        nodes.extend(self.config.channels.iter().map(|channel| {
+            let mut node = CatalogNode::new(
+                channel.channel_id.as_str(),
+                CatalogNodeType::VideoChannel,
+                &channel.name,
+                root_id,
+            );
+            node.status = channel.status.clone();
+            node
+        }));
+        nodes
+    }
+
+    fn catalog_query_packets(
+        &self,
+        query: &gb28181_protocol::manscdp::Query,
+    ) -> Result<Vec<String>> {
+        use gb28181_protocol::{
+            id_codec::{catalog_business_group_id, select_catalog_nodes},
+            manscdp::CatalogItem,
+        };
+        let tree = self.effective_catalog_tree();
+        let selected = select_catalog_nodes(&tree, &query.device_id);
+        let is_2022 = self.config.gb_version.is_2022();
+        let items: Vec<CatalogItem> = selected
+            .iter()
+            .map(|node| CatalogItem {
+                device_id: node.id.clone(),
+                name: node.name.clone(),
+                manufacturer: Some(self.config.device_info.manufacturer.clone()),
+                model: Some(self.config.device_info.model.clone()),
+                civil_code: node.civil_code.clone(),
+                parental: Some(node.node_type.parental()),
+                parent_id: (node.id != node.parent_id).then(|| node.parent_id.clone()),
+                business_group_id: is_2022
+                    .then(|| catalog_business_group_id(&tree, node))
+                    .flatten(),
+                status: node.status.clone(),
+                security_level_code: is_2022.then(|| "A".to_string()),
+                ip_address: None,
+                port: None,
+            })
+            .collect();
+        let result_count = items.len();
+        let responses = self.catalog_responses_by_udp_budget(
+            &query.device_id,
+            query.sn,
+            items,
+            CATALOG_UDP_BODY_MAX_BYTES,
+            CATALOG_UDP_PAYLOAD_MAX_BYTES,
+        )?;
+        let packet_count = responses.len();
+        *self.catalog_activity.lock().unwrap() = Some(CatalogQueryActivity {
+            target_id: query.device_id.clone(),
+            result_count,
+            packet_count,
+            updated_at_ms: epoch_millis(),
+        });
+        responses
+            .into_iter()
+            .map(|response| response.to_xml())
+            .collect()
+    }
+
+    /// 按实际信令编码后的 XML 与完整 SIP UDP payload 字节数贪心装包。
+    ///
+    /// GB/T 28181-2022 附录 M 允许目录多响应，并要求同一请求的响应保持相同 SN；
+    /// 1000 字节是 UDP 实现的工程预算，不是标准规定的固定数值。
+    fn catalog_responses_by_udp_budget(
+        &self,
+        device_id: &str,
+        sn: u32,
+        items: Vec<gb28181_protocol::manscdp::CatalogItem>,
+        max_body_bytes: usize,
+        max_datagram_bytes: usize,
+    ) -> Result<Vec<gb28181_protocol::manscdp::CatalogResponse>> {
+        use gb28181_protocol::manscdp::CatalogResponse;
+
+        fn response(
+            device_id: &str,
+            sn: u32,
+            total: u32,
+            items: Vec<gb28181_protocol::manscdp::CatalogItem>,
+        ) -> CatalogResponse {
+            let mut response = CatalogResponse::new(device_id, sn, items);
+            response.sum_num = total;
+            response
+        }
+
+        let total = items.len() as u32;
+        let encoded_sizes = |response: &CatalogResponse| -> Result<(usize, usize)> {
+            let xml = response.to_xml()?;
+            let body_len = builder::encode_xml_body(&xml, self.config.signaling_encoding).len();
+            // CSeq 用最大十进制长度，保证运行时任意 CSeq 都不会超过测量值。
+            let request = builder::message_xml(
+                &self.config,
+                &self.ids,
+                u32::MAX,
+                &self.local_host(),
+                self.local_port(),
+                &xml,
+            );
+            let datagram_len = sip_core::SipMessage::Request(request).to_bytes().len();
+            Ok((body_len, datagram_len))
+        };
+        let fits = |response: &CatalogResponse| -> Result<bool> {
+            let (body_len, datagram_len) = encoded_sizes(response)?;
+            Ok(body_len <= max_body_bytes && datagram_len <= max_datagram_bytes)
+        };
+
+        if items.is_empty() {
+            let empty = response(device_id, sn, 0, Vec::new());
+            let (body_len, datagram_len) = encoded_sizes(&empty)?;
+            if body_len > max_body_bytes || datagram_len > max_datagram_bytes {
+                return Err(Error::Gb28181(format!(
+                    "Catalog 空响应 body={body_len}B/datagram={datagram_len}B 超过 UDP 预算 body={max_body_bytes}B/datagram={max_datagram_bytes}B"
+                )));
+            }
+            return Ok(vec![empty]);
+        }
+
+        let mut pages = Vec::new();
+        let mut current = Vec::new();
+        for item in items {
+            current.push(item);
+            let candidate = response(device_id, sn, total, current.clone());
+            if fits(&candidate)? {
+                continue;
+            }
+
+            let overflow = current.pop().expect("刚加入的目录项必然存在");
+            if current.is_empty() {
+                let oversized = response(device_id, sn, total, vec![overflow]);
+                let (body_len, datagram_len) = encoded_sizes(&oversized)?;
+                return Err(Error::Gb28181(format!(
+                    "单个 Catalog 目录项 {} 编码后响应 body={body_len}B/datagram={datagram_len}B，超过 UDP 预算 body={max_body_bytes}B/datagram={max_datagram_bytes}B",
+                    oversized
+                        .device_list
+                        .as_ref()
+                        .and_then(|list| list.items.first())
+                        .map(|item| item.device_id.as_str())
+                        .unwrap_or("unknown")
+                )));
+            }
+
+            pages.push(response(device_id, sn, total, std::mem::take(&mut current)));
+            current.push(overflow);
+            let single = response(device_id, sn, total, current.clone());
+            let (body_len, datagram_len) = encoded_sizes(&single)?;
+            if body_len > max_body_bytes || datagram_len > max_datagram_bytes {
+                return Err(Error::Gb28181(format!(
+                    "单个 Catalog 目录项 {} 编码后响应 body={body_len}B/datagram={datagram_len}B，超过 UDP 预算 body={max_body_bytes}B/datagram={max_datagram_bytes}B",
+                    single
+                        .device_list
+                        .as_ref()
+                        .and_then(|list| list.items.first())
+                        .map(|item| item.device_id.as_str())
+                        .unwrap_or("unknown")
+                )));
+            }
+        }
+        if !current.is_empty() {
+            pages.push(response(device_id, sn, total, current));
+        }
+        Ok(pages)
+    }
+
+    /// Catalog NOTIFY 使用与查询 Response 相同的 UDP 预算，并按实际对话内 SIP 头测量。
+    fn catalog_notifies_by_udp_budget(
+        &self,
+        sn: u32,
+        items: Vec<gb28181_protocol::manscdp::CatalogNotifyItem>,
+        dialog: &builder::NotifyDialog,
+        max_body_bytes: usize,
+        max_datagram_bytes: usize,
+    ) -> Result<Vec<gb28181_protocol::manscdp::CatalogNotify>> {
+        use gb28181_protocol::manscdp::{CatalogNotify, CatalogNotifyItem};
+
+        fn notify(
+            sn: u32,
+            total: u32,
+            items: Vec<CatalogNotifyItem>,
+            device_id: &str,
+        ) -> CatalogNotify {
+            let mut notify = CatalogNotify::new(device_id, sn, items);
+            notify.sum_num = total;
+            notify
+        }
+
+        let total = items.len() as u32;
+        let encoded_sizes = |notify: &CatalogNotify| -> Result<(usize, usize)> {
+            let xml = notify.to_xml()?;
+            let body_len = builder::encode_xml_body(&xml, self.config.signaling_encoding).len();
+            let request = builder::notify_in_dialog(
+                &self.config,
+                dialog,
+                u32::MAX,
+                &self.local_host(),
+                self.local_port(),
+                &xml,
+            );
+            let datagram_len = sip_core::SipMessage::Request(request).to_bytes().len();
+            Ok((body_len, datagram_len))
+        };
+        let fits = |notify: &CatalogNotify| -> Result<bool> {
+            let (body_len, datagram_len) = encoded_sizes(notify)?;
+            Ok(body_len <= max_body_bytes && datagram_len <= max_datagram_bytes)
+        };
+
+        if items.is_empty() {
+            let empty = notify(sn, 0, Vec::new(), self.config.device_id.as_str());
+            if !fits(&empty)? {
+                return Err(Error::Gb28181("Catalog NOTIFY 空报文超过 UDP 预算".into()));
+            }
+            return Ok(vec![empty]);
+        }
+
+        let mut pages = Vec::new();
+        let mut current = Vec::new();
+        for item in items {
+            current.push(item);
+            let candidate = notify(sn, total, current.clone(), self.config.device_id.as_str());
+            if fits(&candidate)? {
+                continue;
+            }
+
+            let overflow = current.pop().expect("刚加入的目录通知项必然存在");
+            if current.is_empty() {
+                return Err(Error::Gb28181(format!(
+                    "单个 Catalog NOTIFY 目录项 {} 超过 UDP 预算",
+                    overflow.device_id
+                )));
+            }
+            pages.push(notify(
+                sn,
+                total,
+                std::mem::take(&mut current),
+                self.config.device_id.as_str(),
+            ));
+            current.push(overflow);
+            let single = notify(sn, total, current.clone(), self.config.device_id.as_str());
+            if !fits(&single)? {
+                return Err(Error::Gb28181(format!(
+                    "单个 Catalog NOTIFY 目录项 {} 超过 UDP 预算",
+                    single.device_list.items[0].device_id
+                )));
+            }
+        }
+        if !current.is_empty() {
+            pages.push(notify(sn, total, current, self.config.device_id.as_str()));
+        }
+        Ok(pages)
+    }
+
+    /// 处理查询并返回一条或多条独立 MESSAGE XML。
+    fn handle_query_packets(
+        &self,
+        query: &gb28181_protocol::manscdp::Query,
+    ) -> Result<Vec<String>> {
+        if query.cmd_type == "Catalog" {
+            self.catalog_query_packets(query)
+        } else {
+            self.handle_query(query).map(|xml| vec![xml])
+        }
+    }
+
     /// 处理 Query,返回应答 XML。
     fn handle_query(&self, query: &gb28181_protocol::manscdp::Query) -> Result<String> {
         use gb28181_protocol::manscdp::*;
         match query.cmd_type.as_str() {
-            "Catalog" => {
-                // GB-2022 输出新增字段(安全能力/IP/端口),GB-2016 置 None 不输出。
-                let is_2022 = self.config.gb_version.is_2022();
-                let tree = self.catalog_tree.lock().unwrap();
-                let items: Vec<CatalogItem> = if tree.is_empty() {
-                    // 扁平通道(单通道兼容路径)。
-                    self.config
-                        .channels
-                        .iter()
-                        .map(|ch| CatalogItem {
-                            device_id: ch.channel_id.to_string(),
-                            name: ch.name.clone(),
-                            manufacturer: Some(self.config.device_info.manufacturer.clone()),
-                            model: Some(self.config.device_info.model.clone()),
-                            civil_code: None,
-                            parental: Some(0),
-                            parent_id: Some(self.config.device_id.to_string()),
-                            status: ch.status.clone(),
-                            security_level_code: is_2022.then(|| "A".to_string()),
-                            ip_address: None,
-                            port: None,
-                        })
-                        .collect()
-                } else {
-                    // 多通道目录树(FR-34):根设备自引用节点不作为通道项。
-                    tree.iter()
-                        .filter(|n| n.id != n.parent_id)
-                        .map(|n| CatalogItem {
-                            device_id: n.id.clone(),
-                            name: n.name.clone(),
-                            manufacturer: Some(self.config.device_info.manufacturer.clone()),
-                            model: Some(self.config.device_info.model.clone()),
-                            civil_code: n.civil_code.clone(),
-                            parental: Some(n.node_type.parental()),
-                            parent_id: Some(n.parent_id.clone()),
-                            status: n.status.clone(),
-                            security_level_code: is_2022.then(|| "A".to_string()),
-                            ip_address: None,
-                            port: None,
-                        })
-                        .collect()
-                };
-                let resp = CatalogResponse::new(&query.device_id, query.sn, items);
-                resp.to_xml()
-            }
+            "Catalog" => self
+                .catalog_query_packets(query)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Gb28181("目录查询未生成应答".into())),
             "DeviceInfo" => {
                 let resp = DeviceInfoResponse {
                     cmd_type: "DeviceInfo".into(),
@@ -2403,6 +2771,34 @@ impl DeviceSimulator {
             .await
     }
 
+    /// 发送独立的查询 Response MESSAGE，并等待平台事务确认。
+    ///
+    /// 每片使用独立 Call-ID，避免和注册、心跳及相邻分片争抢同一接收路由；调用方按
+    /// 返回顺序发送下一片，并在单片失败时继续 best-effort 发送剩余片。
+    async fn send_query_response_message(
+        &self,
+        transport: &Arc<UdpTransport>,
+        to: SocketAddr,
+        xml: &str,
+    ) -> Result<u16> {
+        let ids = DialogIds::new();
+        let cseq = self.next_cseq();
+        let request = builder::message_xml(
+            &self.config,
+            &ids,
+            cseq,
+            &self.local_host(),
+            self.local_port(),
+            xml,
+        );
+        let mut rx = transport.register(ids.call_id.clone());
+        let result =
+            sip_core::client_transact(transport, to, &request, &mut rx, query_response_timing())
+                .await;
+        transport.unregister(&ids.call_id);
+        Ok(result?.status)
+    }
+
     /// 处理 INVITE:解析平台 SDP,启动推流,回 200 OK(带本端 SDP)。
     async fn handle_invite(
         self: &Arc<Self>,
@@ -2800,10 +3196,7 @@ mod tests {
                     .expect("REGISTER 缺少 From")
                     .to_string();
                 let cseq_number = req.headers.cseq_number().expect("REGISTER 缺少 CSeq");
-                assert_eq!(
-                    req.headers.get("Expires"),
-                    Some(expected_expires.as_str())
-                );
+                assert_eq!(req.headers.get("Expires"), Some(expected_expires.as_str()));
                 let mut h = Headers::new();
                 h.set("Call-ID", call_id.clone());
                 h.set("CSeq", cseq);
@@ -3150,6 +3543,108 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn catalog分片等待每片确认后串行发送() {
+        use sip_core::Method;
+
+        let device_tp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let platform_tp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let sim = Arc::new(DeviceSimulator::new(test_cfg(
+            "127.0.0.1",
+            platform_addr.port(),
+        )));
+        sim.load_catalog_template("nvr-8ch");
+
+        let query_xml = format!(
+            "<?xml version=\"1.0\"?><Query><CmdType>Catalog</CmdType><SN>1000</SN><DeviceID>{}</DeviceID></Query>",
+            sim.config().device_id
+        );
+        let mut headers = Headers::new();
+        headers.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKserial");
+        headers.set("From", "<sip:34020000002000000001@3402>;tag=platform");
+        headers.set("To", format!("<sip:{}@3402>", sim.config().device_id));
+        headers.set("Call-ID", "catalog-serial-query");
+        headers.set("CSeq", "2 MESSAGE");
+        headers.set("Content-Type", "Application/MANSCDP+xml");
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(sip_core::Request {
+                method: Method::Message,
+                uri: format!("sip:{}@127.0.0.1", sim.config().device_id),
+                headers,
+                body: query_xml.into_bytes(),
+            }),
+            from: platform_addr,
+        };
+
+        let mut query_ack = platform_tp.register("catalog-serial-query");
+        let mut responses = platform_tp.register_inbound("34020000002000000001");
+        let answer_task = tokio::spawn({
+            let sim = sim.clone();
+            let device_tp = device_tp.clone();
+            async move { sim.answer_inbound(&device_tp, &incoming).await }
+        });
+
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(1), query_ack.recv())
+            .await
+            .expect("查询 SIP 200 超时")
+            .expect("查询 SIP 200 队列关闭");
+        assert!(matches!(ack.message, SipMessage::Response(ref r) if r.status == 200));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), responses.recv())
+            .await
+            .expect("首片 Catalog Response 超时")
+            .expect("Catalog Response 队列关闭");
+        let SipMessage::Request(first_request) = first.message else {
+            panic!("应收到 Catalog Response MESSAGE");
+        };
+        assert_eq!(first_request.method, Method::Message);
+        let first_body =
+            builder::decode_xml_body(&first_request.body, sim.config().signaling_encoding);
+        let mut item_count = first_body.matches("<Item>").count();
+        let mut packet_count = 1usize;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(80), responses.recv())
+                .await
+                .is_err(),
+            "上一片未收到 200 OK 前不得发送下一片"
+        );
+        platform_tp
+            .send_to(
+                &SipMessage::Response(builder::response_ok(&first_request)),
+                first.from,
+            )
+            .await
+            .unwrap();
+
+        while item_count < 10 {
+            let packet = tokio::time::timeout(std::time::Duration::from_secs(1), responses.recv())
+                .await
+                .expect("后续 Catalog Response 超时")
+                .expect("Catalog Response 队列关闭");
+            let SipMessage::Request(request) = packet.message else {
+                panic!("应收到 Catalog Response MESSAGE");
+            };
+            let body = builder::decode_xml_body(&request.body, sim.config().signaling_encoding);
+            assert!(body.contains("<SN>1000</SN>"));
+            assert!(body.contains("<SumNum>10</SumNum>"));
+            item_count += body.matches("<Item>").count();
+            packet_count += 1;
+            platform_tp
+                .send_to(
+                    &SipMessage::Response(builder::response_ok(&request)),
+                    packet.from,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(item_count, 10);
+        assert!(packet_count > 1);
+        assert!(answer_task.await.unwrap().unwrap());
+    }
+
     #[test]
     fn 目录应答按gb版本差异化字段() {
         use gb28181_protocol::manscdp::Query;
@@ -3157,7 +3652,7 @@ mod tests {
         let query = Query {
             cmd_type: "Catalog".into(),
             sn: 1,
-            device_id: "35020000001310000001".into(),
+            device_id: "34020000001320000001".into(),
             interval: None,
             group_id: None,
             config_type: None,
@@ -3373,9 +3868,10 @@ mod tests {
             indistinct_query: None,
             stream_number: None,
         };
-        let xml = sim.handle_query(&q).unwrap();
-        // 8 视频通道 + 1 业务分组 = 9 项(根设备自引用被过滤)。
-        assert!(xml.contains("<DeviceList Num=\"9\">"));
+        let packets = sim.handle_query_packets(&q).unwrap();
+        let xml = packets.join("");
+        // 查询设备编码返回设备本身及其后代:根 + 业务分组 + 8 视频通道。
+        assert_eq!(xml.matches("<Item>").count(), 10);
         assert!(xml.contains("<Name>NVR-8</Name>"));
         assert!(xml.contains("<Name>通道-01</Name>"));
         assert!(xml.contains("<Parental>1</Parental>")); // 业务分组
@@ -3388,10 +3884,211 @@ mod tests {
             "新增通道",
             sim.config().device_id.to_string(),
         );
-        assert!(sim.upsert_channel(node.clone()));
-        assert!(!sim.upsert_channel(node)); // 再次 upsert 为更新非新增
-        assert!(sim.remove_channel("34020000001320000099"));
-        assert!(!sim.remove_channel("34020000001320000099")); // 已删
+        assert!(sim.upsert_channel(node.clone()).unwrap());
+        assert!(!sim.upsert_channel(node).unwrap()); // 再次 upsert 为更新非新增
+        assert_eq!(sim.remove_channel("34020000001320000099").unwrap(), 1);
+        assert_eq!(sim.remove_channel("34020000001320000099").unwrap(), 0); // 已删
+    }
+
+    #[test]
+    fn catalog查询按目标子树应答并记录活动() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.load_catalog_template("nvr-8ch");
+        let group = sim
+            .catalog_tree()
+            .into_iter()
+            .find(|node| {
+                node.node_type == gb28181_protocol::id_codec::CatalogNodeType::BusinessGroup
+            })
+            .unwrap();
+        let q = gb28181_protocol::manscdp::Query {
+            cmd_type: "Catalog".into(),
+            sn: 88,
+            device_id: group.id.clone(),
+            interval: None,
+            group_id: None,
+            config_type: None,
+            start_time: None,
+            end_time: None,
+            record_type: None,
+            indistinct_query: None,
+            stream_number: None,
+        };
+        let packets = sim.handle_query_packets(&q).unwrap();
+        assert!(packets.len() > 1);
+        assert!(packets.iter().all(|xml| xml.contains("<SumNum>9</SumNum>")));
+        assert_eq!(
+            packets
+                .iter()
+                .map(|xml| xml.matches("<Item>").count())
+                .sum::<usize>(),
+            9
+        );
+        assert!(packets
+            .iter()
+            .all(|xml| !xml.contains(&sim.config().device_info.device_name)));
+        let activity = sim.catalog_activity().unwrap();
+        assert_eq!(activity.target_id, group.id);
+        assert_eq!(activity.result_count, 9);
+        assert_eq!(activity.packet_count, packets.len());
+    }
+
+    #[test]
+    fn catalog_udp响应按编码后字节预算分片() {
+        const MAX_BODY_BYTES: usize = 1000;
+        const MAX_UDP_PAYLOAD_BYTES: usize = 1200;
+
+        for encoding in [
+            common::SignalingEncoding::Gb18030,
+            common::SignalingEncoding::Utf8,
+        ] {
+            let mut cfg = test_cfg("127.0.0.1", 5060);
+            cfg.signaling_encoding = encoding;
+            let sim = DeviceSimulator::new(cfg);
+            sim.load_catalog_template("nvr-8ch");
+            let q = gb28181_protocol::manscdp::Query {
+                cmd_type: "Catalog".into(),
+                sn: 99,
+                device_id: sim.config().device_id.to_string(),
+                interval: None,
+                group_id: None,
+                config_type: None,
+                start_time: None,
+                end_time: None,
+                record_type: None,
+                indistinct_query: None,
+                stream_number: None,
+            };
+
+            let packets = sim.handle_query_packets(&q).unwrap();
+            assert!(packets.len() > 1, "10 个目录项不应继续塞进一个 UDP MESSAGE");
+
+            let mut item_count = 0usize;
+            for xml in &packets {
+                let encoded = builder::encode_xml_body(xml, sim.config().signaling_encoding);
+                assert!(
+                    encoded.len() <= MAX_BODY_BYTES,
+                    "Catalog body {}B 超过 {}B 预算",
+                    encoded.len(),
+                    MAX_BODY_BYTES
+                );
+                assert!(xml.contains("<SN>99</SN>"));
+                assert!(xml.contains("<SumNum>10</SumNum>"));
+                item_count += xml.matches("<Item>").count();
+
+                let request = builder::message_xml(
+                    sim.config(),
+                    &DialogIds::new(),
+                    1,
+                    "127.0.0.1",
+                    5060,
+                    xml,
+                );
+                let datagram = sip_core::SipMessage::Request(request).to_bytes();
+                assert!(
+                    datagram.len() <= MAX_UDP_PAYLOAD_BYTES,
+                    "完整 SIP UDP payload {}B 超过 {}B",
+                    datagram.len(),
+                    MAX_UDP_PAYLOAD_BYTES
+                );
+            }
+            assert_eq!(item_count, 10);
+
+            let activity = sim.catalog_activity().unwrap();
+            assert_eq!(activity.result_count, 10);
+            assert_eq!(activity.packet_count, packets.len());
+        }
+    }
+
+    #[test]
+    fn catalog单项超过udp预算时拒绝发送() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        let item = gb28181_protocol::manscdp::CatalogItem {
+            device_id: "34020000001320000099".into(),
+            name: "超长目录项".repeat(300),
+            manufacturer: None,
+            model: None,
+            civil_code: None,
+            parental: Some(0),
+            parent_id: Some(sim.config().device_id.to_string()),
+            business_group_id: None,
+            status: "ON".into(),
+            security_level_code: Some("A".into()),
+            ip_address: None,
+            port: None,
+        };
+        let error = sim
+            .catalog_responses_by_udp_budget(
+                sim.config().device_id.as_str(),
+                1,
+                vec![item],
+                CATALOG_UDP_BODY_MAX_BYTES,
+                CATALOG_UDP_PAYLOAD_MAX_BYTES,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("34020000001320000099"));
+        assert!(error.to_string().contains("超过 UDP 预算"));
+    }
+
+    #[test]
+    fn catalog_notify同样按完整udp报文预算分片() {
+        use gb28181_protocol::manscdp::CatalogNotifyItem;
+
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.load_catalog_template("nvr-8ch");
+        let items: Vec<CatalogNotifyItem> = sim
+            .catalog_publishable()
+            .iter()
+            .map(|node| CatalogNotifyItem {
+                device_id: node.id.clone(),
+                name: node.name.clone(),
+                civil_code: node.civil_code.clone(),
+                parental: Some(node.node_type.parental()),
+                parent_id: Some(node.parent_id.clone()),
+                business_group_id: node.business_group_id.clone(),
+                event: "ON".into(),
+                status: node.status.clone(),
+            })
+            .collect();
+        let total = items.len();
+        let dialog = builder::NotifyDialog {
+            call_id: "catalog-subscription-call".into(),
+            local_tag: "device-tag".into(),
+            remote_from: "<sip:34020000002000000001@3402>;tag=platform-tag".into(),
+            event: "Catalog".into(),
+            expires: 3600,
+        };
+
+        let pages = sim
+            .catalog_notifies_by_udp_budget(
+                77,
+                items,
+                &dialog,
+                CATALOG_UDP_BODY_MAX_BYTES,
+                CATALOG_UDP_PAYLOAD_MAX_BYTES,
+            )
+            .unwrap();
+        assert!(pages.len() > 1);
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page.device_list.items.len())
+                .sum::<usize>(),
+            total
+        );
+        for page in pages {
+            assert_eq!(page.sn, 77);
+            assert_eq!(page.sum_num as usize, total);
+            let xml = page.to_xml().unwrap();
+            let body = builder::encode_xml_body(&xml, sim.config().signaling_encoding);
+            assert!(body.len() <= CATALOG_UDP_BODY_MAX_BYTES);
+            let request =
+                builder::notify_in_dialog(sim.config(), &dialog, 1, "127.0.0.1", 5060, &xml);
+            assert!(
+                sip_core::SipMessage::Request(request).to_bytes().len()
+                    <= CATALOG_UDP_PAYLOAD_MAX_BYTES
+            );
+        }
     }
 
     /// 语音广播(FR-36):TargetID 属本设备回 Broadcast Response OK。

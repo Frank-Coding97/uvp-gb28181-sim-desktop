@@ -149,7 +149,7 @@ impl DeviceObserver for Metrics {
             | DeviceEvent::CaptureReady
             | DeviceEvent::CaptureStopped
             | DeviceEvent::CaptureFailure(_) => {}
-            DeviceEvent::RegisterFailure(k) => {
+            DeviceEvent::RegisterFailure { kind: k, .. } => {
                 let kind = match k {
                     CommonKind::Timeout => FailureKind::Timeout,
                     CommonKind::Rejected => FailureKind::Rejected,

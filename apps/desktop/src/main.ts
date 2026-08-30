@@ -6,12 +6,11 @@ import { createRouter, createWebHashHistory } from "vue-router";
 import "./theme.css";
 import App from "./App.vue";
 import Dashboard from "./views/Dashboard.vue";
-import Device from "./views/Device.vue";
+import Ptz from "./views/Ptz.vue";
 import Channels from "./views/Channels.vue";
 import Scenario from "./views/Scenario.vue";
 import System from "./views/System.vue";
 import Preview from "./views/Preview.vue";
-import CameraDemo from "./views/CameraDemo.vue";
 import Settings from "./views/Settings.vue";
 
 const router = createRouter({
@@ -19,7 +18,7 @@ const router = createRouter({
   routes: [
     { path: "/", redirect: "/dashboard" },
     { path: "/dashboard", component: Dashboard },
-    { path: "/device",    component: Device },
+    { path: "/ptz",       component: Ptz },
     { path: "/preview",   component: Preview },
     { path: "/channels",  component: Channels },
     // 压力测试(场景编排 + 实时监控已合并到一页)。
@@ -28,11 +27,12 @@ const router = createRouter({
     { path: "/media-settings",   component: Settings, props: { section: "media" } },
     { path: "/network-settings", component: Settings, props: { section: "network" } },
     { path: "/about",            component: Settings, props: { section: "about" } },
-    { path: "/system",    component: System },
-    { path: "/camera-demo", component: CameraDemo },
+    { path: "/logs",      component: System },
     { path: "/settings",  redirect: "/device-settings" }, // 旧设置入口兼容
     { path: "/monitor",   redirect: "/scenario" }, // 旧路由兼容,重定向到合并页
-    { path: "/config",    redirect: "/device" },   // 平台配置已并入顶栏,旧路由重定向
+    { path: "/device",    redirect: "/dashboard" }, // 设备身份、注册和状态已回归首页
+    { path: "/system",    redirect: "/logs" },      // 旧运行日志入口兼容
+    { path: "/config",    redirect: "/dashboard" }, // 平台配置已并入首页/顶栏
   ],
 });
 

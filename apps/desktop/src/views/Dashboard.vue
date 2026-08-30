@@ -25,7 +25,7 @@ import { persistForm, useDevice } from "../device";
 import { usePlatform } from "../platform";
 import { usePreviewSession } from "../composables/preview/session";
 
-type MediaMode = "none" | "file" | "camera" | "screen";
+type MediaMode = "camera" | "screen" | "file";
 type PreviewState = "idle" | "starting" | "playing" | "stopped" | "error";
 type CaptureState = "stopped" | "starting" | "ready" | "error";
 
@@ -63,15 +63,38 @@ interface SubscriptionState {
   notify_count: number;
 }
 
+interface DeviceRuntimeState {
+  guarded: boolean;
+  alarming: boolean;
+  longitude: number;
+  latitude: number;
+  name: string;
+  expiration: number;
+  heartbeat_interval: number;
+  heartbeat_count: number;
+  video_record_plan_type: number | null;
+  alarm_record_duration: number | null;
+  picture_mask_enabled: number | null;
+  frame_mirror_mode: number | null;
+  alarm_report_enabled: number | null;
+  osd_time_show: number | null;
+  osd_show: number | null;
+  last_change: string;
+  updated_at_ms: number;
+}
+
+interface CmdEntry { kind: string; summary: string; ts_ms: number; }
+
 const message = useMessage();
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const {
   config, profiles, activeId, active,
   setActive, addProfile, removeProfile, saveDesktopConfig,
-  passwordFor, setSessionPassword,
+  passwordFor,
 } = usePlatform();
 const {
   form,
+  deviceState,
   deviceLive,
   effectiveConfig,
   statusMeta,
@@ -84,6 +107,9 @@ const {
 const editing = ref(false);
 const saving = ref(false);
 const registrationBusy = ref(false);
+const registrationActionLabel = computed(() =>
+  deviceState.value === "Failed" && deviceLive.value ? "停止重试" : deviceLive.value ? "注销设备" : "注册设备",
+);
 const sourceLoading = ref(false);
 const previewState = ref<PreviewState>("idle");
 const captureState = ref<CaptureState>("stopped");
@@ -95,10 +121,14 @@ let previewPageActive = true;
 const previewLatency = ref<number | null>(null);
 const previewFps = ref(0);
 const previewSkipped = ref(0);
+const previewWidth = ref<number | null>(null);
+const previewHeight = ref<number | null>(null);
 const sourceProbe = ref("");
 let unlistenCaptureState: UnlistenFn | null = null;
 let unlistenDeviceError: UnlistenFn | null = null;
-let unlistenSubscription: UnlistenFn | null = null;
+let unlistenSub: UnlistenFn | null = null;
+let unlistenPlatformCommand: UnlistenFn | null = null;
+let runtimeRefreshTimer: number | null = null;
 
 const subscriptions = reactive<Record<SubscriptionKind, SubscriptionState>>({
   MobilePosition: { kind: "MobilePosition", active: false, notify_count: 0 },
@@ -106,6 +136,52 @@ const subscriptions = reactive<Record<SubscriptionKind, SubscriptionState>>({
   Alarm: { kind: "Alarm", active: false, notify_count: 0 },
   PTZPosition: { kind: "PTZPosition", active: false, notify_count: 0 },
 });
+const runtimeState = ref<DeviceRuntimeState | null>(null);
+const runtimeStateError = ref("无运行中设备");
+const runtimeUpdatedAt = computed(() => runtimeState.value?.updated_at_ms
+  ? new Date(runtimeState.value.updated_at_ms).toLocaleString("zh-CN", { hour12: false })
+  : "—");
+
+function resetSubscriptions() {
+  for (const item of Object.values(subscriptions)) {
+    item.active = false;
+    item.notify_count = 0;
+  }
+}
+
+function resetRuntimeUi() {
+  runtimeState.value = null;
+  runtimeStateError.value = "无运行中设备";
+  resetSubscriptions();
+  if (runtimeRefreshTimer) {
+    clearTimeout(runtimeRefreshTimer);
+    runtimeRefreshTimer = null;
+  }
+}
+
+async function refreshRuntimeState() {
+  if (!isTauri || !deviceLive.value) {
+    resetRuntimeUi();
+    return;
+  }
+  try {
+    runtimeState.value = await invoke<DeviceRuntimeState>("get_device_runtime_state");
+    runtimeStateError.value = "";
+  } catch (error) {
+    runtimeState.value = null;
+    runtimeStateError.value = String(error).includes("设备未启动") ? "无运行中设备" : `状态读取失败：${String(error)}`;
+  }
+}
+
+function scheduleRuntimeRefresh() {
+  void refreshRuntimeState();
+  if (runtimeRefreshTimer) clearTimeout(runtimeRefreshTimer);
+  // Tauri 事件与后续 invoke 处在不同调度队列，补一次短延迟对账，避免界面读到命令前快照。
+  runtimeRefreshTimer = window.setTimeout(() => {
+    runtimeRefreshTimer = null;
+    void refreshRuntimeState();
+  }, 80);
+}
 
 const draft = reactive({
   name: "",
@@ -132,7 +208,7 @@ function detectMediaMode(source: string): MediaMode {
   if (source.startsWith("live:camera:")) return "camera";
   if (source.startsWith("live:screen:")) return "screen";
   if (source) return "file";
-  return "none";
+  return "camera";
 }
 
 const mediaMode = ref<MediaMode>(detectMediaMode(form.value.video_source.trim()));
@@ -140,7 +216,6 @@ const selectedCamera = ref<number | null>(null);
 const selectedScreen = ref<number | null>(null);
 
 const mediaModes = [
-  { value: "none", label: "仅信令", icon: RadioOutline },
   { value: "camera", label: "摄像头", icon: CameraOutline },
   { value: "screen", label: "屏幕", icon: DesktopOutline },
   { value: "file", label: "视频文件", icon: DocumentOutline },
@@ -184,7 +259,11 @@ const previewEmptyHint = computed(() => {
 });
 const sourceSummary = computed(() => {
   const source = form.value.video_source.trim();
-  if (!source) return "当前仅进行 SIP 信令模拟";
+  if (!source) {
+    if (mediaMode.value === "camera") return "尚未选择摄像头";
+    if (mediaMode.value === "screen") return "尚未选择屏幕";
+    return "尚未选择视频文件";
+  }
   if (source.startsWith("live:camera:")) return `电脑摄像头 ${source.match(/^live:camera:(\d+)/)?.[1] ?? ""}`;
   if (source.startsWith("live:screen:")) return `电脑屏幕 ${source.match(/^live:screen:(\d+)/)?.[1] ?? ""}`;
   return source.split(/[\\/]/).pop() || source;
@@ -208,7 +287,7 @@ function resetDraft() {
     draft.server_port = active.value.server_port;
     draft.server_id = active.value.server_id;
     draft.server_domain = active.value.server_domain;
-    draft.password = passwordFor(active.value.id);
+    draft.password = active.value.password;
     draft.transport = active.value.transport;
   }
   draft.device_id = config.value?.device.device_id ?? form.value.device_id;
@@ -236,17 +315,17 @@ async function addSipProfile() {
   if (deviceLive.value) return;
   const source = active.value;
   try {
-    const id = await addProfile({
+    await addProfile({
       name: `SIP 配置 ${profiles.value.length + 1}`,
       server_host: source?.server_host ?? "127.0.0.1",
       server_port: source?.server_port ?? 5060,
       server_id: source?.server_id ?? "34020000002000000001",
       server_domain: source?.server_domain ?? "3402000000",
+      password: "",
       transport: source?.transport ?? "UDP",
       gb_version: source?.gb_version ?? "V2022",
       signaling_encoding: source?.signaling_encoding ?? "Gb18030",
     });
-    setSessionPassword(id, "");
     resetDraft();
     editing.value = true;
   } catch (error) {
@@ -303,11 +382,11 @@ async function saveConfig() {
         server_port: draft.server_port ?? 5060,
         server_id: draft.server_id.trim(),
         server_domain: draft.server_domain.trim(),
+        password: draft.password,
         transport: draft.transport,
       } : profile),
       device: { ...config.value.device, device_id: draft.device_id.trim() },
     });
-    setSessionPassword(profileId, draft.password);
     editing.value = false;
     message.success("首页配置已保存");
   } catch (error) {
@@ -324,23 +403,25 @@ function cancelEdit() {
 
 function syncLiveSource() {
   sourceProbe.value = "";
-  if (mediaMode.value === "none") {
-    form.value.video_source = "";
-  } else if (mediaMode.value === "camera" && selectedCamera.value !== null) {
-    form.value.video_source = `live:camera:${selectedCamera.value}?audio=none&audio_codec=g711a`;
-  } else if (mediaMode.value === "screen" && selectedScreen.value !== null) {
-    form.value.video_source = `live:screen:${selectedScreen.value}?audio=none&audio_codec=g711a&width=1280&height=720&bitrate=2500&codec=h264`;
+  if (mediaMode.value === "camera") {
+    form.value.video_source = selectedCamera.value === null
+      ? ""
+      : `live:camera:${selectedCamera.value}?audio=none&audio_codec=g711a`;
+  } else if (mediaMode.value === "screen") {
+    form.value.video_source = selectedScreen.value === null
+      ? ""
+      : `live:screen:${selectedScreen.value}?audio=none&audio_codec=g711a&width=1280&height=720&bitrate=2500&codec=h264`;
   }
   persistForm();
 }
 
 async function setMediaMode(mode: MediaMode) {
   if (deviceLive.value) return;
-  mediaMode.value = mode;
   if (mode === "file") {
     await pickVideoFile();
     return;
   }
+  mediaMode.value = mode;
   if (mode === "camera" && selectedCamera.value === null) {
     selectedCamera.value = catalog.value.cameras[0]?.index ?? null;
   }
@@ -364,8 +445,6 @@ async function pickVideoFile() {
     form.value.video_source = picked;
     mediaMode.value = "file";
     persistForm();
-  } else if (!form.value.video_source) {
-    mediaMode.value = "none";
   }
 }
 
@@ -378,6 +457,7 @@ async function refreshSources(showFeedback = true) {
     const screenMatch = form.value.video_source.match(/^live:screen:(\d+)/);
     selectedCamera.value = cameraMatch ? Number(cameraMatch[1]) : catalog.value.cameras[0]?.index ?? null;
     selectedScreen.value = screenMatch ? Number(screenMatch[1]) : catalog.value.screens[0]?.display_id ?? null;
+    if (mediaMode.value === "camera" || mediaMode.value === "screen") syncLiveSource();
     if (showFeedback) message.success("采集设备已刷新");
   } catch (error) {
     sourceProbe.value = `设备枚举失败：${String(error)}`;
@@ -444,6 +524,8 @@ async function startPreview() {
       previewLatency.value = stats.latencyMs;
       previewFps.value = stats.fps;
       previewSkipped.value = stats.skipped;
+      previewWidth.value = canvasRef.value?.width ?? null;
+      previewHeight.value = canvasRef.value?.height ?? null;
     },
   });
   await session.start();
@@ -460,12 +542,23 @@ async function retryPreview() {
   }
 }
 
+function clearPreviewStats() {
+  previewLatency.value = null;
+  previewFps.value = 0;
+  previewSkipped.value = 0;
+  previewWidth.value = null;
+  previewHeight.value = null;
+}
+
 watch(deviceLive, (running) => {
   if (!running) {
     captureState.value = "stopped";
     hasFrame.value = false;
     previewState.value = "idle";
-    previewLatency.value = null;
+    clearPreviewStats();
+    resetRuntimeUi();
+  } else {
+    scheduleRuntimeRefresh();
   }
 });
 
@@ -481,21 +574,28 @@ onMounted(async () => {
     if (event.payload === "ready" && previewPageActive) void startPreview();
     if (event.payload === "stopped" || event.payload === "error") {
       hasFrame.value = false;
+      clearPreviewStats();
       previewState.value = event.payload === "error" ? "error" : "idle";
     }
   });
   unlistenDeviceError = await listen<DeviceErrorEvent>("device_error", (event) => {
+    if (event.payload.scope === "register" && event.payload.message) {
+      message.error(event.payload.message);
+    }
     if (event.payload.scope === "capture" && event.payload.message) {
       previewError.value = event.payload.message;
     }
   });
-  unlistenSubscription = await listen<SubscriptionState>("subscription_state", (event) => {
+  unlistenSub = await listen<SubscriptionState>("subscription_state", (event) => {
     if (event.payload.kind in subscriptions) {
       subscriptions[event.payload.kind] = event.payload;
     }
+    void refreshRuntimeState();
   });
+  unlistenPlatformCommand = await listen<CmdEntry>("platform_command", scheduleRuntimeRefresh);
   const [runtime] = await Promise.all([reconcile(), refreshSources(false)]);
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
+  await refreshRuntimeState();
   await startPreview();
 });
 
@@ -503,6 +603,7 @@ onActivated(async () => {
   previewPageActive = true;
   const runtime = await reconcile();
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
+  await refreshRuntimeState();
   await startPreview();
 });
 
@@ -516,7 +617,9 @@ onUnmounted(() => {
   void session?.stop();
   unlistenCaptureState?.();
   unlistenDeviceError?.();
-  unlistenSubscription?.();
+  unlistenSub?.();
+  unlistenPlatformCommand?.();
+  if (runtimeRefreshTimer) clearTimeout(runtimeRefreshTimer);
 });
 </script>
 
@@ -543,21 +646,25 @@ onUnmounted(() => {
           <div class="preview-status" :class="previewState"><i />{{ previewStateText }}</div>
         </div>
 
-        <div class="preview-stage">
-          <canvas v-show="hasFrame" ref="canvasRef" aria-label="设备采集预览" />
-          <div v-if="!hasFrame" class="preview-cover">
-            <div class="cover-mark"><n-icon :size="42"><VideocamOutline /></n-icon></div>
-            <strong>{{ previewEmptyTitle }}</strong>
-            <span>{{ previewEmptyHint }}</span>
-            <n-button v-if="previewState === 'error' && captureState === 'ready'" size="small" type="primary" secondary @click="retryPreview">
-              重试预览
-            </n-button>
-          </div>
-          <div class="preview-overlay top-left"><i :class="{ on: previewState === 'playing' }" /> UVP-SIM</div>
-          <div class="preview-overlay bottom-row">
-            <span>{{ sourceSummary }}</span>
-            <span v-if="previewLatency !== null">{{ previewFps }} FPS · {{ previewLatency }} ms · 跳 {{ previewSkipped }}</span>
-            <span v-else>1280x720 · H.264</span>
+        <div class="preview-slot">
+          <div class="preview-stage">
+            <canvas v-show="hasFrame" ref="canvasRef" aria-label="设备采集预览" />
+            <div v-if="!hasFrame" class="preview-cover">
+              <div class="cover-mark"><n-icon :size="42"><VideocamOutline /></n-icon></div>
+              <strong>{{ previewEmptyTitle }}</strong>
+              <span>{{ previewEmptyHint }}</span>
+              <n-button v-if="previewState === 'error' && captureState === 'ready'" size="small" type="primary" secondary @click="retryPreview">
+                重试预览
+              </n-button>
+            </div>
+            <div class="preview-overlay top-left"><i :class="{ on: previewState === 'playing' }" /> UVP-SIM</div>
+            <div class="preview-overlay bottom-row">
+              <span>{{ sourceSummary }}</span>
+              <span v-if="previewWidth !== null && previewHeight !== null">
+                本地预览 {{ previewWidth }}×{{ previewHeight }} · {{ previewFps }} FPS · {{ previewLatency }} ms · 跳 {{ previewSkipped }}
+              </span>
+              <span v-else>本地预览待启动</span>
+            </div>
           </div>
         </div>
 
@@ -599,7 +706,6 @@ onUnmounted(() => {
             <button v-else-if="mediaMode === 'file'" type="button" class="file-source" :disabled="deviceLive" @click="pickVideoFile">
               {{ sourceSummary }}
             </button>
-            <span v-else class="source-empty">不发送媒体流</span>
           </div>
           <n-button quaternary circle size="small" :loading="sourceLoading" :disabled="deviceLive" title="刷新采集设备" @click="refreshSources()">
             <template #icon><n-icon><RefreshOutline /></n-icon></template>
@@ -629,11 +735,19 @@ onUnmounted(() => {
         </div>
 
         <div class="sip-profile-switcher">
+          <n-input
+            v-if="editing"
+            v-model:value="draft.name"
+            size="medium"
+            aria-label="配置名称"
+            placeholder="例如 本地平台"
+          />
           <n-select
+            v-else
             size="medium"
             :value="activeId"
             :options="sipProfileOptions"
-            :disabled="deviceLive || editing"
+            :disabled="deviceLive"
             aria-label="SIP 配置"
             @update:value="switchSipProfile"
           />
@@ -671,10 +785,6 @@ onUnmounted(() => {
         </div>
 
         <div class="config-grid">
-          <label v-if="editing" class="field wide">
-            <span>配置名称</span>
-            <n-input v-model:value="draft.name" size="medium" placeholder="例如 本地平台" />
-          </label>
           <label class="field wide">
             <span>服务器</span>
             <div class="host-port">
@@ -729,7 +839,7 @@ onUnmounted(() => {
         <div class="primary-actions">
           <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy || editing || (!deviceLive && !mediaSourceReady) || (!deviceLive && active?.transport === 'TCP')" @click="toggleRegistration">
             <template #icon><n-icon><RadioOutline /></n-icon></template>
-            {{ deviceLive ? "注销设备" : "注册设备" }}
+            {{ registrationActionLabel }}
           </n-button>
         </div>
 
@@ -767,6 +877,26 @@ onUnmounted(() => {
             <span><i />{{ subscriptions.PTZPosition.active ? "已订阅" : "未订阅" }}</span>
           </div>
         </div>
+
+        <section class="runtime-truth" aria-labelledby="runtime-truth-title">
+          <div class="runtime-head">
+            <div>
+              <span class="panel-kicker">DEVICE RUNTIME</span>
+              <h3 id="runtime-truth-title">设备状态真相</h3>
+            </div>
+            <small v-if="runtimeState">{{ runtimeUpdatedAt }}</small>
+          </div>
+          <div v-if="runtimeState" class="runtime-grid">
+            <div><span>布防状态</span><b :class="runtimeState.guarded ? 'on' : ''">{{ runtimeState.guarded ? "已布防" : "未布防" }}</b></div>
+            <div><span>报警状态</span><b :class="runtimeState.alarming ? 'alarm' : ''">{{ runtimeState.alarming ? "报警中" : "无报警" }}</b></div>
+            <div><span>报警订阅</span><b :class="subscriptions.Alarm.active ? 'on' : ''">{{ subscriptions.Alarm.active ? "平台已订阅" : "未订阅" }}</b></div>
+            <div><span>当前位置</span><b class="mono">{{ runtimeState.longitude.toFixed(4) }}, {{ runtimeState.latitude.toFixed(4) }}</b></div>
+            <div><span>最近变更</span><b class="mono">{{ runtimeState.last_change }}</b></div>
+            <div class="runtime-wide"><span>会话参数</span><b>{{ runtimeState.name || "未命名设备" }} · 注册 {{ runtimeState.expiration }}s · 心跳 {{ runtimeState.heartbeat_interval }}s × {{ runtimeState.heartbeat_count }}</b></div>
+            <div class="runtime-wide"><span>平台已应用配置</span><b>录像计划 {{ runtimeState.video_record_plan_type ?? "—" }} · 报警录像 {{ runtimeState.alarm_record_duration ?? "—" }}s · 遮挡 {{ runtimeState.picture_mask_enabled === 1 ? "开" : "关" }} · 镜像 {{ runtimeState.frame_mirror_mode ?? "—" }} · 报警上报 {{ runtimeState.alarm_report_enabled === 1 ? "开" : "关" }} · OSD {{ runtimeState.osd_show === 1 ? "开" : "关" }}</b></div>
+          </div>
+          <div v-else class="runtime-empty">{{ runtimeStateError || "无运行中设备" }}</div>
+        </section>
 
         <div class="config-foot">
           <n-icon :component="deviceIdValid && platformValid ? CheckmarkCircleOutline : AlertCircleOutline" />
@@ -839,7 +969,21 @@ onUnmounted(() => {
 .preview-status.starting i { background: var(--warning); }
 .preview-status.error i { background: var(--error); }
 
-.preview-stage { position: relative; min-height: 260px; overflow: hidden; border-radius: 6px; background: #0a1728; }
+.preview-slot {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  container-type: size;
+}
+.preview-stage {
+  position: relative;
+  width: min(100cqw, calc(100cqh * 16 / 9));
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #0a1728;
+}
 .preview-stage > img, .preview-stage > canvas { width: 100%; height: 100%; object-fit: contain; }
 .preview-cover { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; color: rgba(218, 230, 248, .68); text-align: center; }
 .preview-cover::before { content: ""; position: absolute; inset: 0; background: linear-gradient(rgba(93, 132, 183, .07) 1px, transparent 1px), linear-gradient(90deg, rgba(93, 132, 183, .07) 1px, transparent 1px); background-size: 42px 42px; mask-image: linear-gradient(to bottom, transparent, #000 24%, #000 76%, transparent); }
@@ -861,7 +1005,6 @@ onUnmounted(() => {
 .source-modes button:disabled { cursor: not-allowed; opacity: .55; }
 .source-picker { min-width: 0; }
 .file-source { width: 100%; height: 30px; overflow: hidden; padding: 0 9px; border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-secondary); background: #fff; cursor: pointer; font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
-.source-empty { display: block; color: var(--text-tertiary); font-size: 11px; }
 .source-feedback { overflow: hidden; color: var(--text-secondary); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 
 .config-actions { display: flex; gap: 4px; }
@@ -919,6 +1062,19 @@ onUnmounted(() => {
 .quick-card.action:disabled { cursor: not-allowed; color: var(--text-tertiary); }
 .quick-card.subscription.active { border-color: rgba(24, 160, 88, .38); color: var(--success); background: rgba(24, 160, 88, .07); }
 .subscription-dot { position: absolute; top: 7px; right: 7px; width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
+.runtime-truth { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-subtle); }
+.runtime-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.runtime-head h3 { margin: 1px 0 0; color: var(--text-primary); font-size: 13px; }
+.runtime-head small { color: var(--text-tertiary); font-size: 9px; white-space: nowrap; }
+.runtime-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 7px; }
+.runtime-grid > div { min-width: 0; padding: 7px 8px; border: 1px solid var(--border-default); border-radius: 7px; background: rgba(255,255,255,.48); }
+.runtime-grid span { display: block; margin-bottom: 2px; color: var(--text-tertiary); font-size: 9px; }
+.runtime-grid b { display: block; overflow: hidden; color: var(--text-secondary); font-size: 10px; font-weight: 600; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-grid b.on { color: var(--success); }
+.runtime-grid b.alarm { color: var(--error); }
+.runtime-grid .runtime-wide { grid-column: 1 / -1; }
+.runtime-grid .runtime-wide b { white-space: normal; }
+.runtime-empty { margin-top: 7px; padding: 11px; border: 1px dashed var(--border-default); border-radius: 7px; color: var(--text-tertiary); text-align: center; font-size: 10px; }
 .config-foot { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--text-tertiary); font-size: 10px; }
 
 @media (max-width: 1080px) {

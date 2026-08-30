@@ -1202,6 +1202,9 @@ pub struct CatalogItem {
     /// 父设备/目录 ID。
     #[serde(rename = "ParentID", skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// 所属业务分组 ID(GB/T 28181-2022 附录 J)。
+    #[serde(rename = "BusinessGroupID", skip_serializing_if = "Option::is_none")]
+    pub business_group_id: Option<String>,
     /// 注册/在线状态:ON / OFF。
     #[serde(rename = "Status")]
     pub status: String,
@@ -1232,9 +1235,9 @@ pub struct CatalogResponse {
     /// 通道总数。
     #[serde(rename = "SumNum")]
     pub sum_num: u32,
-    /// 通道列表容器。
-    #[serde(rename = "DeviceList")]
-    pub device_list: DeviceList,
+    /// 通道列表容器；无结果时按附录 M 省略。
+    #[serde(rename = "DeviceList", skip_serializing_if = "Option::is_none")]
+    pub device_list: Option<DeviceList>,
 }
 
 /// 目录通道列表容器(带 Num 属性)。
@@ -1257,8 +1260,42 @@ impl CatalogResponse {
             sn,
             device_id: device_id.into(),
             sum_num: num,
-            device_list: DeviceList { num, items },
+            device_list: (num > 0).then_some(DeviceList { num, items }),
         }
+    }
+
+    /// 按相同 SN 和总数构造多包目录应答；每包最多 10000 项。
+    pub fn pages(
+        device_id: impl Into<String>,
+        sn: u32,
+        items: Vec<CatalogItem>,
+        page_size: usize,
+    ) -> Vec<Self> {
+        let device_id = device_id.into();
+        let total = items.len() as u32;
+        if items.is_empty() {
+            return vec![CatalogResponse {
+                cmd_type: "Catalog".into(),
+                sn,
+                device_id,
+                sum_num: 0,
+                device_list: None,
+            }];
+        }
+        let page_size = page_size.clamp(1, 10_000);
+        items
+            .chunks(page_size)
+            .map(|chunk| CatalogResponse {
+                cmd_type: "Catalog".into(),
+                sn,
+                device_id: device_id.clone(),
+                sum_num: total,
+                device_list: Some(DeviceList {
+                    num: chunk.len() as u32,
+                    items: chunk.to_vec(),
+                }),
+            })
+            .collect()
     }
 
     /// 序列化为完整 XML。
@@ -1854,6 +1891,14 @@ pub struct CatalogNotifyItem {
     pub device_id: String,
     #[serde(rename = "Name")]
     pub name: String,
+    #[serde(rename = "CivilCode", skip_serializing_if = "Option::is_none")]
+    pub civil_code: Option<String>,
+    #[serde(rename = "Parental", skip_serializing_if = "Option::is_none")]
+    pub parental: Option<u8>,
+    #[serde(rename = "ParentID", skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(rename = "BusinessGroupID", skip_serializing_if = "Option::is_none")]
+    pub business_group_id: Option<String>,
     /// 变更事件:ON(上线)/OFF(离线)/ADD/DEL/UPDATE。
     #[serde(rename = "Event")]
     pub event: String,
@@ -1911,8 +1956,19 @@ impl CatalogNotify {
 /// 目录通道快照(用于增量 NOTIFY diff)。仅保留 diff 所需字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogSnapshot {
-    /// 通道 ID → (名称, 状态)。
-    pub channels: std::collections::BTreeMap<String, (String, String)>,
+    /// 通道 ID → 目录关系与状态。
+    pub channels: std::collections::BTreeMap<String, CatalogSnapshotEntry>,
+}
+
+/// 目录快照单项；层级字段参与 diff，确保节点移动能触发 UPDATE。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSnapshotEntry {
+    pub name: String,
+    pub status: String,
+    pub civil_code: Option<String>,
+    pub parental: Option<u8>,
+    pub parent_id: Option<String>,
+    pub business_group_id: Option<String>,
 }
 
 impl CatalogSnapshot {
@@ -1924,7 +1980,43 @@ impl CatalogSnapshot {
     {
         let channels = items
             .into_iter()
-            .map(|(id, name, status)| (id.into(), (name.into(), status.into())))
+            .map(|(id, name, status)| {
+                (
+                    id.into(),
+                    CatalogSnapshotEntry {
+                        name: name.into(),
+                        status: status.into(),
+                        civil_code: None,
+                        parental: None,
+                        parent_id: None,
+                        business_group_id: None,
+                    },
+                )
+            })
+            .collect();
+        CatalogSnapshot { channels }
+    }
+
+    /// 从完整目录节点构造快照，使节点移动和组织关系变更可被检测。
+    pub fn from_nodes<I>(items: I) -> Self
+    where
+        I: IntoIterator<Item = crate::id_codec::CatalogNode>,
+    {
+        let channels = items
+            .into_iter()
+            .map(|node| {
+                (
+                    node.id,
+                    CatalogSnapshotEntry {
+                        name: node.name,
+                        status: node.status,
+                        civil_code: node.civil_code,
+                        parental: Some(node.node_type.parental()),
+                        parent_id: Some(node.parent_id),
+                        business_group_id: node.business_group_id,
+                    },
+                )
+            })
             .collect();
         CatalogSnapshot { channels }
     }
@@ -1940,43 +2032,44 @@ impl CatalogSnapshot {
     pub fn diff(&self, next: &CatalogSnapshot) -> Vec<CatalogNotifyItem> {
         let mut items = Vec::new();
         // 新增 / 变更。
-        for (id, (name, status)) in &next.channels {
+        let to_item = |id: &str, entry: &CatalogSnapshotEntry, event: &str| CatalogNotifyItem {
+            device_id: id.to_string(),
+            name: entry.name.clone(),
+            civil_code: entry.civil_code.clone(),
+            parental: entry.parental,
+            parent_id: entry.parent_id.clone(),
+            business_group_id: entry.business_group_id.clone(),
+            event: event.to_string(),
+            status: entry.status.clone(),
+        };
+        for (id, entry) in &next.channels {
             match self.channels.get(id) {
-                None => items.push(CatalogNotifyItem {
-                    device_id: id.clone(),
-                    name: name.clone(),
-                    event: "ADD".into(),
-                    status: status.clone(),
-                }),
-                Some((old_name, old_status)) => {
-                    if old_name != name {
-                        items.push(CatalogNotifyItem {
-                            device_id: id.clone(),
-                            name: name.clone(),
-                            event: "UPDATE".into(),
-                            status: status.clone(),
-                        });
-                    } else if old_status != status {
-                        let on = status.eq_ignore_ascii_case("ON");
-                        items.push(CatalogNotifyItem {
-                            device_id: id.clone(),
-                            name: name.clone(),
-                            event: if on { "ON" } else { "OFF" }.into(),
-                            status: status.clone(),
-                        });
+                None => items.push(to_item(id, entry, "ADD")),
+                Some(old) => {
+                    let hierarchy_changed = old.name != entry.name
+                        || old.civil_code != entry.civil_code
+                        || old.parental != entry.parental
+                        || old.parent_id != entry.parent_id
+                        || old.business_group_id != entry.business_group_id;
+                    if hierarchy_changed {
+                        items.push(to_item(id, entry, "UPDATE"));
+                    } else if old.status != entry.status {
+                        let event = if entry.status.eq_ignore_ascii_case("ON") {
+                            "ON"
+                        } else {
+                            "OFF"
+                        };
+                        items.push(to_item(id, entry, event));
                     }
                 }
             }
         }
         // 删除。
-        for (id, (name, _)) in &self.channels {
+        for (id, entry) in &self.channels {
             if !next.channels.contains_key(id) {
-                items.push(CatalogNotifyItem {
-                    device_id: id.clone(),
-                    name: name.clone(),
-                    event: "DEL".into(),
-                    status: "OFF".into(),
-                });
+                let mut deleted = entry.clone();
+                deleted.status = "OFF".into();
+                items.push(to_item(id, &deleted, "DEL"));
             }
         }
         items
@@ -2393,6 +2486,7 @@ mod tests {
             civil_code: None,
             parental: Some(0),
             parent_id: Some("34020000001320000001".into()),
+            business_group_id: None,
             status: "ON".into(),
             security_level_code: Some("A".into()),
             ip_address: Some("10.0.0.2".into()),
@@ -2408,6 +2502,37 @@ mod tests {
         assert!(xml.contains("Num=\"1\""));
         assert!(xml.contains("<DeviceID>34020000001320000002</DeviceID>"));
         assert!(xml.contains("<Status>ON</Status>"));
+    }
+
+    #[test]
+    fn 目录应答空结果不携带列表且大目录分片保持总数() {
+        let empty = CatalogResponse::pages("34020000001110000001", 9, vec![], 100);
+        assert_eq!(empty.len(), 1);
+        let xml = empty[0].to_xml().unwrap();
+        assert!(xml.contains("<SumNum>0</SumNum>"));
+        assert!(!xml.contains("<DeviceList"));
+
+        let items = (0..205)
+            .map(|index| CatalogItem {
+                device_id: format!("3402000000132{index:07}"),
+                name: format!("通道-{index}"),
+                manufacturer: None,
+                model: None,
+                civil_code: None,
+                parental: Some(0),
+                parent_id: Some("34020000001110000001".into()),
+                business_group_id: None,
+                status: "ON".into(),
+                security_level_code: None,
+                ip_address: None,
+                port: None,
+            })
+            .collect();
+        let pages = CatalogResponse::pages("34020000001110000001", 10, items, 100);
+        assert_eq!(pages.len(), 3);
+        assert!(pages.iter().all(|page| page.sum_num == 205));
+        assert_eq!(pages[0].device_list.as_ref().unwrap().num, 100);
+        assert_eq!(pages[2].device_list.as_ref().unwrap().num, 5);
     }
 
     #[test]
@@ -2524,6 +2649,10 @@ mod tests {
             vec![CatalogNotifyItem {
                 device_id: "35020000001310000001".into(),
                 name: "Camera-1".into(),
+                civil_code: None,
+                parental: Some(0),
+                parent_id: None,
+                business_group_id: None,
                 event: "ON".into(),
                 status: "ON".into(),
             }],
@@ -2794,6 +2923,31 @@ mod tests {
         assert!(d2.iter().any(|i| i.device_id == "ch2" && i.event == "DEL"));
         // 无变化 → 空。
         assert!(old.diff(&old).is_empty());
+    }
+
+    #[test]
+    fn 目录节点移动触发携带新父节点的update() {
+        use crate::id_codec::{CatalogNode, CatalogNodeType};
+        let channel = CatalogNode::new(
+            "34020000001320000002",
+            CatalogNodeType::VideoChannel,
+            "相机",
+            "34020000002150000001",
+        );
+        let old = CatalogSnapshot::from_nodes([channel.clone()]);
+        let mut moved = channel;
+        moved.parent_id = "34020000002150000002".into();
+        let changes = old.diff(&CatalogSnapshot::from_nodes([moved]));
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].event, "UPDATE");
+        assert_eq!(
+            changes[0].parent_id.as_deref(),
+            Some("34020000002150000002")
+        );
+        let xml = CatalogNotify::new("34020000001320000001", 9, changes)
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<ParentID>34020000002150000002</ParentID>"));
     }
 
     #[test]

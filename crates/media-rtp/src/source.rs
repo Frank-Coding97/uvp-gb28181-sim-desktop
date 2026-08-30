@@ -371,7 +371,7 @@ pub fn start_shared_media(
             }
         }
         // LiveSource::drop 会等待并回收它持有的 camera/preview children。
-        // alive 只能在这个析构完成后变 false，CameraLease 才能安全转交。
+        // alive 只能在这个析构完成后变 false，后续采集才能安全启动。
         drop(source);
         producer
             .alive

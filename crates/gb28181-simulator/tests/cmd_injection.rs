@@ -67,20 +67,29 @@ async fn inject_and_collect(
     call_id: &str,
     body: &str,
 ) -> Vec<String> {
-    let mut reply = platform_tp.register_inbound("3402000000");
+    // MESSAGE 的目标 AOR 是平台国标 ID；平台域仅用于 SIP 域语义。
+    let mut reply = platform_tp.register_inbound("34020000002000000001");
     let incoming = Incoming {
         message: message("p1", call_id, body),
         from: platform_addr,
     };
-    sim.answer_inbound(device_tp, &incoming).await.unwrap();
+    let answer_task = tokio::spawn({
+        let sim = sim.clone();
+        let device_tp = device_tp.clone();
+        async move { sim.answer_inbound(&device_tp, &incoming).await }
+    });
     let mut bodies = Vec::new();
     // 应答为独立 MESSAGE(入 AOR 路由);等首条应答即可,500ms 兜底超时。
     if let Ok(Some(inc)) = tokio::time::timeout(Duration::from_millis(500), reply.recv()).await {
         if let SipMessage::Request(r) = inc.message {
             bodies.push(String::from_utf8_lossy(&r.body).to_string());
+            // 查询 Response 走完整 SIP 事务；平台逐片确认后设备才继续下一片。
+            let response = SipMessage::Response(gb28181_simulator::builder::response_ok(&r));
+            platform_tp.send_to(&response, inc.from).await.unwrap();
         }
     }
-    platform_tp.unregister_inbound("3402000000");
+    answer_task.await.unwrap().unwrap();
+    platform_tp.unregister_inbound("34020000002000000001");
     bodies
 }
 
