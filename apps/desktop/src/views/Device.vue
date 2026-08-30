@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 单设备联调控制台(UC-1),高保真对齐参考原型 frost-blue:
+// 设备联调控制台(UC-1),高保真对齐参考原型 frost-blue:
 // 顶部 4 指标卡 + 双栏配置卡(SIP 服务器 / 设备身份)。
 import { ref, onMounted, onUnmounted, onActivated, computed } from "vue";
 import { NButton, useMessage } from "naive-ui";
@@ -669,7 +669,7 @@ onActivated(reconcile);
 <template>
   <div class="page">
     <div class="page-header">
-      <div class="page-title">单设备联调</div>
+      <div class="page-title">设备联调</div>
       <div class="page-sub">把本机模拟成一台国标下级设备,注册到上级平台并实时观察平台交互</div>
     </div>
 

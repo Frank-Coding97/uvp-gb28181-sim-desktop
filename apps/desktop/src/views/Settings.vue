@@ -9,18 +9,18 @@ import {
   type NetworkSettings,
 } from "../platform";
 
-type SettingKey = "device" | "channels" | "media" | "osd" | "network" | "about";
+type SettingKey = "device" | "media" | "network" | "about";
+
+const props = defineProps<{ section: SettingKey }>();
 
 const settings = [
-  { key: "device" as const, icon: "◈", title: "设备", description: "设备身份、注册周期与出厂信息" },
-  { key: "channels" as const, icon: "▦", title: "设备通道", description: "当前通道与后续目录能力" },
-  { key: "media" as const, icon: "◉", title: "音视频", description: "有效帧率与后续编码能力" },
-  { key: "osd" as const, icon: "◇", title: "OSD 水印", description: "后续阶段能力预告" },
-  { key: "network" as const, icon: "⌁", title: "网络", description: "本机绑定与 SIP 追踪" },
+  { key: "device" as const, icon: "◈", title: "设备配置", description: "设备身份、注册周期与出厂信息" },
+  { key: "media" as const, icon: "◉", title: "音视频配置", description: "有效帧率、编码能力与 OSD 状态" },
+  { key: "network" as const, icon: "⌁", title: "网络配置", description: "本机绑定与 SIP 追踪" },
   { key: "about" as const, icon: "ⓘ", title: "关于", description: "版本、协议与开源信息" },
 ];
 
-const activeKey = ref<SettingKey>("device");
+const activeKey = computed(() => props.section);
 const saving = ref(false);
 const feedback = ref<{ ok: boolean; text: string } | null>(null);
 const { deviceLive, effectiveConfig } = useDevice();
@@ -31,7 +31,7 @@ const {
   resetDesktopConfig,
 } = usePlatform();
 const locked = computed(() => deviceLive.value || saving.value);
-const editableSection = computed(() => ["device", "channels", "media", "network"].includes(activeKey.value));
+const editableSection = computed(() => activeKey.value !== "about");
 
 const deviceDraft = ref<DeviceSettings | null>(null);
 const networkDraft = ref<NetworkSettings | null>(null);
@@ -58,16 +58,6 @@ const runtimeSummary = computed(() => {
     ? `${effective.local_host}:${effective.local_port} · ${effective.network.bind_mode}`
     : "设备未运行";
 });
-const deviceIdPrefix = computed(() => {
-  const id = (deviceDraft.value?.device_id ?? "").replace(/\D/g, "");
-  return id.length >= 17 ? id.slice(0, 17) : id.padEnd(17, "0");
-});
-
-function setActive(key: SettingKey) {
-  activeKey.value = key;
-  feedback.value = null;
-}
-
 function validateDraft(): string | null {
   const device = deviceDraft.value;
   const network = networkDraft.value;
@@ -131,8 +121,8 @@ function setBindMode(mode: BindMode) {
   <div class="settings-page">
     <div class="settings-header">
       <div>
-        <div class="page-title">设置</div>
-        <div class="page-sub">只保存模拟器当前真正支持并能从运行态回读的参数</div>
+        <div class="page-title">{{ activeSetting.title }}</div>
+        <div class="page-sub">{{ activeSetting.description }}</div>
       </div>
       <div class="settings-header-meta">
         <span class="platform-summary">{{ platformSummary }}</span>
@@ -140,23 +130,10 @@ function setBindMode(mode: BindMode) {
       </div>
     </div>
 
-    <div class="settings-layout">
-      <aside class="settings-nav glass-card">
-        <div class="nav-caption">设置项</div>
-        <button v-for="item in settings" :key="item.key" class="settings-nav-item" :class="{ active: activeKey === item.key }" type="button" @click="setActive(item.key)">
-          <span class="nav-icon">{{ item.icon }}</span>
-          <span class="nav-copy"><b>{{ item.title }}</b><small>{{ item.description }}</small></span>
-          <span class="nav-chevron">›</span>
-        </button>
-      </aside>
-
-      <main class="settings-main glass-card">
-        <div class="content-heading">
-          <div>
-            <div class="content-title"><span class="content-icon">{{ activeSetting.icon }}</span>{{ activeSetting.title }}</div>
-            <div class="content-sub">{{ activeSetting.description }}</div>
-          </div>
-          <div v-if="editableSection" class="content-actions">
+    <main class="settings-main glass-card">
+        <div v-if="editableSection" class="content-heading">
+          <div class="content-context"><span class="content-icon">{{ activeSetting.icon }}</span>模拟器有效配置</div>
+          <div class="content-actions">
             <button class="btn ghost" type="button" :disabled="locked" @click="resetCurrent">恢复全部默认</button>
             <button class="btn primary" type="button" :disabled="locked || !config" @click="saveCurrent">保存有效设置</button>
           </div>
@@ -190,17 +167,6 @@ function setBindMode(mode: BindMode) {
           </div>
         </section>
 
-        <section v-else-if="activeKey === 'channels' && deviceDraft" class="settings-section">
-          <div class="section-label">当前有效通道</div>
-          <div class="field-grid two">
-            <label class="field"><span>当前通道名称</span><input v-model="deviceDraft.channel_name" :disabled="locked" /></label>
-            <label class="field"><span>通道 ID（运行时生成）</span><input :value="`${deviceIdPrefix}13200000001`" disabled /></label>
-            <label class="field"><span>额外前置通道</span><input value="后续阶段" disabled /></label>
-            <label class="field"><span>报警通道</span><input value="后续阶段" disabled /></label>
-          </div>
-          <div class="info-note">本阶段仅当前通道名称真实生效；多通道目录与报警通道将在后续阶段接入。</div>
-        </section>
-
         <section v-else-if="activeKey === 'media' && deviceDraft" class="settings-section">
           <div class="section-label">当前有效媒体参数</div>
           <div class="field-grid two">
@@ -211,9 +177,7 @@ function setBindMode(mode: BindMode) {
             <label class="field"><span>音频采样率</span><input value="后续阶段" disabled /></label>
           </div>
           <div class="info-note">只有 FPS 会保存并影响下一次启动；其余控件显示但禁用，避免制造“保存成功”的假象。</div>
-        </section>
-
-        <section v-else-if="activeKey === 'osd'" class="settings-section">
+          <div class="section-label">OSD 水印</div>
           <div class="capability-card">
             <strong>OSD 尚未接入媒体引擎</strong>
             <span>时间戳、通道名、自定义水印及字号均属于后续阶段，本页不保存任何占位值。</span>
@@ -238,12 +202,15 @@ function setBindMode(mode: BindMode) {
           <div class="info-note">指定地址不可绑定时启动会明确失败，不会静默回退自动模式。</div>
         </section>
 
-        <section v-else class="settings-section about-section">
+        <section v-else-if="activeKey === 'about'" class="settings-section about-section">
           <div class="about-hero"><div class="about-logo">UVP</div><div><h2>GB28181 Sim</h2><p>国标设备模拟 · 压力测试</p></div></div>
           <div class="about-grid"><div><span>版本</span><strong>v0.1.2</strong></div><div><span>协议</span><strong>GB/T 28181-2016 / 2022</strong></div><div><span>桌面框架</span><strong>Tauri 2 + Vue 3</strong></div><div><span>配置真相源</span><strong>Rust ConfigStore</strong></div></div>
         </section>
-      </main>
-    </div>
+        <section v-else class="settings-section loading-section">
+          <strong>配置正在加载</strong>
+          <span>正在等待桌面端读取 Rust ConfigStore，请稍候。</span>
+        </section>
+    </main>
   </div>
 </template>
 
@@ -251,26 +218,16 @@ function setBindMode(mode: BindMode) {
 .settings-page { max-width: 1420px; min-height: 100%; }
 .settings-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .page-title { color: var(--text-primary); font-size: 24px; font-weight: 750; }
-.page-sub, .content-sub { margin-top: 5px; color: var(--text-tertiary); font-size: 13px; }
+.page-sub { margin-top: 5px; color: var(--text-tertiary); font-size: 13px; }
 .settings-header-meta { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .platform-summary { color: var(--text-secondary); }
 .lock-badge { padding: 5px 10px; border: 1px solid color-mix(in srgb, var(--success) 35%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--success) 10%, transparent); color: var(--success); }
 .lock-badge.running { border-color: color-mix(in srgb, var(--warning) 35%, transparent); background: color-mix(in srgb, var(--warning) 10%, transparent); color: var(--warning); }
-.settings-layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); align-items: start; gap: 16px; }
-.settings-nav, .settings-main { padding: 16px; }
-.nav-caption, .section-label { color: var(--text-tertiary); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.nav-caption { padding: 3px 10px 10px; }
-.settings-nav-item { display: flex; width: 100%; align-items: center; gap: 10px; padding: 12px 10px; border: 1px solid transparent; border-radius: 10px; background: transparent; color: var(--text-primary); text-align: left; cursor: pointer; }
-.settings-nav-item:hover { background: var(--bg-hover); }
-.settings-nav-item.active { border-color: var(--border-accent); background: var(--accent-dim); }
-.nav-icon, .content-icon { display: grid; width: 28px; height: 28px; flex: 0 0 auto; place-items: center; border-radius: 8px; background: var(--accent-pale); color: var(--accent); font-size: 20px; }
-.nav-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
-.nav-copy b { font-size: 13px; }
-.nav-copy small { overflow: hidden; color: var(--text-tertiary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.nav-chevron { color: var(--text-tertiary); font-size: 22px; }
+.settings-main { padding: 16px; }
+.section-label { color: var(--text-tertiary); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .content-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 2px 2px 17px; border-bottom: 1px solid var(--border-default); }
-.content-title { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 700; }
-.content-icon { width: 30px; height: 30px; font-size: 16px; }
+.content-context { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 13px; font-weight: 600; }
+.content-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: var(--accent-pale); color: var(--accent); font-size: 16px; }
 .content-actions { display: flex; flex: 0 0 auto; gap: 8px; }
 .btn { padding: 7px 14px; border: 1px solid var(--border-default); border-radius: 8px; cursor: pointer; font-size: 12px; }
 .btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
@@ -308,6 +265,8 @@ function setBindMode(mode: BindMode) {
 .about-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .about-grid div { display: flex; flex-direction: column; gap: 6px; padding: 13px; border: 1px solid var(--border-default); border-radius: 9px; background: rgba(255,255,255,.35); }
 .about-grid span { color: var(--text-tertiary); font-size: 11px; }
-@media (max-width: 980px) { .settings-layout { grid-template-columns: 1fr; } .settings-nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; } .nav-caption { grid-column: 1 / -1; } .settings-header { align-items: flex-start; flex-direction: column; } }
-@media (max-width: 680px) { .field-grid.two, .network-options, .about-grid { grid-template-columns: 1fr; } .settings-nav { grid-template-columns: 1fr; } .content-heading { align-items: flex-start; flex-direction: column; } }
+.loading-section { min-height: 180px; align-items: center; justify-content: center; color: var(--text-tertiary); }
+.loading-section strong { color: var(--text-primary); font-size: 15px; }
+@media (max-width: 980px) { .settings-header { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 680px) { .field-grid.two, .network-options, .about-grid { grid-template-columns: 1fr; } .content-heading { align-items: flex-start; flex-direction: column; } }
 </style>

@@ -1,16 +1,47 @@
 <script setup lang="ts">
-// 多通道目录管理页(FR-34):模板选择 + 目录树 CRUD。
-// 通道操作需设备已在「单设备联调」页启动。
+// 目录管理页(FR-34):基础通道配置 + 模板选择 + 目录树 CRUD。
+// 通道操作需设备已在「设备联调」页启动。
 // (OSD 是平台→设备的配置命令,展示在单设备页"OSD 设置(平台下发)",不在此页。)
-import { ref, onMounted, onActivated } from "vue";
+import { computed, h, onActivated, onMounted, ref, watch } from "vue";
 import {
   NButton, NSpace, NSelect, NDataTable, NModal, NForm, NFormItem, NInput,
   NTag, useDialog, useMessage, type DataTableColumns,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
+import { useDevice } from "../device";
+import { usePlatform } from "../platform";
 
 const message = useMessage();
 const dialog = useDialog();
+const { deviceLive } = useDevice();
+const { config, saveDesktopConfig } = usePlatform();
+const channelNameDraft = ref("");
+const generatedChannelId = computed(() => {
+  const id = (config.value?.device.device_id ?? "").replace(/\D/g, "");
+  return id.length >= 17 ? `${id.slice(0, 17)}132` : "配置尚未加载";
+});
+
+watch(config, (value) => {
+  channelNameDraft.value = value?.device.channel_name ?? "";
+}, { immediate: true });
+
+async function saveChannelConfig() {
+  if (!config.value || deviceLive.value) return;
+  const channelName = channelNameDraft.value.trim();
+  if (!channelName) {
+    message.warning("当前通道名称不能为空");
+    return;
+  }
+  try {
+    await saveDesktopConfig({
+      ...config.value,
+      device: { ...config.value.device, channel_name: channelName },
+    });
+    message.success("当前通道配置已保存");
+  } catch (cause) {
+    message.error(String(cause));
+  }
+}
 
 interface ChannelNode {
   id: string;
@@ -155,7 +186,6 @@ const columns: DataTableColumns<ChannelNode> = [
   },
 ];
 
-import { h } from "vue";
 onMounted(() => {
   refresh();
 });
@@ -165,8 +195,24 @@ onActivated(refresh);
 <template>
   <div class="page">
     <div class="page-header">
-      <div class="page-title">多通道目录</div>
-      <div class="page-sub">虚拟通道 CRUD + 目录模板;通道变更实时增量 NOTIFY 推送平台(需先在单设备页启动设备)</div>
+      <div class="page-title">目录管理</div>
+      <div class="page-sub">配置当前通道并管理目录模板；目录变更会向已订阅平台发送增量 NOTIFY</div>
+    </div>
+
+    <div class="glass-card channel-config">
+      <div>
+        <div class="section-title">当前通道配置</div>
+        <div class="section-hint">设备运行期间锁定，保存后在下次启动时生效</div>
+      </div>
+      <label class="channel-field">
+        <span>当前通道名称</span>
+        <n-input v-model:value="channelNameDraft" :disabled="deviceLive" placeholder="请输入通道名称" />
+      </label>
+      <label class="channel-field channel-id">
+        <span>通道 ID（运行时生成）</span>
+        <n-input :value="generatedChannelId" disabled />
+      </label>
+      <n-button type="primary" :disabled="deviceLive || !config" @click="saveChannelConfig">保存通道配置</n-button>
     </div>
 
     <div class="glass-card panel">
@@ -189,7 +235,7 @@ onActivated(refresh);
         :scroll-x="900"
         :row-key="(r: ChannelNode) => r.id"
       />
-      <div v-if="nodes.length === 0" class="empty">设备未启动或目录为空。请到「单设备联调」启动设备,或载入模板。</div>
+      <div v-if="nodes.length === 0" class="empty">设备未启动或目录为空。请到「设备联调」启动设备，或载入模板。</div>
     </div>
 
 
@@ -226,6 +272,9 @@ onActivated(refresh);
 .page-header { margin-bottom: 20px; }
 .page-title { font-size: 24px; font-weight: 700; color: var(--text-primary); }
 .page-sub { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; }
+.channel-config { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(180px, 1fr) minmax(250px, 1.25fr) auto; align-items: end; gap: 14px; margin-bottom: 16px; padding: 18px 20px; }
+.channel-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 12px; }
+.channel-id :deep(input) { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .panel { padding: 24px; }
 .label { color: var(--text-secondary); font-size: 13px; }
 .empty { color: var(--text-tertiary); font-size: 13px; margin-top: 12px; text-align: center; padding: 20px; }
@@ -251,4 +300,5 @@ onActivated(refresh);
 :deep(.n-data-table .n-data-table-empty) { background-color: transparent !important; }
 .section-title { font-size: 16px; font-weight: 600; color: var(--text-primary); }
 .section-hint { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
+@media (max-width: 1180px) { .channel-config { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

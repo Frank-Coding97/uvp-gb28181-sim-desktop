@@ -24,9 +24,13 @@ const router = createRouter({
     { path: "/channels",  component: Channels },
     // 压力测试(场景编排 + 实时监控已合并到一页)。
     { path: "/scenario",  component: Scenario },
-    { path: "/system",    component: System },     // 系统信息(日志等)
+    { path: "/device-settings",  component: Settings, props: { section: "device" } },
+    { path: "/media-settings",   component: Settings, props: { section: "media" } },
+    { path: "/network-settings", component: Settings, props: { section: "network" } },
+    { path: "/about",            component: Settings, props: { section: "about" } },
+    { path: "/system",    component: System },
     { path: "/camera-demo", component: CameraDemo },
-    { path: "/settings",  component: Settings },   // 桌面端设置工作台
+    { path: "/settings",  redirect: "/device-settings" }, // 旧设置入口兼容
     { path: "/monitor",   redirect: "/scenario" }, // 旧路由兼容,重定向到合并页
     { path: "/config",    redirect: "/device" },   // 平台配置已并入顶栏,旧路由重定向
   ],

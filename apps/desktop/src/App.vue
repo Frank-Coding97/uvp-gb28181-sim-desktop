@@ -15,8 +15,10 @@ import ServerOutline from "@vicons/ionicons5/es/ServerOutline.js";
 import PulseOutline from "@vicons/ionicons5/es/PulseOutline.js";
 import GitNetworkOutline from "@vicons/ionicons5/es/GitNetworkOutline.js";
 import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
-import VideocamOutline from "@vicons/ionicons5/es/VideocamOutline.js";
 import SettingsOutline from "@vicons/ionicons5/es/SettingsOutline.js";
+import VideocamOutline from "@vicons/ionicons5/es/VideocamOutline.js";
+import WifiOutline from "@vicons/ionicons5/es/WifiOutline.js";
+import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
 import { useDevice } from "./device";
@@ -30,13 +32,15 @@ function icon(comp: any) {
 }
 
 const menuOptions: MenuOption[] = [
-  { label: "首页",        key: "/dashboard", icon: icon(HomeOutline) },
-  { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
-  { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
-  { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
-  { label: "系统信息",   key: "/system",    icon: icon(TerminalOutline) },
-  { label: "视频采集demo", key: "/camera-demo", icon: icon(VideocamOutline) },
-  { label: "设置",       key: "/settings",  icon: icon(SettingsOutline) },
+  { label: "首页",       key: "/dashboard",        icon: icon(HomeOutline) },
+  { label: "设备联调",   key: "/device",           icon: icon(HardwareChipOutline) },
+  { label: "目录管理",   key: "/channels",         icon: icon(GitNetworkOutline) },
+  { label: "压力测试",   key: "/scenario",         icon: icon(PulseOutline) },
+  { label: "设备配置",   key: "/device-settings",  icon: icon(SettingsOutline) },
+  { label: "音视频配置", key: "/media-settings",   icon: icon(VideocamOutline) },
+  { label: "网络配置",   key: "/network-settings", icon: icon(WifiOutline) },
+  { label: "运行日志",   key: "/system",           icon: icon(TerminalOutline) },
+  { label: "关于",       key: "/about",            icon: icon(InformationCircleOutline) },
 ];
 
 // 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
@@ -247,6 +251,7 @@ const themeOverrides = {
                 </div>
               </div>
               <n-menu
+                class="sidebar-menu"
                 :value="activeKey"
                 :options="menuOptions"
                 :indent="18"
@@ -365,6 +370,7 @@ const themeOverrides = {
   margin-top: auto; padding: 14px 20px; font-size: 11px;
   color: var(--text-tertiary); border-top: 1px solid var(--border-default);
 }
+.sidebar-menu { flex: 1; min-height: 0; overflow-y: auto; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar {
   height: 48px; flex-shrink: 0;

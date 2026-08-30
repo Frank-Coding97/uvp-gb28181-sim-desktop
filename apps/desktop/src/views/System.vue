@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 系统信息页:目前含日志模块——配置日志级别 + 实时日志流。
+// 运行日志页:配置日志级别 + 实时日志流。
 import { ref, onMounted, onUnmounted, onActivated, computed, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -82,7 +82,7 @@ onUnmounted(() => unlisten?.());
 <template>
   <div class="page">
     <div class="page-header">
-      <div class="page-title">系统信息</div>
+      <div class="page-title">运行日志</div>
       <div class="page-sub">软件运行日志:配置级别、实时查看、按级别/关键字筛选</div>
     </div>
 
