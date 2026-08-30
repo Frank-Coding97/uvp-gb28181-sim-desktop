@@ -1,0 +1,84 @@
+# cargo-deny 配置:依赖供应链门禁。
+#
+# 之前 CI 只有 fmt / clippy / test / gitleaks —— **完全没有漏洞库比对**。
+# 一个带已知 RUSTSEC 公告的依赖可以一路进到发布产物里而没人知道。
+#
+# 四类检查各自要回答的问题:
+#   advisories  这些依赖里有没有已知漏洞 / 已被作者标记不再维护?
+#   licenses    有没有引进不允许的许可证(本项目 MIT,不能混入 GPL 传染)?
+#   bans        有没有同一个库被拉进多个不兼容版本(体积与行为不一致的常见来源)?
+#   sources     依赖是不是都来自 crates.io(而不是某个随手加的 git 仓库)?
+
+[graph]
+# 只检查我们真正会构建的目标。少了这一行,cargo-deny 会把所有平台的
+# 平台专属依赖(各家 windows-sys、各种 BSD 的 libc 绑定)全算进来,
+# 重复版本告警里绝大多数都是噪声。
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+version = 2
+# 未维护(unmaintained)只警告不拦:它不等于有漏洞,而 GUI 依赖树里
+# 几乎必然有几个处于这种状态的传递依赖。真漏洞(vulnerability)是硬失败。
+unmaintained = "workspace"
+yanked = "deny"
+# 豁免必须写清三件事:公告编号、为什么本项目不受影响、以及下次复查的触发条件。
+# 没有这三样的豁免等于把门禁关掉。
+ignore = [
+    # RUSTSEC-2025-0008 openh264 解码函数堆溢出。
+    #
+    # 不适用的理由(三条同时成立):
+    # 1. 本项目**只用编码器**(`openh264::encoder::Encoder`,见
+    #    media-rtp/src/source_live.rs 与 source.rs),从不调用任何解码 API,
+    #    而该公告针对的是解码路径;
+    # 2. 依赖树里的 `openh264-sys2` 是 0.6.6,公告原文明确
+    #    "if you rely on our `source` feature only, >=0.6.6 should be safe";
+    # 3. 我们启用的正是 `source` 特性(从内置 C 源码编译),不走 `libloading`
+    #    加载 Cisco 预编译 DLL —— 那条路径才需要升到 0.8.0 + DLL >=2.6.0。
+    #
+    # 复查触发条件:升级 openh264 依赖、或开始使用解码功能时,立刻重新评估。
+    { id = "RUSTSEC-2025-0008", reason = "只用编码器;openh264-sys2 0.6.6 + source 特性已含上游修复" },
+]
+
+[licenses]
+version = 2
+# 允许的许可证。本项目自身是 MIT。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",     # 文件级弱传染,不影响本项目的分发方式
+    "CDLA-Permissive-2.0",
+    "BSL-1.0",
+    "OpenSSL",
+]
+# 置信度阈值:低于此值的许可证识别结果会被当成"识别不出"而失败,
+# 迫使我们人工确认而不是让工具猜。
+confidence-threshold = 0.9
+
+[bans]
+# 同一个库的多个版本只警告:GUI 依赖树里这几乎无法完全消除,
+# 但仍然要看得见 —— 突然多出一份大库的第二个版本往往是误加依赖的信号。
+multiple-versions = "warn"
+wildcards = "deny"      # 禁止 `version = "*"`
+# 工作区内部的 `{ path = "../xxx" }` 依赖会被算成通配符,但它们不是供应链风险:
+# 代码就在同一个仓库里,不存在"某天从注册表拉到一个不同的版本"这回事。
+# 这条开关只放行 path 依赖,外部依赖写 `version = "*"` 仍然会被拦。
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# 不允许任何 git 依赖:git 依赖没有版本语义,也不进 crates.io 的公告体系。
+allow-git = []

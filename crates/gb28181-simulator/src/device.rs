@@ -44,6 +44,9 @@ async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    // URL 里可能带 userinfo(user:pass@host),authority 要先剥掉它再切端口,
+    // 否则 `a@evil.com:80` 会被当成 host=`a@evil.com`。
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
@@ -52,14 +55,30 @@ async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
         ),
         None => (authority.to_string(), 80),
     };
+    // ── 请求走私防护 ──
+    //
+    // `path`/`host` 来自平台下发的 `UploadURL`(A.2.3.1.9 SnapShotConfig),而
+    // quick-xml 会把 `&#13;&#10;` 解成真实的 CR LF。若原样插进请求行与 Host 头,
+    // 恶意平台就能在一次 PUT 里追加任意请求头、甚至第二个完整请求,
+    // 对上传目标(往往是内网可达的代理/缓存)做 HTTP 请求走私。
+    reject_header_unsafe("上传 URL 路径", path)?;
+    reject_header_unsafe("上传 URL 主机", &host)?;
+    // 端口白名单:即使目标被限定为公网 IP,任意端口仍构成一个公网端口扫描器
+    // (2xx / 连接失败 / 超时 三种结果可区分)。只放行常规 HTTP 端口。
+    if !UPLOAD_ALLOWED_PORTS.contains(&port) {
+        return Err(Error::Gb28181(format!(
+            "上传目标端口 {port} 不在允许范围({}),已拒绝",
+            UPLOAD_ALLOWED_PORTS
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        )));
+    }
     // 解析 + 校验:得到一个确定安全的目标地址,后续只用它。
     let target = resolve_safe_target(&host, port).await?;
 
-    let req = format!(
-        "PUT {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: image/jpeg\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    let req = build_put_request(path, &host, body.len());
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::net::TcpStream::connect(target),
@@ -76,12 +95,15 @@ async fn http_put_jpeg(url: &str, body: &[u8]) -> Result<()> {
         .await
         .map_err(|e| Error::Gb28181(format!("上传写入失败: {e}")))?;
 
-    let mut resp = Vec::new();
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stream.read_to_end(&mut resp),
-    )
-    .await;
+    // 响应只用来读状态行,**读满上限就停**:恶意上传目标 5 秒内足够灌进几百 MB,
+    // 压测上万设备同时上传会把这个放大成整机内存耗尽。8 KiB 装得下任何状态行 + 头部。
+    let mut resp = vec![0u8; MAX_UPLOAD_RESPONSE_BYTES];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut resp))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(0);
+    resp.truncate(read);
     // 解析状态行首行 "HTTP/1.1 2xx"。
     let head = String::from_utf8_lossy(&resp);
     let ok = head
@@ -133,6 +155,44 @@ async fn resolve_safe_target(host: &str, port: u16) -> Result<SocketAddr> {
     Ok(addrs[0])
 }
 
+/// 组装抓拍上传的 HTTP PUT 请求头。
+///
+/// 单独抽出来是为了能真的被测到 —— 之前测试里手抄了一份一模一样的格式串,
+/// 于是"实现改了但测试还绿"这种事完全可能发生。
+/// 调用方必须先用 [`reject_header_unsafe`] 校验过 `path`/`host`。
+fn build_put_request(path: &str, host: &str, body_len: usize) -> String {
+    format!(
+        "PUT {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: image/jpeg\r\n\
+         Content-Length: {body_len}\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// 抓拍上传允许的目标端口。
+///
+/// 443 也列进来是为了给"平台配了 https 端口但写了 http"这种常见配置错误一个
+/// 明确的连接失败而不是"端口被拒",诊断更直接。
+pub const UPLOAD_ALLOWED_PORTS: &[u16] = &[80, 443, 8080, 8081, 8000, 8443];
+
+/// 上传响应最多读这么多字节(只需要状态行)。
+pub const MAX_UPLOAD_RESPONSE_BYTES: usize = 8 * 1024;
+
+/// 拒绝会破坏 HTTP 报文结构的字符(CR/LF/NUL/空格)。
+///
+/// 这些字符出现在从 URL 切出来的 host 或 path 里,只可能是注入尝试 ——
+/// 合法路径里的空格应当已被 percent-encode。
+fn reject_header_unsafe(what: &str, value: &str) -> Result<()> {
+    if let Some(bad) = value
+        .chars()
+        .find(|c| matches!(c, '\r' | '\n' | '\0' | ' ' | '\t'))
+    {
+        return Err(Error::Gb28181(format!(
+            "{what}含非法字符 {:?},疑似 HTTP 请求注入,已拒绝",
+            bad
+        )));
+    }
+    Ok(())
+}
+
 /// 拒绝 SSRF 高危目标(环回/链路本地/私网/组播/未指定/唯一本地/文档段)。
 fn reject_unsafe_ip(ip: std::net::IpAddr) -> Result<()> {
     use std::net::IpAddr;
@@ -157,12 +217,31 @@ fn reject_unsafe_ip(ip: std::net::IpAddr) -> Result<()> {
                 || v6.is_unspecified()
                 // fc00::/7 唯一本地地址
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
-                // fe80::/10 链路本地
+                // fe80::/10 链路本地(fec0::/10 站点本地已废弃但仍可能被路由,一并拦)
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xffc0) == 0xfec0
                 // ::ffff:0:0/96 IPv4 映射地址:按其 IPv4 判定
                 || v6
                     .to_ipv4_mapped()
                     .is_some_and(|v4| reject_unsafe_ip(IpAddr::V4(v4)).is_err())
+                // 下面三段都能把一个内网 IPv4 包在 IPv6 地址里,必须拆开按 IPv4 判定,
+                // 否则 `::7f00:1` / `2002:7f00:1::` 这类写法可以直接绕过上面所有规则。
+                //
+                // ::/96 IPv4-**兼容**地址(与上面的"映射"是两回事:前缀是 96 个 0)
+                || (v6.segments()[..5].iter().all(|s| *s == 0)
+                    && v6.segments()[5] == 0
+                    && embedded_v4_unsafe(v6.segments()[6], v6.segments()[7]))
+                // 2002::/16 6to4:第 2~3 段就是被封装的 IPv4
+                || (v6.segments()[0] == 0x2002
+                    && embedded_v4_unsafe(v6.segments()[1], v6.segments()[2]))
+                // 2001:0::/32 Teredo:第 5~6 段是取反后的客户端 IPv4
+                || (v6.segments()[0] == 0x2001
+                    && v6.segments()[1] == 0
+                    && embedded_v4_unsafe(!v6.segments()[4], !v6.segments()[5]))
+                // 64:ff9b::/96 NAT64:末两段是被翻译的 IPv4
+                || (v6.segments()[0] == 0x0064
+                    && v6.segments()[1] == 0xff9b
+                    && embedded_v4_unsafe(v6.segments()[6], v6.segments()[7]))
         }
     };
     if bad {
@@ -171,15 +250,13 @@ fn reject_unsafe_ip(ip: std::net::IpAddr) -> Result<()> {
     Ok(())
 }
 
-/// 兼容旧调用点的按 host 判定入口(字面 IP 直接判定,域名交由
-/// [`resolve_safe_target`] 在解析后判定)。
-#[cfg_attr(not(test), allow(dead_code))]
-fn reject_ssrf(host: &str) -> Result<()> {
-    use std::net::IpAddr;
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return reject_unsafe_ip(ip);
-    }
-    Ok(())
+/// 把 IPv6 里内嵌的两段还原成 IPv4 后判定是否受限。
+///
+/// 6to4 / Teredo / NAT64 / IPv4-兼容地址都是"把一个 IPv4 塞进 IPv6"的形式,
+/// 只按 IPv6 规则看的话它们全是普通的全球单播地址。
+fn embedded_v4_unsafe(hi: u16, lo: u16) -> bool {
+    let v4 = std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+    reject_unsafe_ip(std::net::IpAddr::V4(v4)).is_err()
 }
 
 /// 单个虚拟设备的静态配置。压测时由 `scenario` 按序号批量生成。
@@ -190,7 +267,11 @@ pub struct DeviceConfig {
     /// SIP 认证用户名(通常等于 device_id)。
     pub username: String,
     /// SIP 认证密码。
-    pub password: String,
+    ///
+    /// 用 [`common::Secret`] 而不是 `String`:本结构派生了 `Debug`,
+    /// 裸 `String` 的话任何一处 `tracing::debug!(?config)` 都会把密码写进
+    /// 标准输出、日志文件、内存环形缓冲以及前端可拉取的 `get_recent_logs`。
+    pub password: common::Secret,
     /// 上级平台 SIP 服务地址 host。
     pub server_host: String,
     /// 上级平台 SIP 服务端口。
@@ -433,12 +514,43 @@ impl Default for ControlState {
     }
 }
 
+/// 子任务停止后等待它真正退出的上限。
+///
+/// 为什么要等而不是发完停止信号就走:发信号只保证"任务下次检查时会退出",
+/// 而推流任务一轮可能还在 send 一帧、收流任务可能正阻塞在 recv。
+/// 不等的话"设备已下线"这句日志之后,socket 与子进程可能还活着几百毫秒 ——
+/// 压测反复启停时这些残留会叠起来,而且**没有任何办法证明它收敛了**。
+const TASK_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 等一个子任务退出,超时则强制 abort。返回是否在超时前自行退出。
+///
+/// 超时不是错误:媒体发送可能卡在一个不响应的对端上。但它值得记一条日志 ——
+/// 频繁超时说明某条停止路径没有真正响应停止信号。
+async fn await_task(what: &str, task: tokio::task::JoinHandle<()>) -> bool {
+    match tokio::time::timeout(TASK_JOIN_TIMEOUT, task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) if error.is_cancelled() => true,
+        Ok(Err(error)) => {
+            tracing::warn!(what, %error, "子任务异常结束");
+            true
+        }
+        Err(_) => {
+            tracing::warn!(
+                what,
+                secs = TASK_JOIN_TIMEOUT.as_secs(),
+                "子任务未在超时内退出,已放弃等待"
+            );
+            false
+        }
+    }
+}
+
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
 struct PushSession {
     /// 唯一会话标记，防止已结束的旧任务清理后续新会话。
     marker: Arc<()>,
-    /// push_stream 任务。
-    _task: tokio::task::JoinHandle<()>,
+    /// push_stream 任务。下线时要 join 到它真的退出(见 `await_task`)。
+    task: tokio::task::JoinHandle<()>,
     /// 停止信号发送端(drop 或 send 均可触发停流)。
     stop_tx: tokio::sync::oneshot::Sender<()>,
     /// 回放控制(倍速/暂停),供会话内 INFO 调整推流。
@@ -463,8 +575,8 @@ struct AlarmSubscription {
 /// 一条活跃订阅(周期 NOTIFY 任务句柄 + 停止信号)。
 /// 丢弃或 send 停止信号即终止周期上报任务。
 struct Subscription {
-    /// 周期 NOTIFY 任务。
-    _task: tokio::task::JoinHandle<()>,
+    /// 周期 NOTIFY 任务。下线时要 join 到它真的退出(见 `await_task`)。
+    task: tokio::task::JoinHandle<()>,
     /// 停止信号发送端。
     stop_tx: tokio::sync::oneshot::Sender<()>,
 }
@@ -593,8 +705,8 @@ struct BroadcastSession {
     stats: Arc<media_rtp::RecvStats>,
     /// 停止信号:发送或丢弃即结束收流任务。
     stop_tx: tokio::sync::oneshot::Sender<()>,
-    /// 收流任务。
-    _task: tokio::task::JoinHandle<()>,
+    /// 收流任务。下线时要 join 到它真的退出(见 `await_task`)。
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// 当前推流会话的媒体遥测快照(发送侧统计 + 平台 RTCP 反馈)。
@@ -870,7 +982,8 @@ impl DeviceSimulator {
         local_port: u16,
     ) -> Result<DeviceState> {
         let dst = self.platform_addr()?;
-        let mut rx = transport.register(&self.ids.call_id);
+        // 路由用 RAII 守卫:注册期间被停止打断时也不会在路由表里留下孤条目。
+        let (mut rx, _route) = sip_core::RouteGuard::register(transport, &self.ids.call_id);
         let timing = sip_core::Timing::default();
         let want_expires = self.config.register_expires_secs.max(1);
 
@@ -917,7 +1030,7 @@ impl DeviceSimulator {
                     let auth = authorization(
                         &challenge,
                         &self.config.username,
-                        &self.config.password,
+                        self.config.password.expose_secret(),
                         "REGISTER",
                         &req1.uri,
                     );
@@ -1007,7 +1120,7 @@ impl DeviceSimulator {
         let want_expires = self.config.register_expires_secs.max(1);
         // 重定向后的注册用独立 Call-ID,避免与原事务路由冲突。
         let ids = DialogIds::new();
-        let mut rx = transport.register(&ids.call_id);
+        let (mut rx, _route) = sip_core::RouteGuard::register(transport, &ids.call_id);
         let timing = sip_core::Timing::default();
         let result = async {
             let cseq = self.next_cseq();
@@ -1037,7 +1150,7 @@ impl DeviceSimulator {
                     let auth = authorization(
                         &challenge,
                         &self.config.username,
-                        &self.config.password,
+                        self.config.password.expose_secret(),
                         "REGISTER",
                         &req.uri,
                     );
@@ -1083,7 +1196,6 @@ impl DeviceSimulator {
             }
         }
         .await;
-        transport.unregister(&ids.call_id);
         result
     }
 
@@ -1170,7 +1282,7 @@ impl DeviceSimulator {
             .map_err(|_| Error::Config("平台地址非法".into()))?;
         // 用独立 Call-ID,避免与运行中的注册路由冲突。
         let ids = DialogIds::new();
-        let mut rx = transport.register(&ids.call_id);
+        let (mut rx, _route) = sip_core::RouteGuard::register(transport, &ids.call_id);
         let timing = sip_core::Timing::default();
 
         // 首发 REGISTER Expires=0(无鉴权)。
@@ -1199,7 +1311,7 @@ impl DeviceSimulator {
                     let auth = authorization(
                         &challenge,
                         &self.config.username,
-                        &self.config.password,
+                        self.config.password.expose_secret(),
                         "REGISTER",
                         &req1.uri,
                     );
@@ -1227,7 +1339,6 @@ impl DeviceSimulator {
             }
         }
         .await;
-        transport.unregister(&ids.call_id);
         result
     }
 
@@ -1258,7 +1369,7 @@ impl DeviceSimulator {
             xml,
             transport.protocol(),
         );
-        let mut rx = transport.register(&ids.call_id);
+        let (mut rx, _route) = sip_core::RouteGuard::register(transport, &ids.call_id);
         let result = sip_core::client_transact(
             transport.as_ref(),
             dst,
@@ -1267,7 +1378,6 @@ impl DeviceSimulator {
             sip_core::Timing::default(),
         )
         .await;
-        transport.unregister(&ids.call_id);
         Ok(result?.status)
     }
 
@@ -1401,7 +1511,7 @@ impl DeviceSimulator {
                 &xml,
                 transport.protocol(),
             );
-            let mut rx = transport.register(&dialog.call_id);
+            let (mut rx, _route) = sip_core::RouteGuard::register(transport, &dialog.call_id);
             let result = sip_core::client_transact(
                 transport.as_ref(),
                 sub_dst,
@@ -1410,7 +1520,6 @@ impl DeviceSimulator {
                 sip_core::Timing::default(),
             )
             .await;
-            transport.unregister(&dialog.call_id);
             return Ok(result?.status);
         }
 
@@ -1518,7 +1627,7 @@ impl DeviceSimulator {
             transport.protocol(),
         );
         // 对话内 NOTIFY 的响应按订阅 Call-ID 回来;注册该路由收 200,收完注销。
-        let mut rx = transport.register(&dialog.call_id);
+        let (mut rx, _route) = sip_core::RouteGuard::register(transport, &dialog.call_id);
         let result = sip_core::client_transact(
             transport.as_ref(),
             dst,
@@ -1527,7 +1636,6 @@ impl DeviceSimulator {
             sip_core::Timing::default(),
         )
         .await;
-        transport.unregister(&dialog.call_id);
         Ok(result?.status)
     }
 
@@ -1623,7 +1731,7 @@ impl DeviceSimulator {
             &xml,
             transport.protocol(),
         );
-        let mut rx = transport.register(&dialog.call_id);
+        let (mut rx, _route) = sip_core::RouteGuard::register(transport, &dialog.call_id);
         let result = sip_core::client_transact(
             transport.as_ref(),
             dst,
@@ -1632,7 +1740,6 @@ impl DeviceSimulator {
             sip_core::Timing::default(),
         )
         .await;
-        transport.unregister(&dialog.call_id);
         result?;
         Ok(())
     }
@@ -1688,13 +1795,7 @@ impl DeviceSimulator {
 
         // 插入订阅表(替换旧任务:旧 stop_tx 被 drop → 旧任务在下次 select 时退出)。
         let mut subs = self.subscriptions.lock().await;
-        subs.insert(
-            "MobilePosition".to_string(),
-            Subscription {
-                _task: task,
-                stop_tx,
-            },
-        );
+        subs.insert("MobilePosition".to_string(), Subscription { task, stop_tx });
         tracing::info!(interval = secs, expires, "移动位置订阅已建立,开始周期上报");
     }
 
@@ -1726,13 +1827,7 @@ impl DeviceSimulator {
             }
         });
         let mut subs = self.subscriptions.lock().await;
-        subs.insert(
-            kind.to_string(),
-            Subscription {
-                _task: task,
-                stop_tx,
-            },
-        );
+        subs.insert(kind.to_string(), Subscription { task, stop_tx });
         self.observer
             .on_event(common::DeviceEvent::SubscriptionChanged {
                 kind: kind.to_string(),
@@ -1859,13 +1954,7 @@ impl DeviceSimulator {
         });
 
         let mut subs = self.subscriptions.lock().await;
-        subs.insert(
-            "PTZPosition".to_string(),
-            Subscription {
-                _task: task,
-                stop_tx,
-            },
-        );
+        subs.insert("PTZPosition".to_string(), Subscription { task, stop_tx });
         self.observer
             .on_event(common::DeviceEvent::SubscriptionChanged {
                 kind: "PTZPosition".into(),
@@ -1899,9 +1988,14 @@ impl DeviceSimulator {
 
     /// 停止全部活跃订阅(设备下线/重注册时调,避免残留周期任务)。
     async fn stop_subscriptions(&self) {
-        let mut subs = self.subscriptions.lock().await;
-        for (_, sub) in subs.drain() {
+        // 先把全部订阅摘出来再逐个等待:持锁 await 会挡住入站请求处理。
+        let drained: Vec<Subscription> = {
+            let mut subs = self.subscriptions.lock().await;
+            subs.drain().map(|(_, sub)| sub).collect()
+        };
+        for sub in drained {
             let _ = sub.stop_tx.send(());
+            await_task("周期 NOTIFY 订阅", sub.task).await;
         }
         *self.alarm_dialog.lock().await = None;
         *self.catalog_dialog.lock().await = None;
@@ -3302,7 +3396,7 @@ impl DeviceSimulator {
 
         let remote_uri = format!("sip:{}@{}", source_id, self.config.server_domain);
         let dialog = builder::OutboundDialog::new(remote_uri, self.next_cseq());
-        let mut rx = transport.register(&dialog.call_id);
+        let (mut rx, _route) = sip_core::RouteGuard::register(transport, &dialog.call_id);
         let req = builder::invite(
             &self.config,
             &dialog,
@@ -3326,12 +3420,10 @@ impl DeviceSimulator {
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                transport.unregister(&dialog.call_id);
                 return Err(e);
             }
         };
         if resp.status != 200 {
-            transport.unregister(&dialog.call_id);
             return Err(Error::Sip(format!(
                 "语音广播 INVITE 被拒:{} {}",
                 resp.status, resp.reason
@@ -3398,7 +3490,7 @@ impl DeviceSimulator {
             local_port,
             stats,
             stop_tx,
-            _task: task,
+            task,
         });
         self.observer
             .on_event(common::DeviceEvent::PlatformCommand {
@@ -3421,6 +3513,9 @@ impl DeviceSimulator {
             return false;
         };
         let _ = session.stop_tx.send(());
+        // 等收流任务真的退出再发 BYE:否则 BYE 之后收流端口还在,
+        // 平台如果继续推几个包会打到一个"已经不该存在"的端口上。
+        await_task("语音广播收流", session.task).await;
         transport.unregister(&session.dialog.call_id);
         // 设备主动挂断要发 BYE(附录 K a):否则平台侧那条媒体链路一直挂着。
         let bye = builder::bye_outbound(
@@ -3497,6 +3592,7 @@ impl DeviceSimulator {
         if matches {
             if let Some(session) = guard.take() {
                 let _ = session.stop_tx.send(());
+                await_task("语音广播收流", session.task).await;
                 tracing::info!(%call_id, "平台 BYE 结束语音广播会话");
             }
         }
@@ -4002,7 +4098,7 @@ impl DeviceSimulator {
             });
             *self.session.lock().await = Some(PushSession {
                 marker,
-                _task: task,
+                task,
                 stop_tx,
                 control,
                 is_history: platform_sdp.is_playback() || platform_sdp.is_download(),
@@ -4208,7 +4304,7 @@ impl DeviceSimulator {
         });
         *self.session.lock().await = Some(PushSession {
             marker,
-            _task: task,
+            task,
             stop_tx,
             control: media_rtp::PlaybackControl::new(),
             is_history: false,
@@ -4325,14 +4421,17 @@ impl DeviceSimulator {
     /// 挂着等流,直到它自己的丢流监测超时。
     async fn release_media_on_shutdown(self: &Arc<Self>, transport: &Arc<dyn SipTransport>) {
         // 点播/回放会话:设备是被叫,发反转的会话内 BYE。
-        let dialog = {
+        let taken = {
             let mut guard = self.session.lock().await;
             guard.take().map(|session| {
                 let _ = session.stop_tx.send(());
-                session.dialog
+                (session.dialog, session.task)
             })
         };
-        if let Some(dialog) = dialog {
+        if let Some((dialog, task)) = taken {
+            // 先等推流任务真的停下再发 BYE:否则 BYE 之后还可能飞出几个 RTP 包,
+            // 平台侧会看到"已挂断的会话仍在收流"。
+            await_task("推流会话", task).await;
             self.observer.on_event(common::DeviceEvent::StreamStop);
             self.notify_media_loss(transport, &dialog).await;
         }
@@ -4413,6 +4512,10 @@ impl DeviceSimulator {
         }
         aors.sort();
         aors.dedup();
+        // 保留一份注册清单:下线时必须**逐条**注销。
+        // 之前只注销了设备 ID,通道条目永久留在路由表里 ——
+        // 反复启停一台 16 通道 NVR,每轮多留一批(压测启停时更明显)。
+        let registered_aors = aors.clone();
         let mut inbound = transport.register_inbound_many(aors);
         let inbound_sim = self.clone();
         let inbound_tp = transport.clone();
@@ -4432,9 +4535,33 @@ impl DeviceSimulator {
         let backoff_base = Duration::from_secs(1);
         let backoff_max = Duration::from_secs(self.config.register_retry_max_secs.max(1));
         let mut backoff = backoff_base;
-        while (self.register(&transport, &local_host, local_port).await).is_err() {
+        loop {
+            // **注册本身也必须能被停止打断**。之前只有"退避等待"在 select 里,
+            // 而 `register()` 内部是一次完整的 SIP 客户端事务:平台不可达时会按
+            // Timer A 重传直到 Timer B(约 32 秒)才返回 Err。于是用户点"停止"后
+            // 界面要僵住半分钟,压测批量停止更是逐台叠加。
+            let registered = tokio::select! {
+                _ = &mut shutdown => None,
+                r = self.register(&transport, &local_host, local_port) => Some(r),
+            };
+            match registered {
+                // 注册成功,进入心跳主循环。
+                Some(Ok(_)) => break,
+                Some(Err(_)) => {}
+                None => {
+                    // 注册进行中被要求停止:这条早退路径以前既不注销路由也不清理,
+                    // 于是"启动失败后重试"会一路累积 AOR 条目。
+                    inbound_task.abort();
+                    transport.unregister_inbound_many(&registered_aors);
+                    return;
+                }
+            }
             tokio::select! {
-                _ = &mut shutdown => { inbound_task.abort(); return; }
+                _ = &mut shutdown => {
+                    inbound_task.abort();
+                    transport.unregister_inbound_many(&registered_aors);
+                    return;
+                }
                 _ = tokio::time::sleep(backoff) => {
                     backoff = (backoff * 2).min(backoff_max);
                 }
@@ -4518,7 +4645,14 @@ impl DeviceSimulator {
         } else {
             tracing::info!(device=%self.config.device_id, "已向平台注销");
         }
-        transport.unregister_inbound(self.config.device_id.as_str());
+        transport.unregister_inbound_many(&registered_aors);
+        let (txn_routes, aor_routes) = transport.route_counts();
+        tracing::debug!(
+            device = %self.config.device_id,
+            txn_routes,
+            aor_routes,
+            "设备已下线,路由已注销"
+        );
     }
 }
 
@@ -5109,24 +5243,100 @@ mod tests {
         assert!(precise.contains("<Zoom>1.00</Zoom>"));
     }
 
+    /// 测试辅助:按字面 IP 判定(域名交由 `resolve_safe_target` 在解析后判定)。
+    fn ssrf_ip(host: &str) -> Result<()> {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => reject_unsafe_ip(ip),
+            Err(_) => Ok(()),
+        }
+    }
+
     #[test]
     fn ssrf_拒绝受限地址() {
-        assert!(reject_ssrf("127.0.0.1").is_err());
-        assert!(reject_ssrf("169.254.1.1").is_err());
-        assert!(reject_ssrf("192.168.1.10").is_err());
-        assert!(reject_ssrf("10.0.0.1").is_err());
-        assert!(reject_ssrf("224.0.0.1").is_err());
+        assert!(ssrf_ip("127.0.0.1").is_err());
+        assert!(ssrf_ip("169.254.1.1").is_err());
+        assert!(ssrf_ip("192.168.1.10").is_err());
+        assert!(ssrf_ip("10.0.0.1").is_err());
+        assert!(ssrf_ip("224.0.0.1").is_err());
         // 云元数据端点必须被拒(169.254.169.254 属链路本地)。
-        assert!(reject_ssrf("169.254.169.254").is_err());
+        assert!(ssrf_ip("169.254.169.254").is_err());
         // 运营商级 NAT(100.64.0.0/10)与文档段(203.0.113.0/24)同样拒绝。
-        assert!(reject_ssrf("100.64.0.1").is_err());
-        assert!(reject_ssrf("203.0.113.9").is_err());
+        assert!(ssrf_ip("100.64.0.1").is_err());
+        assert!(ssrf_ip("203.0.113.9").is_err());
         // IPv6 唯一本地与链路本地也拒绝。
-        assert!(reject_ssrf("fd00::1").is_err());
-        assert!(reject_ssrf("fe80::1").is_err());
+        assert!(ssrf_ip("fd00::1").is_err());
+        assert!(ssrf_ip("fe80::1").is_err());
         // 真正的公网 IP 放行;域名留给解析后判定(见 resolve_safe_target)。
-        assert!(reject_ssrf("8.8.8.8").is_ok());
-        assert!(reject_ssrf("upload.example.com").is_ok());
+        assert!(ssrf_ip("8.8.8.8").is_ok());
+        assert!(ssrf_ip("upload.example.com").is_ok());
+    }
+
+    #[test]
+    fn ssrf_ipv6内嵌的内网v4也要拦() {
+        // 这几种写法都是"把一个 IPv4 塞进 IPv6",只按 IPv6 规则看的话
+        // 它们全是普通全球单播地址,会被放行 —— 于是 SSRF 防护形同虚设。
+        //
+        // ::/96 IPv4-兼容地址:::127.0.0.1
+        assert!(ssrf_ip("::7f00:1").is_err(), "IPv4 兼容地址里的环回");
+        assert!(
+            ssrf_ip("::c0a8:1").is_err(),
+            "IPv4 兼容地址里的 192.168.0.1"
+        );
+        // 6to4:2002:<v4>::/48
+        assert!(
+            ssrf_ip("2002:a9fe:a9fe::1").is_err(),
+            "6to4 包裹云元数据地址"
+        );
+        assert!(
+            ssrf_ip("2002:c0a8:101::1").is_err(),
+            "6to4 包裹 192.168.1.1"
+        );
+        // NAT64:64:ff9b::<v4>
+        assert!(ssrf_ip("64:ff9b::a00:1").is_err(), "NAT64 包裹 10.0.0.1");
+        // fec0::/10 站点本地(已废弃但仍可能被路由)
+        assert!(ssrf_ip("fec0::1").is_err());
+        // 反例:6to4 包裹一个公网 IPv4 应放行,别把规则做成"凡 2002:: 全拒"。
+        assert!(ssrf_ip("2002:0808:0808::1").is_ok(), "6to4 包裹 8.8.8.8");
+        // 普通公网 IPv6 照常放行。
+        assert!(ssrf_ip("2400:3200::1").is_ok());
+    }
+
+    #[test]
+    fn 上传url的crlf注入被拒绝() {
+        // quick-xml 会把 &#13;&#10; 解成真实 CR LF,若原样插进请求行,
+        // 恶意平台就能在一次 PUT 里追加请求头甚至第二个完整请求(HTTP 请求走私)。
+        let err = reject_header_unsafe("路径", "/a\r\nX-Injected: 1")
+            .expect_err("含 CRLF 的路径必须拒绝");
+        assert!(err.to_string().contains("请求注入"), "实际: {err}");
+        assert!(reject_header_unsafe("主机", "evil\ncom").is_err());
+        assert!(
+            reject_header_unsafe("路径", "/a b").is_err(),
+            "裸空格会截断请求行"
+        );
+        assert!(reject_header_unsafe("路径", "/a\tb").is_err());
+        assert!(reject_header_unsafe("路径", "/a\0b").is_err());
+        // 正常路径(含 percent-encode 的空格与查询串)放行。
+        assert!(reject_header_unsafe("路径", "/upload/snap%20001.jpg?sn=3").is_ok());
+        assert!(reject_header_unsafe("主机", "upload.example.com").is_ok());
+    }
+
+    #[tokio::test]
+    async fn 上传拒绝非常规端口与注入路径() {
+        // 端口不在白名单:任意端口 = 一个公网端口扫描器。
+        let err = http_put_jpeg("http://8.8.8.8:22/x.jpg", b"x")
+            .await
+            .expect_err("22 端口应被拒");
+        assert!(err.to_string().contains("不在允许范围"), "实际: {err}");
+        // 路径注入在连接之前就被拦下(所以用一个不可达地址也能测)。
+        let err = http_put_jpeg("http://8.8.8.8:80/a\r\nHost: evil\r\n\r\nGET /x", b"x")
+            .await
+            .expect_err("CRLF 路径应被拒");
+        assert!(err.to_string().contains("请求注入"), "实际: {err}");
+        // userinfo 不能用来伪装 host。
+        let err = http_put_jpeg("http://8.8.8.8@127.0.0.1:80/x.jpg", b"x")
+            .await
+            .expect_err("剥掉 userinfo 后是环回地址,应被拒");
+        assert!(err.to_string().contains("受限地址"), "实际: {err}");
     }
 
     #[tokio::test]
@@ -5145,12 +5355,11 @@ mod tests {
                 .unwrap();
             req
         });
-        // http_put_jpeg 对 127.0.0.1 会被 SSRF 拒绝(安全设计),此处直接建连验证 PUT 报文格式与 2xx。
+        // http_put_jpeg 对 127.0.0.1 会被 SSRF 拒绝(安全设计),所以这里用被测函数
+        // **真正生成**的请求头去打桩服务,而不是在测试里手抄一份格式串 ——
+        // 手抄的那份不会随实现变化,改坏了也照样绿。
         let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xD9];
-        let head = format!(
-            "PUT /snap.jpg HTTP/1.1\r\nHost: {addr}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            jpeg.len()
-        );
+        let head = build_put_request("/snap.jpg", &addr.to_string(), jpeg.len());
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         c.write_all(head.as_bytes()).await.unwrap();
         c.write_all(jpeg).await.unwrap();
@@ -5161,6 +5370,10 @@ mod tests {
         let req = srv.await.unwrap();
         assert!(req.starts_with("PUT /snap.jpg HTTP/1.1"));
         assert!(req.contains("Content-Type: image/jpeg"));
+        assert!(req.contains("Content-Length: 4"));
+        assert!(req.contains("Connection: close"));
+        // 头部与正文之间必须有空行(正文是第二次 write_all 发的,不一定和头部同一个 TCP 读到)。
+        assert!(head.ends_with("\r\n\r\n"), "头部必须以空行结束");
 
         // 且 http_put_jpeg 对环回目标必须拒绝(SSRF 防护生效)。
         assert!(http_put_jpeg(&format!("http://{addr}/x.jpg"), jpeg)
@@ -5466,7 +5679,7 @@ mod tests {
         });
         *sim.session.lock().await = Some(PushSession {
             marker: Arc::new(()),
-            _task: task,
+            task,
             stop_tx,
             control: control.clone(),
             is_history: false,

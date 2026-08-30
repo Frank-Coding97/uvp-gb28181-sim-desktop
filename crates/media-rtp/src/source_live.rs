@@ -937,8 +937,8 @@ impl LiveSource {
         // 但"日志完全看不到"是不可接受的:失败时只能报一句"stopped unexpectedly"。
         // 用 ffmpeg 自带的 FFREPORT 把日志写到文件,既不占 stderr 也保住了诊断。
         let report_path = if audio_index.is_some() {
-            let path = std::env::temp_dir().join(format!(
-                "uvp-ffmpeg-camera-{video_index}-{}.log",
+            let path = crate::source::work_dir().join(format!(
+                "ffmpeg-camera-{video_index}-{}.log",
                 std::process::id()
             ));
             let _ = std::fs::remove_file(&path);

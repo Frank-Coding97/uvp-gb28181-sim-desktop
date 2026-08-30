@@ -89,26 +89,9 @@ impl Orchestrator {
     /// 聚合全部传输分片的统计。
     pub fn transport_stats(&self) -> sip_core::TransportStatsSnapshot {
         let guard = self.transport_stats.lock();
-        let mut total = sip_core::TransportStatsSnapshot {
-            received: 0,
-            parse_errors: 0,
-            rejected_source: 0,
-            dropped_queue_full: 0,
-            unrouted: 0,
-            sent: 0,
-            send_errors: 0,
-            oversized_sent: 0,
-        };
+        let mut total = sip_core::TransportStatsSnapshot::default();
         for stats in guard.iter() {
-            let s = stats.snapshot();
-            total.received += s.received;
-            total.parse_errors += s.parse_errors;
-            total.rejected_source += s.rejected_source;
-            total.dropped_queue_full += s.dropped_queue_full;
-            total.unrouted += s.unrouted;
-            total.sent += s.sent;
-            total.send_errors += s.send_errors;
-            total.oversized_sent += s.oversized_sent;
+            total.merge(&stats.snapshot());
         }
         total
     }

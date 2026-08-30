@@ -3,7 +3,6 @@
 // 组件只做渲染与提示,业务逻辑集中在这里(URI 组装/校验的纯函数在 ../lib/liveSource.ts)。
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   DEFAULT_SCREEN_PROFILE,
   SCREEN_RESOLUTIONS,
@@ -216,16 +215,17 @@ function setMediaMode(mode: MediaMode) {
   persistForm();
 }
 
-/** 选择本地 H.264/H.265/容器文件作视频源(FR-8:C 档真实码流)。 */
+/**
+ * 选择本地 H.264/H.265/容器文件作视频源(FR-8:C 档真实码流)。
+ *
+ * 对话框由 **Rust 侧**弹出(命令 `pick_video_source`)而不是前端调 plugin-dialog:
+ * asset 协议的预览授权必须绑定在"用户真的选了这个文件"这件事上。若由前端选完再让
+ * Rust 放行一个前端传过来的路径,任何能执行 JS 的途径都能凭空换取任意文件读取能力。
+ * 现在授权与选择在同一次 Rust 调用里完成,前端只拿到结果。
+ */
 async function pickVideoSource(): Promise<PickResult> {
   try {
-    const picked = await openDialog({
-      multiple: false,
-      directory: false,
-      filters: [
-        { name: "视频", extensions: ["h264", "264", "h265", "hevc", "mp4", "flv", "mkv", "mov"] },
-      ],
-    });
+    const picked = await invoke<string | null>("pick_video_source");
     if (typeof picked !== "string") return { ok: true, path: null };
     mediaMode.value = "file";
     form.value.video_source = picked;

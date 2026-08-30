@@ -1,8 +1,11 @@
 <script setup lang="ts">
-// 系统信息页:目前含日志模块——配置日志级别 + 实时日志流。
+// 系统信息页:日志模块(级别 + 实时流)+ 诊断包导出。
 import { ref, onMounted, onUnmounted, onActivated, computed, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useMessage } from "naive-ui";
+
+const message = useMessage();
 
 interface LogLine { ts_ms: number; level: string; target: string; message: string; }
 /** 后端每 100ms 聚合一次推来的日志批。`dropped` 是因队列满被丢弃的条数。 */
@@ -40,6 +43,30 @@ function fmtTs(ms: number): string {
 }
 function levelClass(lv: string): string {
   return "lv-" + lv.toLowerCase();
+}
+
+/** 诊断包导出中(防重复点击:打包要读几 MB 日志并压缩)。 */
+const exporting = ref(false);
+/** 最近一次导出的诊断包路径。 */
+const lastBundle = ref("");
+
+/**
+ * 导出诊断包(日志 + 运行环境快照)。
+ *
+ * 与压测报告分开:报告回答"这次压测结果如何",诊断包回答"这台机器上到底发生了什么"。
+ * 提示里刻意给出完整路径且不自动消失 —— 用户接下来要去找这个文件。
+ */
+async function exportDiagnostics() {
+  if (exporting.value) return;
+  exporting.value = true;
+  try {
+    lastBundle.value = await invoke<string>("export_diagnostics");
+    message.success(`诊断包已导出:${lastBundle.value}`, { duration: 8000, closable: true });
+  } catch (e) {
+    message.error(`诊断包导出失败:${String(e)}`, { duration: 0, closable: true });
+  } finally {
+    exporting.value = false;
+  }
 }
 
 async function applyLevel(lv: string) {
@@ -120,8 +147,15 @@ onUnmounted(() => unlisten?.());
         <div class="ctl-right">
           <label class="ck"><input type="checkbox" v-model="autoScroll" /> 自动滚动</label>
           <label class="ck"><input type="checkbox" v-model="paused" /> 暂停</label>
-          <button class="mini-btn" @click="refreshHistory">刷新</button>
-          <button class="mini-btn" @click="clearLogs">清空</button>
+          <button type="button" class="mini-btn" @click="refreshHistory">刷新</button>
+          <button type="button" class="mini-btn" @click="clearLogs">清空</button>
+          <button
+            type="button"
+            class="mini-btn primary"
+            :disabled="exporting"
+            :aria-busy="exporting"
+            @click="exportDiagnostics"
+          >{{ exporting ? '打包中…' : '导出诊断包' }}</button>
         </div>
       </div>
 
@@ -141,6 +175,11 @@ onUnmounted(() => unlisten?.());
           · 已丢弃 {{ droppedTotal }} 条(日志产生速率超过推送上限,降低级别可减少丢弃)
         </span>
       </div>
+      <p class="log-hint">
+        日志同时滚动落盘(单文件 16 MB × 保留 8 个),
+        「导出诊断包」会把日志与运行环境打成一个 zip,可直接发给技术支持。
+        <span v-if="lastBundle" class="log-bundle" :title="lastBundle">最近导出:{{ lastBundle }}</span>
+      </p>
     </div>
   </div>
 </template>
@@ -172,7 +211,17 @@ onUnmounted(() => unlisten?.());
   border: 1px solid var(--border-default); background: var(--bg-elevated);
   border-radius: 4px; padding: 2px 8px; font-size: 11px; color: var(--text-secondary); cursor: pointer; height: 24px;
 }
-.mini-btn:hover { border-color: var(--accent); color: var(--accent); }
+.mini-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.mini-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.mini-btn.primary { border-color: var(--accent); color: var(--accent); }
+.log-hint {
+  margin: 6px 0 0; font-size: 11px; line-height: 1.55; color: var(--text-tertiary);
+}
+.log-bundle {
+  display: block; margin-top: 2px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .log-box {
   height: 480px; overflow-y: auto; border-radius: var(--radius-xs);
   background: rgba(15,23,42,0.03); border: 1px solid var(--border-default);

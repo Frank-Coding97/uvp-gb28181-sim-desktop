@@ -4,9 +4,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
+# 凭据擦除:volatile 写 + 编译器屏障,手写循环在 release 下会被优化掉。
+# 该 crate 已在依赖树中(keyring 的 crypto-rust 后端),不新增传递依赖。
+zeroize = { version = "1.9", default-features = false }
+
+[dev-dependencies]
+serde_json.workspace = true

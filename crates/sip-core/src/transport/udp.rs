@@ -13,7 +13,7 @@ use common::{Error, Result};
 use crate::message::SipMessage;
 
 use super::{
-    Incoming, Router, SendFuture, SipTransport, TraceDir, TraceObserver, TransportStats,
+    Incoming, Router, SendFuture, Shutdown, SipTransport, TraceDir, TraceObserver, TransportStats,
     DEFAULT_SOCKET_BUFFER, UDP_SAFE_MTU,
 };
 
@@ -25,8 +25,23 @@ use super::{
 /// 3. 每台设备用其 Call-ID 调 [`SipTransport::register`] 拿到接收端 `Receiver`。
 /// 4. 发送用 [`SipTransport::send_to`];接收循环把消息按路由投递到对应队列。
 pub struct UdpTransport {
-    socket: Arc<UdpSocket>,
+    /// socket + 路由 + 关停信号。**接收循环只持有这个 core,不持有 `UdpTransport`** ——
+    /// 否则循环会把传输对象钉死在内存里,socket 永不关闭(见 `SipTransport::shutdown` 文档)。
+    core: Arc<UdpCore>,
+}
+
+/// 接收循环与发送路径共享的内部状态。
+struct UdpCore {
+    socket: UdpSocket,
     router: Router,
+    shutdown: Shutdown,
+}
+
+impl Drop for UdpTransport {
+    fn drop(&mut self) {
+        // 最后一个 Arc<UdpTransport> 消失即关停:调用方忘了显式 shutdown 也不会泄漏。
+        self.core.shutdown.trigger();
+    }
 }
 
 impl UdpTransport {
@@ -40,38 +55,61 @@ impl UdpTransport {
     pub async fn bind_with_buffer(local: &str, buffer_bytes: usize) -> Result<Arc<Self>> {
         let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
         super::udp::apply_socket_buffers(&socket, buffer_bytes);
-        let transport = Arc::new(UdpTransport {
-            socket: Arc::new(socket),
+        let core = Arc::new(UdpCore {
+            socket,
             router: Router::new(),
+            shutdown: Shutdown::new(),
         });
-        transport.clone().spawn_recv_loop();
-        Ok(transport)
+        spawn_recv_loop(Arc::clone(&core));
+        Ok(Arc::new(UdpTransport { core }))
     }
 
-    /// 启动后台接收循环:收包 → 来源校验 → 解析 → 分发。
-    fn spawn_recv_loop(self: Arc<Self>) {
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                match self.socket.recv_from(&mut buf).await {
-                    Ok((n, from)) => {
-                        if !self.router.source_allowed(from) {
-                            self.router.note_rejected_source(from);
-                            continue;
-                        }
-                        match SipMessage::parse(&buf[..n]) {
-                            Ok(message) => self.router.dispatch(Incoming { message, from }),
-                            Err(e) => self.router.note_parse_error(from, &e),
-                        }
+    /// 本次传输是否已关停。
+    pub fn is_closed(&self) -> bool {
+        self.core.shutdown.is_closed()
+    }
+}
+
+/// 后台接收循环:收包 → 来源校验 → 解析 → 分发,直到关停或 socket 出错。
+///
+/// 参数是 `Arc<UdpCore>` 而不是 `Arc<UdpTransport>`:循环退出后这个 Arc 随任务一起
+/// 释放,socket 才真的关掉。关停信号是唯一的正常退出路径。
+fn spawn_recv_loop(core: Arc<UdpCore>) {
+    tokio::spawn(async move {
+        let mut stop = core.shutdown.subscribe();
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let received = tokio::select! {
+                _ = stop.wait() => {
+                    tracing::debug!(
+                        local = ?core.socket.local_addr().ok(),
+                        "UDP 传输已关停,接收循环退出"
+                    );
+                    return;
+                }
+                r = core.socket.recv_from(&mut buf) => r,
+            };
+            match received {
+                Ok((n, from)) => {
+                    if !core.router.source_allowed(from) {
+                        core.router.note_rejected_source(from);
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::error!(error=%e, "UDP 接收错误,接收循环退出");
-                        break;
+                    match SipMessage::parse(&buf[..n]) {
+                        Ok(message) => core.router.dispatch(Incoming { message, from }),
+                        Err(e) => core.router.note_parse_error(from, &e),
                     }
                 }
+                Err(error) => {
+                    // 收包彻底失败(socket 被关等)时这个 socket 上的所有设备都将失聪,
+                    // 所以除了日志还要计数 —— 否则现象是"设备莫名不再响应平台"却无从查证。
+                    core.router.note_recv_error();
+                    tracing::error!(%error, "UDP 接收错误,接收循环退出");
+                    return;
+                }
             }
-        });
-    }
+        }
+    });
 }
 
 impl SipTransport for UdpTransport {
@@ -80,59 +118,74 @@ impl SipTransport for UdpTransport {
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr().map_err(Error::Io)
+        self.core.socket.local_addr().map_err(Error::Io)
     }
 
     fn register(&self, call_id: &str) -> mpsc::Receiver<Incoming> {
-        self.router.register(call_id)
+        self.core.router.register(call_id)
     }
 
     fn register_inbound(&self, aor: &str) -> mpsc::Receiver<Incoming> {
-        self.router.register_inbound(aor)
+        self.core.router.register_inbound(aor)
     }
 
     fn register_inbound_many(&self, aors: Vec<String>) -> mpsc::Receiver<Incoming> {
-        self.router.register_inbound_many(aors)
+        self.core.router.register_inbound_many(aors)
     }
 
     fn unregister(&self, call_id: &str) {
-        self.router.unregister(call_id);
+        self.core.router.unregister(call_id);
     }
 
     fn unregister_inbound(&self, aor: &str) {
-        self.router.unregister_inbound(aor);
+        self.core.router.unregister_inbound(aor);
+    }
+
+    fn unregister_inbound_many(&self, aors: &[String]) {
+        self.core.router.unregister_inbound_many(aors);
+    }
+
+    fn route_counts(&self) -> (usize, usize) {
+        self.core.router.route_counts()
     }
 
     fn set_tracer(&self, tracer: Option<Arc<dyn TraceObserver>>) {
-        self.router.set_tracer(tracer);
+        self.core.router.set_tracer(tracer);
     }
 
     fn set_trusted_ips(&self, ips: Vec<IpAddr>) {
-        self.router.set_trusted_ips(ips);
+        self.core.router.set_trusted_ips(ips);
     }
 
     fn trust_only_host(&self, host: &str) -> bool {
-        self.router.trust_only_host(host)
+        self.core.router.trust_only_host(host)
     }
 
     fn stats(&self) -> Arc<TransportStats> {
-        self.router.stats()
+        self.core.router.stats()
+    }
+
+    fn shutdown(&self) {
+        self.core.shutdown.trigger();
     }
 
     fn send_to<'a>(&'a self, msg: &'a SipMessage, dst: SocketAddr) -> SendFuture<'a> {
         Box::pin(async move {
-            self.router.trace(TraceDir::Out, msg, dst);
+            if self.core.shutdown.is_closed() {
+                return Err(Error::Sip("UDP 传输已关停".into()));
+            }
+            self.core.router.trace(TraceDir::Out, msg, dst);
             let bytes = msg.to_bytes();
             if bytes.len() > UDP_SAFE_MTU {
-                self.router.note_oversized(bytes.len(), dst);
+                self.core.router.note_oversized(bytes.len(), dst);
             }
-            match self.socket.send_to(&bytes, dst).await {
+            match self.core.socket.send_to(&bytes, dst).await {
                 Ok(_) => {
-                    self.router.note_sent();
+                    self.core.router.note_sent();
                     Ok(())
                 }
                 Err(e) => {
-                    self.router.note_send_error();
+                    self.core.router.note_send_error();
                     Err(Error::Io(e))
                 }
             }
@@ -413,6 +466,91 @@ mod tests {
         sender.set_tracer(None);
         sender.send_to(&req, dst).await.unwrap();
         assert_eq!(sc.outs.load(Ordering::Relaxed), 1, "关闭后不应再增");
+    }
+
+    #[tokio::test]
+    async fn 关停后端口被释放且发送快速失败() {
+        // 这是本次修复的核心不变量:接收循环不能把传输对象钉死。
+        // 之前 spawn_recv_loop 把 Arc<Self> move 进"只在出错时才 break"的循环,
+        // 于是 socket 永不关闭 —— 压测按 64 台设备一个 socket 分片,
+        // 一万台设备每跑一轮泄漏 150 多个 fd,跑十轮就撞 ulimit -n。
+        let t = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let addr = t.local_addr().unwrap();
+        assert!(!t.is_closed());
+
+        t.shutdown();
+        assert!(t.is_closed());
+        // 关停后发送应快速失败,不该挂住调用方。
+        let mut h = Headers::new();
+        h.set("Call-ID", "x");
+        h.set("CSeq", "1 MESSAGE");
+        let msg = SipMessage::Response(Response {
+            status: 200,
+            reason: "OK".into(),
+            headers: h,
+            body: Vec::new(),
+        });
+        assert!(t.send_to(&msg, addr).await.is_err(), "关停后不应还能发送");
+
+        // 释放最后一个 Arc 后接收任务应退出并归还端口。
+        drop(t);
+        let mut rebound = None;
+        for _ in 0..100 {
+            if let Ok(again) = UdpSocket::bind(addr).await {
+                rebound = Some(again);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            rebound.is_some(),
+            "关停后原端口应可重新绑定(socket 已真的关闭)"
+        );
+    }
+
+    #[tokio::test]
+    async fn 传输对象被丢弃时也会自动关停() {
+        // 调用方忘了显式 shutdown 时靠 Drop 兜底。
+        let addr = {
+            let t = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+            t.local_addr().unwrap()
+        };
+        let mut ok = false;
+        for _ in 0..100 {
+            if UdpSocket::bind(addr).await.is_ok() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "Arc 归零后应自动关停并释放端口");
+    }
+
+    #[tokio::test]
+    async fn 畸形包解析错误日志被限流但计数完整() {
+        // 畸形包是攻击者能以最低成本大量制造的东西。计数必须每条都涨(用于诊断),
+        // 但日志必须限流 —— 否则会把 2000 条环形缓冲和推给界面的日志批次挤满,
+        // 相当于用日志把自己的可观测性 DoS 掉。
+        let device = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = device.local_addr().unwrap();
+        const N: u64 = 50;
+        for _ in 0..N {
+            attacker
+                .send_to(b"not a sip message at all", addr)
+                .await
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if device.stats().snapshot().parse_errors >= N {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "解析错误计数未达预期");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // 没有断言"日志条数",那需要装订阅者;这里锁的是计数不因限流而丢。
+        assert!(device.stats().snapshot().parse_errors >= N);
     }
 
     #[tokio::test]

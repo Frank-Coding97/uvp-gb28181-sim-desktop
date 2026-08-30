@@ -62,7 +62,12 @@ pub fn parse_envelope(xml: &str) -> Result<Envelope> {
                 }
             }
             Ok(Event::Text(t)) if in_cmd_type => {
-                cmd_type = t.unescape().unwrap_or_default().trim().to_string();
+                // quick-xml 0.41 起 `Text` 事件不再自动解实体(实体引用会作为
+                // 独立的 `GeneralRef` 事件抛出),`unescape()` 也随之移除。
+                // 这里读的是 `CmdType`,取值是 `Catalog`/`DeviceControl` 这类
+                // 固定枚举词,不可能出现 XML 实体,所以 `xml10_content()`
+                // (解码 + 换行规范化)与旧行为等价。
+                cmd_type = t.xml10_content().unwrap_or_default().trim().to_string();
             }
             Ok(Event::End(_)) => {
                 in_cmd_type = false;

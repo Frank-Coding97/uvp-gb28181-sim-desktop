@@ -102,10 +102,24 @@ pub struct TransportStats {
     pub send_errors: AtomicU64,
     /// 超过安全 MTU 仍按 UDP 发出的报文数(有被中间设备截断的风险)。
     pub oversized_sent: AtomicU64,
+    /// 因入站连接数已达上限而被拒的 TCP 连接数(仅 TCP)。
+    pub rejected_connections: AtomicU64,
+    /// 因空闲/握手超时被主动断开的 TCP 连接数(仅 TCP)。
+    pub timed_out_connections: AtomicU64,
+    /// 接收循环因 socket 错误异常退出的次数。
+    ///
+    /// 非 0 意味着该 socket 上的设备已经**彻底失聪**;之前这种情况只有一行日志,
+    /// 现象是"设备莫名不再响应平台"而无从查证。
+    pub recv_errors: AtomicU64,
 }
 
 /// [`TransportStats`] 的可序列化快照。
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+///
+/// 有 `Default` + [`TransportStatsSnapshot::merge`]:压测把多个 socket 分片的统计
+/// 汇总成一份,而调用方**不该在加字段时被迫改动累加代码** ——
+/// 之前那里是手写的逐字段初始化 + 逐字段相加,每加一个计数器就编译不过一次,
+/// 更糟的是漏加一个字段编译器不会报错。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct TransportStatsSnapshot {
     pub received: u64,
     pub parse_errors: u64,
@@ -115,6 +129,41 @@ pub struct TransportStatsSnapshot {
     pub sent: u64,
     pub send_errors: u64,
     pub oversized_sent: u64,
+    pub rejected_connections: u64,
+    pub timed_out_connections: u64,
+    pub recv_errors: u64,
+}
+
+impl TransportStatsSnapshot {
+    /// 把另一份快照累加进来(汇总多个 socket 分片)。
+    pub fn merge(&mut self, other: &TransportStatsSnapshot) {
+        let TransportStatsSnapshot {
+            received,
+            parse_errors,
+            rejected_source,
+            dropped_queue_full,
+            unrouted,
+            sent,
+            send_errors,
+            oversized_sent,
+            rejected_connections,
+            timed_out_connections,
+            recv_errors,
+        } = other;
+        // 逐字段解构而不是 `other.x`:将来加字段时这里会编译不过,
+        // 强制作者决定"这个新计数器要不要参与汇总",而不是被静默漏掉。
+        self.received += received;
+        self.parse_errors += parse_errors;
+        self.rejected_source += rejected_source;
+        self.dropped_queue_full += dropped_queue_full;
+        self.unrouted += unrouted;
+        self.sent += sent;
+        self.send_errors += send_errors;
+        self.oversized_sent += oversized_sent;
+        self.rejected_connections += rejected_connections;
+        self.timed_out_connections += timed_out_connections;
+        self.recv_errors += recv_errors;
+    }
 }
 
 impl TransportStats {
@@ -128,6 +177,9 @@ impl TransportStats {
             sent: self.sent.load(Ordering::Relaxed),
             send_errors: self.send_errors.load(Ordering::Relaxed),
             oversized_sent: self.oversized_sent.load(Ordering::Relaxed),
+            rejected_connections: self.rejected_connections.load(Ordering::Relaxed),
+            timed_out_connections: self.timed_out_connections.load(Ordering::Relaxed),
+            recv_errors: self.recv_errors.load(Ordering::Relaxed),
         }
     }
 }
@@ -162,6 +214,18 @@ pub trait SipTransport: Send + Sync + 'static {
     /// 注销某设备 AOR 的入站路由(设备下线时调)。
     fn unregister_inbound(&self, aor: &str);
 
+    /// 批量注销入站路由。与 [`SipTransport::register_inbound_many`] 配对。
+    ///
+    /// 之前只有单个版本,而注册是批量的(设备 ID + 全部通道 ID + 目录树里的视频通道),
+    /// 下线时却只注销了设备 ID —— 通道条目永久留在路由表里。
+    /// 反复启停一台 16 通道 NVR,每轮多留一批。
+    fn unregister_inbound_many(&self, aors: &[String]);
+
+    /// 当前路由表规模 `(事务路由数, AOR 路由数)`。
+    ///
+    /// 用于诊断"停止后是否真的收敛":这两个数在设备全部下线后应当归零。
+    fn route_counts(&self) -> (usize, usize);
+
     /// 挂载 SIP 追踪观察者(FR-43)。传 None 关闭。
     fn set_tracer(&self, tracer: Option<Arc<dyn TraceObserver>>);
 
@@ -176,6 +240,129 @@ pub trait SipTransport: Send + Sync + 'static {
 
     /// 发送一条 SIP 消息到目标地址。
     fn send_to<'a>(&'a self, msg: &'a SipMessage, dst: SocketAddr) -> SendFuture<'a>;
+
+    /// 主动关停传输:停掉接收/接受循环,释放 socket 与全部连接。
+    ///
+    /// **为什么必须显式提供而不能只靠 Drop**:接收循环需要持有 socket 才能收包,
+    /// 于是它和传输对象之间天然存在一条引用。早期实现把 `Arc<Self>` 直接 move 进
+    /// 那个"只在出错时才 break"的循环里,引用计数永远 ≥ 1 —— 传输对象永不 drop、
+    /// socket 永不关闭、任务永不退出。压测按 64 台设备一个 socket 分片,
+    /// 一万台设备每跑一轮就泄漏 150 多个 fd 和同样多的任务,跑十轮就撞上 `ulimit -n`。
+    ///
+    /// 实现约定:幂等(重复调用无副作用),且调用后 `send_to` 应快速失败而不是挂住。
+    fn shutdown(&self);
+}
+
+/// 事务路由的 RAII 守卫:离开作用域时自动注销 Call-ID 路由。
+///
+/// # 为什么必须是 RAII
+///
+/// 原来每个发事务的地方都是 `transport.register(&call_id)` … 业务逻辑 …
+/// `transport.unregister(&call_id)`。只要中间那段被**取消**(被 `select!` 的另一个
+/// 分支抢先、调用方超时、任务被 abort),后面的 `unregister` 就不会执行,
+/// 路由表里留下一条永久条目。设备启动期间点"停止"就能稳定复现:
+/// REGISTER 事务正在按 Timer A 重传,停止信号让整个 future 被丢弃,
+/// 那个 Call-ID 从此留在表里。
+///
+/// 手写"记得在每条早退路径上注销"是行不通的 —— 取消点是隐式的,
+/// 没有任何编译期提示。交给 `Drop` 才能覆盖全部路径。
+pub struct RouteGuard {
+    transport: Arc<dyn SipTransport>,
+    call_id: String,
+}
+
+impl RouteGuard {
+    /// 注册一个 Call-ID 路由并返回 `(接收端, 守卫)`。守卫存活期间路由有效。
+    pub fn register(
+        transport: &Arc<dyn SipTransport>,
+        call_id: &str,
+    ) -> (mpsc::Receiver<Incoming>, RouteGuard) {
+        let rx = transport.register(call_id);
+        (
+            rx,
+            RouteGuard {
+                transport: Arc::clone(transport),
+                call_id: call_id.to_string(),
+            },
+        )
+    }
+
+    /// 被守卫的 Call-ID。
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+}
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        self.transport.unregister(&self.call_id);
+    }
+}
+
+impl std::fmt::Debug for RouteGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteGuard")
+            .field("call_id", &self.call_id)
+            .finish()
+    }
+}
+
+/// 关停信号。发一次、所有等待方都能看到,**且晚订阅的一方也立刻看到已关停**。
+///
+/// 用 `watch` 而不是 `Notify`:`notify_waiters()` 对"还没开始 await 的等待方"是丢失的,
+/// 而关停与循环启动之间存在真实竞态(bind 之后立刻 shutdown);
+/// `notify_one()` 只存一个许可,喂不饱 TCP 那边的 N 条读循环。
+pub(crate) struct Shutdown {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl Shutdown {
+    pub(crate) fn new() -> Self {
+        Shutdown {
+            tx: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// 触发关停。幂等。
+    pub(crate) fn trigger(&self) {
+        // 必须用 `send_replace` 而不是 `send`:后者在"当前没有任何接收端"时返回 Err
+        // **并且不更新值**。而 `Shutdown::new()` 建完就丢掉了初始接收端,
+        // 循环里的接收端也要等任务真正被调度起来才存在 —— 用 `send` 的话
+        // "bind 之后立刻 shutdown" 这条路径会静默丢掉关停信号。
+        self.tx.send_replace(true);
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    pub(crate) fn subscribe(&self) -> ShutdownRx {
+        ShutdownRx {
+            rx: self.tx.subscribe(),
+        }
+    }
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// [`Shutdown`] 的等待端。
+pub(crate) struct ShutdownRx {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ShutdownRx {
+    /// 等到关停被触发;**已经关停时立刻返回**。
+    pub(crate) async fn wait(&mut self) {
+        if *self.rx.borrow() {
+            return;
+        }
+        // 发送端随 core 常驻;真断开了也视为关停。
+        let _ = self.rx.changed().await;
+    }
 }
 
 /// 两种传输共用的路由表 + 追踪 + 来源白名单 + 统计。
@@ -249,9 +436,40 @@ impl Router {
         }
     }
 
+    /// 解析失败时的计数 + **限流**日志。
+    ///
+    /// 限流不是可选的:畸形包是攻击者能以最低成本大量制造的东西,每条一行 warn
+    /// 会灌爆日志环形缓冲(2000 条)与推给界面的日志批次,把真正有用的日志挤掉 ——
+    /// 相当于用日志把自己的可观测性 DoS 掉。与 `note_rejected_source` 同一档策略。
     pub(crate) fn note_parse_error(&self, from: SocketAddr, error: &common::Error) {
-        self.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(%from, %error, "SIP 报文解析失败,丢弃");
+        let count = self.stats.parse_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 5 || count % 1000 == 0 {
+            tracing::warn!(%from, %error, count, "SIP 报文解析失败,丢弃");
+        }
+    }
+
+    /// 入站连接数达上限被拒时的计数 + 限流日志。
+    pub(crate) fn note_rejected_connection(&self, from: SocketAddr, limit: usize) {
+        let count = self
+            .stats
+            .rejected_connections
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if count <= 5 || count % 1000 == 0 {
+            tracing::warn!(%from, limit, count, "入站 TCP 连接数已达上限,拒绝新连接");
+        }
+    }
+
+    /// 接收循环异常退出时的计数。
+    pub(crate) fn note_recv_error(&self) {
+        self.stats.recv_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 连接因超时被主动断开时的计数。
+    pub(crate) fn note_connection_timeout(&self) {
+        self.stats
+            .timed_out_connections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn set_tracer(&self, tracer: Option<Arc<dyn TraceObserver>>) {
@@ -294,6 +512,16 @@ impl Router {
 
     pub(crate) fn unregister_inbound(&self, aor: &str) {
         self.aor_routes.remove(aor);
+    }
+
+    pub(crate) fn unregister_inbound_many(&self, aors: &[String]) {
+        for aor in aors {
+            self.aor_routes.remove(aor);
+        }
+    }
+
+    pub(crate) fn route_counts(&self) -> (usize, usize) {
+        (self.routes.len(), self.aor_routes.len())
     }
 
     pub(crate) fn note_sent(&self) {

@@ -1,0 +1,11 @@
+# 固定工具链版本,让本地与 CI 构建出同一份产物。
+#
+# CI 之前用 `dtolnay/rust-toolchain@stable`:stable 每六周变一次,
+# 于是"昨天绿的 clippy 今天红了"与"同一个 commit 在两台机器上构建结果不同"
+# 都会周期性发生,而 `rust-version = "1.75"` 只是下界,管不了这件事。
+#
+# 升级流程:改这里的 channel → 本地跑一遍 fmt/clippy/test → 提交。
+# 这样工具链升级是一次显式的、可回滚的变更,而不是某天早上的意外。
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]

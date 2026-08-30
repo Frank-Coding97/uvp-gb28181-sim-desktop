@@ -56,6 +56,36 @@ pub fn prepare_video_source(path: &str) -> Result<std::path::PathBuf> {
 /// 不含 Homebrew 的 `/opt/homebrew/bin`,故仅靠 PATH 找 `ffmpeg` 在打包后会失败
 /// (终端 `cargo run` 有完整 PATH 所以能找到——这是"终端能用、打包不能用"的根因)。
 /// 先试 PATH,再逐个探测常见绝对路径。返回可用的命令名/路径。
+/// 本 crate 所有临时产物的**唯一**落地目录:`<系统临时目录>/uvp-gb28181/`。
+///
+/// 为什么必须收在一个自有子目录里,而不是直接摊在系统临时目录下:
+/// 1. 桌面端 `tauri.conf.json` 的 `assetProtocol.scope` 声明的是
+///    `$TEMP/uvp-gb28181/**` —— 产物散在 `$TEMP/` 根下会让那条 scope 名不符实,
+///    结果只能靠运行时逐个放行,把好不容易收窄的权限又打开;
+/// 2. 目录权限可以一次性收紧(Unix 下 0700),而系统临时目录是同机所有用户共享的;
+/// 3. 卸载/清理时一条 `rm -rf` 就能收干净,不用按文件名前缀去猜。
+pub fn work_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("uvp-gb28181");
+    // 目录已存在时 create_dir_all 返回 Ok,不需要先判存在。
+    let _ = std::fs::create_dir_all(&dir);
+    harden_dir_permissions(&dir);
+    dir
+}
+
+/// 把工作目录权限收到"仅当前用户可读写执行"。
+///
+/// 系统临时目录是同机所有用户共享的:默认权限下别的用户能读到转封装出来的码流,
+/// 甚至预置同名符号链接把我们的写操作导向别处。Windows 上临时目录本就在用户
+/// profile 内(已按用户隔离),所以这里只处理类 Unix。
+#[cfg(unix)]
+fn harden_dir_permissions(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn harden_dir_permissions(_dir: &std::path::Path) {}
+
 pub fn ffmpeg_bin() -> Option<String> {
     use std::process::Command;
     let probe = |bin: &str| {
@@ -122,7 +152,7 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&(src, mtime), &mut hasher);
     let key = std::hash::Hasher::finish(&hasher);
-    let out = std::env::temp_dir().join(format!("uvp-annexb-{key:016x}.h264"));
+    let out = work_dir().join(format!("annexb-{key:016x}.h264"));
     if out.exists() {
         return Ok(out);
     }
@@ -206,7 +236,7 @@ fn extract_g711a(src: &str) -> Result<Vec<u8>> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&(src, mtime, "g711a"), &mut hasher);
     let key = std::hash::Hasher::finish(&hasher);
-    let out = std::env::temp_dir().join(format!("uvp-g711a-{key:016x}.alaw"));
+    let out = work_dir().join(format!("g711a-{key:016x}.alaw"));
     if out.exists() {
         return std::fs::read(&out).map_err(Error::Io);
     }

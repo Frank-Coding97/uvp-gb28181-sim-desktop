@@ -3,6 +3,8 @@
 //! 按 docs/20-architecture/api-contract.md 注册 IPC 命令。
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
+mod diagnostics;
+mod media_access;
 mod secrets;
 
 use std::sync::{
@@ -37,6 +39,8 @@ struct AppState {
     last_series: Mutex<Option<std::path::PathBuf>>,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
+    /// 用户经**系统文件对话框**授权预览的媒体文件集合(见 media_access 模块文档)。
+    media_grants: media_access::MediaGrants,
 }
 
 /// 压测运行句柄。收到停止请求后仅标记 `stopping`，由后台任务退出时释放。
@@ -54,10 +58,31 @@ struct DeviceHandle {
     local_host: String,
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
+    /// `sim.run()` 的任务句柄。
+    ///
+    /// 之前是 fire-and-forget:`stop_tx.send(())` 之后立刻返回"设备已停止",
+    /// 而真正的下线序列(停订阅 → 拆媒体链路发 BYE → REGISTER Expires=0)还在跑。
+    /// 关窗口时进程被直接结束,平台要等心跳超时才把设备置离线,
+    /// ffmpeg 子进程也来不及被 `Drop` 清掉,留下孤儿进程。
+    run_task: tokio::task::JoinHandle<()>,
 }
 
+/// 退出清理是否已经开始。
+///
+/// `AppHandle::exit()` 会再触发一次 `ExitRequested`;没有这个闸的话
+/// "拦下退出 → 清理 → 调 exit → 又被拦下"会变成死循环,应用永远关不掉。
+static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 优雅停止的等待上限。
+///
+/// 下线序列里最慢的一步是"REGISTER Expires=0"这次 SIP 事务:平台不响应时
+/// 客户端事务会重传到 Timer B(约 32 秒)。用户关窗口不该等那么久 ——
+/// 5 秒足够覆盖平台正常响应的情形,超时就放弃并如实记一条日志。
+const GRACEFUL_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl AppState {
-    fn new() -> Self {
+    /// `app_data_dir` 为 None 时媒体授权退化为仅本次运行有效(拿不到数据目录的极端情形)。
+    fn new(app_data_dir: Option<std::path::PathBuf>) -> Self {
         AppState {
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
@@ -66,6 +91,7 @@ impl AppState {
             last_scenario: Mutex::new(None),
             last_series: Mutex::new(None),
             device: Mutex::new(None),
+            media_grants: media_access::MediaGrants::load(app_data_dir),
         }
     }
 }
@@ -186,6 +212,56 @@ struct TraceEmitter {
     app: AppHandle,
 }
 
+/// 追踪面板里需要脱敏的头域(小写比较)。
+///
+/// `Authorization` / `Proxy-Authorization` 携带 Digest 的 `response=` 摘要,
+/// 而同一条报文里 `username`/`realm`/`nonce`/`uri`/`method` 全是已知明文 ——
+/// 等于把一份可离线爆破的口令哈希连同全部盐值一起交出去。
+/// `WWW-Authenticate` 里的 nonce 本身不是秘密,但一并遮掉可以避免用户
+/// 把整段信令贴进工单时无意泄露一次挑战-响应对。
+const REDACTED_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+    "authentication-info",
+];
+
+/// 遮罩标记。刻意保留头域名与"有值"这个事实 —— 排障需要知道
+/// "这条 REGISTER 到底带没带鉴权",只是不需要知道摘要是什么。
+const REDACTED_MARK: &str = "<已脱敏>";
+
+/// 把 SIP 报文文本里的鉴权头值替换成遮罩。
+///
+/// 只改头部不动正文:MANSCDP 正文里没有凭据(目录项的 `Password` 我们从不输出),
+/// 而正文往下还要给用户看 XML。按行处理,遇到头部与正文之间的空行即停。
+fn redact_sip_credentials(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_headers = true;
+    for line in raw.split_inclusive('\n') {
+        // 头部结束:只含 CR/LF 的空行。
+        if in_headers && line.trim_end_matches(['\r', '\n']).is_empty() {
+            in_headers = false;
+            out.push_str(line);
+            continue;
+        }
+        if in_headers {
+            if let Some((name, _)) = line.split_once(':') {
+                if REDACTED_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str()) {
+                    let eol = &line[line.trim_end_matches(['\r', '\n']).len()..];
+                    out.push_str(name);
+                    out.push_str(": ");
+                    out.push_str(REDACTED_MARK);
+                    out.push_str(eol);
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 impl sip_core::TraceObserver for TraceEmitter {
     fn on_trace(&self, trace: sip_core::SipTrace<'_>) {
         let (method, status, cseq, call_id, summary) = match trace.message {
@@ -212,7 +288,7 @@ impl sip_core::TraceObserver for TraceEmitter {
             };
             // GB18030 兼容 ASCII 头;中文 body 用 GB18030 解码更可读。
             let (text, _, _) = encoding_rs::GB18030.decode(&bytes);
-            text.into_owned()
+            redact_sip_credentials(&text)
         };
         let entry = serde_json::json!({
             "ts_ms": std::time::SystemTime::now()
@@ -302,11 +378,14 @@ fn read_series(path: &std::path::Path) -> Vec<serde_json::Value> {
     }
 }
 
-/// 报告中保留可复现场景,但基于解析后的结构体覆盖密码后再序列化，
-/// 避免 quoted key、多行字符串等 TOML 语法绕过文本脱敏。
-fn serialize_redacted_scenario(mut scenario: scenario::LinearScenario) -> Result<String, String> {
-    scenario.password = "***".into();
-    toml::to_string(&scenario).map_err(|e| format!("脱敏场景序列化失败: {e}"))
+/// 报告中保留可复现场景。
+///
+/// 脱敏由类型保证:`LinearScenario.password` 是 `common::Secret` 且带
+/// `serialize_with = serialize_redacted`,**序列化时恒为占位符**。
+/// 之前这里要先把字段改成 `"***"` 再序列化 —— 那依赖每条导出路径的作者都记得,
+/// 现在漏了也不会泄露。
+fn serialize_redacted_scenario(scenario: &scenario::LinearScenario) -> Result<String, String> {
+    toml::to_string(scenario).map_err(|e| format!("脱敏场景序列化失败: {e}"))
 }
 
 /// 启动压测。`toml` 为场景内容,`count` 为设备数。
@@ -328,8 +407,8 @@ async fn start_stress(
 
     let mut sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
     // 密码只在 Rust 侧存在:场景 TOML 里的字段被钥匙串取值覆盖。
-    sc.password = secrets::get(&profile_id)?;
-    let redacted_scenario = serialize_redacted_scenario(sc.clone())?;
+    sc.password = common::Secret::new(secrets::get(&profile_id)?);
+    let redacted_scenario = serialize_redacted_scenario(&sc)?;
     let orch = Orchestrator::new(&sc, count).map_err(|e| e.to_string())?;
 
     let mut stress_guard = state.stress.lock().await;
@@ -951,7 +1030,7 @@ async fn start_device(
     let cfg = DeviceConfig {
         device_id: device_id.clone(),
         username: config.device_id.clone(),
-        password,
+        password: common::Secret::new(password),
         server_host: config.server_host.clone(),
         server_port: config.server_port,
         server_domain: config.server_domain.clone(),
@@ -1038,7 +1117,7 @@ async fn start_device(
     let sim_run = sim.clone();
     let tp_run = udp.clone();
     let host_run = local_host.clone();
-    tokio::spawn(async move {
+    let run_task = tokio::spawn(async move {
         sim_run
             .run(tp_run, host_run, local_port, async move {
                 let _ = stop_rx.await;
@@ -1052,8 +1131,75 @@ async fn start_device(
         local_host,
         local_port,
         stop_tx,
+        run_task,
     });
     Ok("设备已启动".into())
+}
+
+/// 停设备并**等到下线序列真的走完**(带超时)。返回是否停了一台设备。
+///
+/// 与 `stop_device` 命令的区别:命令要立刻返回让界面响应,这里要等 ——
+/// 应用退出时必须先让平台收到注销,否则平台侧那台设备会挂着直到心跳超时。
+async fn stop_device_graceful(state: &AppState) -> bool {
+    let handle = state.device.lock().await.take();
+    let Some(handle) = handle else {
+        return false;
+    };
+    let _ = handle.stop_tx.send(());
+    match tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, handle.run_task).await {
+        Ok(_) => tracing::info!("设备下线序列已完成"),
+        Err(_) => tracing::warn!(
+            secs = GRACEFUL_STOP_TIMEOUT.as_secs(),
+            "设备下线未在超时内完成(平台可能无响应),继续退出"
+        ),
+    }
+    // 关掉传输,释放监听 socket 与全部连接。
+    handle.transport.shutdown();
+    true
+}
+
+/// 停压测并等到全部设备任务退出(带超时)。返回是否停了一次压测。
+async fn stop_stress_graceful(state: &AppState) -> bool {
+    let mut guard = state.stress.lock().await;
+    let Some(handle) = guard.as_mut() else {
+        return false;
+    };
+    handle.stopping = true;
+    let _ = handle.stop_tx.send(());
+    drop(guard);
+
+    // 后台任务退出时会把 `stress` 槽位清掉,以此判断收敛。
+    let deadline = std::time::Instant::now() + GRACEFUL_STOP_TIMEOUT;
+    loop {
+        if state.stress.lock().await.is_none() {
+            tracing::info!("压测任务已全部退出");
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                secs = GRACEFUL_STOP_TIMEOUT.as_secs(),
+                "压测未在超时内收敛,继续退出"
+            );
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// 应用退出前的清理:先设备、再压测。
+///
+/// 顺序有讲究:设备下线要发 SIP 注销,而那需要传输还活着;
+/// 压测停止会连带释放它自己的分片传输。
+///
+/// **ffmpeg 采集子进程不需要单独处理**:所有权链是
+/// `PushSession.task` → 推流 future → `Box<dyn VideoSource>` → `LiveSource::drop`,
+/// 而 `release_media_on_shutdown` 现在会 join 推流任务(见 gb28181-simulator 的
+/// `await_task`)。等到这里返回时子进程已被各自的 `Drop` 杀掉。
+/// 只有等待超时那条路径可能留下孤儿 —— 那种情况下面会明确告警。
+async fn shutdown_all(state: &AppState) {
+    let stopped_device = stop_device_graceful(state).await;
+    let stopped_stress = stop_stress_graceful(state).await;
+    tracing::info!(stopped_device, stopped_stress, "退出前清理完成");
 }
 
 /// 停止当前设备。
@@ -1064,6 +1210,12 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
         Some(h) => {
             let _ = h.stop_tx.send(());
             let _ = app.emit("device_state", "Disconnected");
+            // 界面要立刻响应,所以不在这里等下线序列;但传输必须在任务真的退出后
+            // 才关闭,否则注销 REGISTER 会因为"传输已关停"直接失败。
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, h.run_task).await;
+                h.transport.shutdown();
+            });
             Ok("设备已停止".into())
         }
         None => Err("没有正在运行的设备".into()),
@@ -1470,18 +1622,74 @@ fn get_recent_logs(max: Option<usize>) -> Vec<common::logging::LogLine> {
     common::logging::recent(max.unwrap_or(500))
 }
 
-/// 允许 webview 通过 asset 协议读取用户刚刚**主动选中**的媒体文件。
+/// 导出诊断包(日志 + 运行环境快照),返回 zip 路径。
 ///
-/// assetProtocol.scope 已收窄到视频目录与应用自有临时目录;用户从任意路径选的文件
-/// 由这里在运行时逐个放行,而不是把整个文档/桌面/下载目录常开。
+/// 与「导出压测报告」分开:报告回答"这次压测结果如何",诊断包回答
+/// "这台机器上到底发生了什么"。后者才是把问题发给技术支持时需要的东西。
 #[tauri::command]
-fn allow_media_preview(path: String, app: AppHandle) -> Result<(), String> {
-    let p = std::path::PathBuf::from(&path);
-    if !p.is_file() {
-        return Err("路径不是一个文件".into());
-    }
+async fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = reports_dir(&app);
+    // 打包会读若干 MB 日志并做 deflate,放到阻塞线程池,别卡住 IPC。
+    tauri::async_runtime::spawn_blocking(move || diagnostics::export(&dir))
+        .await
+        .map_err(|e| format!("诊断包导出任务异常: {e}"))?
+        .map(|p| p.display().to_string())
+}
+
+/// 弹出系统文件对话框让用户选一个视频源文件,并**同时**授权它的 asset 预览。
+///
+/// 对话框由 Rust 侧弹出而不是前端 —— 这样"哪个路径被授权"完全由用户的真实选择决定,
+/// webview 无法凭空捏造一个路径来换取读取能力(见 `media_access` 模块文档)。
+/// 用户取消时返回 `None`。
+#[tauri::command]
+async fn pick_video_source(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("选择视频源文件")
+        .add_filter("视频", media_access::MEDIA_EXTENSIONS)
+        .pick_file(move |picked| {
+            // 对话框回调在别的线程,用 oneshot 把结果搬回当前 async 上下文。
+            let _ = tx.send(picked);
+        });
+    let picked = rx.await.map_err(|_| "文件选择对话框异常关闭".to_string())?;
+    let Some(file) = picked else {
+        return Ok(None); // 用户取消,不是错误
+    };
+    let path = file
+        .into_path()
+        .map_err(|e| format!("无法识别所选文件路径: {e}"))?;
+
+    let canonical = state.media_grants.grant(&path)?;
     app.asset_protocol_scope()
-        .allow_file(&p)
+        .allow_file(&canonical)
+        .map_err(|e| format!("放行媒体预览失败: {e}"))?;
+    Ok(Some(canonical.to_string_lossy().into_owned()))
+}
+
+/// 为**已授权过**的媒体文件重新放行 asset 预览(应用重启后恢复上次选的文件)。
+///
+/// asset scope 的放行只在本次进程内有效,而用户上次选的文件路径存在前端 localStorage 里,
+/// 重启后需要再放行一次。这里只接受 `media_grants` 里已有的条目 ——
+/// 那个集合唯一的写入口是上面的系统文件对话框,所以 webview 传任何别的路径都会被拒。
+#[tauri::command]
+fn allow_media_preview(
+    path: String,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    if !state.media_grants.is_granted(&p) {
+        return Err("该文件尚未经你选择授权,请点「选择文件」重新选取".into());
+    }
+    let canonical = p.canonicalize().map_err(|e| format!("文件不可访问: {e}"))?;
+    app.asset_protocol_scope()
+        .allow_file(&canonical)
         .map_err(|e| format!("放行媒体预览失败: {e}"))
 }
 
@@ -1489,11 +1697,40 @@ fn allow_media_preview(path: String, app: AppHandle) -> Result<(), String> {
 
 /// 初始化日志、注册命令、启动 Tauri 事件循环。
 pub fn run() {
-    common::logging::init();
+    // 注意:日志在 `.setup()` 里初始化,不在这里。
+    // 落盘目录取自 `app_data_dir()`,而那个路径要有 AppHandle 才能解析 ——
+    // 在这里自己按平台规则拼一遍会和 Tauri 的实现产生第二个真相来源。
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::new())
         .setup(|app| {
+            // 日志必须最先初始化,否则 setup 里后续的日志会漏掉落盘。
+            //
+            // 之前只写标准输出:桌面应用从 Finder / 开始菜单启动时标准输出无处可去,
+            // 日志只活在 2000 条内存环里,进程一崩就没有任何现场。
+            let data_dir = app.path().app_data_dir().ok();
+            match data_dir.as_ref().map(|d| d.join("logs")) {
+                Some(dir) => match common::logging::init_with_file(dir) {
+                    Some(dir) => tracing::info!(log_dir = %dir.display(), "日志已落盘"),
+                    None => {
+                        common::logging::init();
+                        tracing::warn!("日志目录不可用,本次仅输出到控制台");
+                    }
+                },
+                None => {
+                    common::logging::init();
+                    tracing::warn!("无法定位应用数据目录,本次仅输出到控制台");
+                }
+            }
+
+            // 状态在 setup 里注册而不是 builder 上:媒体预览授权要落到应用数据目录,
+            // 而那个目录只有拿到 AppHandle 之后才能解析出来。setup 早于窗口加载,
+            // 任何命令跑起来时状态都已就位。
+            app.manage(AppState::new(data_dir));
+            tracing::info!(
+                media_grants = app.state::<AppState>().media_grants.len(),
+                work_dir = %media_rtp::work_dir().display(),
+                "已载入媒体预览授权记录"
+            );
             // 实时日志推送:**批量聚合**后再过 IPC。
             //
             // 之前是每条日志一个 `log_line` 事件。压测时 10k 设备的 info 日志轻易到
@@ -1565,10 +1802,114 @@ pub fn run() {
             get_log_level,
             get_recent_logs,
             allow_media_preview,
+            pick_video_source,
+            export_diagnostics,
             secrets::save_platform_secret,
             secrets::delete_platform_secret,
             secrets::platform_secret_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri 应用启动失败");
+        .build(tauri::generate_context!())
+        .expect("Tauri 应用启动失败")
+        .run(|app, event| {
+            // 退出前收敛设备与压测。
+            //
+            // 之前没有这个钩子,关窗口等于直接结束进程,后果有三个:
+            // 1. 不发注销 REGISTER,平台要等心跳超时(默认几分钟)才把设备置离线,
+            //    下一轮联调看到的是一台"在线但不响应"的幽灵设备;
+            // 2. 压测的分片 socket 被硬关,平台侧留下上万个半死连接;
+            // 3. ffmpeg 采集子进程来不及被 Drop 清掉,变成孤儿进程继续占摄像头。
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                // 只拦第一次。`AppHandle::exit()` 会再发一次 ExitRequested,
+                // 无条件 prevent_exit 会让应用永远退不掉。
+                if CLEANUP_STARTED.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                api.prevent_exit();
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    shutdown_all(&handle.state::<AppState>()).await;
+                    handle.exit(0);
+                });
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sip追踪里的鉴权头被脱敏() {
+        // SIP 追踪面板会把整条报文原文推给前端,用户还能复制导出。
+        // Digest 的 response= 是可离线爆破的口令哈希,而同一条报文里
+        // username/realm/nonce/uri/method 全是已知明文 —— 等于连盐一起交出去。
+        let raw = "REGISTER sip:3402@example SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK1\r\n\
+                   Authorization: Digest username=\"34020000001320000001\", \
+                   realm=\"3402000000\", nonce=\"abc123\", uri=\"sip:3402@example\", \
+                   response=\"6629fae49393a05397450978507c4ef1\"\r\n\
+                   CSeq: 2 REGISTER\r\n\
+                   Content-Length: 0\r\n\r\n";
+        let out = redact_sip_credentials(raw);
+        assert!(
+            !out.contains("6629fae49393a05397450978507c4ef1"),
+            "摘要不能出现在推给前端的报文里:\n{out}"
+        );
+        assert!(!out.contains("nonce=\"abc123\""));
+        assert!(
+            out.contains(&format!("Authorization: {REDACTED_MARK}")),
+            "应保留头域名与「带了鉴权」这个事实,便于排障:\n{out}"
+        );
+        // 其它头与起始行必须原样保留。
+        assert!(out.starts_with("REGISTER sip:3402@example SIP/2.0\r\n"));
+        assert!(out.contains("Via: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK1\r\n"));
+        assert!(out.contains("CSeq: 2 REGISTER\r\n"));
+        assert!(out.ends_with("\r\n\r\n"), "头部结束的空行要保留");
+    }
+
+    #[test]
+    fn 脱敏覆盖全部鉴权头且大小写不敏感() {
+        for name in [
+            "Authorization",
+            "authorization",
+            "PROXY-AUTHORIZATION",
+            "WWW-Authenticate",
+            "Proxy-Authenticate",
+            "Authentication-Info",
+        ] {
+            let raw = format!("SIP/2.0 401 Unauthorized\r\n{name}: Digest secret-here\r\n\r\n");
+            let out = redact_sip_credentials(&raw);
+            assert!(!out.contains("secret-here"), "{name} 未脱敏: {out}");
+            assert!(out.contains(REDACTED_MARK));
+        }
+    }
+
+    #[test]
+    fn 脱敏不动正文() {
+        // MANSCDP 正文里没有凭据(目录项的 Password 我们从不输出),
+        // 而正文还要给用户看,不能被误伤。
+        let raw = "MESSAGE sip:x SIP/2.0\r\n\
+                   Authorization: Digest response=\"deadbeef\"\r\n\
+                   Content-Length: 60\r\n\r\n\
+                   <?xml version=\"1.0\"?><Notify>Authorization: 不该被改</Notify>";
+        let out = redact_sip_credentials(raw);
+        assert!(!out.contains("deadbeef"), "头部仍要脱敏");
+        assert!(
+            out.contains("<Notify>Authorization: 不该被改</Notify>"),
+            "空行之后是正文,不该被当成头部处理:\n{out}"
+        );
+    }
+
+    #[test]
+    fn 脱敏对畸形输入不panic() {
+        assert_eq!(redact_sip_credentials(""), "");
+        // 没有空行(只有头部)。
+        let out = redact_sip_credentials("Authorization: x\r\n");
+        assert!(out.contains(REDACTED_MARK));
+        // 没有冒号的行原样保留。
+        assert_eq!(redact_sip_credentials("garbage\r\n"), "garbage\r\n");
+        // LF-only 行尾也要能处理(某些平台不严格用 CRLF)。
+        let out = redact_sip_credentials("Authorization: x\n\nbody");
+        assert!(out.contains(REDACTED_MARK) && out.ends_with("body"));
+    }
 }

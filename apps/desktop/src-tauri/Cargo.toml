@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 description = "UVP GB28181 桌面端(Tauri 后端)"
 
 [lib]
@@ -31,6 +32,15 @@ toml = "=0.8.2"
 tokio.workspace = true
 tracing.workspace = true
 tauri-plugin-dialog = "=2.7.1"
+
+# 诊断包打成单个 zip:商业支持流程要的是"一个文件发过来",而不是让用户
+# 自己去找目录再打包。只启用 deflate(flate2 已在依赖树中),不引 bzip2/zstd/aes。
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+
+# 诊断包里的 fd 限额用 getrlimit 直接读:sh -c "ulimit -n" 在 macOS 上会报
+# unlimited(与内核给进程的软上限不符),而且要起一个子进程。libc 已在依赖树中。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # 平台凭据存 OS 钥匙串(macOS Keychain / Windows Credential Manager / libsecret),
 # 不再明文落 localStorage。按平台启用原生后端,避免引入不必要的 dbus/openssl 依赖。

@@ -20,6 +20,6 @@ pub use sdp::{
 pub use subject::Subject;
 pub use transaction::{client_transact, Admit, ServerTransactions, Timing, TxToken};
 pub use transport::{
-    Incoming, SipTrace, SipTransport, TcpTransport, TraceDir, TraceObserver, TransportStats,
-    TransportStatsSnapshot, UdpTransport,
+    Incoming, RouteGuard, SipTrace, SipTransport, TcpTransport, TraceDir, TraceObserver,
+    TransportStats, TransportStatsSnapshot, UdpTransport,
 };

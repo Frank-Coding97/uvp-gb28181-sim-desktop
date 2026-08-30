@@ -28,8 +28,11 @@ pub struct LinearScenario {
     /// 桌面端不再把密码写进 TOML:场景由前端生成时留空,启动前由 Tauri 侧从
     /// OS 钥匙串取值覆盖(见 `apps/desktop/src-tauri/src/secrets.rs`)。
     /// CLI 直接读 TOML 文件的用法仍可在文件里写明密码。
-    #[serde(default)]
-    pub password: String,
+    ///
+    /// 类型是 [`common::Secret`]:不进日志、离开作用域擦除,且**序列化时恒为占位符**
+    /// —— 压测报告里的"可复现场景"因此不可能带出明文,不依赖导出代码记得脱敏。
+    #[serde(default, serialize_with = "common::secret::serialize_redacted")]
+    pub password: common::Secret,
     /// 平台 host。
     pub server_host: String,
     /// 平台端口。

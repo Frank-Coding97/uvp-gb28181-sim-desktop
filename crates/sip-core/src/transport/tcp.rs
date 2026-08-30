@@ -16,8 +16,11 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
@@ -25,18 +28,58 @@ use common::{Error, Result};
 
 use crate::message::{parse_incremental, ParseOutcome, SipMessage, MAX_HEAD_LEN};
 
-use super::{Incoming, Router, SendFuture, SipTransport, TraceDir, TraceObserver, TransportStats};
+use super::{
+    Incoming, Router, SendFuture, Shutdown, SipTransport, TraceDir, TraceObserver, TransportStats,
+};
 
 /// 单条连接的读缓冲上限。超过说明对端在灌垃圾或 Content-Length 撒谎,直接断开。
 const MAX_CONNECTION_BUFFER: usize = 4 * 1024 * 1024;
 
+/// 同时保持的**入站**连接数上限。
+///
+/// accept 循环之前是无限接受的:每条连接占一个 fd、一个 tokio 任务、
+/// 一个 16 KiB 读块加一个 8 KiB 缓冲,而 `connections` 表也随之无界增长。
+/// 攻击者(白名单开启时是能完成 TCP 握手的同网段主机)反复建连即可耗尽 fd,
+/// 让整个进程连不上平台。64 条对"一个平台 + 少量级联"绰绰有余。
+const MAX_INBOUND_CONNECTIONS: usize = 64;
+
+/// 建连后必须在这么久内收到**第一条完整报文**,否则断开。
+///
+/// 这一条专治 slowloris:建连后不发字节(或一个字节一个字节地发),
+/// 原先的 `read()` 没有超时,任务会永久挂住并一直占着 fd 与连接名额。
+/// 30 秒对任何真实平台的首条报文都够宽裕。
+const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 已经收过报文的连接,空闲这么久后回收。
+///
+/// 取值刻意宽松:SIP over TCP 连接在两次心跳之间静默是完全正常的,
+/// 这条只用来回收"对端已经消失但 FIN 丢了"的死连接,不该干扰正常长连接。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// 共享 TCP 传输:一个监听端口 + 一组到平台的出站连接,多设备复用。
 pub struct TcpTransport {
-    router: Arc<Router>,
+    /// accept 循环与各读循环**只持有这个 core**,不持有 `TcpTransport` ——
+    /// 否则那些"只在出错时才 break"的循环会把传输对象钉死,
+    /// 监听 socket 与全部连接永不释放(见 `SipTransport::shutdown` 文档)。
+    core: Arc<TcpCore>,
     /// 本地监听地址(写进 Via/Contact)。
     local_addr: SocketAddr,
+}
+
+/// accept / 读循环 / 发送路径共享的内部状态。
+struct TcpCore {
+    router: Arc<Router>,
     /// 对端地址 → 该连接的写半边。出站请求与后续响应共用同一条连接。
     connections: Mutex<HashMap<SocketAddr, Arc<Mutex<OwnedWriteHalf>>>>,
+    /// 当前保持的入站连接数(与 [`MAX_INBOUND_CONNECTIONS`] 比较)。
+    inbound_count: AtomicUsize,
+    shutdown: Shutdown,
+}
+
+impl Drop for TcpTransport {
+    fn drop(&mut self) {
+        self.core.shutdown.trigger();
+    }
 }
 
 impl TcpTransport {
@@ -44,57 +87,125 @@ impl TcpTransport {
     pub async fn bind(local: &str) -> Result<Arc<Self>> {
         let listener = TcpListener::bind(local).await.map_err(Error::Io)?;
         let local_addr = listener.local_addr().map_err(Error::Io)?;
-        let transport = Arc::new(TcpTransport {
+        let core = Arc::new(TcpCore {
             router: Arc::new(Router::new()),
-            local_addr,
             connections: Mutex::new(HashMap::new()),
+            inbound_count: AtomicUsize::new(0),
+            shutdown: Shutdown::new(),
         });
-        transport.clone().spawn_accept_loop(listener);
-        Ok(transport)
+        spawn_accept_loop(Arc::clone(&core), listener);
+        Ok(Arc::new(TcpTransport { core, local_addr }))
     }
 
-    /// 接受平台主动建立的连接(平台侧下发 INVITE / 查询时会这样)。
-    fn spawn_accept_loop(self: Arc<Self>, listener: TcpListener) {
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        if !self.router.source_allowed(peer) {
-                            self.router.note_rejected_source(peer);
-                            continue;
-                        }
-                        tracing::info!(%peer, "接受平台 SIP over TCP 连接");
-                        self.clone().adopt(stream, peer).await;
+    /// 本次传输是否已关停。
+    pub fn is_closed(&self) -> bool {
+        self.core.shutdown.is_closed()
+    }
+
+    /// 当前保持的入站连接数(诊断用)。
+    pub fn inbound_connections(&self) -> usize {
+        self.core.inbound_count.load(AtomicOrdering::Relaxed)
+    }
+}
+
+/// 接受平台主动建立的连接(平台侧下发 INVITE / 查询时会这样)。
+fn spawn_accept_loop(core: Arc<TcpCore>, listener: TcpListener) {
+    tokio::spawn(async move {
+        let mut stop = core.shutdown.subscribe();
+        loop {
+            let accepted = tokio::select! {
+                _ = stop.wait() => {
+                    tracing::debug!("TCP 传输已关停,监听循环退出");
+                    return;
+                }
+                r = listener.accept() => r,
+            };
+            match accepted {
+                Ok((stream, peer)) => {
+                    if !core.router.source_allowed(peer) {
+                        core.router.note_rejected_source(peer);
+                        continue;
                     }
-                    Err(error) => {
-                        tracing::error!(%error, "TCP accept 失败,监听循环退出");
-                        break;
+                    // 先看名额再 adopt:超限时立刻 drop stream(等于回 RST/FIN),
+                    // 不给对方留下"连上了但没人理"的挂起连接。
+                    if core.inbound_count.load(AtomicOrdering::Relaxed) >= MAX_INBOUND_CONNECTIONS {
+                        core.router
+                            .note_rejected_connection(peer, MAX_INBOUND_CONNECTIONS);
+                        drop(stream);
+                        continue;
                     }
+                    tracing::info!(%peer, "接受平台 SIP over TCP 连接");
+                    adopt(Arc::clone(&core), stream, peer).await;
+                }
+                Err(error) => {
+                    core.router.note_recv_error();
+                    tracing::error!(%error, "TCP accept 失败,监听循环退出");
+                    return;
                 }
             }
-        });
-    }
+        }
+    });
+}
 
-    /// 把一条已建立的连接拆成读写两半:写半边入表复用,读半边起流式重组循环。
-    async fn adopt(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
-        stream.set_nodelay(true).ok();
-        let (read_half, write_half) = stream.into_split();
-        self.connections
-            .lock()
-            .await
-            .insert(peer, Arc::new(Mutex::new(write_half)));
-        self.spawn_read_loop(read_half, peer);
-    }
+/// 把一条已建立的连接拆成读写两半:写半边入表复用,读半边起流式重组循环。
+async fn adopt(core: Arc<TcpCore>, stream: TcpStream, peer: SocketAddr) {
+    stream.set_nodelay(true).ok();
+    let (read_half, write_half) = stream.into_split();
+    core.connections
+        .lock()
+        .await
+        .insert(peer, Arc::new(Mutex::new(write_half)));
+    core.inbound_count.fetch_add(1, AtomicOrdering::Relaxed);
+    spawn_read_loop(core, read_half, peer, true);
+}
 
-    /// 单连接读循环:累积字节 → 增量解析 → 分发 → 推进游标。
-    fn spawn_read_loop(self: Arc<Self>, mut read_half: OwnedReadHalf, peer: SocketAddr) {
-        let router = Arc::clone(&self.router);
-        let transport = Arc::clone(&self);
+/// 单连接读循环:累积字节 → 增量解析 → 分发 → 推进游标。
+///
+/// `inbound` 标记这条连接是平台连进来的(需要占用入站名额并在退出时归还)。
+/// 入站与出站连接**共用同一份实现** —— 之前是两份近乎重复的代码,结果出站那份
+/// 漏掉了退出时清理 `connections`,也漏掉了头部长度兜底,写死的连接会一直留在表里。
+fn spawn_read_loop(
+    core: Arc<TcpCore>,
+    mut read_half: OwnedReadHalf,
+    peer: SocketAddr,
+    inbound: bool,
+) {
+    {
+        let router = Arc::clone(&core.router);
+        let transport = Arc::clone(&core);
+        let mut stop = core.shutdown.subscribe();
         tokio::spawn(async move {
             let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
             let mut chunk = [0u8; 16 * 1024];
+            // 还没收到过完整报文时用较短的握手超时,收到之后放宽成空闲超时。
+            let mut seen_message = false;
             loop {
-                let n = match read_half.read(&mut chunk).await {
+                let budget = if seen_message {
+                    IDLE_TIMEOUT
+                } else {
+                    FIRST_MESSAGE_TIMEOUT
+                };
+                let read = match tokio::select! {
+                    _ = stop.wait() => None,
+                    r = tokio::time::timeout(budget, read_half.read(&mut chunk)) => Some(r),
+                } {
+                    None => {
+                        tracing::debug!(%peer, "TCP 传输已关停,连接读循环退出");
+                        break;
+                    }
+                    Some(Ok(result)) => result,
+                    Some(Err(_)) => {
+                        router.note_connection_timeout();
+                        tracing::info!(
+                            %peer,
+                            secs = budget.as_secs(),
+                            seen_message,
+                            "SIP over TCP 连接超时未收到数据,断开"
+                        );
+                        break;
+                    }
+                };
+                let n = match read {
                     Ok(0) => {
                         tracing::debug!(%peer, "SIP over TCP 连接被对端关闭");
                         break;
@@ -116,9 +227,11 @@ impl TcpTransport {
                 }
 
                 // 一次可能到达多条报文(粘包),也可能只到半条(分片)。
+                let mut fatal = false;
                 loop {
                     match parse_incremental(&buf) {
                         Ok(ParseOutcome::Complete { message, consumed }) => {
+                            seen_message = true;
                             router.dispatch(Incoming {
                                 message,
                                 from: peer,
@@ -129,29 +242,46 @@ impl TcpTransport {
                             }
                         }
                         Ok(ParseOutcome::Incomplete) => {
-                            // 头部一直等不到空行也要有上界(解析器内部已有 MAX_HEAD_LEN)。
-                            if buf.len() > MAX_HEAD_LEN && !buf.windows(2).any(|w| w == b"\n\n") {
-                                tracing::warn!(%peer, "TCP 报文头部超限,断开");
-                                buf.clear();
+                            // 头部长度兜底。解析器在"无空行且超 MAX_HEAD_LEN"时已经报 Err,
+                            // 所以这里只会命中"带了空行但正文迟迟不来"的情形:
+                            // 缓冲上限那一条会先兜住,这里留作显式的第二道闸。
+                            if buf.len() > MAX_HEAD_LEN.saturating_add(MAX_CONNECTION_BUFFER / 2) {
+                                tracing::warn!(%peer, bytes = buf.len(), "TCP 报文迟迟不完整,断开");
+                                fatal = true;
                             }
                             break;
                         }
                         Err(e) => {
                             router.note_parse_error(peer, &e);
-                            // 无法同步到下一条报文边界,只能丢弃整个缓冲并断开:
-                            // TCP 上一旦错位,后续字节全部不可信。
-                            buf.clear();
+                            // 无法同步到下一条报文边界:TCP 上一旦错位,后续字节全部不可信,
+                            // 必须**断开连接**而不只是清缓冲继续读。
+                            fatal = true;
                             break;
                         }
                     }
                 }
+                if fatal {
+                    break;
+                }
             }
+            // 无论从哪个分支退出,都要把写半边从表里摘掉,否则死连接会被后续
+            // send_to 复用(表现为"发出去了但对端永远收不到")。
             transport.connections.lock().await.remove(&peer);
+            if inbound {
+                transport
+                    .inbound_count
+                    .fetch_sub(1, AtomicOrdering::Relaxed);
+            }
         });
     }
+}
 
+impl TcpCore {
     /// 取得(或建立)到 `dst` 的连接。
-    async fn connection(&self, dst: SocketAddr) -> Result<Arc<Mutex<OwnedWriteHalf>>> {
+    async fn connection(self: &Arc<Self>, dst: SocketAddr) -> Result<Arc<Mutex<OwnedWriteHalf>>> {
+        if self.shutdown.is_closed() {
+            return Err(Error::Sip("SIP over TCP 传输已关停".into()));
+        }
         if let Some(existing) = self.connections.lock().await.get(&dst).cloned() {
             return Ok(existing);
         }
@@ -167,54 +297,10 @@ impl TcpTransport {
             .await
             .insert(dst, Arc::clone(&writer));
         // 平台的响应会从同一条连接回来,所以出站连接也要挂读循环。
-        self.spawn_read_loop_for(read_half, dst);
+        // 出站连接不占入站名额(是我们主动建的,数量由设备数决定)。
+        spawn_read_loop(Arc::clone(self), read_half, dst, false);
         tracing::info!(%dst, "SIP over TCP 已连接平台");
         Ok(writer)
-    }
-
-    /// 出站连接的读循环。与被动连接共用同一份实现,只是无法用 `Arc<Self>`
-    /// (`&self` 上下文),因此单独走一层路由句柄。
-    fn spawn_read_loop_for(&self, mut read_half: OwnedReadHalf, peer: SocketAddr) {
-        let router = Arc::clone(&self.router);
-        tokio::spawn(async move {
-            let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-            let mut chunk = [0u8; 16 * 1024];
-            loop {
-                let n = match read_half.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(error) => {
-                        tracing::debug!(%peer, %error, "SIP over TCP 出站连接读失败");
-                        break;
-                    }
-                };
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > MAX_CONNECTION_BUFFER {
-                    tracing::warn!(%peer, bytes = buf.len(), "TCP 连接缓冲超限,断开");
-                    break;
-                }
-                loop {
-                    match parse_incremental(&buf) {
-                        Ok(ParseOutcome::Complete { message, consumed }) => {
-                            router.dispatch(Incoming {
-                                message,
-                                from: peer,
-                            });
-                            buf.drain(..consumed);
-                            if buf.is_empty() {
-                                break;
-                            }
-                        }
-                        Ok(ParseOutcome::Incomplete) => break,
-                        Err(e) => {
-                            router.note_parse_error(peer, &e);
-                            buf.clear();
-                            break;
-                        }
-                    }
-                }
-            }
-        });
     }
 }
 
@@ -228,69 +314,84 @@ impl SipTransport for TcpTransport {
     }
 
     fn register(&self, call_id: &str) -> mpsc::Receiver<Incoming> {
-        self.router.register(call_id)
+        self.core.router.register(call_id)
     }
 
     fn register_inbound(&self, aor: &str) -> mpsc::Receiver<Incoming> {
-        self.router.register_inbound(aor)
+        self.core.router.register_inbound(aor)
     }
 
     fn register_inbound_many(&self, aors: Vec<String>) -> mpsc::Receiver<Incoming> {
-        self.router.register_inbound_many(aors)
+        self.core.router.register_inbound_many(aors)
     }
 
     fn unregister(&self, call_id: &str) {
-        self.router.unregister(call_id);
+        self.core.router.unregister(call_id);
     }
 
     fn unregister_inbound(&self, aor: &str) {
-        self.router.unregister_inbound(aor);
+        self.core.router.unregister_inbound(aor);
+    }
+
+    fn unregister_inbound_many(&self, aors: &[String]) {
+        self.core.router.unregister_inbound_many(aors);
+    }
+
+    fn route_counts(&self) -> (usize, usize) {
+        self.core.router.route_counts()
     }
 
     fn set_tracer(&self, tracer: Option<Arc<dyn TraceObserver>>) {
-        self.router.set_tracer(tracer);
+        self.core.router.set_tracer(tracer);
     }
 
     fn set_trusted_ips(&self, ips: Vec<IpAddr>) {
-        self.router.set_trusted_ips(ips);
+        self.core.router.set_trusted_ips(ips);
     }
 
     fn trust_only_host(&self, host: &str) -> bool {
-        self.router.trust_only_host(host)
+        self.core.router.trust_only_host(host)
     }
 
     fn stats(&self) -> Arc<TransportStats> {
-        self.router.stats()
+        self.core.router.stats()
+    }
+
+    fn shutdown(&self) {
+        self.core.shutdown.trigger();
     }
 
     fn send_to<'a>(&'a self, msg: &'a SipMessage, dst: SocketAddr) -> SendFuture<'a> {
         Box::pin(async move {
-            self.router.trace(TraceDir::Out, msg, dst);
+            if self.core.shutdown.is_closed() {
+                return Err(Error::Sip("SIP over TCP 传输已关停".into()));
+            }
+            self.core.router.trace(TraceDir::Out, msg, dst);
             let bytes = msg.to_bytes();
             // TCP 无 MTU 限制:大 body 不需要分片,这也是目录树很大时该选 TCP 的理由。
             for attempt in 0..2 {
-                let writer = self.connection(dst).await?;
+                let writer = self.core.connection(dst).await?;
                 let result = {
                     let mut guard = writer.lock().await;
                     guard.write_all(&bytes).await
                 };
                 match result {
                     Ok(()) => {
-                        self.router.note_sent();
+                        self.core.router.note_sent();
                         return Ok(());
                     }
                     Err(e) => {
                         // 连接可能已被对端半关闭:清掉缓存重连一次再报错。
-                        self.connections.lock().await.remove(&dst);
+                        self.core.connections.lock().await.remove(&dst);
                         if attempt == 1 {
-                            self.router.note_send_error();
+                            self.core.router.note_send_error();
                             return Err(Error::Io(e));
                         }
                         tracing::debug!(%dst, error = %e, "TCP 写失败,重建连接重试");
                     }
                 }
             }
-            self.router.note_send_error();
+            self.core.router.note_send_error();
             Err(Error::Sip("SIP over TCP 发送重试后仍失败".into()))
         })
     }
@@ -460,5 +561,131 @@ mod tests {
             "非可信来源不应进入设备队列"
         );
         assert!(device.stats().snapshot().rejected_source >= 1);
+    }
+
+    #[tokio::test]
+    async fn 入站连接数达上限后拒绝新连接() {
+        // accept 循环之前是无限接受的:每条连接一个 fd + 一个任务 + 24 KiB 缓冲,
+        // 反复建连即可耗尽 fd 让整个进程连不上平台。
+        let device = TcpTransport::bind("127.0.0.1:0").await.unwrap();
+        let addr = device.local_addr().unwrap();
+
+        // 占满名额。保留 stream 句柄,否则连接立刻断开、名额马上被归还。
+        let mut held = Vec::new();
+        for _ in 0..MAX_INBOUND_CONNECTIONS {
+            held.push(TcpStream::connect(addr).await.expect("应能连上"));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while device.inbound_connections() < MAX_INBOUND_CONNECTIONS {
+            assert!(std::time::Instant::now() < deadline, "连接未被全部 adopt");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // 第 65 条:TCP 握手仍会成功(内核 backlog),但应用层应立刻拒绝并计数。
+        let _extra = TcpStream::connect(addr).await.expect("握手由内核完成");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if device.stats().snapshot().rejected_connections >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "超限连接未被拒绝");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            device.inbound_connections(),
+            MAX_INBOUND_CONNECTIONS,
+            "被拒的连接不该占用名额"
+        );
+
+        // 释放一条后名额应归还,新连接可以进来。
+        held.pop();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while device.inbound_connections() >= MAX_INBOUND_CONNECTIONS {
+            assert!(std::time::Instant::now() < deadline, "连接关闭后名额未归还");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn 关停后监听端口被释放且发送快速失败() {
+        // 与 UDP 同一个不变量:accept / 读循环不能把传输对象钉死在内存里。
+        let device = TcpTransport::bind("127.0.0.1:0").await.unwrap();
+        let addr = device.local_addr().unwrap();
+        assert!(!device.is_closed());
+
+        device.shutdown();
+        assert!(device.is_closed());
+        assert!(
+            device.send_to(&request("x", ""), addr).await.is_err(),
+            "关停后不应还能发送"
+        );
+
+        drop(device);
+        let mut rebound = false;
+        for _ in 0..150 {
+            if TcpListener::bind(addr).await.is_ok() {
+                rebound = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(rebound, "关停后监听端口应可重新绑定(listener 已真的释放)");
+    }
+
+    #[tokio::test]
+    async fn 解析错位后断开连接而不是继续读() {
+        // TCP 上一旦错位,后续字节全部不可信 —— 之前只清缓冲继续读,
+        // 于是攻击者可以用一条连接持续灌垃圾,每条都记一次解析失败。
+        use tokio::io::AsyncWriteExt;
+        let device = TcpTransport::bind("127.0.0.1:0").await.unwrap();
+        let addr = device.local_addr().unwrap();
+        let mut attacker = TcpStream::connect(addr).await.unwrap();
+        // 一条结构上不可能是 SIP 的报文(起始行没有空格分隔)。
+        attacker.write_all(b"@@@@@@@@\r\n\r\n").await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if device.stats().snapshot().parse_errors >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "未记录解析失败");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // 连接应被服务端关闭:读到 EOF。
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut attacker, &mut buf),
+        )
+        .await
+        .expect("应在 5s 内被关闭");
+        assert!(
+            matches!(closed, Ok(0)),
+            "解析错位后服务端应关闭连接,实际 {closed:?}"
+        );
+        // 名额也要归还。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while device.inbound_connections() > 0 {
+            assert!(std::time::Instant::now() < deadline, "断开后名额未归还");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn 超时常量的量级符合意图() {
+        // slowloris 防护必须比空闲回收严格得多:前者针对"建连后不说话",
+        // 后者只是回收 FIN 丢失的死连接,不能干扰正常长连接。
+        assert!(
+            FIRST_MESSAGE_TIMEOUT < IDLE_TIMEOUT,
+            "握手超时必须短于空闲超时"
+        );
+        assert!(
+            FIRST_MESSAGE_TIMEOUT >= Duration::from_secs(10),
+            "太短会误杀网络慢的真实平台"
+        );
+        assert!(
+            IDLE_TIMEOUT >= Duration::from_secs(300),
+            "SIP over TCP 在两次心跳之间静默是正常的,空闲超时不能比心跳周期还短"
+        );
     }
 }

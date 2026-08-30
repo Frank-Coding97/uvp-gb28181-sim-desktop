@@ -1,11 +1,18 @@
 //! 日志初始化 + 运行时级别调整 + 实时日志分发。
 //!
-//! 统一用 `tracing`。启动时 [`init`] 装订阅器:
+//! 统一用 `tracing`。启动时 [`init`] / [`init_with_file`] 装订阅器:
 //! - 用 `reload` 层承载级别 filter,[`set_level`] 可运行时热改级别(无需重启);
-//! - 自定义 [`SinkLayer`] 把每条日志格式化后写入环形缓冲(供 UI 打开时拉历史)
-//!   并推给注册的实时回调(desktop 层据此发 Tauri 事件给前端日志页)。
+//! - 自定义 [`SinkLayer`] 把每条日志格式化后写入环形缓冲(供 UI 打开时拉历史)、
+//!   推给注册的实时回调(desktop 层据此发 Tauri 事件给前端日志页),
+//!   并**落盘**(见 [`crate::logfile`])。
+//!
+//! 关于环形缓冲那把全局锁:临界区只有一次 `VecDeque` 的 push/pop(约几十纳秒),
+//! 而日志真正的成本在格式化与 IO。压测一万台设备时瓶颈是日志**量**,不是这把锁 ——
+//! 应对手段是把级别调到 warn(界面上可热改),而不是把缓冲改成无锁结构。
 
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use crate::logfile::{LogFileConfig, LogFileWriter};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -34,6 +41,8 @@ static RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 static BUFFER: OnceLock<Mutex<std::collections::VecDeque<LogLine>>> = OnceLock::new();
 /// 全局:实时回调(可后注册)。
 static CALLBACK: OnceLock<RwLock<Option<Arc<LogCallback>>>> = OnceLock::new();
+/// 全局:落盘写句柄。未配置时为 None(CLI 或目录不可用时只写标准输出)。
+static FILE_WRITER: OnceLock<Option<LogFileWriter>> = OnceLock::new();
 
 const BUFFER_CAP: usize = 2000;
 
@@ -103,11 +112,37 @@ impl<S: Subscriber> Layer<S> for SinkLayer {
                 cb(&line);
             }
         }
+        if let Some(Some(writer)) = FILE_WRITER.get() {
+            // 落盘用自己的紧凑格式而不是复用 fmt layer:后者带 ANSI 与可变宽度对齐,
+            // 事后 grep/awk 反而更难。这里字段顺序固定、以制表符分隔。
+            writer.write_line(&format!(
+                "{}\t{}\t{}\t{}",
+                line.ts_ms, line.level, line.target, line.message
+            ));
+        }
     }
 }
 
-/// 初始化全局日志订阅器。重复调用安全(二次初始化被忽略)。
+/// 初始化全局日志订阅器(不落盘)。重复调用安全(二次初始化被忽略)。
 pub fn init() {
+    init_inner(None);
+}
+
+/// 初始化并**落盘**到 `dir`(按大小滚动、保留数受限,见 [`LogFileConfig`])。
+///
+/// 返回实际的日志目录;`None` 表示目录不可用,已降级为只写标准输出与内存缓冲 ——
+/// 日志写不了不该让应用起不来。
+pub fn init_with_file(dir: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    init_inner(Some(LogFileConfig::new(dir)));
+    FILE_WRITER
+        .get()
+        .and_then(|w| w.as_ref())
+        .map(|w| w.dir().to_path_buf())
+}
+
+fn init_inner(file: Option<LogFileConfig>) {
+    // 写句柄要在装订阅器**之前**就位,否则初始化过程本身产生的日志会漏掉。
+    let _ = FILE_WRITER.set(file.and_then(LogFileWriter::spawn));
     let base = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter, handle) = reload::Layer::new(base);
     let _ = RELOAD.set(handle);
@@ -116,6 +151,23 @@ pub fn init() {
         .with(fmt::layer().with_target(false))
         .with(SinkLayer)
         .try_init();
+}
+
+/// 当前日志目录(未落盘时为 None)。
+pub fn log_dir() -> Option<std::path::PathBuf> {
+    FILE_WRITER
+        .get()
+        .and_then(|w| w.as_ref())
+        .map(|w| w.dir().to_path_buf())
+}
+
+/// 因写队列已满被丢弃的落盘行数(用于告诉用户"日志文件不完整")。
+pub fn file_dropped() -> u64 {
+    FILE_WRITER
+        .get()
+        .and_then(|w| w.as_ref())
+        .map(|w| w.dropped())
+        .unwrap_or(0)
 }
 
 /// 运行时热改全局日志级别。`level` 取 error/warn/info/debug/trace(大小写不敏感),

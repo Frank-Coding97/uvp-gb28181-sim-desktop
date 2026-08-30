@@ -59,7 +59,7 @@ async fn main() {
     let cfg = DeviceConfig {
         device_id: device_id.clone(),
         username: device_id_str.clone(),
-        password,
+        password: password.into(),
         server_host: server_host.clone(),
         server_port,
         server_domain,

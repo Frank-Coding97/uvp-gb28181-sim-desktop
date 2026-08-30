@@ -16,7 +16,7 @@ fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
     DeviceConfig {
         device_id: DeviceId::new(required_env("WVP_DEVICE_ID")).unwrap(),
         username: required_env("WVP_DEVICE_ID"),
-        password: required_env("WVP_SIP_PASSWORD"),
+        password: required_env("WVP_SIP_PASSWORD").into(),
         server_host: required_env("WVP_SERVER_HOST"),
         server_port: required_env("WVP_SERVER_PORT")
             .parse()

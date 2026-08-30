@@ -5,10 +5,14 @@
 
 pub mod clock;
 pub mod error;
+pub mod logfile;
 pub mod logging;
 pub mod observer;
+pub mod secret;
 pub mod types;
 
 pub use error::{Error, Result};
+pub use logfile::{LogFileConfig, LogFileWriter};
 pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver};
+pub use secret::Secret;
 pub use types::{DeviceId, GbVersion, SignalingEncoding, Transport};

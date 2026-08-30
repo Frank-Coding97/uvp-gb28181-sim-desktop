@@ -14,7 +14,12 @@ use stress_engine::{LinearScenario, Orchestrator};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    common::logging::init();
+    // CLI 也落盘:压测跑一夜后要能回看"第几分钟开始失败"。
+    // 目录取当前工作目录下的 `uvp-logs/`(CLI 没有应用数据目录的概念)。
+    match common::logging::init_with_file(std::path::PathBuf::from("uvp-logs")) {
+        Some(dir) => eprintln!("日志落盘目录: {}", dir.display()),
+        None => eprintln!("日志目录不可用,本次仅输出到控制台"),
+    }
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {

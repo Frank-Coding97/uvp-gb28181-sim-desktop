@@ -25,7 +25,6 @@ import {
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { LineChart } from "echarts/charts";
 import {
   DataZoomComponent,
@@ -263,15 +262,11 @@ function validateForm(): string | null {
 
 
 
+// 与单设备页同走 Rust 侧对话框(命令 pick_video_source):选择与 asset 预览授权
+// 在同一次调用里完成,前端拿不到"凭空放行任意路径"的能力。
 async function pickVideoSource() {
   try {
-    const picked = await openDialog({
-      multiple: false,
-      directory: false,
-      filters: [
-        { name: "视频", extensions: ["h264", "264", "h265", "hevc", "mp4", "flv", "mkv", "mov"] },
-      ],
-    });
+    const picked = await invoke<string | null>("pick_video_source");
     if (typeof picked === "string") form.value.video_source = picked;
   } catch (error) {
     message.error(`选择文件失败：${String(error)}`);

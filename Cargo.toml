@@ -28,7 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 encoding_rs = "0.8"
 dashmap = "6"
 parking_lot = "0.12"
@@ -38,9 +38,24 @@ socket2 = { version = "0.5", features = ["all"] }
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+# 版本号的**唯一来源**。
+#
+# 之前有三处各写一份:这里 0.1.0、apps/desktop/package.json 0.1.2、
+# tauri.conf.json 0.1.2。而 `engine_version()` 与设备上报的固件版本用的是
+# `CARGO_PKG_VERSION` = 0.1.0 —— 安装包标 0.1.2、界面显示 0.1.0、
+# 报给平台的固件版本也是 0.1.0,用户报障时版本对不上。
+#
+# 现在:tauri.conf.json 不再写 version(留空即取 crate 版本),
+# package.json 由 scripts/check-version.sh 在 CI 里校验一致。
+version = "0.1.2"
 license = "MIT"
 rust-version = "1.75"
+# 内部 crate 不发布到 crates.io。
+#
+# 除了防止误发布,这还让 `{ path = "..." }` 依赖不再被 cargo-deny 判成
+# "通配符依赖" —— 那条规则的本意是"发到 crates.io 的包不能依赖本地路径",
+# 对只在本仓库内使用的 crate 不适用。
+publish = false
 
 # 发布构建优化:压测引擎长时间高并发运行,开启 LTO 与单元优化。
 [profile.release]

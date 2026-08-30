@@ -10,14 +10,65 @@ on:
     branches: [main, develop]
   workflow_dispatch:
 
+# 工具链版本与 rust-toolchain.toml 保持一致(那份文件是本地的单一来源,
+# 这里显式重复是因为 GitHub Actions 无法从文件读值填进 `with:`)。
+# 两处不一致时 version-check 会失败。
+env:
+  RUST_TOOLCHAIN: "1.96.1"
+
 jobs:
+  # ── 版本号与工具链一致性 ──────────────────────────────
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 版本号单一来源校验
+        run: ./scripts/check-version.sh
+      - name: 工具链声明一致
+        run: |
+          declared=$(awk -F'"' '/^channel/ {print $2}' rust-toolchain.toml)
+          if [ "$declared" != "$RUST_TOOLCHAIN" ]; then
+            echo "rust-toolchain.toml($declared) 与 workflow env RUST_TOOLCHAIN($RUST_TOOLCHAIN) 不一致" >&2
+            exit 1
+          fi
+          echo "工具链声明一致: $declared"
+
+  # ── 依赖供应链门禁:漏洞库 / 许可证 / 来源 ──────────────
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # cargo-deny 的 advisories 检查用的就是 RUSTSEC 库,
+      # 所以不需要再单独跑 cargo-audit。
+      - name: 安装 cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny(漏洞 / 许可证 / 重复版本 / 来源)
+        run: cargo deny --all-features check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: 前端依赖漏洞扫描
+        working-directory: apps/desktop
+        # 只对 high/critical 硬失败:npm 生态里 moderate 级别的传递依赖公告
+        # 常常在开发依赖上且无可用修复,一律拦会让门禁失去信号。
+        run: npm audit --audit-level=high
+
   # ── Rust 质量门:格式 / clippy / 测试 ──────────────────
   rust-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # 不写 toolchain:让 rust-toolchain.toml 说话(单一来源,构建可复现)。
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # Tauri 在 Linux 需要 WebKitGTK 等系统依赖。
@@ -73,7 +124,7 @@ jobs:
 
   # ── 三平台桌面安装包 ─────────────────────────────────
   build-desktop:
-    needs: [rust-check, frontend-check]
+    needs: [version-check, supply-chain, rust-check, frontend-check]
     strategy:
       fail-fast: false
       matrix:
@@ -87,8 +138,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -105,11 +157,29 @@ jobs:
       - name: 安装 macOS FFmpeg 运行时
         if: matrix.os == 'macos-latest'
         run: brew install ffmpeg
+      # 打进 DMG 的是第三方二进制,必须记录它的来源与摘要 ——
+      # 否则用户拿到的包里有一个谁都说不清出处的可执行文件,
+      # 事后也无法回答"那个版本有没有已知漏洞"。
+      - name: 记录 FFmpeg 版本与摘要
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          bin="$(command -v ffmpeg)"
+          echo "路径: $bin"
+          ffmpeg -version | head -1
+          shasum -a 256 "$(readlink -f "$bin" || echo "$bin")" | tee ffmpeg-provenance.txt
+          ffmpeg -version | head -1 >> ffmpeg-provenance.txt
       - name: 构建 macOS 完整 DMG（Swift runtime + FFmpeg）
         if: matrix.os == 'macos-latest'
         working-directory: apps/desktop
         env:
           BUNDLE_FFMPEG: "1"
+          # 签名与公证:secrets 未配置时脚本会退回 ad-hoc 签名并打印提示,
+          # 用户下载后会被 Gatekeeper 拦("无法验证开发者")。
+          # 正式分发前必须在仓库 Secrets 里配好这三项。
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_PROFILE: ${{ secrets.APPLE_NOTARY_PROFILE }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: ./build-macos-dmg.sh
       - name: 构建 Linux / Windows 安装包
         if: matrix.os != 'macos-latest'
@@ -126,6 +196,7 @@ jobs:
             target/${{ matrix.target }}/release/bundle/**/*.AppImage
             target/${{ matrix.target }}/release/bundle/**/*.msi
             target/${{ matrix.target }}/release/bundle/**/*.exe
+            ffmpeg-provenance.txt
           if-no-files-found: ignore
 
   # ── 打 tag 时发布 GitHub Release ────────────────────────
@@ -140,8 +211,23 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+      # 让用户能验证下载物的完整性。macOS 公证只覆盖 DMG,
+      # Windows/Linux 目前无代码签名,校验和是最低限度的可验证性。
+      - name: 生成 SHA256 校验清单
+        run: |
+          set -euo pipefail
+          cd artifacts
+          find . -type f ! -name 'SHA256SUMS.txt' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
           generate_release_notes: true
+          body: |
+            下载后请用 `SHA256SUMS.txt` 校验完整性。
+
+            macOS:若提示"无法验证开发者",说明本次构建未配置签名与公证凭据。
+            Windows:安装包尚未做 Authenticode 签名,SmartScreen 可能告警。
