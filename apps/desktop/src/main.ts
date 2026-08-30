@@ -12,6 +12,7 @@ import Scenario from "./views/Scenario.vue";
 import System from "./views/System.vue";
 import Preview from "./views/Preview.vue";
 import Settings from "./views/Settings.vue";
+import Recordings from "./views/Recordings.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -21,6 +22,7 @@ const router = createRouter({
     { path: "/ptz",       component: Ptz },
     { path: "/preview",   component: Preview },
     { path: "/channels",  component: Channels },
+    { path: "/recordings", component: Recordings },
     // 压力测试(场景编排 + 实时监控已合并到一页)。
     { path: "/scenario",  component: Scenario },
     { path: "/device-settings",  component: Settings, props: { section: "device" } },

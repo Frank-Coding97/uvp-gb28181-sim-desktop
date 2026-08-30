@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { useRouter } from "vue-router";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { NButton, NIcon, NInput, NInputNumber, NPopconfirm, NSelect, useMessage } from "naive-ui";
@@ -86,6 +87,7 @@ interface DeviceRuntimeState {
 interface CmdEntry { kind: string; summary: string; ts_ms: number; }
 
 const message = useMessage();
+const router = useRouter();
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const {
   config, profiles, activeId, active,
@@ -129,6 +131,25 @@ let unlistenDeviceError: UnlistenFn | null = null;
 let unlistenSub: UnlistenFn | null = null;
 let unlistenPlatformCommand: UnlistenFn | null = null;
 let runtimeRefreshTimer: number | null = null;
+let recordingRefreshTimer: number | null = null;
+const recordingPhase = ref<"idle" | "starting" | "recording" | "finalizing" | "failed">("idle");
+const recordingLabel = computed(() => ({
+  idle: deviceLive.value ? "可录制" : "设备未启动",
+  starting: "等待关键帧",
+  recording: "录像中",
+  finalizing: "正在收尾",
+  failed: "录像失败",
+}[recordingPhase.value]));
+
+async function refreshRecordingState() {
+  if (!isTauri) return;
+  try {
+    const state = await invoke<{ phase: typeof recordingPhase.value }>("get_recording_state");
+    recordingPhase.value = state.phase;
+  } catch {
+    recordingPhase.value = "idle";
+  }
+}
 
 const subscriptions = reactive<Record<SubscriptionKind, SubscriptionState>>({
   MobilePosition: { kind: "MobilePosition", active: false, notify_count: 0 },
@@ -596,6 +617,8 @@ onMounted(async () => {
   const [runtime] = await Promise.all([reconcile(), refreshSources(false)]);
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
   await refreshRuntimeState();
+  await refreshRecordingState();
+  recordingRefreshTimer = window.setInterval(() => void refreshRecordingState(), 1000);
   await startPreview();
 });
 
@@ -604,6 +627,7 @@ onActivated(async () => {
   const runtime = await reconcile();
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
   await refreshRuntimeState();
+  await refreshRecordingState();
   await startPreview();
 });
 
@@ -620,6 +644,7 @@ onUnmounted(() => {
   unlistenSub?.();
   unlistenPlatformCommand?.();
   if (runtimeRefreshTimer) clearTimeout(runtimeRefreshTimer);
+  if (recordingRefreshTimer) clearInterval(recordingRefreshTimer);
 });
 </script>
 
@@ -844,11 +869,11 @@ onUnmounted(() => {
         </div>
 
         <div class="quick-actions" aria-label="快捷业务">
-          <div class="quick-card unavailable" title="桌面端录像能力尚未接入">
+          <button type="button" class="quick-card action" :class="{ active: recordingPhase === 'recording' }" title="打开录像中心" @click="router.push('/recordings')">
             <n-icon><VideocamOutline /></n-icon>
             <strong>录像</strong>
-            <span>未就绪</span>
-          </div>
+            <span>{{ recordingLabel }}</span>
+          </button>
           <button
             type="button"
             class="quick-card action"

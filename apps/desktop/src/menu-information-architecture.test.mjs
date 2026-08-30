@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [app, router, settings, channels, system, dashboard, ptz] = await Promise.all([
+const [app, router, settings, channels, system, dashboard, ptz, recordings] = await Promise.all([
   readFile(new URL("./App.vue", import.meta.url), "utf8"),
   readFile(new URL("./main.ts", import.meta.url), "utf8"),
   readFile(new URL("./views/Settings.vue", import.meta.url), "utf8"),
@@ -9,12 +9,14 @@ const [app, router, settings, channels, system, dashboard, ptz] = await Promise.
   readFile(new URL("./views/System.vue", import.meta.url), "utf8"),
   readFile(new URL("./views/Dashboard.vue", import.meta.url), "utf8"),
   readFile(new URL("./views/Ptz.vue", import.meta.url), "utf8"),
+  readFile(new URL("./views/Recordings.vue", import.meta.url), "utf8"),
 ]);
 
 const expectedMenu = [
   ["首页", "/dashboard"],
   ["云台控制", "/ptz"],
   ["目录管理", "/channels"],
+  ["录像中心", "/recordings"],
   ["压力测试", "/scenario"],
   ["设备配置", "/device-settings"],
   ["音视频配置", "/media-settings"],
@@ -38,6 +40,7 @@ assert.match(router, /path: "\/settings"[\s\S]{0,80}redirect: "\/device-settings
 assert.match(router, /path: "\/device"[\s\S]{0,80}redirect: "\/dashboard"/, "旧设备联调地址必须回到首页");
 assert.match(router, /path: "\/system"[\s\S]{0,80}redirect: "\/logs"/, "旧运行日志地址必须兼容重定向");
 assert.match(router, /path: "\/ptz"[\s\S]{0,80}component: Ptz/, "云台控制必须有独立一级路由");
+assert.match(router, /path: "\/recordings"[\s\S]{0,80}component: Recordings/, "录像中心必须有独立一级路由");
 
 assert.doesNotMatch(settings, /settings-nav-item|nav-caption">设置项/, "设置页内部不应再保留二级菜单");
 assert.match(settings, /defineProps<[\s\S]*section:/, "配置页面必须由一级路由决定内容");
@@ -54,3 +57,4 @@ assert.match(system, /平台命令/, "平台命令时间线必须迁移到日志
 assert.match(ptz, /<div class="page-title">云台控制<\/div>/, "云台控制必须成为独立页面");
 assert.match(ptz, /ptz_action/, "云台页必须继续消费平台 PTZ 命令");
 assert.match(dashboard, /设备状态真相/, "设备运行时真相必须迁移到首页");
+assert.match(recordings, /<h1>录像中心<\/h1>/, "录像中心页面标题必须与菜单一致");
