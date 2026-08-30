@@ -29,14 +29,31 @@ import { LineChart } from "echarts/charts";
 import { GridComponent, LegendComponent, TooltipComponent } from "echarts/components";
 import { init, use as useECharts, type ECharts } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
-import { usePlatform } from "../platform";
+import { usePlatform, type PlatformProfile } from "../platform";
 
 useECharts([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
 
 const message = useMessage();
 const { active: activePlatform, passwordFor } = usePlatform();
 
-const form = ref({
+interface ScenarioValues {
+  base_device_id: string;
+  count: number;
+  heartbeat_interval: number;
+  channels_per_device: number;
+  gb_version: string;
+  media_profile: string;
+  bitrate_kbps: number;
+  ramp_per_second: number;
+  active_ratio: number;
+  video_source: string;
+  position_enabled: boolean;
+  position_interval: number;
+  alarm_enabled: boolean;
+  alarm_interval: number;
+}
+
+const form = ref<ScenarioValues>({
   base_device_id: "34020000001320000001",
   count: 10,
   heartbeat_interval: 60,
@@ -132,6 +149,7 @@ function validateForm(): string | null {
   const p = activePlatform.value;
   if (!p) return "请先在顶栏配置目标平台";
   if (p.transport.toUpperCase() !== "UDP") return "当前 SIP 信令仅支持 UDP，请修改目标平台传输模式";
+  if (!passwordFor(p.id).trim()) return "请输入本次注册密码";
   if (!/^\d{20}$/.test(form.value.base_device_id)) return "起始设备 ID 必须是 20 位数字";
   if (form.value.count < 1 || form.value.count > 10_000) return "设备数量必须在 1 到 10000 之间";
   if (form.value.media_profile === "C" && !form.value.video_source.trim()) {
@@ -140,27 +158,30 @@ function validateForm(): string | null {
   return null;
 }
 
-function buildToml(): string {
-  const p = activePlatform.value!;
+function buildScenarioToml(
+  profile: PlatformProfile,
+  password: string,
+  values: ScenarioValues,
+): string {
   const lines = [
-    `base_device_id = ${tomlString(form.value.base_device_id)}`,
-    `password = ${tomlString(passwordFor(p.id))}`,
-    `server_host = ${tomlString(p.server_host.trim())}`,
-    `server_port = ${p.server_port}`,
-    `server_id = ${tomlString(p.server_id.trim())}`,
-    `server_domain = ${tomlString(p.server_domain.trim())}`,
-    `transport = ${tomlString(p.transport.toUpperCase())}`,
-    `heartbeat_interval_secs = ${form.value.heartbeat_interval}`,
-    `channels_per_device = ${form.value.channels_per_device}`,
-    `gb_version = ${tomlString(form.value.gb_version)}`,
-    `media_profile = ${tomlString(form.value.media_profile)}`,
-    `bitrate_kbps = ${form.value.bitrate_kbps}`,
-    `ramp_per_second = ${form.value.ramp_per_second}`,
-    `active_ratio = ${(form.value.active_ratio / 100).toFixed(2)}`,
+    `base_device_id = ${tomlString(values.base_device_id)}`,
+    `password = ${tomlString(password)}`,
+    `server_host = ${tomlString(profile.server_host.trim())}`,
+    `server_port = ${profile.server_port}`,
+    `server_id = ${tomlString(profile.server_id.trim())}`,
+    `server_domain = ${tomlString(profile.server_domain.trim())}`,
+    `transport = ${tomlString(profile.transport.toUpperCase())}`,
+    `heartbeat_interval_secs = ${values.heartbeat_interval}`,
+    `channels_per_device = ${values.channels_per_device}`,
+    `gb_version = ${tomlString(values.gb_version)}`,
+    `media_profile = ${tomlString(values.media_profile)}`,
+    `bitrate_kbps = ${values.bitrate_kbps}`,
+    `ramp_per_second = ${values.ramp_per_second}`,
+    `active_ratio = ${(values.active_ratio / 100).toFixed(2)}`,
     "video_fps = 25",
   ];
-  if (form.value.media_profile === "C") {
-    lines.push(`video_source = ${tomlString(form.value.video_source.trim())}`);
+  if (values.media_profile === "C") {
+    lines.push(`video_source = ${tomlString(values.video_source.trim())}`);
   }
   lines.push(
     "[device_info]",
@@ -210,7 +231,8 @@ async function startStress() {
   starting.value = true;
   statusText.value = "正在启动";
   try {
-    const toml = buildToml();
+    const profile = activePlatform.value!;
+    const toml = buildScenarioToml(profile, passwordFor(profile.id), form.value);
     await invoke("validate_scenario", { toml });
     resetSeries();
     const result = await invoke<string>("start_stress", {
