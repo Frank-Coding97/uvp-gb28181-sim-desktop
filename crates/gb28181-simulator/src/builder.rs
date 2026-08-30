@@ -88,14 +88,26 @@ fn device_aor(cfg: &DeviceConfig) -> String {
     format!("sip:{}@{}", cfg.device_id, cfg.server_domain)
 }
 
-/// 平台侧 SIP URI:`sip:<server_id>@<domain>`(server_id 用平台域的中心编码,
-/// 这里以 domain 作为 server_id 前缀不可得时退化为 domain 本身)。
+/// 平台国标 ID。旧配置没有独立字段时沿用原 server_domain 语义。
+fn platform_id(cfg: &DeviceConfig) -> &str {
+    if cfg.server_id.trim().is_empty() {
+        &cfg.server_domain
+    } else {
+        &cfg.server_id
+    }
+}
+
+/// 平台网络目标 URI:`sip:<server_id>@<host>:<port>`。
 fn platform_uri(cfg: &DeviceConfig) -> String {
-    // Request-URI 指向平台:sip:<domain>@<host:port>
     format!(
         "sip:{}@{}:{}",
-        cfg.server_domain, cfg.server_host, cfg.server_port
+        platform_id(cfg), cfg.server_host, cfg.server_port
     )
+}
+
+/// 平台逻辑 AOR:`sip:<server_id>@<domain>`。
+fn platform_aor(cfg: &DeviceConfig) -> String {
+    format!("sip:{}@{}", platform_id(cfg), cfg.server_domain)
 }
 
 /// 构造 REGISTER 请求。`authorization` 为 None 时是首次(无鉴权)请求;
@@ -133,6 +145,7 @@ pub fn register(
     headers.append("Max-Forwards", "70");
     headers.append("Expires", expires.to_string());
     headers.append("User-Agent", "UVP-GB28181-Sim");
+    headers.append("X-GB-Ver", cfg.gb_version.x_gb_ver());
     if let Some(auth) = authorization {
         headers.append("Authorization", auth.to_string());
     }
@@ -166,10 +179,7 @@ pub fn message_xml(
         ),
     );
     headers.append("From", format!("<{aor}>;tag={}", ids.from_tag));
-    headers.append(
-        "To",
-        format!("<sip:{}@{}>", cfg.server_domain, cfg.server_domain),
-    );
+    headers.append("To", format!("<{}>", platform_aor(cfg)));
     headers.append("Call-ID", ids.call_id.clone());
     headers.append("CSeq", format!("{cseq} MESSAGE"));
     headers.append("Max-Forwards", "70");
@@ -318,7 +328,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_id: "34020000002000000001".into(),
-            server_domain: "34020000002000000001".into(),
+            server_domain: "3402000000".into(),
             transport: Transport::Udp,
             register_expires_secs: 3_600,
             heartbeat_interval_secs: 60,
@@ -344,6 +354,8 @@ mod tests {
         let req = register(&cfg(), &ids, 1, "5.6.7.8", 5070, None, 3600);
         let text = String::from_utf8(req.to_bytes()).unwrap();
         assert!(text.starts_with("REGISTER sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"));
+        assert!(text.contains("From: <sip:34020000001320000001@3402000000>"));
+        assert!(text.contains("X-GB-Ver: 3.0"));
         assert!(text.contains("branch=z9hG4bK"));
         assert!(text.contains("Expires: 3600"));
         assert!(text.contains("CSeq: 1 REGISTER"));
@@ -357,6 +369,7 @@ mod tests {
         let authenticated = register(&cfg(), &ids, 2, "5.6.7.8", 5070, Some("Digest xxx"), 3600);
         let text = String::from_utf8(authenticated.to_bytes()).unwrap();
         assert!(text.contains("Authorization: Digest xxx"));
+        assert!(text.contains("X-GB-Ver: 3.0"));
         assert!(text.contains("CSeq: 2 REGISTER"));
         assert_eq!(
             first.headers.get("Call-ID"),
@@ -372,6 +385,7 @@ mod tests {
         let req = message_xml(&cfg(), &ids, 3, "5.6.7.8", 5070, "<Notify/>");
         let text = String::from_utf8(req.to_bytes()).unwrap();
         assert!(text.contains("Content-Type: Application/MANSCDP+xml"));
+        assert!(text.contains("To: <sip:34020000002000000001@3402000000>"));
         assert!(text.contains("Content-Length: 9"));
         assert!(text.ends_with("<Notify/>"));
     }
@@ -412,5 +426,35 @@ mod tests {
         assert!(text.contains("CSeq: 7 NOTIFY"));
         assert!(text.contains("Event: Catalog"));
         assert!(text.contains("Subscription-State: active;expires=3600"));
+    }
+
+    #[test]
+    fn register_版本头跟随协议版本() {
+        let ids = DialogIds::new();
+        let mut config = cfg();
+        config.gb_version = common::GbVersion::V2016;
+        let v2016 = register(&config, &ids, 1, "5.6.7.8", 5070, None, 3600);
+        assert_eq!(v2016.headers.get("X-GB-Ver"), Some("2.0"));
+
+        config.gb_version = common::GbVersion::V2022;
+        let v2022 = register(&config, &ids, 2, "5.6.7.8", 5070, None, 0);
+        assert_eq!(v2022.headers.get("X-GB-Ver"), Some("3.0"));
+    }
+
+    #[test]
+    fn 空平台id保持旧server_domain目标语义() {
+        let ids = DialogIds::new();
+        let mut config = cfg();
+        config.server_id.clear();
+        config.server_domain = "34020000002000000001".into();
+
+        let register = register(&config, &ids, 1, "5.6.7.8", 5070, None, 3600);
+        let message = message_xml(&config, &ids, 2, "5.6.7.8", 5070, "<Notify/>");
+        assert_eq!(register.uri, "sip:34020000002000000001@1.2.3.4:5060");
+        assert_eq!(message.uri, register.uri);
+        assert_eq!(
+            message.headers.get("To"),
+            Some("<sip:34020000002000000001@34020000002000000001>")
+        );
     }
 }

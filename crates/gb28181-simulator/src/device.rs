@@ -2442,7 +2442,7 @@ mod tests {
             server_host: host.into(),
             server_port: port,
             server_id: "34020000002000000001".into(),
-            server_domain: "34020000002000000001".into(),
+            server_domain: "3402000000".into(),
             transport: Transport::Udp,
             register_expires_secs: 3_600,
             heartbeat_interval_secs: 60,
@@ -2492,6 +2492,8 @@ mod tests {
                 h.set("CSeq", cseq);
                 let resp = if seen == 0 {
                     assert!(req.headers.get("Authorization").is_none());
+                    assert_eq!(req.headers.get("X-GB-Ver"), Some("3.0"));
+                    assert!(req.uri.starts_with("sip:34020000002000000001@"));
                     first_via = Some(via);
                     first_from = Some(from);
                     first_cseq = Some(cseq_number);
@@ -2506,7 +2508,12 @@ mod tests {
                         body: Vec::new(),
                     }
                 } else {
-                    assert!(req.headers.get("Authorization").is_some());
+                    let authorization = req
+                        .headers
+                        .get("Authorization")
+                        .expect("鉴权 REGISTER 缺少 Authorization");
+                    assert!(authorization.contains(&format!("uri=\"{}\"", req.uri)));
+                    assert_eq!(req.headers.get("X-GB-Ver"), Some("3.0"));
                     assert_eq!(req.headers.get("Call-ID"), Some(call_id.as_str()));
                     assert_eq!(first_from.as_deref(), Some(from.as_str()));
                     assert_ne!(first_via.as_deref(), Some(via.as_str()));
