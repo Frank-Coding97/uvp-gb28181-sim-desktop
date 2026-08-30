@@ -1444,6 +1444,18 @@ pub struct RecordItem {
     /// 录像类型:time(定时)/ alarm / manual。
     #[serde(rename = "Type")]
     pub kind: String,
+    /// 设备上的真实录像文件路径。
+    #[serde(rename = "FilePath", skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// 录像文件所在设备的地址。
+    #[serde(rename = "Address", skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// 保密属性:0 为不涉密。
+    #[serde(rename = "Secrecy", skip_serializing_if = "Option::is_none")]
+    pub secrecy: Option<u32>,
+    /// 录像设备编码。
+    #[serde(rename = "RecorderID", skip_serializing_if = "Option::is_none")]
+    pub recorder_id: Option<String>,
 }
 
 /// 录像列表查询应答(RecordInfo,设备 → 平台,FR-10)。
@@ -1491,12 +1503,25 @@ impl RecordInfoResponse {
         items: Vec<RecordItem>,
     ) -> Self {
         let num = items.len() as u32;
+        Self::page(device_id, name, sn, num, items)
+    }
+
+    /// 构造 RecordInfo 分页应答。`sum_num` 是整个查询的总数，
+    /// `RecordList@Num` 由当前页条目数决定。
+    pub fn page(
+        device_id: impl Into<String>,
+        name: impl Into<String>,
+        sn: u32,
+        sum_num: u32,
+        items: Vec<RecordItem>,
+    ) -> Self {
+        let num = items.len() as u32;
         RecordInfoResponse {
             cmd_type: "RecordInfo".into(),
             sn,
             device_id: device_id.into(),
             name: name.into(),
-            sum_num: num,
+            sum_num,
             record_list: RecordList { num, items },
         }
     }
@@ -2586,6 +2611,10 @@ mod tests {
             start_time: "2026-07-03T10:00:00".into(),
             end_time: "2026-07-03T10:05:00".into(),
             kind: "time".into(),
+            file_path: Some("/recordings/rec1.mp4".into()),
+            address: Some("3402000000".into()),
+            secrecy: Some(0),
+            recorder_id: Some("35020000001310000132".into()),
         }];
         let resp = RecordInfoResponse::new("35020000001310000132", 12, items);
         assert_eq!(resp.sum_num, 1);
@@ -2594,6 +2623,35 @@ mod tests {
         assert!(xml.contains("Num=\"1\""));
         assert!(xml.contains("<StartTime>2026-07-03T10:00:00</StartTime>"));
         assert!(xml.contains("<Type>time</Type>"));
+        assert!(xml.contains("<FilePath>/recordings/rec1.mp4</FilePath>"));
+        assert!(xml.contains("<Address>3402000000</Address>"));
+        assert!(xml.contains("<Secrecy>0</Secrecy>"));
+        assert!(xml.contains("<RecorderID>35020000001310000132</RecorderID>"));
+    }
+
+    #[test]
+    fn 录像列表分页保持总数与当前页数() {
+        let item = RecordItem {
+            device_id: "channel".into(),
+            name: "rec".into(),
+            start_time: "2026-08-30T10:00:00".into(),
+            end_time: "2026-08-30T10:01:00".into(),
+            kind: "manual".into(),
+            file_path: None,
+            address: None,
+            secrecy: None,
+            recorder_id: None,
+        };
+        let resp = RecordInfoResponse::page("device", "name", 9, 3, vec![item]);
+        assert_eq!(resp.sn, 9);
+        assert_eq!(resp.sum_num, 3);
+        assert_eq!(resp.record_list.num, 1);
+
+        let empty = RecordInfoResponse::page("device", "name", 9, 0, vec![]);
+        let xml = empty.to_xml().unwrap();
+        assert!(xml.contains("<SumNum>0</SumNum>"));
+        assert!(xml.contains("Num=\"0\""));
+        assert!(!xml.contains("<Item>"));
     }
 
     #[test]

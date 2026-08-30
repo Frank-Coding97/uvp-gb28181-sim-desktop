@@ -2250,6 +2250,10 @@ impl DeviceSimulator {
                     start_time: "2026-07-03T10:00:00".into(),
                     end_time: "2026-07-03T10:05:00".into(),
                     kind: "time".into(),
+                    file_path: None,
+                    address: None,
+                    secrecy: None,
+                    recorder_id: None,
                 }];
                 let resp = RecordInfoResponse::with_name(
                     &query.device_id,
