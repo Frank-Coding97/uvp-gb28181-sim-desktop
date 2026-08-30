@@ -647,6 +647,94 @@ async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_js
     }))
 }
 
+#[derive(Debug, Serialize)]
+struct DeviceRuntimeStateDto {
+    guarded: bool,
+    alarming: bool,
+    longitude: f64,
+    latitude: f64,
+    name: String,
+    expiration: u32,
+    heartbeat_interval: u32,
+    heartbeat_count: u32,
+    video_record_plan_type: Option<u32>,
+    alarm_record_duration: Option<u32>,
+    picture_mask_enabled: Option<u32>,
+    frame_mirror_mode: Option<u32>,
+    alarm_report_enabled: Option<u32>,
+    osd_time_show: Option<u32>,
+    osd_show: Option<u32>,
+    last_change: String,
+    updated_at_ms: u64,
+}
+
+impl From<gb28181_simulator::DeviceRuntimeSnapshot> for DeviceRuntimeStateDto {
+    fn from(snapshot: gb28181_simulator::DeviceRuntimeSnapshot) -> Self {
+        Self {
+            guarded: snapshot.guarded,
+            alarming: snapshot.alarming,
+            longitude: snapshot.longitude,
+            latitude: snapshot.latitude,
+            name: snapshot.name,
+            expiration: snapshot.expiration,
+            heartbeat_interval: snapshot.heartbeat_interval,
+            heartbeat_count: snapshot.heartbeat_count,
+            video_record_plan_type: snapshot.video_record_plan_type,
+            alarm_record_duration: snapshot.alarm_record_duration,
+            picture_mask_enabled: snapshot.picture_mask_enabled,
+            frame_mirror_mode: snapshot.frame_mirror_mode,
+            alarm_report_enabled: snapshot.alarm_report_enabled,
+            osd_time_show: snapshot.osd_time_show,
+            osd_show: snapshot.osd_show,
+            last_change: snapshot.last_change,
+            updated_at_ms: snapshot.updated_at_ms,
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_state_tests {
+    use super::DeviceRuntimeStateDto;
+
+    #[test]
+    fn runtime_state_dto保留设备状态真相字段() {
+        let dto = DeviceRuntimeStateDto::from(gb28181_simulator::DeviceRuntimeSnapshot {
+            guarded: true,
+            alarming: false,
+            longitude: 116.397428,
+            latitude: 39.909230,
+            name: "桌面模拟器".into(),
+            expiration: 7200,
+            heartbeat_interval: 15,
+            heartbeat_count: 5,
+            video_record_plan_type: Some(2),
+            alarm_record_duration: Some(30),
+            picture_mask_enabled: Some(1),
+            frame_mirror_mode: Some(0),
+            alarm_report_enabled: Some(1),
+            osd_time_show: Some(1),
+            osd_show: Some(0),
+            last_change: "device_config_applied".into(),
+            updated_at_ms: 123,
+        });
+        let value = serde_json::to_value(dto).unwrap();
+        assert_eq!(value["guarded"], true);
+        assert_eq!(value["alarming"], false);
+        assert_eq!(value["heartbeat_count"], 5);
+        assert_eq!(value["last_change"], "device_config_applied");
+    }
+}
+
+/// 查询当前设备实例的会话级运行时状态真相。
+#[tauri::command]
+async fn get_device_runtime_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<DeviceRuntimeStateDto, String> {
+    let device = state.device.lock().await;
+    let handle = device.as_ref().ok_or("设备未启动")?;
+    Ok(handle.sim.runtime_snapshot().into())
+}
+
 /// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
 /// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
 #[tauri::command]
@@ -1493,6 +1581,7 @@ pub fn run() {
             set_sip_trace,
             get_stress_status,
             get_device_status,
+            get_device_runtime_state,
             load_catalog_template,
             get_catalog_tree,
             upsert_channel,
