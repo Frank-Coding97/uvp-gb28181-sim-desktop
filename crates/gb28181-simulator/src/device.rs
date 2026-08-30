@@ -3349,6 +3349,11 @@ impl DeviceSimulator {
         }
         inbound_task.abort();
         self.stop_subscriptions().await;
+        if let Some(service) = self.recording_service() {
+            if let Err(error) = service.stop().await {
+                tracing::warn!(%error, "设备下线时录像收尾失败");
+            }
+        }
         self.stop_shared_media().await;
         // 主动向平台注销(REGISTER Expires=0,§9.1.2.2):平台立即置离线,不等心跳超时。
         if let Err(e) = self.unregister(&transport, &local_host, local_port).await {

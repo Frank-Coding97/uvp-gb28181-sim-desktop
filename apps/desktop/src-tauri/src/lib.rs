@@ -9,7 +9,10 @@ use std::sync::{
 };
 
 use common::{DeviceEvent, DeviceId, DeviceObserver, Transport};
-use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
+use gb28181_simulator::{
+    ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator, RecordingEntry, RecordingKind,
+    RecordingPhase, RecordingSource, RecordingState, RecordingStore,
+};
 use serde::Serialize;
 use sip_core::UdpTransport;
 use stress_engine::{Metrics, Orchestrator};
@@ -33,6 +36,8 @@ use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
 struct AppState {
     /// Rust 端配置真相源；路径在首次 Tauri 命令时由 app_data_dir 初始化。
     config_store: OnceLock<ConfigStore>,
+    /// 录像索引真相，设备停止后仍可查看历史文件。
+    recording_store: OnceLock<Arc<RecordingStore>>,
     /// 配置文件读写串行化，避免并发保存与读取看到半次操作。
     config_io: Mutex<()>,
     /// 当前压测句柄；任务完全退出前始终占用槽位。
@@ -77,6 +82,7 @@ impl AppState {
         let preview_manager = Arc::new(PreviewManager::new(Arc::clone(&preview_bus)));
         AppState {
             config_store: OnceLock::new(),
+            recording_store: OnceLock::new(),
             config_io: Mutex::new(()),
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
@@ -88,6 +94,25 @@ impl AppState {
             preview_manager,
         }
     }
+}
+
+fn app_recording_store(state: &AppState, app: &AppHandle) -> Result<Arc<RecordingStore>, String> {
+    if let Some(store) = state.recording_store.get() {
+        return Ok(Arc::clone(store));
+    }
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用录像目录: {error}"))?
+        .join("recordings");
+    let store = Arc::new(RecordingStore::open(directory).map_err(|error| error.to_string())?);
+    let _ = state.recording_store.set(store);
+    Ok(Arc::clone(
+        state
+            .recording_store
+            .get()
+            .expect("RecordingStore 初始化后必须存在"),
+    ))
 }
 
 fn app_config_store(state: &AppState, app: &AppHandle) -> Result<ConfigStore, String> {
@@ -1164,6 +1189,7 @@ async fn start_device(
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
     let sim = Arc::new(DeviceSimulator::with_observer(cfg, observer));
+    sim.install_recording_store(app_recording_store(&state, &app)?);
     sim.set_preview_sink(Some(
         state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
     ));
@@ -1215,16 +1241,127 @@ async fn start_device(
     Ok("设备已启动".into())
 }
 
+#[derive(Debug, Serialize)]
+struct RecordingEntryDto {
+    id: String,
+    channel_id: String,
+    start_time_ms: u64,
+    end_time_ms: u64,
+    start_time: String,
+    end_time: String,
+    source: RecordingSource,
+    kind: RecordingKind,
+    path: String,
+    size_bytes: u64,
+}
+
+impl From<RecordingEntry> for RecordingEntryDto {
+    fn from(entry: RecordingEntry) -> Self {
+        Self {
+            id: entry.id,
+            channel_id: entry.channel_id,
+            start_time_ms: entry.start_time_ms,
+            end_time_ms: entry.end_time_ms,
+            start_time: entry.start_time,
+            end_time: entry.end_time,
+            source: entry.source,
+            kind: entry.kind,
+            path: entry.path.to_string_lossy().into_owned(),
+            size_bytes: entry.size_bytes,
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_recordings(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Vec<RecordingEntryDto>, String> {
+    Ok(app_recording_store(&state, &app)?
+        .list()
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+#[tauri::command]
+async fn get_recording_state(state: tauri::State<'_, AppState>) -> Result<RecordingState, String> {
+    let device = state.device.lock().await;
+    Ok(device
+        .as_ref()
+        .and_then(|handle| handle.sim.recording_service())
+        .map(|service| service.state())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn start_recording(state: tauri::State<'_, AppState>) -> Result<RecordingState, String> {
+    let device = state.device.lock().await;
+    let handle = device.as_ref().ok_or("设备未启动，不能录像")?;
+    handle
+        .sim
+        .start_recording(RecordingKind::Manual, RecordingSource::Local)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn stop_recording(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RecordingEntryDto>, String> {
+    let device = state.device.lock().await;
+    let handle = device.as_ref().ok_or("设备未启动")?;
+    handle
+        .sim
+        .stop_recording()
+        .await
+        .map(|entry| entry.map(Into::into))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_recording(
+    id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<bool, String> {
+    if id.trim().is_empty() {
+        return Err("录像 ID 不能为空".into());
+    }
+    let device = state.device.lock().await;
+    if let Some(service) = device
+        .as_ref()
+        .and_then(|handle| handle.sim.recording_service())
+    {
+        let current = service.state();
+        if current.active_id.as_deref() == Some(id.as_str())
+            && !matches!(current.phase, RecordingPhase::Idle | RecordingPhase::Failed)
+        {
+            return Err("录像正在写入或收尾，不能删除".into());
+        }
+    }
+    drop(device);
+    app_recording_store(&state, &app)?
+        .delete(&id)
+        .map(|entry| entry.is_some())
+        .map_err(|error| error.to_string())
+}
+
 /// 停止当前设备。
 #[tauri::command]
 async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
     let mut guard = state.device.lock().await;
     match guard.take() {
         Some(h) => {
+            let recording_result = match h.sim.recording_service() {
+                Some(service) => service.stop().await.map_err(|error| error.to_string()),
+                None => Ok(None),
+            };
             h.sim.stop_shared_media().await;
             let _ = h.stop_tx.send(());
             let _ = app.emit("device_state", "Disconnected");
-            Ok("设备已停止".into())
+            recording_result?;
+            Ok("设备已停止，活跃录像已收尾".into())
         }
         None => Err("没有正在运行的设备".into()),
     }
@@ -1710,6 +1847,11 @@ pub fn run() {
             retry_binary_preview,
             start_device,
             stop_device,
+            get_recordings,
+            get_recording_state,
+            start_recording,
+            stop_recording,
+            delete_recording,
             fire_alarm,
             fire_position,
             set_sip_trace,
@@ -1747,7 +1889,11 @@ pub fn run() {
                     )
                 };
                 if let Some(handle) = device {
+                    if let Some(service) = handle.sim.recording_service() {
+                        let _ = tauri::async_runtime::block_on(service.stop());
+                    }
                     tauri::async_runtime::block_on(handle.sim.stop_shared_media());
+                    let _ = handle.stop_tx.send(());
                 }
                 tauri::async_runtime::block_on(preview_manager.shutdown());
             }
