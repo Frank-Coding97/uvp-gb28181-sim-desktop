@@ -29,6 +29,9 @@ pub struct LinearScenario {
     pub server_host: String,
     /// 平台端口。
     pub server_port: u16,
+    /// 平台国标 ID；旧 TOML 省略时回退到 server_domain。
+    #[serde(default)]
+    pub server_id: String,
     /// 平台域。
     pub server_domain: String,
     /// 传输方式。
@@ -130,6 +133,17 @@ impl Scenario for LinearScenario {
                 "当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into(),
             ));
         }
+        if !self.server_id.trim().is_empty() {
+            DeviceId::new(self.server_id.clone())
+                .map_err(|_| common::Error::Config("平台 ID 必须是 20 位数字".into()))?;
+            if self.server_domain.len() != 10
+                || !self.server_domain.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(common::Error::Config(
+                    "显式配置平台 ID 时，SIP 域必须是 10 位数字".into(),
+                ));
+            }
+        }
         if self.heartbeat_interval_secs == 0 {
             return Err(common::Error::Config("心跳间隔必须大于 0 秒".into()));
         }
@@ -203,7 +217,11 @@ impl Scenario for LinearScenario {
                 password: self.password.clone(),
                 server_host: self.server_host.clone(),
                 server_port: self.server_port,
-                server_id: self.server_domain.clone(),
+                server_id: if self.server_id.trim().is_empty() {
+                    self.server_domain.clone()
+                } else {
+                    self.server_id.clone()
+                },
                 server_domain: self.server_domain.clone(),
                 transport: self.transport,
                 register_expires_secs: 3_600,
@@ -256,6 +274,7 @@ mod tests {
             password: "12345678".into(),
             server_host: "1.2.3.4".into(),
             server_port: 5060,
+            server_id: String::new(),
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
@@ -294,6 +313,7 @@ mod tests {
             password: "pwd".into(),
             server_host: "1.2.3.4".into(),
             server_port: 5060,
+            server_id: String::new(),
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
@@ -329,6 +349,7 @@ mod tests {
             password: "p".into(),
             server_host: "1.2.3.4".into(),
             server_port: 5060,
+            server_id: String::new(),
             server_domain: "34020000002000000001".into(),
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
@@ -352,5 +373,80 @@ mod tests {
         assert_eq!(active, 3, "10 台 @ 30% 应有 3 台推流");
         assert!(cfgs[0].video_source.is_some());
         assert!(cfgs[3].video_source.is_none());
+    }
+
+    #[test]
+    fn 旧toml无server_id保持旧目标语义() {
+        let toml = r#"
+base_device_id = "34020000001320000001"
+password = "secret"
+server_host = "127.0.0.1"
+server_port = 5060
+server_domain = "34020000002000000001"
+
+[device_info]
+device_name = "Legacy"
+manufacturer = "UVP"
+model = "Sim"
+firmware = "1.0"
+"#;
+        let scenario = LinearScenario::from_toml_str(toml).unwrap();
+        assert!(scenario.server_id.is_empty());
+        let generated = scenario.generate(1).unwrap();
+        assert_eq!(generated[0].server_id, "34020000002000000001");
+        assert_eq!(generated[0].server_domain, "34020000002000000001");
+    }
+
+    #[test]
+    fn 新toml分别保留平台id与域() {
+        let toml = r#"
+base_device_id = "34020000001320000001"
+password = "secret"
+server_host = "127.0.0.1"
+server_port = 5060
+server_id = "34020000002000000001"
+server_domain = "3402000000"
+
+[device_info]
+device_name = "New"
+manufacturer = "UVP"
+model = "Sim"
+firmware = "1.0"
+"#;
+        let scenario = LinearScenario::from_toml_str(toml).unwrap();
+        let generated = scenario.generate(1).unwrap();
+        assert_eq!(generated[0].server_id, "34020000002000000001");
+        assert_eq!(generated[0].server_domain, "3402000000");
+    }
+
+    #[test]
+    fn 新toml非法平台id在生成前失败() {
+        let mut scenario = LinearScenario {
+            base_device_id: "34020000001320000001".into(),
+            password: "secret".into(),
+            server_host: "127.0.0.1".into(),
+            server_port: 5060,
+            server_id: "123".into(),
+            server_domain: "3402000000".into(),
+            transport: Transport::Udp,
+            heartbeat_interval_secs: 60,
+            channels_per_device: 1,
+            device_info: DeviceInfoTemplate {
+                device_name: "Invalid".into(),
+                manufacturer: "UVP".into(),
+                model: "Sim".into(),
+                firmware: "1.0".into(),
+            },
+            media_profile: MediaProfile::A,
+            video_source: None,
+            video_fps: 25,
+            bitrate_kbps: 512,
+            active_ratio: 1.0,
+            ramp_per_second: 0,
+            gb_version: GbVersion::V2022,
+        };
+        assert!(scenario.generate(1).is_err());
+        scenario.server_id = "34020000002000000001".into();
+        assert!(scenario.generate(1).is_ok());
     }
 }
