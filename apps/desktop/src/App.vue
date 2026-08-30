@@ -3,10 +3,13 @@
 // 顶栏右侧状态胶囊 + 磨砂侧边栏 + 内容区路由视图。
 // 必须保留 message/dialog/notification provider,否则子页 useMessage() 抛错致空白。
 import { computed, h, onMounted, onUnmounted, provide, ref, watch } from "vue";
+// 起别名避免与模板里 <router-view> 的插槽变量 `Component` 撞名。
+import type { Component as VueComponent } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
   NMenu, NIcon, NModal, NInput, NInputNumber, NButton, NSelect, zhCN, dateZhCN,
+  createDiscreteApi,
 } from "naive-ui";
 import type { MenuOption } from "naive-ui";
 import SpeedometerOutline from "@vicons/ionicons5/es/SpeedometerOutline.js";
@@ -23,10 +26,17 @@ import { useTheme } from "./theme";
 const route = useRoute();
 const router = useRouter();
 
+/** 读一个 CSS 设计令牌的当前值。取不到时回落到给定默认色。 */
+function readToken(name: string, fallback: string): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
 // 主题:浅色 / 暗色 / 跟随系统。切 <html data-theme> + Naive UI 主题。
 const { isDark, naiveTheme, label: themeLabel, toggle: toggleTheme } = useTheme();
 
-function icon(comp: any) {
+// 侧边栏菜单图标工厂。参数是 @vicons 的组件,用 `Component` 而不是 `any`。
+function icon(comp: VueComponent) {
   return () => h(NIcon, null, { default: () => h(comp) });
 }
 
@@ -94,9 +104,24 @@ function addNew() {
     server_domain: "34020000002000000001", transport: "UDP", signaling_encoding: "GB18030" });
   openEdit();
 }
+// App.vue **本身**渲染 n-dialog-provider,所以它自己不能用 useDialog()
+// (provider 必须是祖先)。createDiscreteApi 就是为这种场景提供的脱离上下文的 API。
+const { dialog: discreteDialog } = createDiscreteApi(["dialog"]);
+
 async function onDeleteProfile() {
-  await removeProfile(activeId.value);
-  openEdit(); // 删除后 activeId 可能切换,重新装载当前档案到表单
+  // 删档案会连带删掉钥匙串里的密码,且不可撤销 —— 必须二次确认。
+  // 之前点一下即删,连提示都没有。
+  const target = profiles.value.find((p) => p.id === activeId.value);
+  discreteDialog.warning({
+    title: "删除平台档案",
+    content: `确定删除「${target?.name ?? activeId.value}」吗?该档案在系统钥匙串里保存的 SIP 密码也会一并删除,此操作无法撤销。`,
+    positiveText: "删除",
+    negativeText: "取消",
+    async onPositiveClick() {
+      await removeProfile(activeId.value);
+      openEdit(); // 删除后 activeId 可能切换,重新装载当前档案到表单
+    },
+  });
 }
 const transportOptions = [
   { label: "UDP(国标最常用)", value: "UDP" },
@@ -115,7 +140,7 @@ function onMenuSelect(key: string) {
 // 全局设备状态 + 注册/注销:来自 device store(顶栏与单设备页共用同一份)。
 type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
 const {
-  deviceState, startedAt, statusMeta, startDisabled, stopDisabled,
+  deviceState, startedAt, statusMeta, startDisabled, stopDisabled, startingUp,
   startDevice, stopDevice, reconcile,
 } = useDevice();
 
@@ -187,9 +212,12 @@ onUnmounted(() => { unlisten?.(); unlistenErr?.(); if (uptimeTimer) clearInterva
 
 const themeOverrides = {
   common: {
-    primaryColor: "#3884ff",
-    primaryColorHover: "#5a9bff",
-    primaryColorPressed: "#1e63dc",
+    // 与 theme.css 的 --accent 同源。naive-ui 的 themeOverrides 只接受具体色值,
+    // 不能写 var(),所以这里从 CSS 令牌读一次而不是再抄一份 ——
+    // 抄一份就意味着改主色要改两处,漏一处就是"按钮和其它控件不同色"。
+    primaryColor: readToken("--accent", "#3884ff"),
+    primaryColorHover: readToken("--accent-hover", "#5a9bff"),
+    primaryColorPressed: readToken("--accent-deep", "#1e63dc"),
     borderRadius: "6px",
     fontSize: "12px",
     fontSizeSmall: "11.5px",
@@ -302,8 +330,23 @@ const themeOverrides = {
                     <template v-if="deviceState === 'Registered' || deviceState === 'InCall'"> · 在线 {{ uptime }}</template>
                   </span>
                   <div class="reg-btns">
-                    <n-button size="small" type="primary" :disabled="startDisabled" @click="onRegister">注册</n-button>
-                    <n-button size="small" secondary type="error" :disabled="stopDisabled" @click="onLogout">注销</n-button>
+                    <!-- :loading 与 :disabled 同时挂 startingUp:注册要几百毫秒到几秒,
+                         这段窗口不给反馈的话用户会连点,重复下发 start_device。 -->
+                    <n-button
+                      size="small"
+                      type="primary"
+                      :disabled="startDisabled"
+                      :loading="startingUp"
+                      @click="onRegister"
+                    >注册</n-button>
+                    <n-button
+                      size="small"
+                      secondary
+                      type="error"
+                      :disabled="stopDisabled"
+                      :loading="startingUp"
+                      @click="onLogout"
+                    >注销</n-button>
                     <button
                       class="theme-toggle"
                       type="button"
@@ -363,15 +406,15 @@ const themeOverrides = {
 .brand { display: flex; align-items: center; gap: 9px; padding: 13px 14px 10px; }
 .brand-logo {
   width: 28px; height: 28px; border-radius: 7px;
-  background: linear-gradient(135deg, #3884ff, #1e63dc);
-  color: #fff; font-weight: 700; font-size: 11px; letter-spacing: 0.5px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+  color: #fff; font-weight: 700; font-size: var(--fs-sm); letter-spacing: 0.5px;
   display: flex; align-items: center; justify-content: center;
   box-shadow: 0 2px 8px var(--accent-glow);
 }
-.brand-title { font-size: 13px; font-weight: 700; color: var(--text-primary); }
-.brand-sub { font-size: 10px; color: var(--text-tertiary); margin-top: 1px; }
+.brand-title { font-size: var(--fs-md); font-weight: 700; color: var(--text-primary); }
+.brand-sub { font-size: var(--fs-xs); color: var(--text-tertiary); margin-top: 1px; }
 .sidebar-footer {
-  margin-top: auto; padding: 10px 14px; font-size: 10px;
+  margin-top: auto; padding: 10px 14px; font-size: var(--fs-xs);
   color: var(--text-tertiary); border-top: 1px solid var(--border-default);
 }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -383,17 +426,17 @@ const themeOverrides = {
 }
 .platform-bar { display: inline-flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 auto; }
 .plat-select { width: clamp(180px, 20vw, 260px); min-width: 140px; }
-.plat-icon { color: var(--accent); font-size: 14px; }
-.plat-label { font-size: 11.5px; color: var(--text-secondary); }
+.plat-icon { color: var(--accent); font-size: var(--fs-lg); }
+.plat-label { font-size: var(--fs-sm); color: var(--text-secondary); }
 .plat-edit { display: flex; flex-direction: column; gap: 6px; width: 100%; }
 .pe-actions { display: flex; gap: 6px; margin-top: 4px; }
 .pe-secret { display: flex; flex-direction: column; gap: 3px; }
-.pe-hint { margin: 0; font-size: 10.5px; color: var(--text-tertiary); line-height: 1.35; }
+.pe-hint { margin: 0; font-size: var(--fs-sm); color: var(--text-tertiary); line-height: 1.35; }
 .pe-hint.warn { color: var(--warning); }
 /* 顶栏密码状态徽标:一眼看出当前档案能否注册 */
 .plat-secret {
   display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto;
-  padding: 1px 7px; border-radius: 999px; font-size: 10.5px; white-space: nowrap;
+  padding: 1px 7px; border-radius: 999px; font-size: var(--fs-sm); white-space: nowrap;
   background: color-mix(in srgb, var(--success) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--success) 32%, transparent);
   color: var(--success);
@@ -412,22 +455,22 @@ const themeOverrides = {
   backdrop-filter: var(--blur-light); -webkit-backdrop-filter: var(--blur-light);
   height: 28px; box-sizing: border-box;
 }
-.conn-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px rgba(56,132,255,.1); }
-.conn-status-text { color: var(--text-primary); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.conn-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent); }
+.conn-status-text { color: var(--text-primary); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; }
 .reg-btns { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; margin-left: 2px; }
 /* 外观切换:轻量图标按钮,与注册/注销同一行 */
 .theme-toggle {
   display: inline-flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; padding: 0; cursor: pointer;
   border: 1px solid var(--border-default); border-radius: var(--radius-xs);
-  background: var(--bg-surface); color: var(--text-secondary); font-size: 12px;
+  background: var(--bg-surface); color: var(--text-secondary); font-size: var(--fs-md);
   transition: border-color var(--transition), background var(--transition);
 }
 .theme-toggle:hover { border-color: var(--accent); background: var(--bg-hover); }
 /* 顶栏轻量提示条:居中浮在顶栏下方,不占布局。 */
 .top-toast {
   position: absolute; top: 50px; left: 50%; transform: translateX(-50%);
-  z-index: 50; padding: 5px 14px; border-radius: 999px; font-size: 11.5px;
+  z-index: 50; padding: 5px 14px; border-radius: 999px; font-size: var(--fs-sm);
   box-shadow: var(--shadow-elevated); backdrop-filter: var(--blur-light);
 }
 .top-toast.ok { background: color-mix(in srgb, var(--success) 16%, var(--bg-base)); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
@@ -441,9 +484,9 @@ const themeOverrides = {
   margin: 3px 16px 0; padding: 6px 10px; border-radius: 6px;
   background: color-mix(in srgb, var(--error) 10%, transparent);
   border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-  color: var(--error); font-size: 11.5px;
+  color: var(--error); font-size: var(--fs-sm);
 }
-.eb-icon { flex: 0 0 auto; font-size: 13px; }
+.eb-icon { flex: 0 0 auto; font-size: var(--fs-md); }
 .eb-scope { flex: 0 0 auto; font-weight: 700; }
 .eb-msg {
   flex: 1 1 auto; min-width: 0; color: var(--text-primary);
@@ -451,7 +494,7 @@ const themeOverrides = {
 }
 .eb-close {
   flex: 0 0 auto; background: none; border: none; cursor: pointer;
-  color: var(--error); font-size: 11px; padding: 1px 4px; border-radius: 4px;
+  color: var(--error); font-size: var(--fs-sm); padding: 1px 4px; border-radius: 4px;
 }
 .eb-close:hover { background: color-mix(in srgb, var(--error) 20%, transparent); }
 

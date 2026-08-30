@@ -74,21 +74,69 @@ const typeLabel: Record<string, string> = {
 };
 const typeOptions = Object.entries(typeLabel).map(([value, label]) => ({ label, value }));
 
+/** 各类 IPC 进行中标志:防连点。upsert/remove 都会向已订阅平台发增量通知,
+ *  重复发送就是重复通知。 */
+const busy = ref(false);
+
 async function loadTemplate() {
+  if (busy.value) return;
+  // 载入模板会**整体覆盖**当前目录。手工编辑过的通道会被静默替换掉,
+  // 所以有内容时必须先确认(之前直接覆盖,只在成功后提示"已载入模板")。
+  if (nodes.value.length > 0) {
+    const confirmed = await new Promise<boolean>((resolve) => {
+      dialog.warning({
+        title: "载入目录模板",
+        content: `当前已有 ${nodes.value.length} 个节点,载入模板会整体覆盖它们(含你手工编辑过的通道)。继续吗?`,
+        positiveText: "覆盖载入",
+        negativeText: "取消",
+        onPositiveClick: () => resolve(true),
+        onNegativeClick: () => resolve(false),
+        onClose: () => resolve(false),
+        onMaskClick: () => resolve(false),
+      });
+    });
+    if (!confirmed) return;
+  }
+  busy.value = true;
   try {
     nodes.value = await invoke<ChannelNode[]>("load_catalog_template", { template: template.value });
+    loadState.value = "ready";
     message.success(`已载入模板,共 ${nodes.value.length} 个节点`);
   } catch (e) {
-    message.error(String(e));
+    message.error(`载入模板失败:${String(e)}`, { duration: 0, closable: true });
+  } finally {
+    busy.value = false;
   }
 }
 
+/**
+ * 目录加载状态。
+ *
+ * 之前"加载中 / 加载失败 / 设备未启动 / 目录真空"四种情况全部呈现为同一行灰字
+ * (「设备未启动或目录为空」),用户无法判断该做什么 —— 该去启动设备?该重试?
+ * 还是该载入模板?现在四态各有各的呈现。
+ */
+type LoadState = "loading" | "ready" | "offline" | "error";
+const loadState = ref<LoadState>("loading");
+const loadError = ref("");
+
 async function refresh() {
+  loadState.value = "loading";
+  loadError.value = "";
   try {
     nodes.value = await invoke<ChannelNode[]>("get_catalog_tree");
-  } catch {
-    // 设备未启动时忽略
+    loadState.value = "ready";
+  } catch (e) {
+    // 后端在"设备未启动"时返回错误。这两种情况的下一步动作完全不同:
+    // 未启动要去单设备页启动,真错误要看日志或重试。
+    const msg = String(e);
     nodes.value = [];
+    if (msg.includes("未启动") || msg.includes("没有正在运行")) {
+      loadState.value = "offline";
+    } else {
+      loadState.value = "error";
+      loadError.value = msg;
+    }
   }
 }
 function countBy(type: string): number {
@@ -134,13 +182,18 @@ async function saveNode() {
     message.warning("经度与纬度必须同时填写或同时留空");
     return;
   }
+  if (busy.value) return;
+  busy.value = true;
   try {
     const msg = await invoke<string>("upsert_channel", { node: editing.value });
     message.success(msg);
     showEdit.value = false;
     await refresh();
   } catch (e) {
-    message.error(String(e));
+    // 失败提示不自动消失:校验错误信息往往要照着改表单,一闪而过没法用。
+    message.error(`保存通道失败:${String(e)}`, { duration: 0, closable: true });
+  } finally {
+    busy.value = false;
   }
 }
 
@@ -151,12 +204,16 @@ function removeNode(row: ChannelNode) {
     positiveText: "删除",
     negativeText: "取消",
     async onPositiveClick() {
+      if (busy.value) return;
+      busy.value = true;
       try {
         await invoke<string>("remove_channel", { id: row.id });
         message.success("已删除通道");
         await refresh();
       } catch (e) {
-        message.error(String(e));
+        message.error(`删除通道失败:${String(e)}`, { duration: 0, closable: true });
+      } finally {
+        busy.value = false;
       }
     },
   });
@@ -177,11 +234,11 @@ const columns: DataTableColumns<ChannelNode> = [
   },
   {
     title: "国标 ID", key: "id", minWidth: 200,
-    render: (r) => h("span", { style: "font-family:monospace;font-size:12px;white-space:nowrap" }, r.id),
+    render: (r) => h("span", { style: "font-family:monospace;font-size: var(--fs-md);white-space:nowrap" }, r.id),
   },
   {
     title: "父节点", key: "parent_id", minWidth: 200,
-    render: (r) => h("span", { style: "font-family:monospace;font-size:12px;color:var(--text-tertiary);white-space:nowrap" }, r.parent_id),
+    render: (r) => h("span", { style: "font-family:monospace;font-size: var(--fs-md);color:var(--text-tertiary);white-space:nowrap" }, r.parent_id),
   },
   { title: "区划码", key: "civil_code", width: 84, render: (r) => r.civil_code ?? "—" },
   {
@@ -234,9 +291,9 @@ onActivated(refresh);
       <n-space align="center">
         <span class="label">目录模板</span>
         <n-select v-model:value="template" :options="templateOptions" style="width: 260px" />
-        <n-button type="primary" @click="loadTemplate">载入模板</n-button>
-        <n-button @click="refresh">刷新</n-button>
-        <n-button type="info" @click="openAdd">+ 新增通道</n-button>
+        <n-button type="primary" :loading="busy" :disabled="busy" @click="loadTemplate">载入模板</n-button>
+        <n-button :loading="loadState === 'loading'" :disabled="busy" @click="refresh">刷新</n-button>
+        <n-button type="info" :disabled="busy || loadState !== 'ready'" @click="openAdd">+ 新增通道</n-button>
         <span v-if="nodes.length" class="chan-summary">
           共 {{ nodes.length }} 节点 · 视频 {{ countBy('VideoChannel') }} · 报警 {{ countBy('AlarmChannel') }} · 分组 {{ countBy('BusinessGroup') + countBy('VirtualOrg') }}
         </span>
@@ -248,9 +305,24 @@ onActivated(refresh);
         size="small"
         style="margin-top: 16px"
         :scroll-x="900"
+        :loading="loadState === 'loading'"
         :row-key="(r: ChannelNode) => r.id"
       />
-      <div v-if="nodes.length === 0" class="empty">设备未启动或目录为空。请到「单设备联调」启动设备,或载入模板。</div>
+      <!-- 四态各自呈现,并各自给出下一步动作。 -->
+      <div v-if="loadState === 'loading'" class="state-note" role="status" aria-live="polite">
+        正在读取目录…
+      </div>
+      <div v-else-if="loadState === 'offline'" class="state-note">
+        设备未启动。请到「单设备联调」页启动设备后再管理目录;也可以先在这里载入模板,
+        启动后会一并同步给平台。
+      </div>
+      <div v-else-if="loadState === 'error'" class="state-note error" role="alert">
+        读取目录失败:{{ loadError }}
+        <button type="button" class="retry-btn" @click="refresh">重试</button>
+      </div>
+      <div v-else-if="nodes.length === 0" class="state-note">
+        目录为空。选一个模板载入,或点「+ 新增通道」手工添加。
+      </div>
     </div>
 
 
@@ -326,9 +398,20 @@ onActivated(refresh);
 <style scoped>
 .page { max-width: 1200px; }
 .panel { padding: 12px 14px; border-radius: var(--radius-md); }
-.label { color: var(--text-secondary); font-size: 11.5px; }
-.empty { color: var(--text-tertiary); font-size: 11.5px; margin-top: 8px; text-align: center; padding: 14px; }
-.chan-summary { font-size: 11px; color: var(--text-tertiary); margin-left: auto; }
+.label { color: var(--text-secondary); font-size: var(--fs-sm); }
+.state-note {
+  display: flex; align-items: center; justify-content: center; gap: var(--sp-3);
+  margin-top: var(--sp-3); padding: var(--sp-6) var(--sp-4);
+  font-size: var(--fs-sm); line-height: var(--lh-normal);
+  color: var(--text-secondary); text-align: center;
+}
+.state-note.error { color: var(--error); }
+.retry-btn {
+  min-height: var(--ctl-h-sm); padding: 0 var(--sp-3);
+  border: 1px solid currentColor; border-radius: var(--radius-xs);
+  background: transparent; color: inherit; font-size: var(--fs-sm); cursor: pointer;
+}
+.chan-summary { font-size: var(--fs-sm); color: var(--text-tertiary); margin-left: auto; }
 
 /* 弹窗里把"必填基本信息"与"A.2.1.9 扩展字段"用一条分隔线分开 */
 .ext-head {
@@ -336,8 +419,8 @@ onActivated(refresh);
   margin: 4px 0 10px; padding-top: 10px;
   border-top: 1px solid var(--border-default);
 }
-.ext-title { font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
-.ext-hint { font-size: 10.5px; color: var(--text-tertiary); }
+.ext-title { font-size: var(--fs-sm); font-weight: 600; color: var(--text-secondary); }
+.ext-hint { font-size: var(--fs-sm); color: var(--text-tertiary); }
 
 /* 表格半透明质感:去掉 naive-ui 默认白底,融入磨砂卡片 */
 :deep(.n-data-table),
@@ -346,20 +429,20 @@ onActivated(refresh);
 :deep(.n-data-table .n-data-table-table),
 :deep(.n-data-table-base-table) { background-color: transparent !important; }
 :deep(.n-data-table .n-data-table-th) {
-  background-color: rgba(120,130,150,0.06) !important;
-  color: var(--text-secondary); font-weight: 600; font-size: 11.5px;
+  background-color: var(--table-head-bg) !important;
+  color: var(--text-secondary); font-weight: 600; font-size: var(--fs-sm);
   padding: 6px 10px !important;
-  border-bottom: 1px solid rgba(120,130,150,0.12) !important;
+  border-bottom: 1px solid var(--border-default) !important;
 }
 :deep(.n-data-table .n-data-table-td) {
   padding: 5px 10px !important;
-  font-size: 11.5px;
-  border-bottom: 1px solid rgba(120,130,150,0.08) !important;
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid var(--border-default) !important;
 }
 :deep(.n-data-table .n-data-table-tr:hover .n-data-table-td) {
-  background-color: rgba(56,132,255,0.05) !important;
+  background-color: color-mix(in srgb, var(--accent) 6%, transparent) !important;
 }
 :deep(.n-data-table .n-data-table-empty) { background-color: transparent !important; }
-.section-title { font-size: 13.5px; font-weight: 600; color: var(--text-primary); }
-.section-hint { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+.section-title { font-size: var(--fs-lg); font-weight: 600; color: var(--text-primary); }
+.section-hint { font-size: var(--fs-sm); color: var(--text-tertiary); margin-top: 2px; }
 </style>

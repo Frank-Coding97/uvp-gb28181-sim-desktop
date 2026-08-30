@@ -17,6 +17,12 @@ use crate::metrics::Metrics;
 /// 分片同时把接收循环并行化,也更接近"很多台设备各有自己五元组"的真实拓扑。
 const DEVICES_PER_SOCKET: usize = 64;
 
+/// 爬坡减速的最大倍数(闭环背压)。
+///
+/// 16 倍(如 200/s → 12/s)已经足够慢到让本机喘过来;再慢就该判定
+/// "本机根本跑不动这个规模",继续等下去只是把结论推迟。
+const MAX_GAP_MULTIPLIER: u32 = 16;
+
 /// 一个传输分片:共享 socket + 本端地址。
 struct TransportShard {
     transport: Arc<dyn SipTransport>,
@@ -84,6 +90,21 @@ impl Orchestrator {
             transport_kind,
             transport_stats: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// 当前累计的本地压力(队列丢弃 + 发送失败 + 解析失败 + 本地归因失败)。
+    ///
+    /// 与 `MetricsSnapshot::local_pressure` 同一个定义,但这里避免构造整个快照
+    /// (爬坡窗口每秒一次,而快照会克隆失败样本 Vec)。
+    fn local_pressure(&self) -> u64 {
+        let t = self.transport_stats();
+        t.dropped_queue_full
+            + t.send_errors
+            + t.parse_errors
+            + self
+                .metrics
+                .fail_local
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 聚合全部传输分片的统计。
@@ -180,18 +201,31 @@ impl Orchestrator {
         // 爬坡:按 1s/ramp 的**均匀间隔**逐台发放,而不是"攒一批后突发"。
         // 批量突发会在批内瞬时打满,既不像真实设备上线过程,也容易自己把自己打挂。
         let ramp = self.ramp_per_second;
-        let ramp_gap = (ramp > 0).then(|| {
+        let base_gap = (ramp > 0).then(|| {
             std::time::Duration::from_nanos((1_000_000_000f64 / ramp as f64).max(1.0) as u64)
         });
         let mut next_slot = tokio::time::Instant::now();
+
+        // ── 闭环背压 ──
+        //
+        // 爬坡原来是**开环**的:完全由时间驱动,不读任何反馈。本机一旦开始丢包
+        // (socket 缓冲不够、fd 紧张、CPU 打满),它仍按原速继续拉设备,
+        // 于是失败里混进了本机瓶颈,而 `results_trustworthy` 只能**事后**告诉你
+        // "这轮不可信" —— 一小时压测白跑。
+        //
+        // 现在每个爬坡窗口结束时看一次本地压力增量:涨了就把间隔翻倍(上限
+        // [`MAX_GAP_MULTIPLIER`]),没涨就逐步收回。这是控制"加压速率"而不是
+        // "目标台数",所以不会偷偷少起设备,只会起得慢一些。
+        let mut gap_multiplier: u32 = 1;
+        let mut pressure_at_window = self.local_pressure();
 
         // 批量启动设备 run 任务。
         let mut handles = Vec::new();
         for (i, dev) in self.devices.iter().enumerate() {
             // 爬坡等待必须可被停止打断,否则停止后仍会继续创建新设备,且晚订阅者
             // 收不到之前已经发送过的 broadcast 信号。
-            if let Some(gap) = ramp_gap {
-                next_slot += gap;
+            if let Some(gap) = base_gap {
+                next_slot += gap * gap_multiplier;
                 tokio::select! {
                     _ = ramp_stop.recv() => {
                         tracing::info!(started = i, "爬坡阶段收到停止信号");
@@ -199,15 +233,45 @@ impl Orchestrator {
                     }
                     _ = tokio::time::sleep_until(next_slot) => {}
                 }
-                // 每上线 ramp 台输出一次进度,便于观察"已上线/目标"。
+                // 每上线 ramp 台(≈ 一个爬坡窗口)输出一次进度并做一次背压判定。
                 if ramp > 0 && (i as u32 + 1) % ramp == 0 {
+                    let online = self
+                        .metrics
+                        .devices_online
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let pressure = self.local_pressure();
+                    let delta = pressure.saturating_sub(pressure_at_window);
+                    pressure_at_window = pressure;
+
+                    if delta > 0 {
+                        // 本机在这一窗口里丢过东西:减速。
+                        let before = gap_multiplier;
+                        gap_multiplier = (gap_multiplier * 2).min(MAX_GAP_MULTIPLIER);
+                        if gap_multiplier != before {
+                            self.metrics.on_ramp_throttled();
+                        }
+                        tracing::warn!(
+                            started = i + 1,
+                            online,
+                            local_pressure_delta = delta,
+                            effective_ramp_per_sec = ramp / gap_multiplier.max(1),
+                            "本机出现背压(丢包/发送失败),爬坡减速 ——                              此时的失败不能算作平台承载上限"
+                        );
+                    } else if gap_multiplier > 1 {
+                        // 压力停止增长:逐步收回速率,而不是一次跳回原速
+                        // (一次跳回容易立刻再次触发,变成振荡)。
+                        gap_multiplier = (gap_multiplier / 2).max(1);
+                        tracing::info!(
+                            started = i + 1,
+                            effective_ramp_per_sec = ramp / gap_multiplier.max(1),
+                            "本机压力缓解,爬坡恢复提速"
+                        );
+                    }
+
                     tracing::info!(
                         started = i + 1,
                         target = self.devices.len(),
-                        online = self
-                            .metrics
-                            .devices_online
-                            .load(std::sync::atomic::Ordering::Relaxed),
+                        online,
                         "爬坡进度"
                     );
                 }

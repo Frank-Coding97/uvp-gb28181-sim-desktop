@@ -14,8 +14,16 @@ pub enum DeviceEvent {
     RegisterAttempt { retry: bool },
     /// 注册成功,携带整条注册事务的往返耗时(毫秒)。
     RegisterSuccess { rtt_ms: u64 },
-    /// 注册失败(带归因)。
-    RegisterFailure(FailureKind),
+    /// 注册失败(带归因与设备 ID)。
+    ///
+    /// 带 `device_id` 是为了让压测报告能给出**失败样本** —— 排障要挑一台具体设备
+    /// 复现,而之前只有一个总计数,拿不到任何一台可复现的设备编号。
+    RegisterFailure {
+        /// 失败归因。
+        kind: FailureKind,
+        /// 失败设备的国标编号。
+        device_id: String,
+    },
     /// 心跳成功,携带往返耗时(毫秒)。
     HeartbeatOk { rtt_ms: u64 },
     /// 心跳失败。
@@ -91,18 +99,69 @@ pub enum DeviceEvent {
 }
 
 /// 失败归因(与 docs/20-architecture/data-model.md#4 对齐)。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// 事务超时无响应。
     Timeout,
-    /// 平台拒绝(4xx/5xx)。
-    Rejected,
+    /// 平台以非 2xx 最终响应拒绝,携带状态码。
+    ///
+    /// 状态码必须带上:401/403 是凭据或权限问题(再加并发也没用),
+    /// 486/503 才是承载力信号。之前全被压成同一个 `Rejected`,
+    /// 报告里看不出该去修配置还是该降并发。
+    Rejected {
+        /// SIP 最终响应状态码。
+        status: u16,
+    },
     /// **本地**发送失败(ENOBUFS、socket 错误、队列满)。
     ///
     /// 单独一类是为了压测结论可信:本机瓶颈导致的失败绝不能算成"平台承载不住"。
     Local,
     /// 网络/其它。
     Other,
+}
+
+impl FailureKind {
+    /// 平台拒绝时按**处置动作**分档,而不是逐个状态码统计。
+    ///
+    /// 分档的依据是"看到这个数该做什么":凭据问题去改配置,
+    /// 过载问题去降并发,其它需要人看一眼原因短语。
+    pub fn reject_bucket(&self) -> Option<RejectBucket> {
+        match self {
+            FailureKind::Rejected { status } => Some(RejectBucket::of(*status)),
+            _ => None,
+        }
+    }
+}
+
+/// 平台拒绝的处置分档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectBucket {
+    /// 401 / 403:凭据或权限问题。加并发不会变好,要去核对用户名/密码/域。
+    Auth,
+    /// 486 / 503 / 480:平台忙、过载或暂时不可用 —— 这才是承载力信号。
+    Overload,
+    /// 其它 4xx/5xx:需要看原因短语,常见是编号不被平台接受(404)。
+    Other,
+}
+
+impl RejectBucket {
+    /// 按状态码分档。
+    pub fn of(status: u16) -> Self {
+        match status {
+            401 | 403 | 407 => RejectBucket::Auth,
+            480 | 486 | 503 | 500 | 504 => RejectBucket::Overload,
+            _ => RejectBucket::Other,
+        }
+    }
+
+    /// 供报告与界面显示的中文名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            RejectBucket::Auth => "凭据/权限",
+            RejectBucket::Overload => "平台忙/过载",
+            RejectBucket::Other => "其它拒绝",
+        }
+    }
 }
 
 /// 设备事件观察者。设备层持有 `Arc<dyn DeviceObserver>` 并在关键节点回调。

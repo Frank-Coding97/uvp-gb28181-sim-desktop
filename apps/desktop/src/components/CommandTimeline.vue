@@ -26,15 +26,15 @@ const { commands } = usePlatformRuntime();
 
 <style scoped>
 .timeline-panel { height: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
-.empty-timeline { padding: 12px 0; font-size: 11px; }
+.empty-timeline { padding: 12px 0; font-size: var(--fs-sm); }
 .cmd-list { margin: 4px 0 0; padding: 0; list-style: none; max-height: 180px; overflow-y: auto; }
 .cmd-item {
   display: flex; align-items: center; gap: 6px; padding: 3px 0;
-  border-bottom: 1px solid var(--border-default); font-size: 10.5px;
+  border-bottom: 1px solid var(--border-default); font-size: var(--fs-sm);
 }
-.cmd-ts { color: var(--text-tertiary); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 9.5px; flex-shrink: 0; }
+.cmd-ts { color: var(--text-tertiary); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-xs); flex-shrink: 0; }
 .cmd-tag {
-  flex-shrink: 0; font-size: 9px; font-weight: 600; padding: 1px 5px; border-radius: 4px;
+  flex-shrink: 0; font-size: var(--fs-xs); font-weight: 600; padding: 1px 5px; border-radius: 4px;
   background: var(--accent-dim); color: var(--accent);
 }
 .cmd-tag.k-control { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); }

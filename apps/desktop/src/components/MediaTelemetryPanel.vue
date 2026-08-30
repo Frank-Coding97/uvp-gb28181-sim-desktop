@@ -143,7 +143,7 @@ const {
 .telemetry-idle { padding: 6px 0; line-height: 1.5; }
 
 .tm-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.tm-state { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-secondary); }
+.tm-state { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-sm); color: var(--text-secondary); }
 .tm-state i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
 .tm-state.live { color: var(--success); }
 .tm-state.live i {
@@ -159,7 +159,7 @@ const {
 @keyframes tmPulse { 50% { opacity: 0.45; } }
 
 .tm-source {
-  flex: 0 1 auto; min-width: 0; font-size: 10px; color: var(--text-tertiary);
+  flex: 0 1 auto; min-width: 0; font-size: var(--fs-xs); color: var(--text-tertiary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
@@ -170,7 +170,7 @@ const {
 .tm-side { min-width: 0; }
 .tm-side-title {
   display: flex; align-items: baseline; gap: 5px;
-  margin: 0 0 4px; font-size: 9.5px; font-weight: 600;
+  margin: 0 0 4px; font-size: var(--fs-xs); font-weight: 600;
   color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.3px;
 }
 .tm-age { font-weight: 400; letter-spacing: 0; text-transform: none; }
@@ -181,11 +181,11 @@ const {
   background: var(--bg-card); border: 1px solid var(--border-default);
 }
 .tm-item dt {
-  font-size: 8.5px; color: var(--text-tertiary);
+  font-size: var(--fs-xs); color: var(--text-tertiary);
   text-transform: uppercase; letter-spacing: 0.2px;
 }
 .tm-item dd {
-  margin: 2px 0 0; font-size: 10.5px; color: var(--text-primary);
+  margin: 2px 0 0; font-size: var(--fs-sm); color: var(--text-primary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .tm-item dd.mono {
@@ -197,7 +197,7 @@ const {
 .tm-nofeedback {
   padding: 6px 7px; border-radius: var(--radius-xs);
   background: var(--bg-surface); border: 1px dashed var(--border-default);
-  font-size: 10px; line-height: 1.5; color: var(--text-tertiary);
+  font-size: var(--fs-xs); line-height: 1.5; color: var(--text-tertiary);
 }
 
 @media (max-width: 1080px) {

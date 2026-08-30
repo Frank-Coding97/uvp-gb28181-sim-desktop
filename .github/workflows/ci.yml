@@ -97,6 +97,11 @@ jobs:
       - name: 安装前端依赖
         working-directory: apps/desktop
         run: npm ci
+      # lint 放在类型检查之前:它拦的是类型系统看不见的那一类问题
+      # (label 与控件未关联、分段控件缺 aria-pressed、button 缺 type)。
+      - name: ESLint(含 vuejs-accessibility)
+        working-directory: apps/desktop
+        run: npx eslint .
       - name: 类型检查
         working-directory: apps/desktop
         run: npx vue-tsc --noEmit

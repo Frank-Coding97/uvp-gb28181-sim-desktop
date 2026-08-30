@@ -402,7 +402,7 @@ onUnmounted(disposeScene);
   border-radius: 10px;
   color: #b4233b;
   background: var(--glass-fallback);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   text-align: center;
 }
 </style>

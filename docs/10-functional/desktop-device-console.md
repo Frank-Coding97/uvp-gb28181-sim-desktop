@@ -83,8 +83,46 @@ live:screen:<display_id>?audio=<none|system|microphone:N>&audio_codec=<g711a|g71
 | `composables/useSipTrace.ts` | 信令追踪缓冲与过滤 |
 | `composables/useVoiceBroadcast.ts` | 语音广播状态轮询(500 ms)、丢流判定、挂断 |
 | `composables/useMediaTelemetry.ts` | 推流遥测轮询(500 ms)、反馈可用性/质量阈值判定、数值格式化 |
+| `lib/ipcError.ts` | IPC 错误的统一呈现:把后端原文映射成「出了什么事 + 下一步做什么」 |
 
 跨面板复用的页头、表单与面板原语放在全局 `src/theme.css`(scoped 样式不跨组件边界),各页面若需微调用 scoped 规则覆盖。
+
+### 4.1 设计令牌与可访问性约定
+
+`src/theme.css` 是设计系统的唯一来源。除颜色/圆角/阴影外,还包含:
+
+| 令牌组 | 用途 | 约定 |
+|---|---|---|
+| `--fs-xs … --fs-2xl` | 字号阶梯(11/12/13/15/18/24) | **下限就是 11px**。需要更小说明层级划分有问题;组件里不再出现裸 px 字号 |
+| `--sp-1 … --sp-8` | 间距阶梯(4px 基准) | 替代散落的魔法数字 |
+| `--ctl-h-sm/md/lg` | 控件高度(26/30/34) | 输入框与按钮统一走这三档,保证点击区足够 |
+| `--z-base … --z-toast` | 层级 | 加浮层时按语义选,不再拍一个裸数字 |
+| `--fw-*` / `--lh-*` | 字重与行高 | — |
+
+可访问性基线(由 ESLint 的 `vuejs-accessibility` 规则集守住,见 `apps/desktop/eslint.config.js`):
+
+- 表单控件必须有关联 label。多实例组件用 `useId()` 生成 id ——
+  写死 id 在同页出现两个实例时会让屏幕阅读器把字段名读串。
+- 分段控件(`.seg`)用 `role="group"` + `aria-labelledby` + 每个按钮的 `aria-pressed`;
+  **一组按钮不是表单控件**,所以标题用 `<span class="fg-label">` 而不是 `<label>`。
+- 所有 `<button>` 必须写 `type`(`vue/html-button-has-type`)。
+- `--text-tertiary` 对背景的对比度过 WCAG AA(浅色 4.60:1、暗色 4.98:1);
+  另有 `prefers-contrast: more` 分支把两级次要文字并到接近正文色,并关掉磨砂层。
+- 动效尊重 `prefers-reduced-motion`(含 `ThreePtzCamera` 直接停 rAF)。
+
+### 4.2 状态与错误呈现约定
+
+- 每个数据面板要区分**加载中 / 就绪 / 设备未启动 / 出错**四态,并各自给出下一步动作。
+  典型实现见 `views/Channels.vue` 的 `LoadState`。
+- 云台卡在设备未启动时进入 idle 态(降饱和 + 蒙层说明):
+  照常渲染默认读数会让人误以为在运行。
+- 长耗时操作必须防重复提交。注册/注销由 `device.ts` 的 `busy` 标志把
+  "IPC 已发出但未返回"这段窗口封住(`startDisabled` / `startingUp`),
+  回归测试见 `src/device.test.ts`。
+- 破坏性操作必须二次确认:删除通道、**删除平台档案**(会连带删钥匙串密码)、
+  **载入目录模板**(整体覆盖当前目录)。
+- 失败提示走 `lib/ipcError.ts` 的 `formatError()`,且 `duration: 0` 不自动消失 ——
+  错误信息往往要照着改配置,一闪而过没法用。
 
 ## 5. 与压测页的关系
 

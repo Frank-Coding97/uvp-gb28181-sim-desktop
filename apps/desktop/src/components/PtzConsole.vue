@@ -4,6 +4,14 @@
 import { onMounted, onUnmounted } from "vue";
 import ThreePtzCamera from "./ThreePtzCamera.vue";
 import { PRESET_IDS, usePtzPose } from "../composables/usePtzPose";
+import { useDevice } from "../device";
+
+// 设备未启动时整卡进入 idle 态。
+//
+// 之前无论设备有没有起来,3D 舞台、罗盘、姿态读数、预置位芯片都照常渲染,
+// 显示的是默认值 —— 看起来像"在运行",而平台其实根本没连上。
+// 这是最容易误导用户的一种缺失状态。
+const { deviceLive } = useDevice();
 
 const {
   ptz, pan, tilt, zoom, seeking, activePreset, presetNames,
@@ -18,10 +26,16 @@ onUnmounted(stopPtzTracking);
 </script>
 
 <template>
-  <div class="glass-card console-panel ptz-panel">
+  <div class="glass-card console-panel ptz-panel" :class="{ idle: !deviceLive }">
     <div class="ptz-head">
       <div class="panel-title">云台控制</div>
-      <div class="ptz-sub">平台下发 PTZ 时机芯与光学变倍实时联动</div>
+      <div class="ptz-sub">
+        {{ deviceLive ? '平台下发 PTZ 时机芯与光学变倍实时联动' : '设备未启动,以下为静态示意' }}
+      </div>
+    </div>
+    <!-- 未启动蒙层:说清"这不是实时数据"以及下一步做什么。 -->
+    <div v-if="!deviceLive" class="ptz-idle-note">
+      设备未启动,云台读数不是实时值。请在上方「注册」按钮启动设备,平台下发 PTZ 后此处会实时联动。
     </div>
     <div class="ptz-body">
       <div class="ptz-stage" :class="{ active: ptzActive, seeking }">
@@ -101,7 +115,7 @@ onUnmounted(stopPtzTracking);
   gap: 8px; margin-bottom: 6px; flex: 0 0 auto;
 }
 .ptz-head .panel-title { margin-bottom: 0; }
-.ptz-sub { font-size: 10.5px; color: var(--text-tertiary); }
+.ptz-sub { font-size: var(--fs-sm); color: var(--text-tertiary); }
 .ptz-body { flex: 1 1 0; min-height: 0; display: flex; gap: 10px; align-items: stretch; }
 
 /* 桌面球机 3D 舞台:弹性自动放大,占卡片主要宽度并随窗口舒展 */
@@ -145,7 +159,7 @@ onUnmounted(stopPtzTracking);
   background: repeating-conic-gradient(from -1deg, rgba(61,105,158,.58) 0 2deg, transparent 2deg 10deg);
 }
 .compass-dial::after { content: ""; position: absolute; inset: 27%; border-radius: 50%; border: 1px dashed var(--border-accent); }
-.compass-dial span { position: absolute; color: var(--text-secondary); font-size: 8px; font-weight: 800; }
+.compass-dial span { position: absolute; color: var(--text-secondary); font-size: var(--fs-xs); font-weight: 800; }
 .compass-dial .north { left: 50%; top: -2px; transform: translateX(-50%); color: var(--accent); }
 .compass-dial .east { right: 2px; top: 50%; transform: translateY(-50%); }
 .compass-dial .south { left: 50%; bottom: -2px; transform: translateX(-50%); }
@@ -158,7 +172,7 @@ onUnmounted(stopPtzTracking);
 .direction-hud span {
   position: absolute; z-index: 10; display: grid; place-items: center; width: 18px; height: 18px;
   border-radius: 4px; color: var(--text-tertiary); background: var(--bg-surface); border: 1px solid var(--border-default);
-  font-size: 11px; transition: .15s ease;
+  font-size: var(--fs-sm); transition: .15s ease;
 }
 .direction-hud span.on { color: #fff; background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: scale(1.1); }
 .hud-up { top: 6px; left: calc(50% - 9px); }
@@ -179,7 +193,7 @@ onUnmounted(stopPtzTracking);
 .tilt-track::after { bottom: 0; }
 .tilt-marker {
   position: absolute; left: -1px; top: 29px; min-width: 22px; height: 12px; padding-left: 6px; border-radius: 4px;
-  color: #fff; background: var(--accent); font-size: 7px; line-height: 12px; box-shadow: 0 2px 5px var(--accent-glow);
+  color: #fff; background: var(--accent); font-size: var(--fs-xs); line-height: 12px; box-shadow: 0 2px 5px var(--accent-glow);
   transition: transform .12s linear;
 }
 .tilt-marker::before {
@@ -205,17 +219,17 @@ onUnmounted(stopPtzTracking);
   display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 5px 8px; border-radius: var(--radius-xs);
   background: var(--bg-card); border: 1px solid var(--border-default);
 }
-.ptz-stat span { font-size: 8.5px; color: var(--text-tertiary); width: auto; flex-shrink: 0; text-transform: uppercase; letter-spacing: .2px; }
-.ptz-stat b { font-size: 10.5px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ptz-stat span { font-size: var(--fs-xs); color: var(--text-tertiary); width: auto; flex-shrink: 0; text-transform: uppercase; letter-spacing: .2px; }
+.ptz-stat b { font-size: var(--fs-sm); color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ptz-stat b.hot { color: var(--accent); }
-.ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: 10.5px; }
+.ptz-stat b.pose { font-variant-numeric: tabular-nums; font-size: var(--fs-sm); }
 .ptz-stat.action-state { flex: 0 0 auto; }
 
 .action-chips { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
 .action-chip {
   display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 17px; padding: 0 4px;
   border-radius: 4px; color: var(--text-tertiary); background: var(--bg-surface);
-  border: 1px solid var(--border-default); font-size: 9px; transition: all .15s ease;
+  border: 1px solid var(--border-default); font-size: var(--fs-xs); transition: all .15s ease;
 }
 .action-chip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px var(--accent-glow); transform: translateY(-1px); }
 .action-chip.stop.on { background: var(--text-secondary); border-color: var(--text-secondary); box-shadow: 0 0 6px rgba(100,116,139,.2); }
@@ -226,7 +240,7 @@ onUnmounted(stopPtzTracking);
 .pchip {
   display: inline-flex; align-items: center; justify-content: center; gap: 3px;
   min-width: 58px; height: 20px; padding: 0 5px; border-radius: 4px;
-  font-size: 9.5px; font-weight: 600; color: var(--text-secondary);
+  font-size: var(--fs-xs); font-weight: 600; color: var(--text-secondary);
   background: var(--bg-surface); border: 1px solid var(--border-default); transition: all 0.15s;
 }
 .pchip small {
@@ -242,5 +256,23 @@ onUnmounted(stopPtzTracking);
 @media (max-width: 760px) {
   .ptz-body { flex-direction: column; }
   .ptz-stage { flex-basis: 200px; width: 100%; }
+}
+/* 未启动态:整卡降饱和 + 蒙层提示,避免把默认值误读成实时数据。 */
+.ptz-panel.idle .ptz-body {
+  filter: saturate(0.25) opacity(0.55);
+  pointer-events: none;
+}
+.ptz-idle-note {
+  margin: var(--sp-2) 0 var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-xs);
+  background: var(--bg-surface);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--text-secondary);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ptz-panel.idle .ptz-body { filter: opacity(0.6); }
 }
 </style>

@@ -1,11 +1,13 @@
 <script setup lang="ts">
 // 系统信息页:日志模块(级别 + 实时流)+ 诊断包导出。
-import { ref, onMounted, onUnmounted, onActivated, computed, nextTick } from "vue";
+import { ref, onMounted, onUnmounted, onActivated, computed, nextTick, useId } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useMessage } from "naive-ui";
 
 const message = useMessage();
+const idLevelLabel = useId();
+const idLevelFilter = useId();
 
 interface LogLine { ts_ms: number; level: string; target: string; message: string; }
 /** 后端每 100ms 聚合一次推来的日志批。`dropped` 是因队列满被丢弃的条数。 */
@@ -126,24 +128,34 @@ onUnmounted(() => unlisten?.());
       <!-- 控制栏:级别切换 + 筛选 + 开关 -->
       <div class="log-ctl">
         <div class="ctl-group">
-          <span class="ctl-label">级别</span>
-          <div class="seg">
+          <span :id="idLevelLabel" class="ctl-label">级别</span>
+          <!-- role=group + aria-pressed:分段控件的"当前选中"此前只有视觉状态,
+               屏幕阅读器读不出选的是哪一档;缺 type=button 在表单里还会触发提交。 -->
+          <div class="seg" role="group" :aria-labelledby="idLevelLabel">
             <button
               v-for="lv in LEVELS"
               :key="lv"
+              type="button"
               :class="{ on: baseLevel === lv }"
+              :aria-pressed="baseLevel === lv"
               @click="applyLevel(lv)"
             >{{ lv.toUpperCase() }}</button>
           </div>
         </div>
         <div class="ctl-group">
-          <span class="ctl-label">只看</span>
-          <select v-model="levelFilter" class="mini-select">
+          <label :for="idLevelFilter" class="ctl-label">只看</label>
+          <select :id="idLevelFilter" v-model="levelFilter" class="mini-select">
             <option value="">全部</option>
             <option v-for="lv in LEVELS" :key="lv" :value="lv">{{ lv.toUpperCase() }}</option>
           </select>
         </div>
-        <input v-model="filterText" class="log-search" placeholder="关键字过滤(消息/模块)" />
+        <input
+          v-model="filterText"
+          class="log-search"
+          type="search"
+          aria-label="按关键字过滤日志(消息或模块名)"
+          placeholder="关键字过滤(消息/模块)"
+        />
         <div class="ctl-right">
           <label class="ck"><input type="checkbox" v-model="autoScroll" /> 自动滚动</label>
           <label class="ck"><input type="checkbox" v-model="paused" /> 暂停</label>
@@ -191,31 +203,31 @@ onUnmounted(() => unlisten?.());
 .panel-title { margin-bottom: 8px; }
 .log-ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .ctl-group { display: inline-flex; align-items: center; gap: 6px; }
-.ctl-label { font-size: 11px; color: var(--text-secondary); }
+.ctl-label { font-size: var(--fs-sm); color: var(--text-secondary); }
 .seg button {
   padding: 2px 8px;
 }
 .mini-select {
   height: 24px; padding: 0 6px; border: 1px solid var(--border-default);
-  border-radius: var(--radius-xs); background: var(--bg-elevated); font-size: 11px; color: var(--text-primary);
+  border-radius: var(--radius-xs); background: var(--bg-elevated); font-size: var(--fs-sm); color: var(--text-primary);
 }
 .log-search {
   flex: 1 1 180px; min-width: 140px; height: 24px; padding: 0 8px;
   border: 1px solid var(--border-default); border-radius: var(--radius-xs);
-  background: var(--bg-elevated); font-size: 11px; color: var(--text-primary); outline: none;
+  background: var(--bg-elevated); font-size: var(--fs-sm); color: var(--text-primary); outline: none;
 }
 .log-search:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 .ctl-right { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
-.ck { font-size: 11px; color: var(--text-secondary); cursor: pointer; user-select: none; }
+.ck { font-size: var(--fs-sm); color: var(--text-secondary); cursor: pointer; user-select: none; }
 .mini-btn {
   border: 1px solid var(--border-default); background: var(--bg-elevated);
-  border-radius: 4px; padding: 2px 8px; font-size: 11px; color: var(--text-secondary); cursor: pointer; height: 24px;
+  border-radius: 4px; padding: 2px 8px; font-size: var(--fs-sm); color: var(--text-secondary); cursor: pointer; height: 24px;
 }
 .mini-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .mini-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .mini-btn.primary { border-color: var(--accent); color: var(--accent); }
 .log-hint {
-  margin: 6px 0 0; font-size: 11px; line-height: 1.55; color: var(--text-tertiary);
+  margin: 6px 0 0; font-size: var(--fs-sm); line-height: 1.55; color: var(--text-tertiary);
 }
 .log-bundle {
   display: block; margin-top: 2px;
@@ -225,19 +237,19 @@ onUnmounted(() => unlisten?.());
 .log-box {
   height: 480px; overflow-y: auto; border-radius: var(--radius-xs);
   background: rgba(15,23,42,0.03); border: 1px solid var(--border-default);
-  padding: 6px 8px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; line-height: 1.45;
+  padding: 6px 8px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-sm); line-height: 1.45;
 }
-.log-empty { color: var(--text-tertiary); text-align: center; padding: 18px; font-size: 11.5px; }
+.log-empty { color: var(--text-tertiary); text-align: center; padding: 18px; font-size: var(--fs-sm); }
 .log-row { display: flex; gap: 8px; padding: 1px 0; white-space: nowrap; }
-.log-ts { color: var(--text-tertiary); flex: 0 0 auto; font-size: 10.5px; }
-.log-lv { flex: 0 0 46px; font-weight: 700; text-transform: uppercase; font-size: 10.5px; }
+.log-ts { color: var(--text-tertiary); flex: 0 0 auto; font-size: var(--fs-sm); }
+.log-lv { flex: 0 0 46px; font-weight: 700; text-transform: uppercase; font-size: var(--fs-sm); }
 .lv-error, .lv-ERROR { color: var(--error); }
 .lv-warn, .lv-WARN { color: var(--warning); }
 .lv-info, .lv-INFO { color: var(--success); }
 .lv-debug, .lv-DEBUG { color: var(--accent); }
 .lv-trace, .lv-TRACE { color: var(--text-tertiary); }
-.log-target { color: var(--text-secondary); flex: 0 0 auto; max-width: 200px; overflow: hidden; text-overflow: ellipsis; font-size: 10.5px; }
+.log-target { color: var(--text-secondary); flex: 0 0 auto; max-width: 200px; overflow: hidden; text-overflow: ellipsis; font-size: var(--fs-sm); }
 .log-msg { color: var(--text-primary); flex: 1 1 auto; white-space: pre-wrap; word-break: break-all; }
-.log-foot { margin-top: 6px; font-size: 10.5px; color: var(--text-tertiary); }
+.log-foot { margin-top: 6px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .log-dropped { color: var(--warning); }
 </style>

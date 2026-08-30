@@ -73,19 +73,19 @@ async function onToggleTrace() {
 <style scoped>
 .trace-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .trace-ctl { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
-.trace-toggle { font-size: 10.5px; color: var(--text-secondary); cursor: pointer; user-select: none; }
+.trace-toggle { font-size: var(--fs-sm); color: var(--text-secondary); cursor: pointer; user-select: none; }
 .trace-filter, .trace-clear {
   border: 1px solid var(--border-default); background: var(--bg-surface);
-  border-radius: 4px; padding: 1px 6px; font-size: 10px; color: var(--text-secondary); cursor: pointer;
+  border-radius: 4px; padding: 1px 6px; font-size: var(--fs-xs); color: var(--text-secondary); cursor: pointer;
 }
 .trace-filter { height: 22px; outline: none; }
 .trace-filter:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 .trace-log {
   height: 220px; overflow-y: auto; overflow-x: hidden; border-radius: var(--radius-xs);
   background: var(--bg-card); border: 1px solid var(--border-default);
-  padding: 5px 7px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+  padding: 5px 7px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-sm);
 }
-.trace-empty { color: var(--text-secondary); padding: 8px; text-align: center; font-size: 11px; }
+.trace-empty { color: var(--text-secondary); padding: 8px; text-align: center; font-size: var(--fs-sm); }
 /* trace-row 是真正的 <button>(可 Tab 聚焦 + 回车展开),这里抹掉原生按钮外观。 */
 .trace-row {
   display: flex; align-items: baseline; gap: 5px; padding: 2px 4px 2px 5px;
@@ -100,10 +100,10 @@ async function onToggleTrace() {
 .trace-row.error { background: color-mix(in srgb, var(--error) 10%, transparent); border-left-color: var(--error); }
 .trace-row:hover { background: var(--accent-dim); }
 .trace-row.open { background: color-mix(in srgb, var(--accent) 10%, transparent); }
-.trace-caret { flex: 0 0 auto; color: var(--text-tertiary); font-size: 8px; width: 7px; }
+.trace-caret { flex: 0 0 auto; color: var(--text-tertiary); font-size: var(--fs-xs); width: 7px; }
 .trace-raw {
-  margin: 0 0 4px 14px; padding: 6px 8px; background: #0f172a; color: #cbd5e1;
-  border-radius: 4px; font-size: 10px; line-height: 1.4; white-space: pre-wrap;
+  margin: 0 0 4px 14px; padding: 6px 8px; background: var(--code-bg); color: var(--code-fg);
+  border-radius: 4px; font-size: var(--fs-xs); line-height: 1.4; white-space: pre-wrap;
   word-break: break-all; max-height: 200px; overflow-y: auto;
 }
 .trace-ts { color: var(--text-secondary); flex: 0 0 auto; }

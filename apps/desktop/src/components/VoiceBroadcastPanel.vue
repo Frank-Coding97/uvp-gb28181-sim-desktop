@@ -109,7 +109,7 @@ function fmtIdle(ms: number | null): string {
 .broadcast-idle { padding: 6px 0; line-height: 1.5; }
 
 .bc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.bc-state { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-secondary); }
+.bc-state { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-sm); color: var(--text-secondary); }
 .bc-state i {
   width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary);
 }
@@ -136,7 +136,7 @@ function fmtIdle(ms: number | null): string {
 }
 .bc-level-txt {
   flex: 0 0 auto; min-width: 32px; text-align: right;
-  font-size: 10px; color: var(--text-tertiary);
+  font-size: var(--fs-xs); color: var(--text-tertiary);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-variant-numeric: tabular-nums;
 }
@@ -150,11 +150,11 @@ function fmtIdle(ms: number | null): string {
   background: var(--bg-card); border: 1px solid var(--border-default);
 }
 .bc-item dt {
-  font-size: 8.5px; color: var(--text-tertiary);
+  font-size: var(--fs-xs); color: var(--text-tertiary);
   text-transform: uppercase; letter-spacing: 0.2px;
 }
 .bc-item dd {
-  margin: 2px 0 0; font-size: 10.5px; color: var(--text-primary);
+  margin: 2px 0 0; font-size: var(--fs-sm); color: var(--text-primary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .bc-item dd.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-variant-numeric: tabular-nums; }

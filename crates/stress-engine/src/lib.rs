@@ -12,6 +12,6 @@
 pub mod metrics;
 pub mod scheduler;
 
-pub use metrics::{Metrics, MetricsSnapshot};
+pub use metrics::{FailureSample, LatencySnapshot, Metrics, MetricsSnapshot, NO_FAILURE_YET};
 pub use scenario::{LinearScenario, MediaProfile, Scenario};
 pub use scheduler::Orchestrator;

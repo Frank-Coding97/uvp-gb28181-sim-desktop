@@ -100,13 +100,47 @@ CREATE TABLE failure_stat (
 
 ## 4. 失败归因分类
 
-实际实现的 `common::FailureKind` 只有 3 个桶(见 `crates/common/src/observer.rs`),对应 `MetricsSnapshot` 的 `fail_timeout`/`fail_rejected`/`fail_other`:
+`common::FailureKind`(见 `crates/common/src/observer.rs`)四个桶,对应 `MetricsSnapshot`
+的 `fail_timeout` / `fail_rejected` / `fail_local` / `fail_other`:
 
 | FailureKind | 含义 | 来源 |
 |---|---|---|
-| `Timeout` | 事务超时无响应 | SIP 事务层 |
-| `Rejected` | 平台返回 4xx/5xx 拒绝 | SIP 响应 |
-| `Other` | 网络/其它(含 socket/IO 错误) | 兜底 |
+| `Timeout` | 事务超时无响应 | `Error::Timeout`(SIP 事务层) |
+| `Rejected { status }` | 平台以非 2xx 最终响应拒绝,**携带状态码** | `Error::Rejected` |
+| `Local` | **本机**发送失败(ENOBUFS / socket 错误 / 队列满) | `Error::Io` |
+| `Other` | 网络/其它 | 兜底 |
+
+### 为什么归因按错误变体而不是错误文案
+
+早期实现是 `msg.contains("超时")` / `msg.contains("被拒")`。任何一次文案措辞调整
+都会静默地把失败归到 `Other`,而压测结论的可信度恰恰建立在这个分类上。
+现在 `common::Error` 有独立的 `Timeout` 与 `Rejected { status, reason }` 变体,
+归因是一次 `match`。
+
+### 为什么 `Local` 必须单独一类
+
+本机瓶颈导致的失败绝不能算成"平台承载不住" —— 那会让压测结论直接失真。
+`MetricsSnapshot::local_pressure` 汇总本地压力(队列丢弃 + 发送失败 + 解析失败 +
+本地归因失败),`results_trustworthy` 在它非零时置 false;压测爬坡还会据此**闭环减速**
+(见 `stress-engine::scheduler` 的 `MAX_GAP_MULTIPLIER`),而不是等事后才发现这轮白跑。
+
+### 平台拒绝按处置动作再分档
+
+状态码必须带上,因为该做什么完全不同。`common::RejectBucket`:
+
+| 分档 | 状态码 | 处置动作 | 快照字段 |
+|---|---|---|---|
+| `Auth` | 401 / 403 / 407 | 凭据或权限问题,**加并发不会变好**;核对用户名/密码/域/设备是否已在平台注册 | `fail_rejected_auth` |
+| `Overload` | 480 / 486 / 500 / 503 / 504 | 平台忙或过载 —— 这才是承载力信号,降并发找拐点 | `fail_rejected_overload` |
+| `Other` | 其它 4xx/5xx | 需看原因短语,常见 404 = 编号不被平台接受 | `fail_rejected_other` |
+
+### 报告里另外三个用于定位的字段
+
+| 字段 | 回答的问题 |
+|---|---|
+| `first_failure_online` | **失败水位**:撑到多少台在线时出现首次失败(哨兵 `u64::MAX` → `None`;不能用 0,"第一台还没上线就失败"是真实且最值得注意的情形) |
+| `failure_samples` | 挑哪台复现(最多 20 条:device_id + 归因 + 状态码 + 当时在线数) |
+| `ramp_throttled` | 爬坡因本机背压减速的次数;非 0 即"本机跟不上设定速率" |
 
 ---
 

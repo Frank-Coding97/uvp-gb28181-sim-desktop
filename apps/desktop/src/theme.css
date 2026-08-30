@@ -11,8 +11,13 @@
   --border-accent: rgba(56, 132, 255, 0.35);
   --text-primary: #0e2747;
   --text-secondary: #4c6385;
-  --text-tertiary: #8fa1bd;
+  /* 次要文字对 --bg-base 的对比度。
+     原值 #8fa1bd 只有 2.32:1,远低于 WCAG AA 对正文要求的 4.5:1,而它被用在
+     三十多处小字上 —— "字小 + 颜色浅"叠在一起是本项目此前最伤观感的组合。
+     现在 4.60:1(卡片背景上 4.87:1),过 AA。 */
+  --text-tertiary: #5a6e8c;
   --accent: #3884ff;
+  --accent-hover: #5a9bff;
   --accent-deep: #1e63dc;
   --accent-pale: #d9e7ff;
   --accent-dim: rgba(56, 132, 255, 0.08);
@@ -39,12 +44,70 @@
   --scrollbar-thumb: rgba(76, 99, 133, 0.2);
   --selection-bg: rgba(56, 132, 255, 0.18);
   --glass-fallback: rgba(255, 255, 255, 0.88);
+  /* 代码/报文块。浅色主题下用深底提高等宽文本可读性,但必须是令牌 ——
+     之前 SipTracePanel 里写死 #0f172a,在浅色主题里是一块突兀的黑。 */
+  --code-bg: #10203a;
+  --code-fg: #d7e3f4;
+  /* 数据表表头底色(naive-ui 默认白底要被压掉才能融进磨砂卡片)。 */
+  --table-head-bg: rgba(120, 140, 175, 0.08);
+
+  /* ── 字号阶梯 ──
+     之前字号是散落的魔法数字(全项目 119 处 font-size 里 64 处小于 11px,
+     最小 7px),而桌面软件正文低于 12px 就开始难读,叠上
+     `--text-tertiary` 这种低对比度的次要色更是雪上加霜 ——
+     "字小 + 颜色浅"是本项目此前最伤观感的组合。
+     现在统一到六档,且**下限就是 11px**:需要更小只能说明层级划分有问题。 */
+  --fs-xs: 11px;   /* 角标、单位、表格里的极次要信息 */
+  --fs-sm: 12px;   /* 标签、元信息、卡片内次要文字 */
+  --fs-md: 13px;   /* 正文基准 */
+  --fs-lg: 15px;   /* 卡片标题 */
+  --fs-xl: 18px;   /* 页面标题 */
+  --fs-2xl: 24px;  /* 大数字指标 */
+
+  /* ── 字重与行高 ── */
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+  --lh-tight: 1.3;
+  --lh-normal: 1.5;
+  --lh-loose: 1.65;
+
+  /* ── 间距阶梯(4px 基准) ── */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 10px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 20px;
+  --sp-8: 24px;
+
+  /* ── 控件尺寸 ──
+     输入框原来 26px、紧凑按钮 22px,在 13px 字号下点击区太小。
+     桌面软件常规是 28~32px。 */
+  --ctl-h-sm: 26px;
+  --ctl-h-md: 30px;
+  --ctl-h-lg: 34px;
+
+  /* ── 层级 ──
+     原来是散落的裸数字(App.vue 的 50、DevicePreview 的 1),
+     加新浮层时无从判断该写多少。 */
+  --z-base: 0;
+  --z-raised: 10;
+  --z-sticky: 50;
+  --z-overlay: 100;
+  --z-toast: 200;
 }
 
 /* 暗色主题:只覆盖设计令牌,组件里的 var(--xxx) 全部自动跟随。
    由 `<html data-theme="dark">` 触发(见 src/theme.ts)。
-   对比度按 WCAG AA 取值:正文 #e6edf7 对 #0d1523 约 14:1,次要文字约 7:1。 */
+   对比度按 WCAG AA 取值:正文 #e6edf7 对 #0d1523 约 14:1,
+   --text-secondary 9.45:1,--text-tertiary 4.98:1,均过 AA。 */
 :root[data-theme="dark"] {
+  --code-bg: #060d18;
+  --code-fg: #cbd8ea;
+  --table-head-bg: rgba(150, 175, 210, 0.08);
   --bg-base: #0d1523;
   --bg-surface: rgba(24, 36, 56, 0.62);
   --bg-card: rgba(24, 36, 56, 0.55);
@@ -57,6 +120,7 @@
   --text-secondary: #a9bcd6;
   --text-tertiary: #7387a3;
   --accent: #5a9bff;
+  --accent-hover: #7cb0ff;
   --accent-deep: #8ab8ff;
   --accent-pale: #1b2c48;
   --accent-dim: rgba(90, 155, 255, 0.16);
@@ -92,13 +156,36 @@ body {
   /* 主题切换时整页平滑过渡,避免闪白。 */
   transition: background-color var(--transition), color var(--transition);
   color: var(--text-primary);
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: var(--fs-md);
+  line-height: var(--lh-normal);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
   letter-spacing: -0.01em;
+}
+
+/* 用户在系统里开了"提高对比度"时,把两级次要文字并到正文色附近,并加深边框。
+   低视力用户常年开着这个开关,而磨砂玻璃 + 浅色次要文字对他们几乎不可读。 */
+@media (prefers-contrast: more) {
+  :root {
+    --text-secondary: #23374f;
+    --text-tertiary: #33475f;
+    --border-default: rgba(30, 70, 120, 0.42);
+    --border-subtle: rgba(30, 70, 120, 0.3);
+  }
+  :root[data-theme="dark"] {
+    --text-secondary: #dce6f4;
+    --text-tertiary: #c2d0e4;
+    --border-default: rgba(200, 220, 245, 0.4);
+    --border-subtle: rgba(200, 220, 245, 0.28);
+  }
+  /* 磨砂层在高对比度下反而降低可读性:换成实色背景。 */
+  .glass-card {
+    background: var(--glass-fallback);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
 }
 
 /* 磨砂玻璃卡片(供 Vue 组件用 class 复用) */
@@ -122,14 +209,14 @@ body {
 }
 .page-title {
   margin: 0;
-  font-size: 17px;
-  font-weight: 700;
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-bold);
   color: var(--text-primary);
   letter-spacing: -0.2px;
 }
 .page-sub {
-  margin-top: 2px;
-  font-size: 11.5px;
+  margin-top: var(--sp-1);
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 
@@ -152,9 +239,9 @@ body {
 }
 .panel-title {
   margin-bottom: 0;
-  font-size: 11px;
-  font-weight: 650;
-  color: var(--text-tertiary);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.4px;
 }
@@ -168,39 +255,44 @@ body {
 .param-badge {
   padding: 1px 6px;
   border: 1px solid var(--border-default);
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   background: var(--bg-surface);
-  font-size: 9.5px;
-  font-weight: 600;
-  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--text-secondary);
 }
 
 /* 表单原语 */
 .fg {
-  margin-bottom: 6px;
+  margin-bottom: var(--sp-2);
 }
-.fg label {
+/* `.fg-label` 与 `.fg label` 同款外观。
+   分开一个 class 是因为**分段控件那种"一组按钮"不是表单控件**,
+   给它挂 `<label>` 在语义上是错的(label 必须关联到一个控件),
+   正确写法是普通文本元素 + `aria-labelledby` 指到 role=group。 */
+.fg label,
+.fg .fg-label {
   display: block;
-  margin-bottom: 2px;
-  font-size: 10.5px;
-  font-weight: 500;
+  margin-bottom: var(--sp-1);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
   color: var(--text-secondary);
 }
 .fg-hint {
-  margin-top: 4px;
-  font-size: 9.5px;
-  line-height: 1.35;
-  color: var(--text-tertiary);
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--text-secondary);
 }
 .inp {
   width: 100%;
-  height: 26px;
-  padding: 0 8px;
+  height: var(--ctl-h-md);
+  padding: 0 var(--sp-3);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-xs);
   background: var(--bg-elevated);
   color: var(--text-primary);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   transition: border-color var(--transition), box-shadow var(--transition);
   outline: none;
@@ -218,11 +310,12 @@ body {
   background: var(--bg-surface);
 }
 .seg button {
-  padding: 2px 10px;
+  min-height: var(--ctl-h-sm);
+  padding: 0 var(--sp-4);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   background: transparent;
-  font-size: 10.5px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   cursor: pointer;
   transition: all var(--transition);
@@ -234,12 +327,12 @@ body {
 }
 .file-btn {
   flex: 0 0 auto;
-  min-height: 24px;
-  padding: 0 8px;
+  min-height: var(--ctl-h-md);
+  padding: 0 var(--sp-4);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-xs);
   background: var(--bg-elevated);
-  font-size: 10.5px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   white-space: nowrap;
   cursor: pointer;
@@ -253,9 +346,9 @@ body {
   cursor: not-allowed;
 }
 .file-btn.compact {
-  min-height: 22px;
-  padding: 0 6px;
-  font-size: 10px;
+  min-height: var(--ctl-h-sm);
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-xs);
 }
 .file-btn.primary {
   border-color: var(--accent);
@@ -280,8 +373,8 @@ body {
   margin-bottom: 5px;
   padding-bottom: 3px;
   border-bottom: 1px solid var(--border-default);
-  font-size: 10px;
-  font-weight: 700;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
   color: var(--text-primary);
 }
 .rt-block {
@@ -293,29 +386,30 @@ body {
   padding-top: 0;
 }
 .rt-label {
-  margin-bottom: 4px;
-  font-size: 10.5px;
-  font-weight: 600;
+  margin-bottom: var(--sp-1);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
   color: var(--text-secondary);
 }
 .rt-idle {
-  font-size: 11px;
-  color: var(--text-tertiary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--text-secondary);
 }
 .rt-time {
-  margin-left: 4px;
-  font-size: 10px;
+  margin-left: var(--sp-1);
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
 }
 .source-notice {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin-top: 5px;
-  padding: 4px 6px;
-  border-radius: 4px;
-  font-size: 9.5px;
-  line-height: 1.3;
+  margin-top: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-xs);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
 }
 .source-notice.error {
   color: var(--error);

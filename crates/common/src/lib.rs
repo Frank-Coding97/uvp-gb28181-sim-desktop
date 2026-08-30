@@ -13,6 +13,6 @@ pub mod types;
 
 pub use error::{Error, Result};
 pub use logfile::{LogFileConfig, LogFileWriter};
-pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver};
+pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver, RejectBucket};
 pub use secret::Secret;
 pub use types::{DeviceId, GbVersion, SignalingEncoding, Transport};

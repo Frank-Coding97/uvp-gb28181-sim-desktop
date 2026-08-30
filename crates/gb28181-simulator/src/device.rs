@@ -946,15 +946,19 @@ impl DeviceSimulator {
                 self.set_online(true);
             }
             Err(e) => {
-                // 按错误信息归因。**本地发送失败单独一类**:本机 ENOBUFS/socket 错误
-                // 绝不能算成"平台承载不住",否则压测结论直接失真。
+                // 按**错误变体**归因,不再匹配错误文案。
+                // **本地发送失败单独一类**:本机 ENOBUFS/socket 错误绝不能算成
+                // "平台承载不住",否则压测结论直接失真。
                 let kind = match e {
                     Error::Io(_) => FailureKind::Local,
-                    Error::Sip(msg) if msg.contains("超时") => FailureKind::Timeout,
-                    Error::Sip(msg) if msg.contains("被拒") => FailureKind::Rejected,
+                    Error::Timeout(_) => FailureKind::Timeout,
+                    Error::Rejected { status, .. } => FailureKind::Rejected { status: *status },
                     _ => FailureKind::Other,
                 };
-                self.observer.on_event(DeviceEvent::RegisterFailure(kind));
+                self.observer.on_event(DeviceEvent::RegisterFailure {
+                    kind,
+                    device_id: self.config.device_id.as_str().to_string(),
+                });
             }
         }
         result
@@ -1070,8 +1074,9 @@ impl DeviceSimulator {
                                 .to_string();
                             let stale = Challenge::parse(&next).map(|c| c.stale).unwrap_or(false);
                             if !stale && next == challenge_header {
-                                return Err(Error::Sip(
-                                    "鉴权后注册被拒: 401(nonce 未更新,通常是密码或用户名错)".into(),
+                                return Err(Error::rejected(
+                                    401,
+                                    "Unauthorized(nonce 未更新,通常是密码或用户名错)",
                                 ));
                             }
                             tracing::info!(stale, "平台再次挑战,用新 nonce 重算鉴权");
@@ -1094,16 +1099,19 @@ impl DeviceSimulator {
                                 .await;
                         }
                         other => {
-                            return Err(Error::Sip(format!(
-                                "鉴权后注册被拒: {} {}",
-                                other, resp2.reason
-                            )))
+                            return Err(Error::rejected(
+                                other,
+                                format!("{}(鉴权后注册)", resp2.reason),
+                            ))
                         }
                     }
                 }
-                Err(Error::Sip("鉴权后注册被拒: 反复 401".into()))
+                Err(Error::rejected(
+                    401,
+                    "Unauthorized(反复 401,鉴权始终不被接受)",
+                ))
             }
-            other => Err(Error::Sip(format!("注册被拒: {} {}", other, resp.reason))),
+            other => Err(Error::rejected(other, format!("{}(注册)", resp.reason))),
         }
     }
 
@@ -1182,17 +1190,17 @@ impl DeviceSimulator {
                         self.accept_registration(&resp2, want_expires);
                         Ok(DeviceState::Registered)
                     } else {
-                        Err(Error::Sip(format!(
-                            "重定向后鉴权注册被拒: {} {}",
-                            resp2.status, resp2.reason
-                        )))
+                        Err(Error::rejected(
+                            resp2.status,
+                            format!("{}(重定向后鉴权注册)", resp2.reason),
+                        ))
                     }
                 }
                 302 => Err(Error::Sip("注册重定向环路(连续两次 302),放弃".into())),
-                other => Err(Error::Sip(format!(
-                    "重定向后注册被拒: {} {}",
-                    other, resp.reason
-                ))),
+                other => Err(Error::rejected(
+                    other,
+                    format!("{}(重定向后注册)", resp.reason),
+                )),
             }
         }
         .await;

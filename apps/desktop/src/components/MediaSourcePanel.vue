@@ -9,6 +9,7 @@ import { useLiveSources } from "../composables/useLiveSources";
 import { useMediaPreview } from "../composables/useMediaPreview";
 import MediaAudioFields from "./MediaAudioFields.vue";
 import MediaVideoFields from "./MediaVideoFields.vue";
+import { formatError } from "../lib/ipcError";
 
 const message = useMessage();
 const { form, startDisabled, canReport } = useDevice();
@@ -68,7 +69,7 @@ async function fireAlarm() {
   try {
     message.success(await invoke<string>("fire_alarm", { description: "移动侦测报警" }));
   } catch (e) {
-    message.error(String(e));
+    message.error(formatError(e, "上报报警失败"), { duration: 0, closable: true });
   }
 }
 
@@ -76,7 +77,7 @@ async function firePosition() {
   try {
     message.success(await invoke<string>("fire_position", { longitude: 116.397, latitude: 39.908 }));
   } catch (e) {
-    message.error(String(e));
+    message.error(formatError(e, "上报位置失败"), { duration: 0, closable: true });
   }
 }
 </script>
@@ -302,7 +303,7 @@ async function firePosition() {
   border-top: 1px solid var(--border-default);
 }
 .media-select-wrap { display: flex; flex-direction: column; gap: 2px; flex: 1 1 260px; max-width: 360px; }
-.media-select-wrap label { font-size: 10.5px; color: var(--text-secondary); font-weight: 600; }
+.media-select-wrap label { font-size: var(--fs-sm); color: var(--text-secondary); font-weight: 600; }
 .media-mode-select { font-weight: 600; color: var(--text-primary); }
 .media-actions-wrap { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: 0 0 auto; }
 .file-config-box { margin-top: 6px; }
@@ -314,14 +315,14 @@ async function firePosition() {
 .media-param-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 4px; }
 .source-capability {
   display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
-  color: var(--text-secondary); font-size: 10px;
+  color: var(--text-secondary); font-size: var(--fs-xs);
 }
-.cap-badge { padding: 1px 5px; border-radius: 6px; font-size: 9px; font-weight: 650; }
+.cap-badge { padding: 1px 5px; border-radius: 6px; font-size: var(--fs-xs); font-weight: 650; }
 .cap-badge.ok { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
 .cap-badge.warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
 .file-row { display: flex; gap: 6px; align-items: stretch; }
 .file-row .inp { flex: 1 1 auto; }
-.probe-result { margin-top: 5px; padding: 4px 6px; border-radius: 4px; font-size: 9.5px; line-height: 1.3; }
+.probe-result { margin-top: 5px; padding: 4px 6px; border-radius: 4px; font-size: var(--fs-xs); line-height: 1.3; }
 .probe-result.loading { color: var(--accent); background: var(--accent-dim); }
 .probe-result.success { color: var(--success); background: color-mix(in srgb, var(--success) 10%, transparent); }
 .probe-result.warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }

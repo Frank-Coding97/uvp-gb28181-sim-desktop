@@ -64,18 +64,18 @@ const { subList, osd, progress } = usePlatformRuntime();
 .sub-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .sub-item {
   display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px;
-  background: color-mix(in srgb, var(--success) 10%, transparent); border-radius: 4px; font-size: 10.5px;
+  background: color-mix(in srgb, var(--success) 10%, transparent); border-radius: 4px; font-size: var(--fs-sm);
 }
 .sub-dot {
   width: 5px; height: 5px; border-radius: 50%; background: var(--success);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 18%, transparent);
 }
 .sub-kind { font-weight: 600; color: var(--text-primary); }
-.sub-count { color: var(--text-tertiary); font-size: 9.5px; }
+.sub-count { color: var(--text-tertiary); font-size: var(--fs-xs); }
 
 /* OSD 设置(平台下发) */
 .osd-applied { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
-.osd-badge { font-size: 9.5px; font-weight: 600; padding: 1px 6px; border-radius: 6px; }
+.osd-badge { font-size: var(--fs-xs); font-weight: 600; padding: 1px 6px; border-radius: 6px; }
 .osd-badge.on { color: var(--success); background: color-mix(in srgb, var(--success) 14%, transparent); }
 .osd-badge.off { color: var(--text-tertiary); background: var(--bg-surface); }
 
@@ -83,5 +83,5 @@ const { subList, osd, progress } = usePlatformRuntime();
 .prog-wrap { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
 .prog-bar { flex: 1; height: 5px; background: var(--bg-surface); border-radius: 3px; overflow: hidden; }
 .prog-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.4s; }
-.prog-txt { font-size: 10.5px; color: var(--text-secondary); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.prog-txt { font-size: var(--fs-sm); color: var(--text-secondary); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 </style>

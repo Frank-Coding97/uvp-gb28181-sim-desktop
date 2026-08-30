@@ -113,7 +113,7 @@ function bindPreviewEl(el: unknown) {
 }
 .preview-head .panel-title { margin-bottom: 1px; }
 .preview-head-right { display: flex; align-items: center; gap: 6px; }
-.preview-sub { color: var(--text-secondary); font-size: 10.5px; }
+.preview-sub { color: var(--text-secondary); font-size: var(--fs-sm); }
 .preview-badge {
   padding: 2px 6px; border-radius: 999px; font: 700 9px/1 "SF Mono", Menlo, monospace; letter-spacing: .5px;
   color: var(--text-tertiary); background: var(--bg-surface); border: 1px solid var(--border-default);
@@ -143,8 +143,8 @@ function bindPreviewEl(el: unknown) {
   position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; align-content: center;
   gap: 4px; padding: 12px; text-align: center; color: rgba(231,241,255,.92);
 }
-.preview-empty strong { font-size: 11.5px; }
-.preview-empty span { max-width: 240px; color: rgba(210,226,246,.68); font-size: 10px; line-height: 1.4; }
+.preview-empty strong { font-size: var(--fs-sm); }
+.preview-empty span { max-width: 240px; color: rgba(210,226,246,.68); font-size: var(--fs-xs); line-height: 1.4; }
 .scan-mark {
   display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%;
   border: 1px solid rgba(122,181,255,.45); color: #9ec8ff; font: 800 11px/1 "SF Mono", Menlo, monospace;
@@ -154,13 +154,13 @@ function bindPreviewEl(el: unknown) {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin-top: 5px; flex: 0 0 auto;
 }
-.preview-status { display: flex; align-items: center; gap: 5px; color: var(--text-secondary); font-size: 10.5px; line-height: 1.35; }
+.preview-status { display: flex; align-items: center; gap: 5px; color: var(--text-secondary); font-size: var(--fs-sm); line-height: 1.35; }
 .preview-status i { width: 5px; height: 5px; border-radius: 50%; background: var(--text-tertiary); flex: 0 0 auto; }
 .preview-status.live i { background: var(--success); box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 12%, transparent); }
 .preview-status.warn i { background: var(--warning); box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 12%, transparent); }
 .preview-actions { display: flex; gap: 4px; }
 .toggle-fit-btn { background: var(--accent-dim); border-color: var(--border-accent); color: var(--accent); }
-.preview-note { color: var(--text-tertiary); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-note { color: var(--text-tertiary); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 1080px) {
   .preview-panel { min-height: 240px; }

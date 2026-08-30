@@ -60,6 +60,14 @@ const deviceState = ref<DState>("Disconnected");
 const startedAt = ref<number | null>(null);
 // 引擎里是否存在设备实例(与状态灯解耦):设备后台在跑(哪怕在重试注册)即为 true。
 const deviceLive = ref(false);
+/**
+ * 启停 IPC 进行中。
+ *
+ * 单独一个标志而不是复用 `deviceLive`:`deviceLive` 表达"引擎里有没有设备实例",
+ * 而它要等 `start_device` 返回才置 true —— 注册通常几百毫秒到几秒,
+ * 这段窗口按钮不该可点。
+ */
+const busy = ref(false);
 
 export function persistForm() {
   localStorage.setItem(FORM_KEY, JSON.stringify(form.value));
@@ -75,10 +83,15 @@ export function useDevice() {
       default:            return { text: "未连接", color: "var(--text-tertiary)" };
     }
   });
-  // "注册"禁用:设备实例存在时禁用(避免重复启动)。
-  const startDisabled = computed(() => deviceLive.value);
-  // "注销"禁用:设备实例不存在时禁用。注册失败/重试中设备仍在跑,注销可点。
-  const stopDisabled = computed(() => !deviceLive.value);
+  // "注册"禁用:设备实例存在**或正在启动中**时禁用。
+  //
+  // `deviceLive` 直到 `start_device` 返回后才置 true,而 SIP 注册通常要几百毫秒
+  // 到几秒 —— 这段窗口按钮此前仍可点,连点就会重复下发 start_device。
+  const startDisabled = computed(() => deviceLive.value || busy.value);
+  // "注销"禁用:设备实例不存在或正在启停中时禁用。
+  const stopDisabled = computed(() => !deviceLive.value || busy.value);
+  /// 启停进行中(供按钮显示 loading 并防重复提交)。
+  const startingUp = computed(() => busy.value);
   const canReport = computed(
     () => deviceState.value === "Registered" || deviceState.value === "InCall"
   );
@@ -87,6 +100,9 @@ export function useDevice() {
   // 密码不经此处:只传 profile_id,由 Rust 侧从 OS 钥匙串取。
   async function startDevice(platform: PlatformProfile | undefined): Promise<{ ok: boolean; msg: string }> {
     if (!platform) return { ok: false, msg: "请先在顶栏配置目标平台" };
+    // 二次守卫:即使调用方忘了看 startDisabled,这里也不会重复发起。
+    if (busy.value) return { ok: false, msg: "正在处理上一次操作,请稍候" };
+    busy.value = true;
     persistForm();
     try {
       const config = {
@@ -106,10 +122,14 @@ export function useDevice() {
       deviceLive.value = false;
       deviceState.value = "Failed";
       return { ok: false, msg: String(e) };
+    } finally {
+      busy.value = false;
     }
   }
 
   async function stopDevice(): Promise<{ ok: boolean; msg: string }> {
+    if (busy.value) return { ok: false, msg: "正在处理上一次操作,请稍候" };
+    busy.value = true;
     try {
       await invoke<string>("stop_device");
       deviceLive.value = false;
@@ -118,6 +138,8 @@ export function useDevice() {
       return { ok: true, msg: "设备已停止" };
     } catch (e) {
       return { ok: false, msg: String(e) };
+    } finally {
+      busy.value = false;
     }
   }
 
@@ -137,7 +159,7 @@ export function useDevice() {
 
   return {
     form, deviceState, startedAt, deviceLive,
-    statusMeta, startDisabled, stopDisabled, canReport,
+    statusMeta, startDisabled, stopDisabled, startingUp, canReport,
     startDevice, stopDevice, reconcile,
   };
 }

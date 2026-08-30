@@ -29,7 +29,9 @@
 | `save_platform_secret` | `{ profileId, password }` | `{ backend, message }` | 把平台密码写入 OS 钥匙串(见 `SECURITY.md`) | ✅ |
 | `delete_platform_secret` | `{ profileId }` | — | 删除钥匙串条目 | ✅ |
 | `platform_secret_status` | `{ profileIds: string[] }` | `Record<string, boolean>` | 批量查询哪些档案已配置密码(**不返回明文**) | ✅ |
-| `allow_media_preview` | `{ path }` | — | 运行时放行用户选中的媒体文件给 webview 预览(asset scope 已收窄) | ✅ |
+| `pick_video_source` | — | `string \| null` | **由 Rust 侧弹出系统文件对话框**选视频源,并同时授权它的 asset 预览。取消返回 `null`。对话框在 Rust 侧而不是前端:授权必须绑定在"用户真的选了这个文件"这件事上 | ✅ |
+| `allow_media_preview` | `{ path }` | — | 为**已授权过**的媒体文件重新放行 asset 预览(应用重启后恢复上次选的文件)。只接受 `pick_video_source` 记下的路径 —— 之前只检查 `is_file()` 就放行,等于把收窄后的 asset scope 又整体打开(任何能执行 JS 的途径都能读任意文件) | ✅ |
+| `export_diagnostics` | — | `string`(zip 路径) | 导出诊断包:滚动日志 + 运行环境快照(版本 / CPU / **fd 限额** / ffmpeg 可用性)+ 隐私说明 README。与压测报告分开:报告答"结果如何",诊断包答"这台机器上发生了什么" | ✅ |
 | `get_run_status`(规划,未实现) | `{ run_id: string }` | `RunStatus` | 查询某次运行状态 | ⬜ |
 | `list_runs`(规划,未实现) | — | `RunSummary[]` | 历史运行列表 | ⬜ |
 | `save_scenario`(规划,未实现) | `{ name: string, toml: string }` | `{ id: string }` | 保存场景 | ⬜ |

@@ -142,8 +142,10 @@ pub async fn client_transact(
 }
 
 fn timeout_error(request: &Request, retransmits: u32, total: Duration) -> Error {
-    Error::Sip(format!(
-        "事务超时:{} 在 {:.1}s 内无最终响应(重传 {} 次)",
+    // 用 `Error::Timeout` 而不是 `Error::Sip`:压测的失败归因据此分类,
+    // 之前靠 `msg.contains("超时")` 匹配文案,改一次措辞就会静默归错类。
+    Error::Timeout(format!(
+        "{} 在 {:.1}s 内无最终响应(重传 {} 次)",
         request.method,
         total.as_secs_f32(),
         retransmits

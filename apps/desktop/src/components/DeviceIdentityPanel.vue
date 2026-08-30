@@ -1,10 +1,13 @@
 <script setup lang="ts">
+import { useId } from "vue";
 // 设备身份与国标参数卡片:设备自身的国标参数(平台连接参数在顶栏全局平台档案里),
 // 卡片下半部分是媒体源配置(MediaSourcePanel)。
 import { useDevice } from "../device";
 import MediaSourcePanel from "./MediaSourcePanel.vue";
 
 const { form } = useDevice();
+
+const idGbVersionLabel = useId();
 </script>
 
 <template>
@@ -17,12 +20,25 @@ const { form } = useDevice();
     <!-- 国标基础与扩展参数:自适应多列网格 -->
     <div class="identity-grid">
       <div class="fg">
-        <label>国标版本</label>
-        <div class="seg" role="group" aria-label="国标版本">
-          <button type="button" :class="{ on: form.gb_version === '2022' }" @click="form.gb_version = '2022'">
+        <!-- 一组按钮不是表单控件,所以用 span + aria-labelledby 指到 role=group,
+             并给按钮加 aria-pressed:分段控件的"选中"此前只有 .on 这个视觉状态,
+             屏幕阅读器读不出当前选的是哪一项。 -->
+        <span :id="idGbVersionLabel" class="fg-label">国标版本</span>
+        <div class="seg" role="group" :aria-labelledby="idGbVersionLabel">
+          <button
+            type="button"
+            :class="{ on: form.gb_version === '2022' }"
+            :aria-pressed="form.gb_version === '2022'"
+            @click="form.gb_version = '2022'"
+          >
             GB/T 2022
           </button>
-          <button type="button" :class="{ on: form.gb_version === '2016' }" @click="form.gb_version = '2016'">
+          <button
+            type="button"
+            :class="{ on: form.gb_version === '2016' }"
+            :aria-pressed="form.gb_version === '2016'"
+            @click="form.gb_version = '2016'"
+          >
             GB/T 2016
           </button>
         </div>

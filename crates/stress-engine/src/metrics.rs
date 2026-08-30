@@ -10,8 +10,9 @@
 //! - **失败归因区分本地与平台**:本机丢包/发送失败绝不能算成平台承载不住。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use common::{DeviceEvent, DeviceObserver, FailureKind as CommonKind};
+use common::{DeviceEvent, DeviceObserver};
 
 /// 延迟直方图的桶数。桶 i 覆盖 [2^i, 2^(i+1)) 毫秒,i∈[0,BUCKETS)。
 /// 24 个桶覆盖到约 16.7 秒,足够容纳 SIP 事务的 Timer B(32s 之前的全部有效样本)。
@@ -116,8 +117,14 @@ pub struct LatencySnapshot {
     pub max_ms: u64,
 }
 
+/// `first_failure_online` 的哨兵值:还没有任何失败。
+///
+/// 不能用 0 —— "第一台设备还没上线就失败了"是完全可能的真实情形,
+/// 用 0 当哨兵会把这种最值得注意的情况显示成"从未失败"。
+pub const NO_FAILURE_YET: u64 = u64::MAX;
+
 /// 压测实时指标(原子计数,可跨设备共享)。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metrics {
     /// 已尝试注册次数(含重试)。
     pub register_attempted: AtomicU64,
@@ -141,8 +148,24 @@ pub struct Metrics {
     pub devices_online_peak: AtomicU64,
     /// 失败归因:超时。
     pub fail_timeout: AtomicU64,
-    /// 失败归因:平台拒绝(4xx/5xx)。
+    /// 失败归因:平台拒绝(4xx/5xx)总数。
     pub fail_rejected: AtomicU64,
+    /// 平台拒绝里的**凭据/权限**档(401/403/407)。
+    ///
+    /// 单独计数是因为处置动作完全不同:这个数大说明要去核对用户名/密码/域,
+    /// 而不是"平台承载不住"。以前它和 503 混在同一个计数里,报告读不出结论。
+    pub fail_rejected_auth: AtomicU64,
+    /// 平台拒绝里的**忙/过载**档(480/486/500/503/504)—— 真正的承载力信号。
+    pub fail_rejected_overload: AtomicU64,
+    /// 平台拒绝里的其它状态码(常见 404:编号不被平台接受)。
+    pub fail_rejected_other: AtomicU64,
+    /// 首次失败时的在线设备数(**失败水位**)。
+    ///
+    /// `u64::MAX` 表示还没有失败过。这个数回答"撑到多少台开始出问题" ——
+    /// 之前只有全局累计计数,时序 JSONL 事后差分才能勉强看出拐点。
+    pub first_failure_online: AtomicU64,
+    /// 爬坡因本地背压而减速的次数(见 scheduler 的闭环背压)。
+    pub ramp_throttled: AtomicU64,
     /// 失败归因:**本地**发送失败/背压(不是平台的问题)。
     pub fail_local: AtomicU64,
     /// 失败归因:网络/其它。
@@ -155,17 +178,68 @@ pub struct Metrics {
     pub register_latency: LatencyHistogram,
     /// 心跳往返延迟分布。
     pub heartbeat_latency: LatencyHistogram,
+    /// 失败设备样本(最多 [`MAX_FAILURE_SAMPLES`] 条,先到先留)。
+    ///
+    /// 排障要挑一台具体设备复现,而计数器给不出任何一台的编号。
+    /// 用锁没问题:只在失败时写,且写满就不再加锁修改。
+    failure_samples: Mutex<Vec<FailureSample>>,
 }
 
-/// 失败归因分类(对应 docs/20-architecture/data-model.md#4)。
-#[derive(Debug, Clone, Copy)]
-pub enum FailureKind {
-    Timeout,
-    Rejected,
-    /// 本地瓶颈(发送失败 / 队列满),与平台过载严格区分。
-    Local,
-    Other,
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics {
+            register_attempted: AtomicU64::new(0),
+            register_first_attempt: AtomicU64::new(0),
+            register_retry: AtomicU64::new(0),
+            register_succeeded: AtomicU64::new(0),
+            register_failed: AtomicU64::new(0),
+            heartbeat_succeeded: AtomicU64::new(0),
+            heartbeat_failed: AtomicU64::new(0),
+            active_streams: AtomicU64::new(0),
+            devices_online: AtomicU64::new(0),
+            devices_online_peak: AtomicU64::new(0),
+            fail_timeout: AtomicU64::new(0),
+            fail_rejected: AtomicU64::new(0),
+            fail_rejected_auth: AtomicU64::new(0),
+            fail_rejected_overload: AtomicU64::new(0),
+            fail_rejected_other: AtomicU64::new(0),
+            first_failure_online: AtomicU64::new(NO_FAILURE_YET),
+            ramp_throttled: AtomicU64::new(0),
+            fail_local: AtomicU64::new(0),
+            fail_other: AtomicU64::new(0),
+            position_reported: AtomicU64::new(0),
+            alarm_reported: AtomicU64::new(0),
+            register_latency: LatencyHistogram::default(),
+            heartbeat_latency: LatencyHistogram::default(),
+            failure_samples: Mutex::new(Vec::new()),
+        }
+    }
 }
+
+/// 失败样本上限。留够挑几台复现即可,不做全量记录 ——
+/// 大面积失败时全量记录本身就会变成压力源。
+pub const MAX_FAILURE_SAMPLES: usize = 20;
+
+/// 一条失败样本。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FailureSample {
+    /// 失败设备国标编号。
+    pub device_id: String,
+    /// 归因分类名(timeout/rejected/local/other)。
+    pub kind: String,
+    /// 平台状态码(仅拒绝类有)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// 出现该失败时的在线设备数 —— 定位"在什么水位上发生的"。
+    pub online_at_failure: u64,
+}
+
+/// 失败归因分类。
+///
+/// **直接复用 `common::FailureKind`**,不再在本 crate 重复定义一份 ——
+/// 两份枚举加一个手写的转换 match,意味着 common 那边加一个变体时
+/// 这里只会静默地映射到 `Other`,而失败归因的可信度正建立在这个分类上。
+pub use common::FailureKind;
 
 impl Metrics {
     /// 记一次注册尝试。`retry` 区分首次与重试。
@@ -184,15 +258,74 @@ impl Metrics {
         self.register_latency.record(rtt_ms);
     }
 
-    /// 记一次注册失败(带归因)。
-    pub fn on_register_failure(&self, kind: FailureKind) {
+    /// 记一次注册失败(带归因与设备 ID)。
+    ///
+    /// 除了分类计数,还记录**失败水位**(首次失败时的在线数)与**失败样本**
+    /// (最多几台设备编号)—— 排障需要"撑到多少台开始出问题"和"挑哪台复现",
+    /// 这两个问题总计数都回答不了。
+    pub fn on_register_failure(&self, kind: FailureKind, device_id: &str) {
         self.register_failed.fetch_add(1, Ordering::Relaxed);
-        match kind {
-            FailureKind::Timeout => self.fail_timeout.fetch_add(1, Ordering::Relaxed),
-            FailureKind::Rejected => self.fail_rejected.fetch_add(1, Ordering::Relaxed),
-            FailureKind::Local => self.fail_local.fetch_add(1, Ordering::Relaxed),
-            FailureKind::Other => self.fail_other.fetch_add(1, Ordering::Relaxed),
+        let online = self.devices_online.load(Ordering::Relaxed);
+        let (label, status) = match kind {
+            FailureKind::Timeout => {
+                self.fail_timeout.fetch_add(1, Ordering::Relaxed);
+                ("timeout", None)
+            }
+            FailureKind::Rejected { status } => {
+                self.fail_rejected.fetch_add(1, Ordering::Relaxed);
+                match common::RejectBucket::of(status) {
+                    common::RejectBucket::Auth => {
+                        self.fail_rejected_auth.fetch_add(1, Ordering::Relaxed)
+                    }
+                    common::RejectBucket::Overload => {
+                        self.fail_rejected_overload.fetch_add(1, Ordering::Relaxed)
+                    }
+                    common::RejectBucket::Other => {
+                        self.fail_rejected_other.fetch_add(1, Ordering::Relaxed)
+                    }
+                };
+                ("rejected", Some(status))
+            }
+            FailureKind::Local => {
+                self.fail_local.fetch_add(1, Ordering::Relaxed);
+                ("local", None)
+            }
+            FailureKind::Other => {
+                self.fail_other.fetch_add(1, Ordering::Relaxed);
+                ("other", None)
+            }
         };
+        // 失败水位只记第一次:用 CAS 而不是"读了再写",避免并发下被后来的失败覆盖。
+        let _ = self.first_failure_online.compare_exchange(
+            NO_FAILURE_YET,
+            online,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        // 样本满了就不再加锁 —— 大面积失败时抢锁本身会变成压力源。
+        if let Ok(mut samples) = self.failure_samples.lock() {
+            if samples.len() < MAX_FAILURE_SAMPLES {
+                samples.push(FailureSample {
+                    device_id: device_id.to_string(),
+                    kind: label.into(),
+                    status,
+                    online_at_failure: online,
+                });
+            }
+        }
+    }
+
+    /// 记一次爬坡减速(闭环背压触发)。
+    pub fn on_ramp_throttled(&self) {
+        self.ramp_throttled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 当前失败样本快照。
+    pub fn failure_samples(&self) -> Vec<FailureSample> {
+        self.failure_samples
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     /// 记一次心跳成功(带往返耗时)。
@@ -274,6 +407,15 @@ impl Metrics {
             devices_online_peak: self.devices_online_peak.load(Ordering::Relaxed),
             fail_timeout: self.fail_timeout.load(Ordering::Relaxed),
             fail_rejected: self.fail_rejected.load(Ordering::Relaxed),
+            fail_rejected_auth: self.fail_rejected_auth.load(Ordering::Relaxed),
+            fail_rejected_overload: self.fail_rejected_overload.load(Ordering::Relaxed),
+            fail_rejected_other: self.fail_rejected_other.load(Ordering::Relaxed),
+            first_failure_online: match self.first_failure_online.load(Ordering::Relaxed) {
+                NO_FAILURE_YET => None,
+                v => Some(v),
+            },
+            ramp_throttled: self.ramp_throttled.load(Ordering::Relaxed),
+            failure_samples: self.failure_samples(),
             fail_local: self.fail_local.load(Ordering::Relaxed),
             fail_other: self.fail_other.load(Ordering::Relaxed),
             position_reported: self.position_reported.load(Ordering::Relaxed),
@@ -322,8 +464,20 @@ pub struct MetricsSnapshot {
     pub devices_online_peak: u64,
     pub fail_timeout: u64,
     pub fail_rejected: u64,
+    /// 拒绝里的凭据/权限档(401/403/407):加并发不会变好,去核对账号配置。
+    pub fail_rejected_auth: u64,
+    /// 拒绝里的忙/过载档(480/486/500/503/504):真正的承载力信号。
+    pub fail_rejected_overload: u64,
+    /// 拒绝里的其它状态码(常见 404:编号不被平台接受)。
+    pub fail_rejected_other: u64,
     pub fail_local: u64,
     pub fail_other: u64,
+    /// 首次失败时的在线设备数(失败水位);从未失败为 None。
+    pub first_failure_online: Option<u64>,
+    /// 爬坡因本地背压减速的次数。非 0 说明本机已经跟不上设定的爬坡速率。
+    pub ramp_throttled: u64,
+    /// 失败设备样本(最多 20 条),供挑一台复现。
+    pub failure_samples: Vec<FailureSample>,
     pub position_reported: u64,
     pub alarm_reported: u64,
     pub register_latency: LatencySnapshot,
@@ -343,14 +497,9 @@ impl DeviceObserver for Metrics {
         match event {
             DeviceEvent::RegisterAttempt { retry } => self.on_register_attempt(retry),
             DeviceEvent::RegisterSuccess { rtt_ms } => self.on_register_success(rtt_ms),
-            DeviceEvent::RegisterFailure(k) => {
-                let kind = match k {
-                    CommonKind::Timeout => FailureKind::Timeout,
-                    CommonKind::Rejected => FailureKind::Rejected,
-                    CommonKind::Local => FailureKind::Local,
-                    CommonKind::Other => FailureKind::Other,
-                };
-                self.on_register_failure(kind);
+            DeviceEvent::RegisterFailure { kind, device_id } => {
+                // 不需要转换:归因枚举就是 common 那一个。
+                self.on_register_failure(kind, &device_id);
             }
             DeviceEvent::HeartbeatOk { rtt_ms } => self.on_heartbeat_success(rtt_ms),
             DeviceEvent::HeartbeatFail => self.on_heartbeat_failure(),
@@ -382,7 +531,7 @@ mod tests {
         for _ in 0..150 {
             m.on_register_success(20);
         }
-        m.on_register_failure(FailureKind::Timeout);
+        m.on_register_failure(FailureKind::Timeout, "34020000001320000001");
         let s = m.snapshot();
         assert_eq!(s.register_attempted, 200);
         assert_eq!(s.register_succeeded, 150);
@@ -498,10 +647,116 @@ mod tests {
         m.on_register_success(10);
         assert!(m.snapshot().results_trustworthy, "干净跑时结论可信");
 
-        m.on_register_failure(FailureKind::Local);
+        m.on_register_failure(FailureKind::Local, "34020000001320000001");
         let s = m.snapshot();
         assert_eq!(s.fail_local, 1);
         assert!(!s.results_trustworthy, "出现本地瓶颈后不应再把失败归给平台");
         assert_eq!(s.local_pressure, 1);
+    }
+
+    #[test]
+    fn 平台拒绝按处置动作分档() {
+        // 分档的意义:401 说明去改配置,503 说明去降并发。
+        // 之前两者混在同一个 fail_rejected 里,报告读不出该做什么。
+        let m = Metrics::default();
+        for status in [401u16, 403, 407] {
+            m.on_register_failure(FailureKind::Rejected { status }, "34020000001320000001");
+        }
+        for status in [480u16, 486, 500, 503, 504] {
+            m.on_register_failure(FailureKind::Rejected { status }, "34020000001320000002");
+        }
+        for status in [404u16, 415] {
+            m.on_register_failure(FailureKind::Rejected { status }, "34020000001320000003");
+        }
+        let s = m.snapshot();
+        assert_eq!(s.fail_rejected, 10, "总数仍是全部拒绝之和");
+        assert_eq!(s.fail_rejected_auth, 3);
+        assert_eq!(s.fail_rejected_overload, 5);
+        assert_eq!(s.fail_rejected_other, 2);
+        // 凭据问题不该被算成本地压力,也不该让结论变"不可信" ——
+        // 那是配置错,不是本机瓶颈。
+        assert!(s.results_trustworthy);
+    }
+
+    #[test]
+    fn 失败水位只记第一次() {
+        let m = Metrics::default();
+        assert!(
+            m.snapshot().first_failure_online.is_none(),
+            "未失败时应为 None"
+        );
+
+        // 先上线 3 台再失败。
+        for _ in 0..3 {
+            m.on_online_changed(true);
+        }
+        m.on_register_failure(FailureKind::Timeout, "dev-a");
+        assert_eq!(m.snapshot().first_failure_online, Some(3));
+
+        // 之后又上线更多并再次失败:水位保持第一次的值。
+        for _ in 0..5 {
+            m.on_online_changed(true);
+        }
+        m.on_register_failure(FailureKind::Timeout, "dev-b");
+        assert_eq!(
+            m.snapshot().first_failure_online,
+            Some(3),
+            "水位回答的是「撑到多少台开始出问题」,不该被后来的失败改写"
+        );
+    }
+
+    #[test]
+    fn 零台在线时失败与从未失败可区分() {
+        // 这正是不能用 0 当哨兵的理由:"第一台还没上线就失败"是最值得注意的情形。
+        let m = Metrics::default();
+        m.on_register_failure(FailureKind::Local, "dev-x");
+        assert_eq!(m.snapshot().first_failure_online, Some(0));
+        assert_ne!(Metrics::default().snapshot().first_failure_online, Some(0));
+    }
+
+    #[test]
+    fn 失败样本有上限且带可复现信息() {
+        let m = Metrics::default();
+        m.on_online_changed(true);
+        for i in 0..(MAX_FAILURE_SAMPLES + 30) {
+            m.on_register_failure(
+                FailureKind::Rejected { status: 503 },
+                &format!("3402000000132{i:07}"),
+            );
+        }
+        let samples = m.snapshot().failure_samples;
+        assert_eq!(
+            samples.len(),
+            MAX_FAILURE_SAMPLES,
+            "大面积失败时全量记录本身会变成压力源"
+        );
+        assert_eq!(samples[0].kind, "rejected");
+        assert_eq!(samples[0].status, Some(503));
+        assert_eq!(samples[0].online_at_failure, 1);
+        assert!(samples[0].device_id.starts_with("3402000000132"));
+    }
+
+    #[test]
+    fn 爬坡减速被记录进报告() {
+        let m = Metrics::default();
+        assert_eq!(m.snapshot().ramp_throttled, 0);
+        m.on_ramp_throttled();
+        m.on_ramp_throttled();
+        assert_eq!(
+            m.snapshot().ramp_throttled,
+            2,
+            "减速次数非 0 是「本机跟不上设定速率」的证据,必须进报告"
+        );
+    }
+
+    #[test]
+    fn 拒绝分档与状态码映射一致() {
+        use common::RejectBucket;
+        assert_eq!(RejectBucket::of(401), RejectBucket::Auth);
+        assert_eq!(RejectBucket::of(403), RejectBucket::Auth);
+        assert_eq!(RejectBucket::of(486), RejectBucket::Overload);
+        assert_eq!(RejectBucket::of(503), RejectBucket::Overload);
+        assert_eq!(RejectBucket::of(404), RejectBucket::Other);
+        assert!(!RejectBucket::Auth.label().is_empty());
     }
 }

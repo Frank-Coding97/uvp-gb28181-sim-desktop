@@ -106,7 +106,7 @@ impl DeviceObserver for StateEmitter {
         let state = match event {
             DeviceEvent::RegisterAttempt { .. } => "Registering",
             DeviceEvent::RegisterSuccess { .. } => "Registered",
-            DeviceEvent::RegisterFailure(_) => "Failed",
+            DeviceEvent::RegisterFailure { .. } => "Failed",
             DeviceEvent::StreamStart => "InCall",
             DeviceEvent::StreamStop => "Registered",
             // 心跳与在线翻转不改变状态灯(状态灯由注册/推流事件驱动)。
@@ -674,6 +674,13 @@ async fn export_report(
         let series = series_path.as_deref().map(read_series).unwrap_or_default();
         let report = serde_json::json!({
             "generated_at_epoch_secs": ts,
+            // 运行环境快照。
+            //
+            // 报告以前只有"这次压测的结果",没有"这个结果是在什么机器上得到的" ——
+            // 于是结论既无法复现也无法采信。其中 fd 限额尤其关键:
+            // 压测按 64 台设备一个 socket 分片,fd 不够的表现是
+            // "注册到某个数量就大面积失败",极易被误判成平台承载不住。
+            "environment": diagnostics::Environment::collect(),
             "scenario_toml_redacted": scenario.as_ref().map(|(t, _)| t),
             "device_count": scenario.as_ref().map(|(_, c)| c),
             "metrics": snap,
