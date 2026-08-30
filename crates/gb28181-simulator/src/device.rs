@@ -248,6 +248,10 @@ pub struct DeviceSimulator {
     presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
     /// 设备控制态(布防/看守位/巡航/精准姿态)。扩展查询与控制命令共同维护(FR-17/18)。
     control_state: std::sync::Mutex<ControlState>,
+    /// 平台下发后已应用的会话级设备配置。ConfigDownload 从这里回读，不再返回固定值。
+    runtime_config: std::sync::Mutex<gb28181_protocol::manscdp::ConfigDownloadResponse>,
+    /// 最近一次影响运行时快照的变更来源与时间。
+    runtime_change: std::sync::Mutex<RuntimeChange>,
     /// 多通道目录树(FR-34)。为空时用 `config.channels` 扁平列表出目录;
     /// 非空时用此树(含业务分组/虚拟组织/报警通道层级)出目录,支持 CRUD + 增量 NOTIFY。
     catalog_tree: std::sync::Mutex<Vec<gb28181_protocol::id_codec::CatalogNode>>,
@@ -259,7 +263,9 @@ pub struct DeviceSimulator {
 /// 供扩展查询(AlarmStatus/HomePositionQuery/CruiseTrack*/PTZPosition)读回。
 #[derive(Debug, Clone)]
 pub struct ControlState {
-    /// 是否处于布防/报警态(AlarmStatus 的 DutyStatus)。
+    /// 是否处于布防态。GuardCmd 只更新本字段。
+    pub guarded: bool,
+    /// 是否正在报警(AlarmStatus 的 DutyStatus)。主动报警/报警复位更新本字段。
     pub alarming: bool,
     /// 看守位是否启用。
     pub home_enabled: bool,
@@ -274,6 +280,7 @@ pub struct ControlState {
 impl Default for ControlState {
     fn default() -> Self {
         ControlState {
+            guarded: false,
             alarming: false,
             home_enabled: true,
             home_set: false,
@@ -281,6 +288,56 @@ impl Default for ControlState {
             precise_pose: (0.0, 0.0, 1.0),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeChange {
+    kind: String,
+    updated_at_ms: u64,
+}
+
+/// 桌面端只读的设备运行时真相快照。
+#[derive(Debug, Clone)]
+pub struct DeviceRuntimeSnapshot {
+    pub guarded: bool,
+    pub alarming: bool,
+    pub longitude: f64,
+    pub latitude: f64,
+    pub name: String,
+    pub expiration: u32,
+    pub heartbeat_interval: u32,
+    pub heartbeat_count: u32,
+    pub video_record_plan_type: Option<u32>,
+    pub alarm_record_duration: Option<u32>,
+    pub picture_mask_enabled: Option<u32>,
+    pub frame_mirror_mode: Option<u32>,
+    pub alarm_report_enabled: Option<u32>,
+    pub osd_time_show: Option<u32>,
+    pub osd_show: Option<u32>,
+    pub last_change: String,
+    pub updated_at_ms: u64,
+}
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn initial_runtime_config(
+    config: &DeviceConfig,
+) -> gb28181_protocol::manscdp::ConfigDownloadResponse {
+    gb28181_protocol::manscdp::ConfigDownloadResponse::by_type(
+        config.device_id.as_str(),
+        1,
+        "BasicParam/VideoParamOpt/VideoRecordPlan/VideoAlarmRecord/PictureMask/FrameMirror/AlarmReport/OSDConfig/SnapShotConfig/VideoParamAttribute/SVACEncodeConfig/SVACDecodeConfig",
+        config.device_info.device_name.clone(),
+        config.register_expires_secs,
+        config.heartbeat_interval_secs as u32,
+        config.heartbeat_fail_threshold,
+        "1920*1080",
+    )
 }
 
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
@@ -309,6 +366,7 @@ struct Subscription {
 impl DeviceSimulator {
     /// 用配置创建一个待运行的设备仿真实例(无观察者)。
     pub fn new(config: DeviceConfig) -> Self {
+        let runtime_config = initial_runtime_config(&config);
         Self {
             config,
             preview_sink: std::sync::Mutex::new(None),
@@ -324,6 +382,11 @@ impl DeviceSimulator {
             catalog_dialog: tokio::sync::Mutex::new(None),
             presets: std::sync::Mutex::new(default_presets()),
             control_state: std::sync::Mutex::new(ControlState::default()),
+            runtime_config: std::sync::Mutex::new(runtime_config),
+            runtime_change: std::sync::Mutex::new(RuntimeChange {
+                kind: "device_started".into(),
+                updated_at_ms: epoch_millis(),
+            }),
             catalog_tree: std::sync::Mutex::new(Vec::new()),
             catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
@@ -333,6 +396,7 @@ impl DeviceSimulator {
 
     /// 带事件观察者创建(压测时由编排器注入共享 Metrics)。
     pub fn with_observer(config: DeviceConfig, observer: Arc<dyn common::DeviceObserver>) -> Self {
+        let runtime_config = initial_runtime_config(&config);
         Self {
             config,
             preview_sink: std::sync::Mutex::new(None),
@@ -348,6 +412,11 @@ impl DeviceSimulator {
             catalog_dialog: tokio::sync::Mutex::new(None),
             presets: std::sync::Mutex::new(default_presets()),
             control_state: std::sync::Mutex::new(ControlState::default()),
+            runtime_config: std::sync::Mutex::new(runtime_config),
+            runtime_change: std::sync::Mutex::new(RuntimeChange {
+                kind: "device_started".into(),
+                updated_at_ms: epoch_millis(),
+            }),
             catalog_tree: std::sync::Mutex::new(Vec::new()),
             catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
                 channels: std::collections::BTreeMap::new(),
@@ -371,6 +440,206 @@ impl DeviceSimulator {
     /// 只读访问配置。
     pub fn config(&self) -> &DeviceConfig {
         &self.config
+    }
+
+    fn mark_runtime_change(&self, kind: impl Into<String>) {
+        if let Ok(mut change) = self.runtime_change.lock() {
+            change.kind = kind.into();
+            change.updated_at_ms = epoch_millis();
+        }
+    }
+
+    fn mark_alarm_active(&self) {
+        if let Ok(mut state) = self.control_state.lock() {
+            state.alarming = true;
+        }
+        self.mark_runtime_change("alarm_raised");
+    }
+
+    /// 读取当前设备实例的会话级运行时状态。只复制数据，不持锁执行 I/O。
+    pub fn runtime_snapshot(&self) -> DeviceRuntimeSnapshot {
+        let (guarded, alarming) = self
+            .control_state
+            .lock()
+            .map(|state| (state.guarded, state.alarming))
+            .unwrap_or((false, false));
+        let (longitude, latitude) = self
+            .position
+            .lock()
+            .map(|position| *position)
+            .unwrap_or_default();
+        let config = self.runtime_config.lock().ok();
+        let basic = config.as_ref().and_then(|value| value.basic_param.as_ref());
+        let change = self.runtime_change.lock().ok();
+        DeviceRuntimeSnapshot {
+            guarded,
+            alarming,
+            longitude,
+            latitude,
+            name: basic.map(|value| value.name.clone()).unwrap_or_default(),
+            expiration: basic.map(|value| value.expiration).unwrap_or_default(),
+            heartbeat_interval: basic
+                .map(|value| value.heartbeat_interval)
+                .unwrap_or_default(),
+            heartbeat_count: basic.map(|value| value.heartbeat_count).unwrap_or_default(),
+            video_record_plan_type: config
+                .as_ref()
+                .and_then(|value| value.video_record_plan.as_ref())
+                .map(|value| value.record_plan_type),
+            alarm_record_duration: config
+                .as_ref()
+                .and_then(|value| value.video_alarm_record.as_ref())
+                .map(|value| value.duration),
+            picture_mask_enabled: config
+                .as_ref()
+                .and_then(|value| value.picture_mask.as_ref())
+                .map(|value| value.enabled),
+            frame_mirror_mode: config
+                .as_ref()
+                .and_then(|value| value.frame_mirror.as_ref())
+                .map(|value| value.mode),
+            alarm_report_enabled: config
+                .as_ref()
+                .and_then(|value| value.alarm_report.as_ref())
+                .map(|value| value.enabled),
+            osd_time_show: config
+                .as_ref()
+                .and_then(|value| value.osd_config.as_ref())
+                .map(|value| value.time_show_flag),
+            osd_show: config
+                .as_ref()
+                .and_then(|value| value.osd_config.as_ref())
+                .map(|value| value.osd_show_flag),
+            last_change: change
+                .as_ref()
+                .map(|value| value.kind.clone())
+                .unwrap_or_default(),
+            updated_at_ms: change
+                .as_ref()
+                .map(|value| value.updated_at_ms)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn runtime_config_response(&self, query: &gb28181_protocol::manscdp::Query) -> Result<String> {
+        let mut response = self
+            .runtime_config
+            .lock()
+            .map_err(|_| Error::Gb28181("设备运行配置锁异常".into()))?
+            .clone();
+        response.sn = query.sn;
+        response.device_id = query.device_id.clone();
+        let lower = query
+            .config_type
+            .as_deref()
+            .unwrap_or("BasicParam")
+            .to_ascii_lowercase();
+        let wants = |name: &str| lower.contains(name);
+        if !(lower.is_empty() || wants("basicparam")) {
+            response.basic_param = None;
+        }
+        if !wants("videoparamopt") {
+            response.video_param_opt = None;
+        }
+        if !wants("videorecordplan") {
+            response.video_record_plan = None;
+        }
+        if !wants("videoalarmrecord") {
+            response.video_alarm_record = None;
+        }
+        if !wants("picturemask") {
+            response.picture_mask = None;
+        }
+        if !wants("framemirror") {
+            response.frame_mirror = None;
+        }
+        if !wants("alarmreport") {
+            response.alarm_report = None;
+        }
+        if !wants("osdconfig") {
+            response.osd_config = None;
+        }
+        if !wants("snapshotconfig") {
+            response.snap_shot_config = None;
+        }
+        if !wants("videoparamattribute") {
+            response.video_param_attribute = None;
+        }
+        if !wants("svacencodeconfig") {
+            response.svac_encode_config = None;
+        }
+        if !wants("svacdecodeconfig") {
+            response.svac_decode_config = None;
+        }
+        response.to_xml()
+    }
+
+    fn apply_device_config(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<bool> {
+        let mut current = self
+            .runtime_config
+            .lock()
+            .map_err(|_| Error::Gb28181("设备运行配置锁异常".into()))?;
+        let mut changed = false;
+        if let Some(incoming) = &ctrl.cfg_basic_param {
+            if let Some(basic) = current.basic_param.as_mut() {
+                if !incoming.name.trim().is_empty() {
+                    basic.name = incoming.name.clone();
+                }
+                if incoming.expiration > 0 {
+                    basic.expiration = incoming.expiration;
+                }
+                if incoming.heartbeat_interval > 0 {
+                    basic.heartbeat_interval = incoming.heartbeat_interval;
+                }
+                if incoming.heartbeat_count > 0 {
+                    basic.heartbeat_count = incoming.heartbeat_count;
+                }
+            } else {
+                current.basic_param = Some(incoming.clone());
+            }
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_video_record_plan {
+            current.video_record_plan = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_video_alarm_record {
+            current.video_alarm_record = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_picture_mask {
+            current.picture_mask = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_frame_mirror {
+            current.frame_mirror = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_alarm_report {
+            current.alarm_report = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_osd_config {
+            current.osd_config = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_video_param_attribute {
+            current.video_param_attribute = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_svac_encode {
+            current.svac_encode_config = Some(value.clone());
+            changed = true;
+        }
+        if let Some(value) = &ctrl.cfg_svac_decode {
+            current.svac_decode_config = Some(value.clone());
+            changed = true;
+        }
+        drop(current);
+        if changed {
+            self.mark_runtime_change("device_config_applied");
+        }
+        Ok(changed)
     }
 
     /// 设置桌面端预览接收器。必须在启动设备前调用。
@@ -823,6 +1092,8 @@ impl DeviceSimulator {
         local_port: u16,
         description: &str,
     ) -> Result<u16> {
+        // 报警是设备本地已经发生的事实，不取决于平台是否成功应答通知。
+        self.mark_alarm_active();
         let sn = self.next_cseq();
         // 报警时间用校时后的 ISO8601(与平台时间对齐,见 common::clock)。
         let time = common::clock::synced_iso8601();
@@ -903,6 +1174,7 @@ impl DeviceSimulator {
         if let Ok(mut p) = self.position.lock() {
             *p = (longitude, latitude);
         }
+        self.mark_runtime_change("position_updated");
         let sn = self.next_cseq();
         // 位置上报时间用校时后的 ISO8601(与平台时间对齐)。
         let time = common::clock::synced_iso8601();
@@ -1500,6 +1772,7 @@ impl DeviceSimulator {
             "Catalog" => format!("查询目录 → 回 {ch_count} 通道"),
             "DeviceInfo" => "查询设备信息 → 已应答".into(),
             "DeviceStatus" => "查询设备状态 → 在线".into(),
+            "MobilePosition" => "查询移动位置 → 已应答当前坐标".into(),
             "RecordInfo" => "检索录像 → 回录像列表".into(),
             "ConfigDownload" => "查询设备配置 → 已应答".into(),
             "PresetQuery" => "查询预置位 → 回预置位列表".into(),
@@ -1586,6 +1859,21 @@ impl DeviceSimulator {
                 };
                 resp.to_xml()
             }
+            "MobilePosition" => {
+                let (longitude, latitude) = self
+                    .position
+                    .lock()
+                    .map(|position| *position)
+                    .map_err(|_| Error::Gb28181("设备位置状态锁异常".into()))?;
+                MobilePositionResponse::new(
+                    &query.device_id,
+                    query.sn,
+                    common::clock::synced_iso8601(),
+                    longitude,
+                    latitude,
+                )
+                .to_xml()
+            }
             "RecordInfo" => {
                 // 返回一段模拟录像(FR-10)。真实实现应按查询时间范围列举本地录像。
                 let items = vec![RecordItem {
@@ -1604,19 +1892,8 @@ impl DeviceSimulator {
                 resp.to_xml()
             }
             "ConfigDownload" => {
-                // 设备配置查询:按 ConfigType 返回基本参数(BasicParam)和/或视频参数(VideoParamOpt)。
-                // 心跳超时次数固定 3(与 device-simulation.md §3.2 重注册阈值一致)。
-                let resp = ConfigDownloadResponse::by_type(
-                    &query.device_id,
-                    query.sn,
-                    query.config_type.as_deref().unwrap_or("BasicParam"),
-                    self.config.device_info.device_name.clone(),
-                    3600,
-                    self.config.heartbeat_interval_secs as u32,
-                    3,
-                    "1920*1080",
-                );
-                resp.to_xml()
+                // 从当前会话已应用配置回读，只返回 ConfigType 请求的块。
+                self.runtime_config_response(query)
             }
             "PresetQuery" => {
                 // 预置位查询:返回当前预置位表(可被 PTZ 预置位设置/删除命令动态修改)。
@@ -1800,13 +2077,27 @@ impl DeviceSimulator {
             let disk = ctrl.disk_num.unwrap_or(0);
             tracing::info!(disk, "格式化 SD 卡(模拟接受)");
         }
-        // 布防/撤防:更新报警值守态(供 AlarmStatus 查询读回)。
+        // 布防/撤防只更新 Guarded，不再冒充正在报警。
         if let Some(g) = &ctrl.guard_cmd {
             let arm = g.eq_ignore_ascii_case("SetGuard");
             if let Ok(mut s) = self.control_state.lock() {
-                s.alarming = arm;
+                s.guarded = arm;
             }
+            self.mark_runtime_change(if arm { "guard_set" } else { "guard_reset" });
             tracing::info!(guard = %g, "布防/撤防");
+        }
+        // 报警复位：兼容移动端已验证的 0/2/ResetAlarm；其它值只留痕。
+        if let Some(command) = ctrl.alarm_cmd.as_deref() {
+            let numeric = command.parse::<u32>().ok();
+            let reset =
+                matches!(numeric, Some(0 | 2)) || command.eq_ignore_ascii_case("ResetAlarm");
+            if reset {
+                if let Ok(mut state) = self.control_state.lock() {
+                    state.alarming = false;
+                }
+                self.mark_runtime_change("alarm_reset");
+            }
+            tracing::info!(alarm = command, reset, "报警控制");
         }
         // 看守位设置:更新启用/已设标志(供 HomePositionQuery 读回)。
         if let Some(hp) = &ctrl.home_position {
@@ -1819,8 +2110,7 @@ impl DeviceSimulator {
         if ctrl.iframe_cmd.is_some() {
             tracing::info!("强制关键帧(下一帧起带 IDR)");
         }
-        // DeviceConfig 控制命令(GB28181-2022 A.2.3.2):设备配置修改。
-        // 模拟器接受所有配置修改并回 OK,实际不改变设备行为(仅记录日志)。
+        // DeviceConfig 控制命令(GB28181-2022 A.2.3.2):应用到当前会话配置真相。
         // CmdType=DeviceConfig 时应答须为 DeviceConfig(A.2.6.8),而非 DeviceControl。
         let is_device_config = ctrl.cmd_type == "DeviceConfig"
             || ctrl.cfg_basic_param.is_some()
@@ -1860,6 +2150,9 @@ impl DeviceSimulator {
                 time_show,
                 osd_show,
             });
+        }
+        if is_device_config {
+            self.apply_device_config(ctrl)?;
         }
         let resp = if is_device_config {
             gb28181_protocol::manscdp::ControlResponse::config_ok(&ctrl.device_id, ctrl.sn)
@@ -3187,7 +3480,7 @@ mod tests {
             (90.0, 10.0, 2.0)
         );
 
-        // 布防 → alarming=true。
+        // 布防只更新 guarded，不冒充报警。
         let guard = Control {
             cmd_type: "DeviceControl".into(),
             device_id: "d".into(),
@@ -3196,7 +3489,9 @@ mod tests {
             ..Default::default()
         };
         sim.handle_control(&guard).await.unwrap();
-        assert!(sim.control_state.lock().unwrap().alarming);
+        let state = sim.control_state.lock().unwrap();
+        assert!(state.guarded);
+        assert!(!state.alarming);
     }
 
     #[tokio::test]
@@ -3414,5 +3709,89 @@ mod tests {
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         assert!(!control.is_paused());
         assert_eq!(control.speed(), 1.0);
+    }
+
+    #[test]
+    fn mobile_position单次查询_读取当前共享坐标() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        *sim.position.lock().unwrap() = (121.473_701, 31.230_416);
+        let query = gb28181_protocol::manscdp::Query::parse(
+            "<Query><CmdType>MobilePosition</CmdType><SN>17</SN><DeviceID>34020000001320000001</DeviceID></Query>",
+        )
+        .unwrap();
+        let xml = sim.handle_query(&query).unwrap();
+        assert!(xml.contains("<Response>"));
+        assert!(xml.contains("<SN>17</SN>"));
+        assert!(xml.contains("<Longitude>121.473701</Longitude>"));
+        assert!(xml.contains("<Latitude>31.230416</Latitude>"));
+    }
+
+    #[tokio::test]
+    async fn guarded与alarming独立_报警复位不撤防() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        let guard = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID><GuardCmd>SetGuard</GuardCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&guard).await.unwrap();
+        {
+            let state = sim.control_state.lock().unwrap();
+            assert!(state.guarded);
+            assert!(!state.alarming);
+        }
+
+        sim.mark_alarm_active();
+        let reset = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>2</SN><DeviceID>d</DeviceID><AlarmCmd>ResetAlarm</AlarmCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&reset).await.unwrap();
+        {
+            let state = sim.control_state.lock().unwrap();
+            assert!(state.guarded);
+            assert!(!state.alarming);
+        }
+
+        sim.mark_alarm_active();
+        let unknown = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>3</SN><DeviceID>d</DeviceID><AlarmCmd>unknown</AlarmCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&unknown).await.unwrap();
+        let snapshot = sim.runtime_snapshot();
+        assert!(snapshot.guarded);
+        assert!(snapshot.alarming, "未知 AlarmCmd 不得伪造复位");
+        assert_eq!(snapshot.last_change, "alarm_raised");
+    }
+
+    #[tokio::test]
+    async fn device_config应用后_config_download回读当前值() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        let control = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>3</SN><DeviceID>d</DeviceID><BasicParam><Name>平台下发名称</Name><Expiration>7200</Expiration><HeartBeatInterval>15</HeartBeatInterval><HeartBeatCount>5</HeartBeatCount></BasicParam><PictureMask><Enabled>1</Enabled></PictureMask><AlarmReport><Enabled>0</Enabled></AlarmReport></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&control).await.unwrap();
+
+        let query = gb28181_protocol::manscdp::Query::parse(
+            "<Query><CmdType>ConfigDownload</CmdType><SN>4</SN><DeviceID>d</DeviceID><ConfigType>BasicParam/PictureMask/AlarmReport</ConfigType></Query>",
+        )
+        .unwrap();
+        let xml = sim.handle_query(&query).unwrap();
+        assert!(xml.contains("<Name>平台下发名称</Name>"));
+        assert!(xml.contains("<Expiration>7200</Expiration>"));
+        assert!(xml.contains("<HeartBeatInterval>15</HeartBeatInterval>"));
+        assert!(xml.contains("<HeartBeatCount>5</HeartBeatCount>"));
+        assert!(xml.contains("<PictureMask><Enabled>1</Enabled></PictureMask>"));
+        assert!(xml.contains("<AlarmReport><Enabled>0</Enabled></AlarmReport>"));
+
+        let snapshot = sim.runtime_snapshot();
+        assert_eq!(snapshot.name, "平台下发名称");
+        assert_eq!(snapshot.expiration, 7200);
+        assert_eq!(snapshot.heartbeat_interval, 15);
+        assert_eq!(snapshot.heartbeat_count, 5);
+        assert_eq!(snapshot.picture_mask_enabled, Some(1));
+        assert_eq!(snapshot.alarm_report_enabled, Some(0));
+        assert_eq!(snapshot.last_change, "device_config_applied");
     }
 }

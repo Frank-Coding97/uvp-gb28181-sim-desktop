@@ -6,7 +6,9 @@
 pub mod builder;
 pub mod device;
 
-pub use device::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator, DeviceState};
+pub use device::{
+    ChannelConfig, DeviceConfig, DeviceInfo, DeviceRuntimeSnapshot, DeviceSimulator, DeviceState,
+};
 
 // 转出媒体侧的视频源预处理(桌面在设备上线前预热容器转封装缓存,避免 INVITE 阻塞)。
 pub use media_rtp::prepare_video_source;
