@@ -38,7 +38,12 @@ const menuOptions: MenuOption[] = [
 ];
 
 // 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
-const { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile } = usePlatform();
+const {
+  profiles, activeId, active, error: configError,
+  loadDesktopConfig, resetDesktopConfig,
+  setActive, addProfile, updateProfile, removeProfile,
+  passwordFor, setSessionPassword,
+} = usePlatform();
 provide("platform", { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile });
 const profileOptions = computed(() =>
   profiles.value.map((p) => ({ label: `${p.name}  (${p.server_host}:${p.server_port})`, value: p.id }))
@@ -50,37 +55,59 @@ const editForm = ref({
   server_port: 5060,
   server_id: "",
   server_domain: "",
-  device_id: "",
   password: "",
-  transport: "UDP" as "UDP" | "TCP",
-  audio_transport: "TCP_ACTIVE" as "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE",
-  signaling_encoding: "GB18030",
+  transport: "Udp" as "Udp" | "Tcp",
+  gb_version: "V2022" as "V2016" | "V2022",
+  signaling_encoding: "Gb18030" as "Gb18030" | "Utf8",
 });
 function openEdit() {
-  if (active.value) Object.assign(editForm.value, active.value);
+  if (active.value) {
+    Object.assign(editForm.value, active.value);
+    editForm.value.password = passwordFor(active.value.id);
+  }
 }
-function saveEdit() {
-  updateProfile(activeId.value, { ...editForm.value });
+async function saveEdit() {
+  if (!active.value || deviceLive.value) return;
+  try {
+    await updateProfile(activeId.value, {
+      name: editForm.value.name.trim(),
+      server_host: editForm.value.server_host.trim(),
+      server_port: editForm.value.server_port,
+      server_id: editForm.value.server_id.trim(),
+      server_domain: editForm.value.server_domain.trim(),
+      transport: editForm.value.transport,
+      gb_version: editForm.value.gb_version,
+      signaling_encoding: editForm.value.signaling_encoding,
+    });
+    setSessionPassword(activeId.value, editForm.value.password);
+    topMessage.value = { text: "平台配置已保存", ok: true };
+  } catch (cause) {
+    lastError.value = { scope: "config", message: String(cause), ts_ms: Date.now() };
+  }
 }
-function addNew() {
-  addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
+async function addNew() {
+  if (deviceLive.value) return;
+  try {
+    const id = await addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
     server_id: "34020000002000000001", server_domain: "3402000000",
-    device_id: "35020000001310000001", password: "change-me",
-    transport: "UDP", audio_transport: "TCP_ACTIVE", signaling_encoding: "GB18030" });
-  openEdit();
+      transport: "Udp", gb_version: "V2022", signaling_encoding: "Gb18030" });
+    setSessionPassword(id, "");
+    openEdit();
+  } catch (cause) {
+    lastError.value = { scope: "config", message: String(cause), ts_ms: Date.now() };
+  }
 }
 const transportOptions = [
-  { label: "UDP（当前支持）", value: "UDP" },
-  { label: "TCP（待信令层支持）", value: "TCP" },
+  { label: "UDP（当前支持）", value: "Udp" },
+  { label: "TCP（信令层尚未实现）", value: "Tcp" },
 ];
-const audioTransportOptions = [
-  { label: "UDP", value: "UDP" },
-  { label: "TCP 主动", value: "TCP_ACTIVE" },
-  { label: "TCP 被动", value: "TCP_PASSIVE" },
+const versionOptions = [
+  { label: "GB/T 28181-2022", value: "V2022" },
+  { label: "GB/T 28181-2016", value: "V2016" },
 ];
 const encodingOptions = [
-  { label: "GB18030(国标默认)", value: "GB18030" },
-  { label: "UTF-8", value: "UTF-8" },
+  { label: "GB18030(国标默认)", value: "Gb18030" },
+  { label: "UTF-8", value: "Utf8" },
 ];
 
 const activeKey = computed(() => route.path);
@@ -92,9 +119,10 @@ function onMenuSelect(key: string) {
 // 全局设备状态 + 注册/注销:来自 device store(顶栏与单设备页共用同一份)。
 type DState = "Disconnected" | "Registering" | "Registered" | "InCall" | "Failed";
 const {
-  deviceState, startedAt, statusMeta, startDisabled, stopDisabled,
+  deviceState, startedAt, statusMeta, deviceLive,
   startDevice, stopDevice, reconcile,
 } = useDevice();
+const registrationBusy = ref(false);
 
 const uptime = ref("--:--:--");
 let uptimeTimer: number | undefined;
@@ -111,18 +139,22 @@ function tickUptime() {
 const statusChips = computed(() => [
   { key: "state", label: "连接状态", value: statusMeta.value.text, color: statusMeta.value.color, dot: true },
   { key: "uptime", label: "在线时长", value: uptime.value, mono: true },
-  { key: "transport", label: "传输模式", value: active.value?.transport ?? "—", mono: true },
+  { key: "transport", label: "传输模式", value: active.value?.transport.toUpperCase() ?? "—", mono: true },
 ]);
 
 // 顶栏注册/注销:任意页面可操作同一台设备。成功用 message,失败落全局错误条。
-async function onRegister() {
-  const r = await startDevice(active.value);
-  if (r.ok) topMessage.value = { text: r.msg, ok: true };
-  else lastError.value = { scope: "register", message: r.msg, ts_ms: Date.now() };
-}
-async function onLogout() {
-  const r = await stopDevice();
-  topMessage.value = { text: r.msg, ok: r.ok };
+async function toggleRegistration() {
+  if (registrationBusy.value) return;
+  registrationBusy.value = true;
+  try {
+    const r = deviceLive.value
+      ? await stopDevice()
+      : await startDevice(active.value, active.value ? passwordFor(active.value.id) : "");
+    if (r.ok) topMessage.value = { text: r.msg, ok: true };
+    else lastError.value = { scope: "register", message: r.msg, ts_ms: Date.now() };
+  } finally {
+    registrationBusy.value = false;
+  }
 }
 // 顶栏轻量提示(2.5s 自动消失),避免依赖 message provider(其在本组件树更外层)。
 const topMessage = ref<{ text: string; ok: boolean } | null>(null);
@@ -139,12 +171,29 @@ interface DeviceError { scope: string; message: string; ts_ms: number; }
 const lastError = ref<DeviceError | null>(null);
 function dismissError() { lastError.value = null; }
 const errorScopeLabel: Record<string, string> = {
-  capture: "视频源采集", invite: "点播", stream: "推流", register: "注册",
+  capture: "视频源采集", invite: "点播", stream: "推流", register: "注册", config: "配置",
 };
+
+async function resetBrokenConfig() {
+  try {
+    await resetDesktopConfig();
+    lastError.value = null;
+    topMessage.value = { text: "配置已恢复默认", ok: true };
+  } catch (cause) {
+    lastError.value = { scope: "config", message: String(cause), ts_ms: Date.now() };
+  }
+}
 
 let unlisten: UnlistenFn | null = null;
 let unlistenErr: UnlistenFn | null = null;
 onMounted(async () => {
+  if (isTauri) {
+    try {
+      await loadDesktopConfig();
+    } catch {
+      lastError.value = { scope: "config", message: configError.value, ts_ms: Date.now() };
+    }
+  }
   if (!isTauri) {
     uptimeTimer = window.setInterval(tickUptime, 1000);
     return;
@@ -220,7 +269,7 @@ const themeOverrides = {
                   />
                   <n-popover trigger="click" placement="bottom-start" @update:show="(s: boolean) => s && openEdit()">
                     <template #trigger>
-                      <n-button size="small" tertiary>编辑</n-button>
+                      <n-button size="small" tertiary :disabled="deviceLive">编辑</n-button>
                     </template>
                     <div class="plat-edit">
                       <div class="pe-title">平台档案</div>
@@ -229,15 +278,14 @@ const themeOverrides = {
                       <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
                       <n-input v-model:value="editForm.server_id" size="small" maxlength="20" placeholder="服务器 ID（20 位）" />
                       <n-input v-model:value="editForm.server_domain" size="small" maxlength="10" placeholder="服务器域（10 位）" />
-                      <n-input v-model:value="editForm.device_id" size="small" maxlength="20" placeholder="设备 ID（20 位）" />
                       <n-input v-model:value="editForm.password" size="small" type="password" show-password-on="click" placeholder="SIP 密码" />
                       <n-select v-model:value="editForm.transport" size="small" :options="transportOptions" />
-                      <n-select v-model:value="editForm.audio_transport" size="small" :options="audioTransportOptions" />
+                      <n-select v-model:value="editForm.gb_version" size="small" :options="versionOptions" />
                       <n-select v-model:value="editForm.signaling_encoding" size="small" :options="encodingOptions" />
                       <div class="pe-actions">
-                        <n-button size="small" type="primary" @click="saveEdit">保存</n-button>
-                        <n-button size="small" @click="addNew">+ 新增</n-button>
-                        <n-button size="small" type="error" :disabled="profiles.length <= 1" @click="removeProfile(activeId)">删除</n-button>
+                        <n-button size="small" type="primary" :disabled="deviceLive" @click="saveEdit">保存</n-button>
+                        <n-button size="small" :disabled="deviceLive" @click="addNew">+ 新增</n-button>
+                        <n-button size="small" type="error" :disabled="deviceLive || profiles.length <= 1" @click="removeProfile(activeId)">删除</n-button>
                       </div>
                     </div>
                   </n-popover>
@@ -256,8 +304,9 @@ const themeOverrides = {
                     </div>
                   </div>
                   <div class="reg-btns">
-                    <n-button size="small" type="primary" :disabled="startDisabled" @click="onRegister">注册</n-button>
-                    <n-button size="small" :disabled="stopDisabled" @click="onLogout">注销</n-button>
+                    <n-button size="small" :type="deviceLive ? 'error' : 'primary'" :loading="registrationBusy" :disabled="registrationBusy || (!deviceLive && active?.transport === 'Tcp')" @click="toggleRegistration">
+                      {{ deviceLive ? "注销" : "注册" }}
+                    </n-button>
                   </div>
                 </div>
               </header>
@@ -272,6 +321,7 @@ const themeOverrides = {
                 <span class="eb-icon">⚠</span>
                 <span class="eb-scope">{{ errorScopeLabel[lastError.scope] ?? lastError.scope }}失败</span>
                 <span class="eb-msg" :title="lastError.message">{{ lastError.message }}</span>
+                <n-button v-if="lastError.scope === 'config'" size="tiny" type="warning" @click="resetBrokenConfig">显式恢复默认</n-button>
                 <button class="eb-close" @click="dismissError" title="关闭">✕</button>
               </div>
               <section class="content">

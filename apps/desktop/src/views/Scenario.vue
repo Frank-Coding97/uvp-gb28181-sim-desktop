@@ -34,7 +34,7 @@ import { usePlatform } from "../platform";
 useECharts([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
 
 const message = useMessage();
-const { active: activePlatform } = usePlatform();
+const { active: activePlatform, passwordFor } = usePlatform();
 
 const form = ref({
   base_device_id: "34020000001320000001",
@@ -144,10 +144,11 @@ function buildToml(): string {
   const p = activePlatform.value!;
   const lines = [
     `base_device_id = ${tomlString(form.value.base_device_id)}`,
-    `password = ${tomlString(p.password)}`,
+    `password = ${tomlString(passwordFor(p.id))}`,
     `server_host = ${tomlString(p.server_host.trim())}`,
     `server_port = ${p.server_port}`,
-    `server_domain = ${tomlString(p.server_id.trim())}`,
+    `server_id = ${tomlString(p.server_id.trim())}`,
+    `server_domain = ${tomlString(p.server_domain.trim())}`,
     `transport = ${tomlString(p.transport.toUpperCase())}`,
     `heartbeat_interval_secs = ${form.value.heartbeat_interval}`,
     `channels_per_device = ${form.value.channels_per_device}`,
@@ -459,7 +460,7 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <n-alert v-if="activePlatform?.transport === 'TCP'" type="warning" :show-icon="false" class="notice">
+    <n-alert v-if="activePlatform?.transport === 'Tcp'" type="warning" :show-icon="false" class="notice">
       当前 SIP 信令层仅支持 UDP。请在顶栏将目标平台传输模式改为 UDP 后再启动。
     </n-alert>
 

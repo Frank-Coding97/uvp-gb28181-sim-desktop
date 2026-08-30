@@ -65,10 +65,15 @@ interface SubscriptionState {
 
 const message = useMessage();
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-const { profiles, activeId, active, setActive, addProfile, updateProfile, removeProfile } = usePlatform();
+const {
+  config, profiles, activeId, active,
+  setActive, addProfile, removeProfile, saveDesktopConfig,
+  passwordFor, setSessionPassword,
+} = usePlatform();
 const {
   form,
   deviceLive,
+  effectiveConfig,
   statusMeta,
   canReport,
   startDevice,
@@ -110,8 +115,7 @@ const draft = reactive({
   server_domain: "",
   password: "",
   device_id: "",
-  transport: "UDP" as "UDP" | "TCP",
-  audio_transport: "TCP_ACTIVE" as "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE",
+  transport: "Udp" as "Udp" | "Tcp",
 });
 const serverDomainManuallyEdited = ref(false);
 
@@ -142,13 +146,8 @@ const mediaModes = [
   { value: "file", label: "视频文件", icon: DocumentOutline },
 ] as const;
 const signalingTransportOptions = [
-  { label: "UDP", value: "UDP" },
-  { label: "TCP", value: "TCP" },
-];
-const audioTransportOptions = [
-  { label: "UDP", value: "UDP" },
-  { label: "TCP 主动", value: "TCP_ACTIVE" },
-  { label: "TCP 被动", value: "TCP_PASSIVE" },
+  { label: "UDP（当前支持）", value: "Udp" },
+  { label: "TCP（信令层尚未实现）", value: "Tcp" },
 ];
 const sipProfileOptions = computed(() =>
   profiles.value.map((profile) => ({ label: profile.name, value: profile.id })),
@@ -164,6 +163,7 @@ const screenOptions = computed(() =>
   })),
 );
 const mediaModeLabel = computed(() => mediaModes.find((item) => item.value === mediaMode.value)?.label ?? "未配置");
+const mediaSourceReady = computed(() => form.value.video_source.trim().length > 0);
 const previewStateText = computed(() => ({
   idle: "等待启动",
   starting: "等待画面",
@@ -198,6 +198,8 @@ const platformValid = computed(() =>
   (draft.server_domain === "" || /^\d{10}$/.test(draft.server_domain)),
 );
 const canSave = computed(() => editing.value && deviceIdValid.value && platformValid.value && !deviceLive.value);
+const displayedDevice = computed(() => effectiveConfig.value?.device ?? config.value?.device);
+const displayedProfile = computed(() => effectiveConfig.value?.profile ?? active.value);
 
 function resetDraft() {
   if (active.value) {
@@ -206,53 +208,61 @@ function resetDraft() {
     draft.server_port = active.value.server_port;
     draft.server_id = active.value.server_id;
     draft.server_domain = active.value.server_domain;
-    draft.password = active.value.password;
+    draft.password = passwordFor(active.value.id);
     draft.transport = active.value.transport;
-    draft.audio_transport = active.value.audio_transport;
   }
-  draft.device_id = active.value?.device_id || form.value.device_id;
+  draft.device_id = config.value?.device.device_id ?? form.value.device_id;
   serverDomainManuallyEdited.value = false;
 }
 
-function syncDeviceIdFromProfile() {
-  if (!active.value?.device_id) return;
-  form.value.device_id = active.value.device_id;
-  persistForm();
-}
-
-function switchSipProfile(id: string) {
-  if (deviceLive.value || id === activeId.value) return;
-  editing.value = false;
-  setActive(id);
-  syncDeviceIdFromProfile();
-  resetDraft();
-}
-
-function addSipProfile() {
+function beginEdit() {
   if (deviceLive.value) return;
-  const source = active.value;
-  addProfile({
-    name: `SIP 配置 ${profiles.value.length + 1}`,
-    server_host: source?.server_host ?? "",
-    server_port: source?.server_port ?? 5060,
-    server_id: source?.server_id ?? "",
-    server_domain: source?.server_domain ?? "",
-    device_id: source?.device_id || form.value.device_id,
-    password: source?.password ?? "",
-    transport: source?.transport ?? "UDP",
-    audio_transport: source?.audio_transport ?? "TCP_ACTIVE",
-    signaling_encoding: source?.signaling_encoding ?? "GB18030",
-  });
   resetDraft();
   editing.value = true;
 }
 
-function deleteSipProfile() {
+async function switchSipProfile(id: string) {
+  if (deviceLive.value || id === activeId.value) return;
+  editing.value = false;
+  try {
+    await setActive(id);
+    resetDraft();
+  } catch (error) {
+    message.error(`切换配置失败：${String(error)}`);
+  }
+}
+
+async function addSipProfile() {
+  if (deviceLive.value) return;
+  const source = active.value;
+  try {
+    const id = await addProfile({
+      name: `SIP 配置 ${profiles.value.length + 1}`,
+      server_host: source?.server_host ?? "127.0.0.1",
+      server_port: source?.server_port ?? 5060,
+      server_id: source?.server_id ?? "34020000002000000001",
+      server_domain: source?.server_domain ?? "3402000000",
+      transport: source?.transport ?? "Udp",
+      gb_version: source?.gb_version ?? "V2022",
+      signaling_encoding: source?.signaling_encoding ?? "Gb18030",
+    });
+    setSessionPassword(id, "");
+    resetDraft();
+    editing.value = true;
+  } catch (error) {
+    message.error(`新增配置失败：${String(error)}`);
+  }
+}
+
+async function deleteSipProfile() {
   if (deviceLive.value || profiles.value.length <= 1) return;
   editing.value = false;
-  removeProfile(activeId.value);
-  syncDeviceIdFromProfile();
-  resetDraft();
+  try {
+    await removeProfile(activeId.value);
+    resetDraft();
+  } catch (error) {
+    message.error(`删除配置失败：${String(error)}`);
+  }
 }
 
 function updateServerId(value: string) {
@@ -279,25 +289,32 @@ function clearDraft() {
   serverDomainManuallyEdited.value = false;
 }
 
-function saveConfig() {
-  if (!canSave.value || !active.value) return;
+async function saveConfig() {
+  if (!canSave.value || !active.value || !config.value) return;
   saving.value = true;
-  updateProfile(active.value.id, {
-    name: draft.name.trim(),
-    server_host: draft.server_host.trim(),
-    server_port: draft.server_port ?? 5060,
-    server_id: draft.server_id.trim(),
-    server_domain: draft.server_domain.trim(),
-    device_id: draft.device_id.trim(),
-    password: draft.password,
-    transport: draft.transport,
-    audio_transport: draft.audio_transport,
-  });
-  form.value.device_id = draft.device_id.trim();
-  persistForm();
-  editing.value = false;
-  saving.value = false;
-  message.success("首页配置已保存");
+  try {
+    const profileId = active.value.id;
+    await saveDesktopConfig({
+      ...config.value,
+      profiles: config.value.profiles.map((profile) => profile.id === profileId ? {
+        ...profile,
+        name: draft.name.trim(),
+        server_host: draft.server_host.trim(),
+        server_port: draft.server_port ?? 5060,
+        server_id: draft.server_id.trim(),
+        server_domain: draft.server_domain.trim(),
+        transport: draft.transport,
+      } : profile),
+      device: { ...config.value.device, device_id: draft.device_id.trim() },
+    });
+    setSessionPassword(profileId, draft.password);
+    editing.value = false;
+    message.success("首页配置已保存");
+  } catch (error) {
+    message.error(`保存失败：${String(error)}`);
+  } finally {
+    saving.value = false;
+  }
 }
 
 function cancelEdit() {
@@ -381,13 +398,18 @@ async function probeSource() {
 }
 
 async function registerDevice() {
-  const result = await startDevice(active.value);
+  const result = await startDevice(active.value, active.value ? passwordFor(active.value.id) : "");
   if (result.ok) message.success(result.msg);
   else message.error(result.msg);
 }
 
 async function toggleRegistration() {
-  if (registrationBusy.value) return;
+  if (registrationBusy.value || editing.value) return;
+  if (!deviceLive.value && !mediaSourceReady.value) return;
+  if (!deviceLive.value && active.value?.transport === "Tcp") {
+    message.error("信令 TCP 尚未实现，请改用 UDP");
+    return;
+  }
   registrationBusy.value = true;
   try {
     if (!deviceLive.value) {
@@ -448,12 +470,10 @@ watch(deviceLive, (running) => {
 });
 
 watch(active, () => {
-  syncDeviceIdFromProfile();
   if (!editing.value) resetDraft();
 });
 
 onMounted(async () => {
-  syncDeviceIdFromProfile();
   resetDraft();
   if (!isTauri) return;
   unlistenCaptureState = await listen<string>("capture_state", (event) => {
@@ -507,9 +527,9 @@ onUnmounted(() => {
         <span class="state-dot" :style="{ background: statusMeta.color }" />
         <div><small>设备状态</small><b :style="{ color: statusMeta.color }">{{ statusMeta.text }}</b></div>
       </div>
-      <div class="state-item"><small>设备 ID</small><b class="mono">{{ form.device_id }}</b></div>
-      <div class="state-item"><small>目标平台</small><b>{{ active?.name ?? "未配置" }}</b></div>
-      <div class="state-item"><small>协议版本</small><b>GB/T 28181-{{ form.gb_version }}</b></div>
+      <div class="state-item"><small>设备 ID</small><b class="mono">{{ displayedDevice?.device_id ?? "—" }}</b></div>
+      <div class="state-item"><small>目标平台</small><b>{{ displayedProfile?.name ?? "未配置" }}</b></div>
+      <div class="state-item"><small>协议版本</small><b>GB/T 28181-{{ displayedProfile?.gb_version === "V2016" ? "2016" : "2022" }}</b></div>
       <div class="state-item"><small>采集来源</small><b>{{ mediaModeLabel }}</b></div>
     </section>
 
@@ -596,7 +616,7 @@ onUnmounted(() => {
             <h2>SIP 配置</h2>
           </div>
           <div class="config-actions">
-            <n-button v-if="!editing" size="small" type="primary" secondary :disabled="deviceLive" @click="editing = true">编辑</n-button>
+            <n-button v-if="!editing" size="small" type="primary" secondary :disabled="deviceLive" @click="beginEdit">编辑配置</n-button>
             <template v-else>
               <n-button size="small" quaternary @click="clearDraft">重置</n-button>
               <n-button size="small" quaternary @click="cancelEdit">取消</n-button>
@@ -703,14 +723,11 @@ onUnmounted(() => {
             <span>注册密码</span>
             <n-input v-model:value="draft.password" size="medium" :disabled="!editing" type="password" show-password-on="click" placeholder="上级平台配置的 SIP 密码" />
           </label>
-          <label class="field wide">
-            <span>对讲传输</span>
-            <n-select v-model:value="draft.audio_transport" size="medium" :disabled="!editing" :options="audioTransportOptions" />
-          </label>
+          <div class="field wide capability-note">对讲传输将在后续阶段接入；当前不保存伪配置。</div>
         </div>
 
         <div class="primary-actions">
-          <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy" @click="toggleRegistration">
+          <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy || editing || (!deviceLive && !mediaSourceReady) || (!deviceLive && active?.transport === 'Tcp')" @click="toggleRegistration">
             <template #icon><n-icon><RadioOutline /></n-icon></template>
             {{ deviceLive ? "注销设备" : "注册设备" }}
           </n-button>
@@ -807,7 +824,12 @@ onUnmounted(() => {
   box-shadow: 0 8px 24px rgba(32, 51, 79, .06);
 }
 .preview-panel { display: grid; grid-template-rows: 42px minmax(0, 1fr) 40px auto; gap: 9px; }
-.config-panel { display: flex; flex-direction: column; }
+.config-panel {
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
 .panel-head { display: flex; align-items: center; justify-content: space-between; min-width: 0; }
 .panel-head.compact { min-height: 38px; }
 .panel-kicker { display: block; color: var(--accent); font-size: 9px; font-weight: 750; }
