@@ -1,9 +1,118 @@
-use std::{collections::HashSet, fmt, net::IpAddr};
+use std::{
+    collections::HashSet,
+    fmt,
+    fs::{self, OpenOptions},
+    io::Write,
+    net::IpAddr,
+    path::PathBuf,
+};
 
 use common::{DeviceId, GbVersion, SignalingEncoding, Transport};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct ConfigStore {
+    path: PathBuf,
+}
+
+impl ConfigStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn load(&self) -> Result<DesktopConfigV1, String> {
+        if !self.path.exists() {
+            return Ok(DesktopConfigV1::default());
+        }
+        let bytes = fs::read(&self.path).map_err(|error| {
+            format!("读取配置失败 {}: {error}", self.path.display())
+        })?;
+        let config: DesktopConfigV1 = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("配置 JSON 损坏 {}: {error}", self.path.display())
+        })?;
+        config
+            .validate()
+            .map_err(|error| format!("配置校验失败 {}: {error}", self.path.display()))?;
+        Ok(config)
+    }
+
+    pub fn save(&self, config: &DesktopConfigV1) -> Result<DesktopConfigV1, String> {
+        config
+            .validate()
+            .map_err(|error| format!("配置校验失败: {error}"))?;
+        let bytes = serde_json::to_vec_pretty(config)
+            .map_err(|error| format!("配置序列化失败: {error}"))?;
+        self.atomic_write(&bytes)?;
+        Ok(config.clone())
+    }
+
+    pub fn reset(&self) -> Result<DesktopConfigV1, String> {
+        self.save(&DesktopConfigV1::default())
+    }
+
+    fn atomic_write(&self, bytes: &[u8]) -> Result<(), String> {
+        let parent = self.path.parent().ok_or_else(|| {
+            format!("配置路径缺少父目录: {}", self.path.display())
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("创建配置目录失败 {}: {error}", parent.display())
+        })?;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("desktop-config-v1.json");
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp-{}-{nonce}",
+            std::process::id()
+        ));
+
+        let write_result = (|| -> Result<(), String> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .map_err(|error| {
+                    format!("创建配置临时文件失败 {}: {error}", temp_path.display())
+                })?;
+            file.write_all(bytes).map_err(|error| {
+                format!("写入配置临时文件失败 {}: {error}", temp_path.display())
+            })?;
+            file.sync_all().map_err(|error| {
+                format!("同步配置临时文件失败 {}: {error}", temp_path.display())
+            })?;
+            fs::rename(&temp_path, &self.path).map_err(|error| {
+                format!(
+                    "原子替换配置失败 {} -> {}: {error}",
+                    temp_path.display(),
+                    self.path.display()
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                let directory = fs::File::open(parent).map_err(|error| {
+                    format!("打开配置目录失败 {}: {error}", parent.display())
+                })?;
+                directory.sync_all().map_err(|error| {
+                    format!("同步配置目录失败 {}: {error}", parent.display())
+                })?;
+            }
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_result
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopConfigV1 {
@@ -63,6 +172,15 @@ pub struct StartDeviceInput {
     #[serde(default)]
     pub video_source: Option<String>,
     #[serde(default)]
+    pub catalog_template: String,
+}
+
+pub struct ResolvedStartConfig {
+    pub profile: PlatformProfileConfig,
+    pub device: DeviceSettings,
+    pub network: NetworkSettings,
+    pub password: String,
+    pub video_source: Option<String>,
     pub catalog_template: String,
 }
 
@@ -216,12 +334,48 @@ impl DesktopConfigV1 {
         }
         Ok(())
     }
+
+    pub fn resolve_start(&self, mut input: StartDeviceInput) -> Result<ResolvedStartConfig, String> {
+        self.validate()?;
+        if input.password.trim().is_empty() {
+            return Err("SIP 认证密码不能为空".into());
+        }
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == input.profile_id)
+            .cloned()
+            .ok_or_else(|| format!("平台档案不存在: {}", input.profile_id))?;
+        input.video_source = input
+            .video_source
+            .take()
+            .map(|source| source.trim().to_string())
+            .filter(|source| !source.is_empty());
+        Ok(ResolvedStartConfig {
+            profile,
+            device: self.device.clone(),
+            network: self.network.clone(),
+            password: input.password,
+            video_source: input.video_source,
+            catalog_template: input.catalog_template.trim().to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::{GbVersion, SignalingEncoding, Transport};
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("uvp-desktop-config-test-{}-{nonce}", std::process::id()))
+            .join(name)
+    }
 
     #[test]
     fn 默认配置通过校验且不包含秘密字段() {
@@ -295,5 +449,99 @@ mod tests {
             config.profiles[0].signaling_encoding,
             SignalingEncoding::Gb18030
         );
+    }
+
+    #[test]
+    fn 配置文件round_trip且目录内无临时残留() {
+        let path = temp_config_path("desktop-config-v1.json");
+        let store = ConfigStore::new(path.clone());
+        let mut config = DesktopConfigV1::default();
+        config.device.device_name = "Round Trip".into();
+
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap(), config);
+        let names = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["desktop-config-v1.json"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn 不存在返回默认值但不主动落盘() {
+        let path = temp_config_path("desktop-config-v1.json");
+        let store = ConfigStore::new(path.clone());
+        assert_eq!(store.load().unwrap(), DesktopConfigV1::default());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn 损坏json报路径且不覆盖原文件() {
+        let path = temp_config_path("desktop-config-v1.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{broken-json").unwrap();
+        let store = ConfigStore::new(path.clone());
+
+        let error = store.load().unwrap_err();
+        assert!(error.contains(path.to_string_lossy().as_ref()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{broken-json");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn 无效保存不破坏旧文件且显式reset可恢复() {
+        let path = temp_config_path("desktop-config-v1.json");
+        let store = ConfigStore::new(path.clone());
+        let mut original = DesktopConfigV1::default();
+        original.device.device_name = "Keep Me".into();
+        store.save(&original).unwrap();
+
+        let mut invalid = original.clone();
+        invalid.device.register_expires_secs = 1;
+        assert!(store.save(&invalid).is_err());
+        assert_eq!(store.load().unwrap(), original);
+
+        assert_eq!(store.reset().unwrap(), DesktopConfigV1::default());
+        assert_eq!(store.load().unwrap(), DesktopConfigV1::default());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn 启动输入只补充会话字段并解析已保存档案() {
+        let config = DesktopConfigV1::default();
+        let resolved = config
+            .resolve_start(StartDeviceInput {
+                profile_id: "local".into(),
+                password: "session-secret".into(),
+                video_source: Some("  live:0  ".into()),
+                catalog_template: " single ".into(),
+            })
+            .unwrap();
+        assert_eq!(resolved.profile.server_id, "34020000002000000001");
+        assert_eq!(resolved.profile.server_domain, "3402000000");
+        assert_eq!(resolved.password, "session-secret");
+        assert_eq!(resolved.video_source.as_deref(), Some("live:0"));
+        assert_eq!(resolved.catalog_template, "single");
+    }
+
+    #[test]
+    fn 启动拒绝未知档案和空密码() {
+        let config = DesktopConfigV1::default();
+        let unknown = config.resolve_start(StartDeviceInput {
+            profile_id: "missing".into(),
+            password: "x".into(),
+            video_source: None,
+            catalog_template: String::new(),
+        });
+        assert!(unknown.err().unwrap().contains("平台档案不存在"));
+
+        let empty_password = config.resolve_start(StartDeviceInput {
+            profile_id: "local".into(),
+            password: "  ".into(),
+            video_source: None,
+            catalog_template: String::new(),
+        });
+        assert!(empty_password.err().unwrap().contains("密码不能为空"));
     }
 }
