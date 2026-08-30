@@ -3762,6 +3762,20 @@ mod tests {
         assert!(snapshot.guarded);
         assert!(snapshot.alarming, "未知 AlarmCmd 不得伪造复位");
         assert_eq!(snapshot.last_change, "alarm_raised");
+
+        let numeric_reset = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>4</SN><DeviceID>d</DeviceID><AlarmCmd>2</AlarmCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&numeric_reset).await.unwrap();
+        let reset_guard = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>5</SN><DeviceID>d</DeviceID><GuardCmd>ResetGuard</GuardCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&reset_guard).await.unwrap();
+        let snapshot = sim.runtime_snapshot();
+        assert!(!snapshot.guarded);
+        assert!(!snapshot.alarming);
     }
 
     #[tokio::test]
@@ -3793,5 +3807,50 @@ mod tests {
         assert_eq!(snapshot.picture_mask_enabled, Some(1));
         assert_eq!(snapshot.alarm_report_enabled, Some(0));
         assert_eq!(snapshot.last_change, "device_config_applied");
+
+        let partial = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>5</SN><DeviceID>d</DeviceID><BasicParam><Name>只改名称</Name></BasicParam></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&partial).await.unwrap();
+        let snapshot = sim.runtime_snapshot();
+        assert_eq!(snapshot.name, "只改名称");
+        assert_eq!(snapshot.expiration, 7200, "未携带的字段必须保留");
+        assert_eq!(snapshot.heartbeat_interval, 15);
+        assert_eq!(snapshot.heartbeat_count, 5);
+
+        let basic_only = gb28181_protocol::manscdp::Query::parse(
+            "<Query><CmdType>ConfigDownload</CmdType><SN>6</SN><DeviceID>d</DeviceID><ConfigType>BasicParam</ConfigType></Query>",
+        )
+        .unwrap();
+        let xml = sim.handle_query(&basic_only).unwrap();
+        assert!(xml.contains("<BasicParam>"));
+        assert!(!xml.contains("<PictureMask>"));
+        assert!(!xml.contains("<AlarmReport>"));
+
+        let fresh = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        assert_ne!(fresh.runtime_snapshot().name, "只改名称");
+    }
+
+    #[test]
+    fn runtime_snapshot新实例含初始状态与基本配置() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        let snapshot = sim.runtime_snapshot();
+        assert!(!snapshot.guarded);
+        assert!(!snapshot.alarming);
+        assert_eq!(
+            (snapshot.longitude, snapshot.latitude),
+            (116.397428, 39.909230)
+        );
+        assert_eq!(snapshot.expiration, sim.config().register_expires_secs);
+        assert_eq!(
+            snapshot.heartbeat_interval,
+            sim.config().heartbeat_interval_secs as u32
+        );
+        assert_eq!(
+            snapshot.heartbeat_count,
+            sim.config().heartbeat_fail_threshold
+        );
+        assert_eq!(snapshot.last_change, "device_started");
     }
 }
