@@ -60,21 +60,32 @@ pub struct UdpTransport {
     /// 设备 AOR(device_id)→ 该设备的入站请求投递端。
     aor_routes: Arc<DashMap<String, mpsc::UnboundedSender<Incoming>>>,
     /// 可选 SIP 追踪观察者(FR-43);None 时零开销。
-    tracer: std::sync::RwLock<Option<Arc<dyn TraceObserver>>>,
+    tracer: Arc<std::sync::RwLock<Option<Arc<dyn TraceObserver>>>>,
+    /// 后台接收任务。任务只持有运行所需字段，不反向强持有 `UdpTransport`；
+    /// 最后一个业务侧 `Arc` 释放时由 `Drop` 中止，确保 socket 随之关闭。
+    recv_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl UdpTransport {
     /// 绑定本地地址(如 "0.0.0.0:0" 由系统分配端口),启动后台接收循环。
     pub async fn bind(local: &str) -> Result<Arc<Self>> {
-        let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
-        let transport = Arc::new(UdpTransport {
-            socket: Arc::new(socket),
-            routes: Arc::new(DashMap::new()),
-            aor_routes: Arc::new(DashMap::new()),
-            tracer: std::sync::RwLock::new(None),
-        });
-        transport.clone().spawn_recv_loop();
-        Ok(transport)
+        let socket = Arc::new(UdpSocket::bind(local).await.map_err(Error::Io)?);
+        let routes = Arc::new(DashMap::new());
+        let aor_routes = Arc::new(DashMap::new());
+        let tracer = Arc::new(std::sync::RwLock::new(None));
+        let recv_task = Self::spawn_recv_loop(
+            Arc::clone(&socket),
+            Arc::clone(&routes),
+            Arc::clone(&aor_routes),
+            Arc::clone(&tracer),
+        );
+        Ok(Arc::new(UdpTransport {
+            socket,
+            routes,
+            aor_routes,
+            tracer,
+            recv_task: std::sync::Mutex::new(Some(recv_task)),
+        }))
     }
 
     /// 挂载 SIP 追踪观察者(FR-43),开始接收收发报文回调。传 None 关闭。
@@ -144,13 +155,23 @@ impl UdpTransport {
     }
 
     /// 启动后台接收循环:收包 → 解析 → 分发。
-    fn spawn_recv_loop(self: Arc<Self>) {
+    fn spawn_recv_loop(
+        socket: Arc<UdpSocket>,
+        routes: Arc<DashMap<String, mpsc::UnboundedSender<Incoming>>>,
+        aor_routes: Arc<DashMap<String, mpsc::UnboundedSender<Incoming>>>,
+        tracer: Arc<std::sync::RwLock<Option<Arc<dyn TraceObserver>>>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
-                match self.socket.recv_from(&mut buf).await {
+                match socket.recv_from(&mut buf).await {
                     Ok((n, from)) => match SipMessage::parse(&buf[..n]) {
-                        Ok(message) => self.dispatch(Incoming { message, from }),
+                        Ok(message) => Self::dispatch(
+                            &routes,
+                            &aor_routes,
+                            &tracer,
+                            Incoming { message, from },
+                        ),
                         Err(e) => tracing::warn!(%from, error=%e, "SIP 报文解析失败,丢弃"),
                     },
                     Err(e) => {
@@ -159,20 +180,33 @@ impl UdpTransport {
                     }
                 }
             }
-        });
+        })
     }
 
     /// 分发:响应按 Call-ID 路由到事务队列;若 Call-ID 无匹配且是请求,
     /// 则按 Request-URI 的 AOR(user 部分)路由到设备入站队列。
-    fn dispatch(&self, incoming: Incoming) {
-        self.trace(TraceDir::In, &incoming.message, incoming.from);
+    fn dispatch(
+        routes: &DashMap<String, mpsc::UnboundedSender<Incoming>>,
+        aor_routes: &DashMap<String, mpsc::UnboundedSender<Incoming>>,
+        tracer: &std::sync::RwLock<Option<Arc<dyn TraceObserver>>>,
+        incoming: Incoming,
+    ) {
+        if let Ok(guard) = tracer.read() {
+            if let Some(observer) = guard.as_ref() {
+                observer.on_trace(SipTrace {
+                    dir: TraceDir::In,
+                    message: &incoming.message,
+                    peer: incoming.from,
+                });
+            }
+        }
         // 先按 Call-ID 尝试(响应、以及在对话内的请求)。
         let call_id = match &incoming.message {
             SipMessage::Request(r) => r.headers.call_id(),
             SipMessage::Response(r) => r.headers.call_id(),
         };
         if let Some(id) = call_id {
-            if let Some(tx) = self.routes.get(id) {
+            if let Some(tx) = routes.get(id) {
                 let _ = tx.send(incoming);
                 return;
             }
@@ -180,7 +214,7 @@ impl UdpTransport {
         // 未匹配 Call-ID:入站请求按 AOR 路由。
         if let SipMessage::Request(req) = &incoming.message {
             if let Some(aor) = uri_user(&req.uri) {
-                if let Some(tx) = self.aor_routes.get(aor) {
+                if let Some(tx) = aor_routes.get(aor) {
                     let _ = tx.send(incoming);
                     return;
                 }
@@ -193,6 +227,16 @@ impl UdpTransport {
             }
         }
         tracing::debug!("消息无匹配路由,丢弃");
+    }
+}
+
+impl Drop for UdpTransport {
+    fn drop(&mut self) {
+        if let Ok(task) = self.recv_task.get_mut() {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
     }
 }
 
@@ -335,5 +379,34 @@ mod tests {
         sender.set_tracer(None);
         sender.send_to(&req, dst).await.unwrap();
         assert_eq!(sc.outs.load(Ordering::Relaxed), 1, "关闭后不应再增");
+    }
+
+    #[tokio::test]
+    async fn 丢弃_transport_会停止接收任务并释放_udp_socket() {
+        let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let addr = transport.local_addr().unwrap();
+        let weak = Arc::downgrade(&transport);
+
+        drop(transport);
+        tokio::task::yield_now().await;
+
+        assert!(
+            weak.upgrade().is_none(),
+            "接收任务不得反向持有 UdpTransport 导致生命周期泄漏"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match UdpSocket::bind(addr).await {
+                    Ok(socket) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("重新绑定旧地址失败: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("UdpTransport 丢弃后 1 秒内应释放 socket");
     }
 }
