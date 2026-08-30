@@ -12,7 +12,8 @@ pub use device::{
     DeviceSimulator, DeviceState,
 };
 pub use recording::{
-    RecordingEntry, RecordingKind, RecordingQuery, RecordingSource, RecordingStore,
+    RecordingEntry, RecordingKind, RecordingPhase, RecordingQuery, RecordingService,
+    RecordingSource, RecordingState, RecordingStore,
 };
 
 // 转出媒体侧的视频源预处理(桌面在设备上线前预热容器转封装缓存,避免 INVITE 阻塞)。

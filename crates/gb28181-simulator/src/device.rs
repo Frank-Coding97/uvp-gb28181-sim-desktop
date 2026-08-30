@@ -250,6 +250,8 @@ pub struct DeviceSimulator {
     preview_sink: std::sync::Mutex<Option<Arc<dyn media_rtp::PreviewSink>>>,
     /// 注册后启动的唯一采集源；平台点播只订阅它，不再重复打开摄像头/文件。
     shared_media: tokio::sync::Mutex<Option<Arc<media_rtp::SharedMedia>>>,
+    /// 可选的本地录像状态机，桌面端从 app_data_dir 注入。
+    recording_service: tokio::sync::Mutex<Option<Arc<crate::recording::RecordingService>>>,
     ids: DialogIds,
     cseq: AtomicU32,
     /// 当前活跃的推流会话(INVITE → 推流中,BYE → 停止)。
@@ -397,6 +399,7 @@ impl DeviceSimulator {
             config,
             preview_sink: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
+            recording_service: tokio::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
@@ -428,6 +431,7 @@ impl DeviceSimulator {
             config,
             preview_sink: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
+            recording_service: tokio::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
@@ -468,6 +472,45 @@ impl DeviceSimulator {
     /// 只读访问配置。
     pub fn config(&self) -> &DeviceConfig {
         &self.config
+    }
+
+    /// 注入桌面端录像目录。重复注入时保留新 Store 的持久化真相。
+    pub async fn install_recording_store(&self, store: Arc<crate::recording::RecordingStore>) {
+        *self.recording_service.lock().await =
+            Some(Arc::new(crate::recording::RecordingService::new(store)));
+    }
+
+    pub async fn recording_service(&self) -> Option<Arc<crate::recording::RecordingService>> {
+        self.recording_service.lock().await.clone()
+    }
+
+    pub async fn start_recording(
+        &self,
+        kind: crate::recording::RecordingKind,
+        source: crate::recording::RecordingSource,
+    ) -> Result<crate::recording::RecordingState> {
+        let service = self
+            .recording_service()
+            .await
+            .ok_or_else(|| Error::Media("录像存储未配置".into()))?;
+        let media = self.shared_media.lock().await.clone();
+        let channel_id = self
+            .config
+            .channels
+            .first()
+            .map(|channel| channel.channel_id.as_str().to_owned())
+            .unwrap_or_else(|| self.config.device_id.as_str().to_owned());
+        service
+            .start(media, channel_id, kind, source, self.config.video_fps)
+            .await
+    }
+
+    pub async fn stop_recording(&self) -> Result<Option<crate::recording::RecordingEntry>> {
+        let service = self
+            .recording_service()
+            .await
+            .ok_or_else(|| Error::Media("录像存储未配置".into()))?;
+        service.stop().await
     }
 
     fn mark_runtime_change(&self, kind: impl Into<String>) {
@@ -2481,6 +2524,19 @@ impl DeviceSimulator {
         }
         if ctrl.iframe_cmd.is_some() {
             tracing::info!("强制关键帧(下一帧起带 IDR)");
+        }
+        if let Some(command) = ctrl.record_cmd.as_deref() {
+            if command.eq_ignore_ascii_case("Record") {
+                self.start_recording(
+                    crate::recording::RecordingKind::Manual,
+                    crate::recording::RecordingSource::Platform,
+                )
+                .await?;
+                tracing::info!("平台录像已启动");
+            } else if command.eq_ignore_ascii_case("StopRecord") {
+                self.stop_recording().await?;
+                tracing::info!("平台录像已停止");
+            }
         }
         // DeviceConfig 控制命令(GB28181-2022 A.2.3.2):应用到当前会话配置真相。
         // CmdType=DeviceConfig 时应答须为 DeviceConfig(A.2.6.8),而非 DeviceControl。
