@@ -184,6 +184,26 @@ pub struct DeviceInfo {
     pub firmware: String,
 }
 
+const REGISTER_RETRY_MIN_SECS: u64 = 60;
+const REGISTER_RETRY_MAX_SECS: u64 = 300;
+
+fn register_retry_base() -> std::time::Duration {
+    std::time::Duration::from_secs(REGISTER_RETRY_MIN_SECS)
+}
+
+fn next_register_retry(current: std::time::Duration) -> std::time::Duration {
+    (current * 2).min(std::time::Duration::from_secs(REGISTER_RETRY_MAX_SECS))
+}
+
+fn register_renew_after(expires_secs: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((u64::from(expires_secs) * 80 / 100).max(1))
+}
+
+fn record_heartbeat_failure(failures: &mut u32, threshold: u32) -> bool {
+    *failures = failures.saturating_add(1);
+    *failures >= threshold.max(1)
+}
+
 /// 设备状态(与 docs/10-functional/device-simulation.md#2、UI DTO 对齐)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceState {
@@ -608,7 +628,7 @@ impl DeviceSimulator {
             local_host,
             local_port,
             None,
-            3600,
+            self.config.register_expires_secs,
         );
         let resp = sip_core::client_transact(transport, dst, &req1, &mut rx, timing).await?;
 
@@ -636,7 +656,7 @@ impl DeviceSimulator {
                     local_host,
                     local_port,
                     Some(&auth),
-                    3600,
+                    self.config.register_expires_secs,
                 );
                 let resp2 =
                     sip_core::client_transact(transport, dst, &req2, &mut rx, timing).await?;
@@ -2366,26 +2386,25 @@ impl DeviceSimulator {
         });
 
         // 初次注册(失败则退避重试)。
-        let backoff_base = Duration::from_secs(1);
-        let backoff_max = Duration::from_secs(30);
+        let backoff_base = register_retry_base();
         let mut backoff = backoff_base;
         while (self.register(&transport, &local_host, local_port).await).is_err() {
             tokio::select! {
                 _ = &mut shutdown => { inbound_task.abort(); return; }
                 _ = tokio::time::sleep(backoff) => {
-                    backoff = (backoff * 2).min(backoff_max);
+                    backoff = next_register_retry(backoff);
                 }
             }
         }
         tracing::info!(device=%self.config.device_id, "注册成功");
 
         // 心跳主循环 + 注册续约(FR-32)。
-        // 注册有效期 3600s(与 builder::register 一致),到期前 80%(2880s)主动重注册续约。
+        // 按配置有效期的 80% 主动重注册续约。
         let interval = Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
-        let renew_after = Duration::from_secs(3600 * 80 / 100);
+        let renew_after = register_renew_after(self.config.register_expires_secs);
         let mut renew_ticker = tokio::time::interval(renew_after);
         renew_ticker.reset(); // 跳过启动即触发
-        let max_hb_fail = 3u32;
+        let max_hb_fail = self.config.heartbeat_fail_threshold.max(1);
         let mut hb_fail = 0u32;
         loop {
             tokio::select! {
@@ -2399,15 +2418,14 @@ impl DeviceSimulator {
                     match self.send_keepalive(&transport, &local_host, local_port).await {
                         Ok(200) => hb_fail = 0,
                         _ => {
-                            hb_fail += 1;
-                            if hb_fail >= max_hb_fail {
+                            if record_heartbeat_failure(&mut hb_fail, max_hb_fail) {
                                 tracing::warn!(device=%self.config.device_id, "心跳连续失败,重注册");
                                 hb_fail = 0;
                                 let mut b = backoff_base;
                                 while self.register(&transport, &local_host, local_port).await.is_err() {
                                     tokio::select! {
                                         _ = &mut shutdown => { inbound_task.abort(); return; }
-                                        _ = tokio::time::sleep(b) => { b = (b * 2).min(backoff_max); }
+                                        _ = tokio::time::sleep(b) => { b = next_register_retry(b); }
                                     }
                                 }
                             }
@@ -2467,8 +2485,10 @@ mod tests {
         platform: Arc<UdpTransport>,
         device_addr: SocketAddr,
         call_id: String,
+        expected_expires: u32,
     ) {
         let mut prx = platform.register(call_id.clone());
+        let expected_expires = expected_expires.to_string();
         let mut seen = 0;
         let mut first_via: Option<String> = None;
         let mut first_from: Option<String> = None;
@@ -2487,6 +2507,10 @@ mod tests {
                     .expect("REGISTER 缺少 From")
                     .to_string();
                 let cseq_number = req.headers.cseq_number().expect("REGISTER 缺少 CSeq");
+                assert_eq!(
+                    req.headers.get("Expires"),
+                    Some(expected_expires.as_str())
+                );
                 let mut h = Headers::new();
                 h.set("Call-ID", call_id.clone());
                 h.set("CSeq", cseq);
@@ -2548,6 +2572,7 @@ mod tests {
             platform_tp.clone(),
             device_addr,
             sim.call_id().to_string(),
+            3_600,
         ));
 
         let state = sim
@@ -2557,6 +2582,106 @@ mod tests {
         assert_eq!(state, DeviceState::Registered);
         assert!(!sim.capture_ready().await, "未配置视频源时不应伪造采集就绪");
         platform_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 注册使用配置有效期() {
+        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+
+        let mut config = test_cfg("127.0.0.1", platform_addr.port());
+        config.register_expires_secs = 7_200;
+        let sim = DeviceSimulator::new(config);
+        let platform_task = tokio::spawn(mock_platform_register(
+            platform_tp,
+            device_addr,
+            sim.call_id().to_string(),
+            7_200,
+        ));
+
+        sim.register(&device_tp, "127.0.0.1", device_addr.port())
+            .await
+            .unwrap();
+        platform_task.await.unwrap();
+    }
+
+    #[test]
+    fn 注册策略满足重试下限和续约比例() {
+        assert_eq!(register_retry_base(), std::time::Duration::from_secs(60));
+        assert_eq!(
+            next_register_retry(std::time::Duration::from_secs(240)),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            register_renew_after(7_200),
+            std::time::Duration::from_secs(5_760)
+        );
+    }
+
+    #[test]
+    fn 心跳失败阈值按配置且成功会清零() {
+        let mut failures = 0;
+        for _ in 0..4 {
+            assert!(!record_heartbeat_failure(&mut failures, 5));
+        }
+        assert!(record_heartbeat_failure(&mut failures, 5));
+        failures = 0;
+        assert!(!record_heartbeat_failure(&mut failures, 5));
+        assert_eq!(failures, 1);
+    }
+
+    #[tokio::test]
+    async fn 注册失败后的重试等待可被立即停止() {
+        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+        let sim = Arc::new(DeviceSimulator::new(test_cfg(
+            "127.0.0.1",
+            platform_addr.port(),
+        )));
+
+        let mut requests = platform_tp.register(sim.call_id().to_string());
+        let platform_task = tokio::spawn(async move {
+            let incoming = requests.recv().await.expect("应收到首次 REGISTER");
+            let SipMessage::Request(request) = incoming.message else {
+                panic!("应为 REGISTER 请求");
+            };
+            let mut headers = Headers::new();
+            headers.set("Call-ID", request.headers.call_id().unwrap_or_default());
+            headers.set("CSeq", request.headers.cseq().unwrap_or("1 REGISTER"));
+            platform_tp
+                .send_to(
+                    &SipMessage::Response(Response {
+                        status: 403,
+                        reason: "Forbidden".into(),
+                        headers,
+                        body: Vec::new(),
+                    }),
+                    device_addr,
+                )
+                .await
+                .unwrap();
+        });
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(sim.run(
+            device_tp,
+            "127.0.0.1".into(),
+            device_addr.port(),
+            async move {
+                let _ = stop_rx.await;
+            },
+        ));
+        platform_task.await.unwrap();
+        stop_tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), run)
+            .await
+            .expect("停止不应等待 60 秒重试计时")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2589,6 +2714,7 @@ mod tests {
             platform_tp,
             device_addr,
             sim.call_id().to_string(),
+            3_600,
         ));
 
         assert_eq!(
