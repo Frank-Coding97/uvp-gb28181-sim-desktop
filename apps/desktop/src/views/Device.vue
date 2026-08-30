@@ -9,6 +9,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import ThreePtzCamera from "../components/ThreePtzCamera.vue";
 
 const message = useMessage();
+const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // 选择本地 H.264 文件作视频源(FR-8:C 档真实码流)。
 async function pickVideoSource() {
@@ -97,6 +98,46 @@ interface LiveProbeResult {
   message: string;
 }
 type ProbeState = { kind: "loading" | "success" | "warning" | "error"; message: string };
+
+interface DeviceRuntimeState {
+  guarded: boolean;
+  alarming: boolean;
+  longitude: number;
+  latitude: number;
+  name: string;
+  expiration: number;
+  heartbeat_interval: number;
+  heartbeat_count: number;
+  video_record_plan_type: number | null;
+  alarm_record_duration: number | null;
+  picture_mask_enabled: number | null;
+  frame_mirror_mode: number | null;
+  alarm_report_enabled: number | null;
+  osd_time_show: number | null;
+  osd_show: number | null;
+  last_change: string;
+  updated_at_ms: number;
+}
+
+const runtimeState = ref<DeviceRuntimeState | null>(null);
+const runtimeStateError = ref("无运行中设备");
+
+async function refreshRuntimeState() {
+  if (!isTauri) return;
+  try {
+    runtimeState.value = await invoke<DeviceRuntimeState>("get_device_runtime_state");
+    runtimeStateError.value = "";
+  } catch (error) {
+    runtimeState.value = null;
+    runtimeStateError.value = String(error).includes("设备未启动")
+      ? "无运行中设备"
+      : `状态读取失败：${String(error)}`;
+  }
+}
+
+const runtimeUpdatedAt = computed(() => runtimeState.value?.updated_at_ms
+  ? new Date(runtimeState.value.updated_at_ms).toLocaleString("zh-CN", { hour12: false })
+  : "—");
 
 interface ParsedCameraSource {
   videoIndex: number;
@@ -346,19 +387,32 @@ async function startDevice() {
     return;
   }
   const r = await storeStart(activePlatform.value);
-  if (r.ok) message.success(r.msg); else message.error(r.msg);
+  if (r.ok) {
+    message.success(r.msg);
+    await refreshRuntimeState();
+  } else message.error(r.msg);
 }
 async function stopDevice() {
   const r = await storeStop();
-  if (r.ok) message.info(r.msg); else message.error(r.msg);
+  if (r.ok) {
+    runtimeState.value = null;
+    runtimeStateError.value = "无运行中设备";
+    message.info(r.msg);
+  } else message.error(r.msg);
 }
 async function fireAlarm() {
-  try { message.success(await invoke<string>("fire_alarm", { description: "移动侦测报警" })); }
+  try {
+    message.success(await invoke<string>("fire_alarm", { description: "移动侦测报警" }));
+  }
   catch (e) { message.error(String(e)); }
+  finally { await refreshRuntimeState(); }
 }
 async function firePosition() {
-  try { message.success(await invoke<string>("fire_position", { longitude: 116.397, latitude: 39.908 })); }
+  try {
+    message.success(await invoke<string>("fire_position", { longitude: 116.397, latitude: 39.908 }));
+  }
   catch (e) { message.error(String(e)); }
+  finally { await refreshRuntimeState(); }
 }
 
 // 平台命令时间线 / 活跃订阅 / 长任务进度(展示后端语义事件)。
@@ -377,6 +431,7 @@ let unlistenProg: (() => void) | null = null;
 let progHideTimer: number | null = null;
 
 const subList = computed(() => Object.values(subs.value).filter((s) => s.active));
+const alarmSubscriptionActive = computed(() => subs.value.Alarm?.active === true);
 const kindLabel: Record<string, string> = {
   query: "查询", control: "控制", invite: "点播", broadcast: "广播",
   Catalog: "目录", Alarm: "报警", MobilePosition: "移动位置", PTZPosition: "PTZ精准位置",
@@ -631,10 +686,12 @@ onMounted(async () => {
   unlistenCmd = await listen<CmdEntry>("platform_command", (e) => {
     commands.value.unshift(e.payload);
     if (commands.value.length > MAX_CMD) commands.value.splice(MAX_CMD);
+    void refreshRuntimeState();
   });
   // 活跃订阅。
   unlistenSub = await listen<SubState>("subscription_state", (e) => {
     subs.value = { ...subs.value, [e.payload.kind]: e.payload };
+    void refreshRuntimeState();
   });
   // 长任务进度(抓拍/升级);完成后 3s 自动隐藏。
   unlistenProg = await listen<TaskProgress>("task_progress", (e) => {
@@ -644,7 +701,7 @@ onMounted(async () => {
       progHideTimer = window.setTimeout(() => { progress.value = null; }, 3000);
     }
   });
-  await refreshLiveSources(false);
+  await Promise.all([refreshLiveSources(false), refreshRuntimeState()]);
 });
 onUnmounted(() => {
   unlistenTrace?.();
@@ -660,8 +717,11 @@ onUnmounted(() => {
   if (ptzStopTimer) clearTimeout(ptzStopTimer);
 });
 
-// keep-alive 激活时与引擎对账(store 内统一实现),避免切页后按钮态错乱。
-onActivated(reconcile);
+// keep-alive 激活时同时对账设备生命周期与 Rust 运行时快照。
+onActivated(async () => {
+  await reconcile();
+  await refreshRuntimeState();
+});
 
 // 注册状态/在线时长/传输模式已上移到全局顶栏(App.vue),所有菜单页可见,本页不再重复展示。
 </script>
@@ -874,6 +934,47 @@ onActivated(reconcile);
           </div>
     </div>
 
+    <section class="glass-card panel runtime-truth-panel" aria-labelledby="runtime-truth-title">
+      <div class="runtime-truth-head">
+        <div>
+          <div id="runtime-truth-title" class="panel-title">设备状态真相</div>
+          <p>以下数据直接读取当前 Rust 设备实例；平台事件只负责触发刷新。</p>
+        </div>
+        <span v-if="runtimeState" class="runtime-updated">更新于 {{ runtimeUpdatedAt }}</span>
+      </div>
+      <div v-if="runtimeState" class="runtime-truth-grid">
+        <div class="truth-cell">
+          <span>布防状态</span>
+          <b :class="runtimeState.guarded ? 'state-on' : 'state-off'">{{ runtimeState.guarded ? "已布防" : "未布防" }}</b>
+        </div>
+        <div class="truth-cell">
+          <span>报警状态</span>
+          <b :class="runtimeState.alarming ? 'state-alarm' : 'state-off'">{{ runtimeState.alarming ? "报警中" : "无报警" }}</b>
+        </div>
+        <div class="truth-cell">
+          <span>报警订阅</span>
+          <b :class="alarmSubscriptionActive ? 'state-on' : 'state-off'">{{ alarmSubscriptionActive ? "平台已订阅" : "未订阅" }}</b>
+        </div>
+        <div class="truth-cell">
+          <span>当前位置</span>
+          <b class="mono">{{ runtimeState.longitude.toFixed(6) }}, {{ runtimeState.latitude.toFixed(6) }}</b>
+        </div>
+        <div class="truth-cell truth-wide">
+          <span>会话参数</span>
+          <b>{{ runtimeState.name || "未命名设备" }} · 注册 {{ runtimeState.expiration }}s · 心跳 {{ runtimeState.heartbeat_interval }}s × {{ runtimeState.heartbeat_count }}</b>
+        </div>
+        <div class="truth-cell truth-wide">
+          <span>已应用配置摘要</span>
+          <b>录像计划 {{ runtimeState.video_record_plan_type ?? "—" }} · 报警录像 {{ runtimeState.alarm_record_duration ?? "—" }}s · 遮挡 {{ runtimeState.picture_mask_enabled === 1 ? "开" : "关" }} · 镜像 {{ runtimeState.frame_mirror_mode ?? "—" }} · 报警上报 {{ runtimeState.alarm_report_enabled === 1 ? "开" : "关" }} · OSD {{ runtimeState.osd_show === 1 ? "开" : "关" }}</b>
+        </div>
+        <div class="truth-cell truth-wide">
+          <span>最近变更</span>
+          <b class="mono">{{ runtimeState.last_change || "device_started" }}</b>
+        </div>
+      </div>
+      <div v-else class="runtime-empty">{{ runtimeStateError || "无运行中设备" }}</div>
+    </section>
+
     <!-- 下方工作区：所有卡片全宽单列，按云台、状态、时间线顺序阅读。 -->
     <div class="workspace">
       <div class="ws-col">
@@ -1028,6 +1129,28 @@ onActivated(reconcile);
 .workspace { display: flex; flex-direction: column; gap: 18px; }
 .ws-col { display: contents; }
 .workspace > .ws-col > .panel { width: 100%; box-sizing: border-box; }
+.runtime-truth-panel { margin-bottom: 18px; }
+.runtime-truth-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.runtime-truth-head .panel-title { margin-bottom: 4px; }
+.runtime-truth-head p { margin: 0 0 16px; color: var(--text-tertiary); font-size: 12px; }
+.runtime-updated { color: var(--text-tertiary); font-size: 11.5px; white-space: nowrap; }
+.runtime-truth-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.truth-cell { padding: 12px 14px; border: 1px solid rgba(120,130,150,.13); border-radius: 10px; background: rgba(255,255,255,.34); min-width: 0; }
+.truth-cell > span { display: block; margin-bottom: 6px; color: var(--text-tertiary); font-size: 11.5px; }
+.truth-cell > b { display: block; color: var(--text-primary); font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.truth-cell > b.state-on { color: var(--success); }
+.truth-cell > b.state-alarm { color: var(--error); }
+.truth-cell > b.state-off { color: var(--text-secondary); }
+.truth-wide { grid-column: span 2; }
+.runtime-empty { padding: 18px; border: 1px dashed var(--border-default); border-radius: 10px; color: var(--text-tertiary); text-align: center; font-size: 12.5px; }
+@media (max-width: 900px) {
+  .runtime-truth-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .runtime-truth-head { flex-direction: column; }
+  .runtime-truth-grid { grid-template-columns: 1fr; }
+  .truth-wide { grid-column: span 1; }
+}
 .panel {
   position: relative; overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--border-default) 82%, white);
