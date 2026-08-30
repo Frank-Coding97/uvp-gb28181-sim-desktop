@@ -192,6 +192,7 @@ const CATALOG_UDP_BODY_MAX_BYTES: usize = 1000;
 /// 完整 SIP UDP payload 的互操作预算。1200B 低于 IPv6 最小 MTU 扣除头部后的
 /// 1232B，也兼容部分对较大 UDP SIP 报文处理不完整的平台。
 const CATALOG_UDP_PAYLOAD_MAX_BYTES: usize = 1200;
+const RECORD_INFO_PAGE_SIZE: usize = 5;
 
 fn register_retry_base() -> std::time::Duration {
     std::time::Duration::from_secs(REGISTER_RETRY_MIN_SECS)
@@ -251,7 +252,7 @@ pub struct DeviceSimulator {
     /// 注册后启动的唯一采集源；平台点播只订阅它，不再重复打开摄像头/文件。
     shared_media: tokio::sync::Mutex<Option<Arc<media_rtp::SharedMedia>>>,
     /// 可选的本地录像状态机，桌面端从 app_data_dir 注入。
-    recording_service: tokio::sync::Mutex<Option<Arc<crate::recording::RecordingService>>>,
+    recording_service: std::sync::Mutex<Option<Arc<crate::recording::RecordingService>>>,
     ids: DialogIds,
     cseq: AtomicU32,
     /// 当前活跃的推流会话(INVITE → 推流中,BYE → 停止)。
@@ -399,7 +400,7 @@ impl DeviceSimulator {
             config,
             preview_sink: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
-            recording_service: tokio::sync::Mutex::new(None),
+            recording_service: std::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
@@ -431,7 +432,7 @@ impl DeviceSimulator {
             config,
             preview_sink: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
-            recording_service: tokio::sync::Mutex::new(None),
+            recording_service: std::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
             session: tokio::sync::Mutex::new(None),
@@ -475,13 +476,17 @@ impl DeviceSimulator {
     }
 
     /// 注入桌面端录像目录。重复注入时保留新 Store 的持久化真相。
-    pub async fn install_recording_store(&self, store: Arc<crate::recording::RecordingStore>) {
-        *self.recording_service.lock().await =
-            Some(Arc::new(crate::recording::RecordingService::new(store)));
+    pub fn install_recording_store(&self, store: Arc<crate::recording::RecordingStore>) {
+        if let Ok(mut service) = self.recording_service.lock() {
+            *service = Some(Arc::new(crate::recording::RecordingService::new(store)));
+        }
     }
 
-    pub async fn recording_service(&self) -> Option<Arc<crate::recording::RecordingService>> {
-        self.recording_service.lock().await.clone()
+    pub fn recording_service(&self) -> Option<Arc<crate::recording::RecordingService>> {
+        self.recording_service
+            .lock()
+            .ok()
+            .and_then(|service| service.clone())
     }
 
     pub async fn start_recording(
@@ -491,7 +496,6 @@ impl DeviceSimulator {
     ) -> Result<crate::recording::RecordingState> {
         let service = self
             .recording_service()
-            .await
             .ok_or_else(|| Error::Media("录像存储未配置".into()))?;
         let media = self.shared_media.lock().await.clone();
         let channel_id = self
@@ -508,7 +512,6 @@ impl DeviceSimulator {
     pub async fn stop_recording(&self) -> Result<Option<crate::recording::RecordingEntry>> {
         let service = self
             .recording_service()
-            .await
             .ok_or_else(|| Error::Media("录像存储未配置".into()))?;
         service.stop().await
     }
@@ -1647,16 +1650,16 @@ impl DeviceSimulator {
                                             .await
                                         {
                                             Ok(200..=299) => {}
-                                            Ok(status) => tracing::warn!(
-                                                status,
-                                                cmd_type = %cmd_type,
-                                                "查询 Response MESSAGE 未获平台 2xx 确认，继续发送后续分片"
-                                            ),
-                                            Err(error) => tracing::warn!(
-                                                error = %error,
-                                                cmd_type = %cmd_type,
-                                                "查询 Response MESSAGE 事务失败，继续发送后续分片"
-                                            ),
+                                            Ok(status) => {
+                                                tracing::warn!(status, cmd_type = %cmd_type,
+                                                    "查询 Response MESSAGE 未获平台 2xx 确认，停止后续分片");
+                                                break;
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(error = %error, cmd_type = %cmd_type,
+                                                    "查询 Response MESSAGE 事务失败，停止后续分片");
+                                                break;
+                                            }
                                         }
                                     }
                                     // 平台命令时间线:上报语义摘要(查询类)。
@@ -2229,11 +2232,83 @@ impl DeviceSimulator {
         &self,
         query: &gb28181_protocol::manscdp::Query,
     ) -> Result<Vec<String>> {
-        if query.cmd_type == "Catalog" {
-            self.catalog_query_packets(query)
-        } else {
-            self.handle_query(query).map(|xml| vec![xml])
+        match query.cmd_type.as_str() {
+            "Catalog" => self.catalog_query_packets(query),
+            "RecordInfo" => self.record_info_packets(query),
+            _ => self.handle_query(query).map(|xml| vec![xml]),
         }
+    }
+
+    fn record_info_packets(&self, query: &gb28181_protocol::manscdp::Query) -> Result<Vec<String>> {
+        use crate::recording::{RecordingKind, RecordingQuery};
+        use gb28181_protocol::manscdp::{RecordInfoResponse, RecordItem};
+
+        let parse_time = |value: Option<&String>| {
+            value
+                .and_then(|value| common::clock::parse_iso8601(value))
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .map(|seconds| seconds.saturating_mul(1_000))
+        };
+        let kind = match query.record_type.as_deref().map(str::trim) {
+            None | Some("") | Some("all") | Some("ALL") => None,
+            Some(value) if value.eq_ignore_ascii_case("time") => Some(RecordingKind::Time),
+            Some(value) if value.eq_ignore_ascii_case("alarm") => Some(RecordingKind::Alarm),
+            Some(value) if value.eq_ignore_ascii_case("manual") => Some(RecordingKind::Manual),
+            Some(value) => return Err(Error::Gb28181(format!("RecordInfo Type 不支持: {value}"))),
+        };
+        let entries = self
+            .recording_service()
+            .map(|service| {
+                service.store().query(&RecordingQuery {
+                    start_time_ms: parse_time(query.start_time.as_ref()),
+                    end_time_ms: parse_time(query.end_time.as_ref()),
+                    channel_id: Some(query.device_id.clone()),
+                    kind,
+                })
+            })
+            .unwrap_or_default();
+        let total = entries.len() as u32;
+        let items: Vec<RecordItem> = entries
+            .into_iter()
+            .map(|entry| RecordItem {
+                device_id: entry.channel_id.clone(),
+                name: entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.id.clone()),
+                start_time: entry.start_time,
+                end_time: entry.end_time,
+                kind: entry.kind.as_str().into(),
+                file_path: Some(entry.path.to_string_lossy().into_owned()),
+                address: Some(self.local_host()),
+                secrecy: Some(0),
+                recorder_id: Some(self.config.device_id.as_str().to_owned()),
+            })
+            .collect();
+        if items.is_empty() {
+            return Ok(vec![RecordInfoResponse::page(
+                &query.device_id,
+                self.config.device_info.device_name.clone(),
+                query.sn,
+                0,
+                Vec::new(),
+            )
+            .to_xml()?]);
+        }
+        items
+            .chunks(RECORD_INFO_PAGE_SIZE)
+            .map(|page| {
+                RecordInfoResponse::page(
+                    &query.device_id,
+                    self.config.device_info.device_name.clone(),
+                    query.sn,
+                    total,
+                    page.to_vec(),
+                )
+                .to_xml()
+            })
+            .collect()
     }
 
     /// 处理 Query,返回应答 XML。
@@ -2285,27 +2360,11 @@ impl DeviceSimulator {
                 )
                 .to_xml()
             }
-            "RecordInfo" => {
-                // 返回一段模拟录像(FR-10)。真实实现应按查询时间范围列举本地录像。
-                let items = vec![RecordItem {
-                    device_id: query.device_id.clone(),
-                    name: "record".into(),
-                    start_time: "2026-07-03T10:00:00".into(),
-                    end_time: "2026-07-03T10:05:00".into(),
-                    kind: "time".into(),
-                    file_path: None,
-                    address: None,
-                    secrecy: None,
-                    recorder_id: None,
-                }];
-                let resp = RecordInfoResponse::with_name(
-                    &query.device_id,
-                    self.config.device_info.device_name.clone(),
-                    query.sn,
-                    items,
-                );
-                resp.to_xml()
-            }
+            "RecordInfo" => self
+                .record_info_packets(query)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Gb28181("RecordInfo 未生成应答".into())),
             "ConfigDownload" => {
                 // 从当前会话已应用配置回读，只返回 ConfigType 请求的块。
                 self.runtime_config_response(query)
@@ -2526,7 +2585,9 @@ impl DeviceSimulator {
             tracing::info!("强制关键帧(下一帧起带 IDR)");
         }
         if let Some(command) = ctrl.record_cmd.as_deref() {
-            if command.eq_ignore_ascii_case("Record") {
+            if self.recording_service().is_none() {
+                tracing::info!(command, "未注入录像存储，保持纯信令模拟应答");
+            } else if command.eq_ignore_ascii_case("Record") {
                 self.start_recording(
                     crate::recording::RecordingKind::Manual,
                     crate::recording::RecordingSource::Platform,
@@ -4609,5 +4670,62 @@ mod tests {
             sim.config().heartbeat_fail_threshold
         );
         assert_eq!(snapshot.last_change, "device_started");
+    }
+
+    #[test]
+    fn record_info仅返回真实索引并保持分页总数() {
+        use crate::recording::{RecordingEntry, RecordingKind, RecordingSource, RecordingStore};
+        let root = std::env::temp_dir().join(format!(
+            "uvp-record-info-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Arc::new(RecordingStore::open(&root).unwrap());
+        let channel = "34020000001320000001";
+        for index in 0..6_u64 {
+            let path = root.join(format!("record-{index}.mp4"));
+            std::fs::write(&path, b"media").unwrap();
+            store
+                .add(RecordingEntry {
+                    id: format!("record-{index}"),
+                    channel_id: channel.into(),
+                    start_time_ms: 1_000 + index,
+                    end_time_ms: 2_000 + index,
+                    start_time: "1970-01-01T00:00:01".into(),
+                    end_time: "1970-01-01T00:00:02".into(),
+                    source: RecordingSource::Local,
+                    kind: RecordingKind::Manual,
+                    path,
+                    size_bytes: 5,
+                })
+                .unwrap();
+        }
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.install_recording_store(store);
+        let query = gb28181_protocol::manscdp::Query::parse(
+            "<Query><CmdType>RecordInfo</CmdType><SN>88</SN><DeviceID>34020000001320000001</DeviceID><StartTime>1970-01-01T00:00:00</StartTime><EndTime>1970-01-01T00:00:10</EndTime><Type>manual</Type></Query>",
+        )
+        .unwrap();
+        let packets = sim.handle_query_packets(&query).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert!(packets[0].contains("<SN>88</SN>"));
+        assert!(packets[0].contains("<SumNum>6</SumNum>"));
+        assert!(packets[0].contains("Num=\"5\""));
+        assert!(packets[1].contains("<SumNum>6</SumNum>"));
+        assert!(packets[1].contains("Num=\"1\""));
+        assert!(packets[0].contains("<FilePath>"));
+        assert!(!packets.join("").contains("2026-07-03"));
+
+        let empty = gb28181_protocol::manscdp::Query::parse(
+            "<Query><CmdType>RecordInfo</CmdType><SN>89</SN><DeviceID>34020000001320000001</DeviceID><Type>alarm</Type></Query>",
+        )
+        .unwrap();
+        let packets = sim.handle_query_packets(&empty).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].contains("<SumNum>0</SumNum>"));
+        assert!(!packets[0].contains("<Item>"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
