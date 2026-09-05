@@ -181,6 +181,12 @@ const failureWatermark = computed(() => {
 });
 const rampThrottled = computed(() => (latest.value?.ramp_throttled ?? 0) > 0);
 const failureSamples = computed(() => (latest.value?.failure_samples ?? []).slice(0, 5));
+
+function calcFailPercent(val?: number): string {
+  const total = latest.value?.register_failed ?? 0;
+  if (!total || !val) return "0%";
+  return `${Math.min(100, Math.max(0, Math.round((val / total) * 100)))}%`;
+}
 const scenarioSummary = computed(() => {
   const media = mediaLabels[form.value.media_profile] ?? form.value.media_profile;
   return [
@@ -375,9 +381,9 @@ onUnmounted(() => {
   <div class="page" :class="{ 'is-running': running || starting || stopping || stopPending }">
     <header class="page-header">
       <div>
-        <div class="eyebrow">LOAD TESTING</div>
+        <div class="eyebrow">LOAD TESTING WORKBENCH</div>
         <h1>压力测试工作台</h1>
-        <p>批量模拟注册、心跳、媒体与主动上报，实时观察上级平台承载能力。</p>
+        <p>高并发模拟注册、心跳、媒体与主动上报，实时观察平台承载与瓶颈诊断。</p>
       </div>
       <div class="header-actions">
         <div class="status-chip" :class="statusTone">
@@ -389,92 +395,142 @@ onUnmounted(() => {
     </header>
 
     <n-alert v-if="activePlatform?.transport === 'TCP'" type="info" :show-icon="false" class="notice">
-      当前使用 SIP over TCP:目录树很大(单条报文超 MTU)或网络丢包较多时更稳,
-      代价是每台设备一条 TCP 连接,万级压测请优先用 UDP。
+      当前使用 SIP over TCP：目录树很大（单条报文超 MTU）或网络丢包较多时更稳，代价是每台设备一条 TCP 连接，万级压测请优先用 UDP。
     </n-alert>
 
-    <div class="stress-sections" :class="{ running: running || starting || stopping || stopPending }">
-      <ScenarioForm
-        v-model:form="form"
-        :running="running"
-        :starting="starting"
-        :stopping="stopping"
-        :stop-pending="stopPending"
-        :platform-label="platformLabel"
-        :scenario-summary="scenarioSummary"
-        @start="startStress"
-        @stop="stopStress"
-        @pick-video="pickVideoSource"
-      />
+    <div v-if="trustWarning" class="trust-warning" role="status" aria-live="polite">
+      <span aria-hidden="true">⚠</span>
+      <span>{{ trustWarning }}</span>
+    </div>
 
-      <div v-if="trustWarning" class="trust-warning" role="status" aria-live="polite">
-        <span aria-hidden="true">⚠</span>
-        <span>{{ trustWarning }}</span>
+    <!-- 顶部 6 列高密 KPI 指标矩阵 -->
+    <section class="metric-grid">
+      <div class="glass-card metric primary">
+        <span class="metric-label">上线成功率</span>
+        <strong class="metric-value">{{ successRate }}</strong>
+        <small class="metric-sub">
+          {{ latest?.register_succeeded ?? 0 }} 成功 / {{ latest?.register_first_attempt ?? 0 }} 台 · 重试 {{ latest?.register_retry ?? 0 }} · {{ successHealth }}
+        </small>
       </div>
+      <div class="glass-card metric">
+        <span class="metric-label">当前在线</span>
+        <strong class="metric-value">{{ onlineText }}</strong>
+        <small class="metric-sub">{{ onlineNote }}</small>
+      </div>
+      <div class="glass-card metric">
+        <span class="metric-label">注册延迟 P95</span>
+        <strong class="metric-value">{{ latencyText }}</strong>
+        <small class="metric-sub">{{ latencyNote }}</small>
+      </div>
+      <div class="glass-card metric">
+        <span class="metric-label">活跃推流</span>
+        <strong class="metric-value">{{ latest?.active_streams ?? 0 }}</strong>
+        <small class="metric-sub">{{ streamNote }}</small>
+      </div>
+      <div class="glass-card metric">
+        <span class="metric-label">心跳成功</span>
+        <strong class="metric-value">{{ latest?.heartbeat_succeeded ?? 0 }}</strong>
+        <small class="metric-sub">
+          失败 {{ latest?.heartbeat_failed ?? 0 }} · {{ heartbeatNote }}
+          <template v-if="heartbeatLatencyNote"> · {{ heartbeatLatencyNote }}</template>
+        </small>
+      </div>
+      <div class="glass-card metric">
+        <span class="metric-label">主动上报</span>
+        <strong class="metric-value">{{ (latest?.position_reported ?? 0) + (latest?.alarm_reported ?? 0) }}</strong>
+        <small class="metric-sub">位置 {{ latest?.position_reported ?? 0 }} · 报警 {{ latest?.alarm_reported ?? 0 }} · {{ reportNote }}</small>
+      </div>
+    </section>
 
-      <section class="metric-grid">
-        <div class="glass-card metric primary">
-          <span>设备上线成功率</span>
-          <strong>{{ successRate }}</strong>
-          <small>
-            {{ latest?.register_succeeded ?? 0 }} 成功 / {{ latest?.register_first_attempt ?? 0 }} 台
-            · 重试 {{ latest?.register_retry ?? 0 }} 次 · {{ successHealth }}
-          </small>
-        </div>
-        <div class="glass-card metric">
-          <span>当前在线设备</span>
-          <strong>{{ onlineText }}</strong>
-          <small>{{ onlineNote }}</small>
-        </div>
-        <div class="glass-card metric">
-          <span>注册延迟 p95</span>
-          <strong>{{ latencyText }}</strong>
-          <small>{{ latencyNote }}</small>
-        </div>
-        <div class="glass-card metric">
-          <span>当前活跃流</span>
-          <strong>{{ latest?.active_streams ?? 0 }}</strong>
-          <small>{{ streamNote }}</small>
-        </div>
-        <div class="glass-card metric">
-          <span>心跳成功</span>
-          <strong>{{ latest?.heartbeat_succeeded ?? 0 }}</strong>
-          <small>
-            失败 {{ latest?.heartbeat_failed ?? 0 }} 次 · {{ heartbeatNote }}
-            <template v-if="heartbeatLatencyNote"> · {{ heartbeatLatencyNote }}</template>
-          </small>
-        </div>
-        <div class="glass-card metric">
-          <span>主动上报</span>
-          <strong>{{ (latest?.position_reported ?? 0) + (latest?.alarm_reported ?? 0) }}</strong>
-          <small>位置 {{ latest?.position_reported ?? 0 }} · 报警 {{ latest?.alarm_reported ?? 0 }} · {{ reportNote }}</small>
-        </div>
-      </section>
-
-      <section class="monitor-grid">
+    <!-- 核心压测双列协同布局：左侧走势与归因，右侧 340px 紧凑控制面板 -->
+    <div class="pressure-layout">
+      <!-- 左列：监控走势与深度失败归因 -->
+      <div class="monitor-column">
         <ScenarioCharts ref="chartRef" />
 
         <div class="glass-card panel failure-panel">
-          <div class="panel-title">失败归因</div>
-          <div class="failure-total">{{ latest?.register_failed ?? 0 }}</div>
-          <div class="failure-caption">注册失败总数</div>
-          <div class="failure-list">
-            <div><span><i class="timeout" />事务超时</span><b>{{ latest?.fail_timeout ?? 0 }}</b></div>
-            <div><span><i class="rejected" />平台拒绝</span><b>{{ latest?.fail_rejected ?? 0 }}</b></div>
-            <div class="sub"><span>· 凭据/权限 401·403</span><b>{{ latest?.fail_rejected_auth ?? 0 }}</b></div>
-            <div class="sub"><span>· 平台忙/过载 486·503</span><b>{{ latest?.fail_rejected_overload ?? 0 }}</b></div>
-            <div class="sub"><span>· 其它拒绝</span><b>{{ latest?.fail_rejected_other ?? 0 }}</b></div>
-            <div><span><i class="local" />本机瓶颈</span><b>{{ latest?.fail_local ?? 0 }}</b></div>
-            <div><span><i class="other" />网络或其它</span><b>{{ latest?.fail_other ?? 0 }}</b></div>
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">失败归因与根因诊断</div>
+              <div class="panel-sub">根据错误类型、状态码与本机指标智能分析承载瓶颈</div>
+            </div>
+            <div class="failure-badge" :class="{ 'has-fail': (latest?.register_failed ?? 0) > 0 }">
+              注册失败 {{ latest?.register_failed ?? 0 }}
+            </div>
           </div>
-          <div class="failure-advice">{{ failureAdvice }}</div>
+
+          <!-- 失败分类水平条形图对比 -->
+          <div class="failure-bars">
+            <div class="fb-item">
+              <div class="fb-header">
+                <span class="fb-label"><i class="timeout" />事务超时</span>
+                <span class="fb-val">{{ latest?.fail_timeout ?? 0 }} <em class="fb-pct">({{ calcFailPercent(latest?.fail_timeout) }})</em></span>
+              </div>
+              <div class="fb-track">
+                <div class="fb-fill timeout" :style="{ width: calcFailPercent(latest?.fail_timeout) }" />
+              </div>
+            </div>
+
+            <div class="fb-item">
+              <div class="fb-header">
+                <span class="fb-label"><i class="rejected" />平台拒绝 (4xx/5xx)</span>
+                <span class="fb-val">{{ latest?.fail_rejected ?? 0 }} <em class="fb-pct">({{ calcFailPercent(latest?.fail_rejected) }})</em></span>
+              </div>
+              <div class="fb-track">
+                <div class="fb-fill rejected" :style="{ width: calcFailPercent(latest?.fail_rejected) }" />
+              </div>
+              <div v-if="(latest?.fail_rejected ?? 0) > 0" class="fb-sub-items">
+                <div class="fb-sub">
+                  <span>· 凭据/鉴权 401/403</span>
+                  <b>{{ latest?.fail_rejected_auth ?? 0 }}</b>
+                </div>
+                <div class="fb-sub">
+                  <span>· 平台过载 486/503</span>
+                  <b>{{ latest?.fail_rejected_overload ?? 0 }}</b>
+                </div>
+                <div class="fb-sub">
+                  <span>· 其它拒绝</span>
+                  <b>{{ latest?.fail_rejected_other ?? 0 }}</b>
+                </div>
+              </div>
+            </div>
+
+            <div class="fb-item">
+              <div class="fb-header">
+                <span class="fb-label"><i class="local" />本机瓶颈</span>
+                <span class="fb-val">{{ latest?.fail_local ?? 0 }} <em class="fb-pct">({{ calcFailPercent(latest?.fail_local) }})</em></span>
+              </div>
+              <div class="fb-track">
+                <div class="fb-fill local" :style="{ width: calcFailPercent(latest?.fail_local) }" />
+              </div>
+            </div>
+
+            <div class="fb-item">
+              <div class="fb-header">
+                <span class="fb-label"><i class="other" />网络或其它</span>
+                <span class="fb-val">{{ latest?.fail_other ?? 0 }} <em class="fb-pct">({{ calcFailPercent(latest?.fail_other) }})</em></span>
+              </div>
+              <div class="fb-track">
+                <div class="fb-fill other" :style="{ width: calcFailPercent(latest?.fail_other) }" />
+              </div>
+            </div>
+          </div>
+
+          <!-- 诊断处置建议 -->
+          <div class="diag-card">
+            <div class="diag-title">诊断建议</div>
+            <div class="diag-desc">{{ failureAdvice }}</div>
+          </div>
+
           <div v-if="failureWatermark" class="failure-meta">{{ failureWatermark }}</div>
           <div v-if="rampThrottled" class="failure-meta warn">
-            爬坡曾因本机背压减速 {{ latest?.ramp_throttled }} 次 —— 本机跟不上设定速率,
+            爬坡曾因本机背压减速 {{ latest?.ramp_throttled }} 次 —— 本机跟不上设定速率，
             这段时间的失败不能算作平台承载上限。
           </div>
+
+          <!-- 失败样本复现 -->
           <details v-if="failureSamples.length" class="failure-samples">
-            <summary>失败样本({{ failureSamples.length }} 条,可挑一台复现)</summary>
+            <summary>失败样本（{{ failureSamples.length }} 条，可挑一台复现）</summary>
             <ul>
               <li v-for="sample in failureSamples" :key="sample.device_id + sample.online_at_failure">
                 <code>{{ sample.device_id }}</code>
@@ -484,80 +540,399 @@ onUnmounted(() => {
             </ul>
           </details>
         </div>
-      </section>
+      </div>
+
+      <!-- 右列：紧凑表单控制面板 (340px 固定宽度) -->
+      <div class="control-column">
+        <ScenarioForm
+          v-model:form="form"
+          :running="running"
+          :starting="starting"
+          :stopping="stopping"
+          :stop-pending="stopPending"
+          :platform-label="platformLabel"
+          :scenario-summary="scenarioSummary"
+          @start="startStress"
+          @stop="stopStress"
+          @pick-video="pickVideoSource"
+        />
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.page { width: min(1320px, 100%); margin: 0 auto; }
-.page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin: 8px 0 12px; }
-.eyebrow { color: var(--accent); font-size: var(--fs-xs); font-weight: 800; letter-spacing: 1.5px; }
-h1 { margin: 3px 0 0; color: var(--text-primary); font-size: clamp(18px, 2vw, 22px); letter-spacing: -0.4px; }
-.page-header p { margin: 4px 0 0; color: var(--text-tertiary); font-size: var(--fs-sm); line-height: 1.45; }
-.header-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-.status-chip { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; padding: 0 10px; border: 1px solid var(--border-default); border-radius: 999px; background: var(--bg-surface); color: var(--text-secondary); font-size: var(--fs-sm); font-weight: 650; }
-.status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
-.status-chip.running { color: var(--success); border-color: rgba(8,179,136,.25); background: rgba(8,179,136,.08); }
-.status-chip.running .status-dot { background: var(--success); box-shadow: 0 0 0 3px rgba(8,179,136,.12); animation: pulse 1.8s infinite; }
-.status-chip.busy { color: var(--warning); }
-.status-chip.busy .status-dot { background: var(--warning); }
-.notice { margin-bottom: 12px; border-radius: var(--radius-md); }
-.stress-sections { display: flex; flex-direction: column; gap: 12px; }
-.stress-sections.running .metric-grid { order: 1; }
-.stress-sections.running .monitor-grid { order: 2; }
-.panel { padding: 12px 16px; border-radius: var(--radius-md); }
-.metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 0; }
-.metric { position: relative; overflow: hidden; padding: 10px 14px; border-radius: var(--radius-md); }
-.metric::after { content: ""; position: absolute; width: 64px; height: 64px; right: -20px; top: -25px; border-radius: 50%; background: var(--accent-dim); }
-.metric.primary { border-color: var(--border-accent); background: linear-gradient(145deg, var(--bg-elevated), color-mix(in srgb, var(--accent) 10%, transparent)); }
-.metric > span { display: block; color: var(--text-tertiary); font-size: var(--fs-sm); }
-.metric strong { display: block; margin-top: 4px; color: var(--text-primary); font-size: var(--fs-xl); line-height: 1; font-variant-numeric: tabular-nums; }
-.metric.primary strong { color: var(--accent-deep); }
-.metric small { display: block; margin-top: 4px; color: var(--text-tertiary); font-size: var(--fs-xs); }
-.monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 10px; }
-.panel-title { color: var(--text-primary); font-size: var(--fs-md); font-weight: 700; }
-.failure-panel { display: flex; flex-direction: column; }
-.failure-total { margin-top: 12px; color: var(--text-primary); font-size: var(--fs-2xl); font-weight: 750; line-height: 1; }
-.failure-caption { margin-top: 3px; color: var(--text-tertiary); font-size: var(--fs-sm); }
-.failure-list { display: flex; flex-direction: column; gap: 8px; margin-top: auto; padding-top: 14px; }
-.failure-list > div { display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); font-size: var(--fs-sm); }
-.failure-list span { display: inline-flex; align-items: center; gap: 6px; }
-.failure-list i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
-.failure-list i.timeout { background: var(--warning); }
-.failure-list i.rejected { background: var(--error); }
-.failure-list i.local { background: var(--accent-deep, #1e63dc); }
-.failure-list i.other { background: var(--violet); }
+.page {
+  width: min(1360px, 100%);
+  margin: 0 auto;
+}
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin: 4px 0 10px;
+}
+.eyebrow {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+}
+h1 {
+  margin: 2px 0 0;
+  color: var(--text-primary);
+  font-size: 20px;
+  letter-spacing: -0.3px;
+}
+.page-header p {
+  margin: 2px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+.status-chip.running {
+  color: var(--success);
+  border-color: rgba(8, 179, 136, 0.25);
+  background: rgba(8, 179, 136, 0.08);
+}
+.status-chip.running .status-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(8, 179, 136, 0.12);
+  animation: pulse 1.8s infinite;
+}
+.status-chip.busy {
+  color: var(--warning);
+}
+.status-chip.busy .status-dot {
+  background: var(--warning);
+}
+.notice {
+  margin-bottom: 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
 .trust-warning {
-  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px;
-  padding: 8px 10px; border-radius: var(--radius-sm); font-size: var(--fs-sm); line-height: 1.5;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.45;
   background: color-mix(in srgb, var(--warning) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--warning) 32%, transparent);
   color: var(--text-primary);
 }
-.failure-list b { color: var(--text-primary); font-size: var(--fs-lg); font-variant-numeric: tabular-nums; }
-.failure-advice { margin-top: 18px; padding: 10px 12px; border-radius: var(--radius-sm); background: rgba(56,132,255,.07); color: var(--text-secondary); font-size: var(--fs-sm); line-height: 1.55; }
-@keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(8,179,136,0); } }
-@media (max-width: 1120px) {
-  .metric-grid { grid-template-columns: repeat(2, 1fr); }
+
+/* 顶部 6 列紧凑 KPI 矩阵 */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 12px;
 }
-@media (max-width: 820px) {
-  .page-header { flex-direction: column; }
-  .header-actions { width: 100%; justify-content: space-between; }
-  .monitor-grid { grid-template-columns: 1fr; }
-  .failure-list { margin-top: 0; }
+.metric {
+  position: relative;
+  overflow: hidden;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
 }
+.metric::after {
+  content: "";
+  position: absolute;
+  width: 50px;
+  height: 50px;
+  right: -15px;
+  top: -20px;
+  border-radius: 50%;
+  background: var(--accent-dim);
+  pointer-events: none;
+}
+.metric.primary {
+  border-color: var(--border-accent);
+  background: linear-gradient(145deg, var(--bg-elevated), color-mix(in srgb, var(--accent) 10%, transparent));
+}
+.metric-label {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+}
+.metric-value {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-primary);
+  font-size: 20px;
+  font-weight: 750;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+.metric.primary .metric-value {
+  color: var(--accent-deep, #1e63dc);
+}
+.metric-sub {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 压测核心双列协同布局 */
+.pressure-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 12px;
+  align-items: start;
+}
+.monitor-column {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.control-column {
+  position: sticky;
+  top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* 失败归因面板 */
+.panel {
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+.panel-title {
+  color: var(--text-primary);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+.panel-sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 2px;
+}
+.failure-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 700;
+  background: var(--bg-surface);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border-default);
+  font-variant-numeric: tabular-nums;
+}
+.failure-badge.has-fail {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--error);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.failure-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 6px 0;
+}
+.fb-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fb-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+}
+.fb-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+.fb-label i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.fb-label i.timeout { background: var(--warning); }
+.fb-label i.rejected { background: var(--error); }
+.fb-label i.local { background: var(--accent-deep, #1e63dc); }
+.fb-label i.other { background: var(--violet); }
+.fb-val {
+  color: var(--text-primary);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.fb-pct {
+  font-style: normal;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-left: 2px;
+}
+.fb-track {
+  width: 100%;
+  height: 5px;
+  background: rgba(120, 140, 170, 0.15);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.fb-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.fb-fill.timeout { background: var(--warning); }
+.fb-fill.rejected { background: var(--error); }
+.fb-fill.local { background: var(--accent-deep, #1e63dc); }
+.fb-fill.other { background: var(--violet); }
+
+.fb-sub-items {
+  display: flex;
+  gap: 12px;
+  padding-left: 12px;
+  margin-top: 1px;
+}
+.fb-sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  display: flex;
+  gap: 4px;
+}
+.fb-sub b {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.diag-card {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: rgba(56, 132, 255, 0.06);
+  border: 1px solid rgba(56, 132, 255, 0.18);
+}
+.diag-title {
+  font-size: 11px;
+  font-weight: 750;
+  color: var(--accent-deep, #1e63dc);
+  margin-bottom: 2px;
+}
+.diag-desc {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
 .failure-meta {
-  margin-top: 6px; font-size: var(--fs-sm); line-height: 1.55; color: var(--text-tertiary);
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-tertiary);
 }
-.failure-meta.warn { color: var(--warning); }
-.failure-samples { margin-top: 6px; font-size: var(--fs-sm); color: var(--text-tertiary); }
-.failure-samples summary { cursor: pointer; }
-.failure-samples ul { margin: 4px 0 0; padding-left: 16px; }
-.failure-samples li { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
+.failure-meta.warn {
+  color: var(--warning);
+}
+.failure-samples {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+.failure-samples summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.failure-samples ul {
+  margin: 4px 0 0;
+  padding-left: 14px;
+}
+.failure-samples li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 1px 0;
+}
 .failure-samples code {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--text-secondary);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--text-secondary);
 }
-.failure-samples .dim { color: var(--text-tertiary); margin-left: auto; }
-.failure-list .sub span { padding-left: 10px; color: var(--text-tertiary); }
+.failure-samples .dim {
+  color: var(--text-tertiary);
+  margin-left: auto;
+}
+
+@keyframes pulse {
+  50% { box-shadow: 0 0 0 7px rgba(8, 179, 136, 0); }
+}
+
+@media (max-width: 1200px) {
+  .metric-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 980px) {
+  .pressure-layout {
+    grid-template-columns: 1fr;
+  }
+  .control-column {
+    position: static;
+  }
+}
+
+@media (max-width: 640px) {
+  .metric-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .page-header {
+    flex-direction: column;
+  }
+  .header-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .fb-sub-items {
+    flex-direction: column;
+    gap: 2px;
+  }
+}
 </style>
