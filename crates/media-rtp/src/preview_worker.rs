@@ -499,7 +499,7 @@ impl PreviewAttempt {
         active_child: Arc<Mutex<Option<Child>>>,
         stop: Arc<AtomicBool>,
     ) -> std::result::Result<Self, String> {
-        let args = preview_worker_args_with_codec(codec, fps, 480);
+        let args = preview_worker_args_with_codec(codec, fps, 0);
         let mut child = Command::new(ffmpeg)
             .args(&args)
             .stdin(Stdio::piped())
@@ -688,7 +688,8 @@ pub fn preview_worker_args(fps: u32, width: u32) -> Vec<String> {
     preview_worker_args_with_codec(VideoCodec::H264, fps, width)
 }
 
-/// 生成指定编码的 FFmpeg 预览参数；输入只从 stdin 读取，输出仍为 MJPEG stdout。
+/// 生成指定编码的 FFmpeg 预览参数；width 为 0 时保留原始尺寸，否则按指定宽度缩放。
+/// 输入只从 stdin 读取，输出仍为 MJPEG stdout。
 pub fn preview_worker_args_with_codec(codec: VideoCodec, fps: u32, width: u32) -> Vec<String> {
     let input_format = match codec {
         VideoCodec::H264 => "h264",
@@ -717,13 +718,17 @@ pub fn preview_worker_args_with_codec(codec: VideoCodec, fps: u32, width: u32) -
         "0:v:0".into(),
         "-an".into(),
         "-vf".into(),
-        format!("scale={}:-2,format=yuvj420p", width.max(160)),
+        if width == 0 {
+            "format=yuvj420p".into()
+        } else {
+            format!("scale={}:-2,format=yuvj420p", width.max(160))
+        },
         "-c:v".into(),
         "mjpeg".into(),
         "-threads:v".into(),
         "1".into(),
         "-q:v".into(),
-        "8".into(),
+        "2".into(),
         "-fps_mode".into(),
         "passthrough".into(),
         "-f".into(),
@@ -848,6 +853,16 @@ mod tests {
     }
 
     #[test]
+    fn native_preview_preserves_resolution_and_uses_high_quality_jpeg() {
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let args = preview_worker_args_with_codec(codec, 25, 0);
+            let filter = args.windows(2).find(|pair| pair[0] == "-vf").unwrap();
+            assert_eq!(filter[1], "format=yuvj420p");
+            assert!(args.windows(2).any(|pair| pair == ["-q:v", "2"]));
+        }
+    }
+
+    #[test]
     fn worker命令只读h264标准输入且不打开采集设备() {
         let args = preview_worker_args(30, 480);
         let command = args.join(" ");
@@ -950,7 +965,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc=duration=1:size=160x120:rate=10",
+                "testsrc=duration=1:size=1920x1080:rate=10",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -1016,6 +1031,29 @@ mod tests {
         assert!(frames
             .iter()
             .all(|frame| frame.data.starts_with(&[0xff, 0xd8, 0xff])));
+        for frame in frames.iter() {
+            // Read the JPEG SOF segment to verify the worker's actual output pixels.
+            let mut offset = 2;
+            let dimensions = loop {
+                assert!(offset + 8 < frame.data.len(), "missing JPEG SOF");
+                assert_eq!(frame.data[offset], 0xff);
+                let marker = frame.data[offset + 1];
+                let length =
+                    u16::from_be_bytes([frame.data[offset + 2], frame.data[offset + 3]]) as usize;
+                if matches!(marker, 0xc0..=0xc2) {
+                    break (
+                        u16::from_be_bytes([frame.data[offset + 7], frame.data[offset + 8]]),
+                        u16::from_be_bytes([frame.data[offset + 5], frame.data[offset + 6]]),
+                    );
+                }
+                offset += 2 + length;
+            };
+            assert_eq!(
+                dimensions,
+                (1920, 1080),
+                "preview must preserve source detail"
+            );
+        }
         assert!(statuses
             .iter()
             .any(|status| status.phase == PreviewPhase::Playing));
