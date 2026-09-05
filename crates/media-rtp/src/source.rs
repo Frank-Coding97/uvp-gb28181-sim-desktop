@@ -7,6 +7,13 @@
 
 use common::{Error, Result};
 
+#[path = "timing.rs"]
+mod timing;
+pub use timing::{
+    ps_timestamp, rtp_timestamp, LegacyMediaClock, MediaEvent, SampleClock, TimedAudioAu,
+    TimedVideoAu, MEDIA_CLOCK_HZ, PS_TIMESTAMP_MASK, RTP_TIMESTAMP_MASK,
+};
+
 /// 判断字节流是否以 Annex B 起始码开头(`00 00 01` 或 `00 00 00 01`)。
 fn starts_with_annexb(b: &[u8]) -> bool {
     b.starts_with(&[0, 0, 1]) || b.starts_with(&[0, 0, 0, 1])
@@ -152,6 +159,26 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     }
 
     // ② 回退:重编码为 H.264 Annex B(兼容任意编码/容器)。
+    // HEVC 容器使用不同的 Annex-B bitstream filter；先尝试无损保留
+    // H.265，避免历史录像被静默重编码成 H.264 后时间轴/编码声明失真。
+    let hevc_copy_ok = Command::new(&ffmpeg)
+        .args([
+            "-y",
+            "-i",
+            src,
+            "-c:v",
+            "copy",
+            "-bsf:v",
+            "hevc_mp4toannexb",
+        ])
+        .arg(&out)
+        .output()
+        .map(|o| o.status.success() && out.exists())
+        .unwrap_or(false);
+    if hevc_copy_ok {
+        return Ok(out);
+    }
+
     let _ = std::fs::remove_file(&out);
     let enc = Command::new(&ffmpeg)
         .args([
@@ -244,6 +271,45 @@ pub trait VideoSource: Send {
         Vec::new()
     }
 
+    /// 当前源是否已经提供带真实 PTS/时长的媒体事件。
+    ///
+    /// 默认值为 `false`，旧实现仍通过 [`next_frame`] / [`next_audio`] 读取；
+    /// 共享媒体和推流边界会用 [`LegacyMediaClock`] 只补一次时间戳。新的
+    /// 摄像头、屏幕和文件适配器应覆盖此方法并实现 [`next_media_event`]。
+    fn supports_timed_events(&self) -> bool {
+        false
+    }
+
+    /// 定时事件是否已经由源按其 PTS 做过墙钟调度。
+    ///
+    /// 默认值为 `false`，推流器会为有限源提供回放等待；如果文件读取器
+    /// 自己已经等待 PTS，则覆盖为 `true`，避免同一时间轴被等待两次。
+    fn timed_events_are_paced(&self) -> bool {
+        false
+    }
+
+    /// 读取下一个独立媒体事件。
+    ///
+    /// 默认实现只把旧视频入口包装成一个未定时事件。旧调用者继续使用
+    /// [`next_frame`] / [`next_audio`] 不受影响；新的来源覆盖该方法后可以
+    /// 任意顺序交付视频、音频和时间轴 discontinuity。
+    fn next_media_event(&mut self) -> Option<MediaEvent> {
+        let frame = self.next_frame()?;
+        Some(MediaEvent::Video(TimedVideoAu::new(
+            frame.data,
+            self.codec(),
+            frame.key_frame,
+            0,
+            0,
+        )))
+    }
+
+    /// 源的默认音频采样率，仅用于旧入口的时间戳适配。
+    /// 带时间戳的新事件必须使用 [`TimedAudioAu::sample_rate_hz`] 自身的值。
+    fn audio_sample_rate_hz(&self) -> u32 {
+        self.audio_codec().default_sample_rate_hz()
+    }
+
     /// 本源是否带音频轨(决定 PS 是否声明音频 ES)。
     fn has_audio(&self) -> bool {
         false
@@ -288,10 +354,11 @@ pub trait VideoSource: Send {
 
 /// 注册期唯一采集源的帧总线。预览和平台点播各自订阅，任何慢消费者都不会阻塞采集。
 pub struct SharedMedia {
-    frames: tokio::sync::broadcast::Sender<SharedFrame>,
-    /// 最近一帧同时包含参数集和关键图像的访问单元。
+    events: tokio::sync::broadcast::Sender<MediaEvent>,
+    /// 最近一帧含参数集和关键图像的访问单元。
     /// 新订阅者必须从它开始，否则延迟加入的 FFmpeg/RTP 解码器只有 IDR、没有 SPS/PPS。
-    latest_config_keyframe: std::sync::Mutex<Option<SharedFrame>>,
+    /// 这里只缓存视频，不缓存该关键帧产生时的旧音频。
+    latest_config_keyframe: std::sync::Mutex<Option<TimedVideoAu>>,
     stop: std::sync::atomic::AtomicBool,
     alive: std::sync::atomic::AtomicBool,
     has_audio: bool,
@@ -303,12 +370,6 @@ pub struct SharedMedia {
     preview_control: Option<std::sync::Arc<crate::preview_worker::PreviewControl>>,
 }
 
-#[derive(Clone)]
-struct SharedFrame {
-    frame: Frame,
-    audio: Vec<Vec<u8>>,
-}
-
 /// 从一个源启动唯一采集线程。实时源在设备注册期间持续运行，直到调用 [`SharedMedia::stop`]。
 pub fn start_shared_media(
     mut source: Box<dyn VideoSource>,
@@ -316,9 +377,11 @@ pub fn start_shared_media(
 ) -> std::sync::Arc<SharedMedia> {
     let fps = fps.max(1);
     let preview_control = source.preview_control();
-    let (frames, _) = tokio::sync::broadcast::channel((fps * 4).max(32) as usize);
+    // 音频事件独立于视频事件，容量按事件而不是视频帧估算。
+    let (events, _) = tokio::sync::broadcast::channel((fps * 8).max(64) as usize);
+    let timed_source = source.supports_timed_events();
     let media = std::sync::Arc::new(SharedMedia {
-        frames,
+        events,
         latest_config_keyframe: std::sync::Mutex::new(None),
         stop: std::sync::atomic::AtomicBool::new(false),
         alive: std::sync::atomic::AtomicBool::new(true),
@@ -333,8 +396,8 @@ pub fn start_shared_media(
     let producer = std::sync::Arc::clone(&media);
     std::thread::spawn(move || {
         let interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
-        let mut pts_90k = 0_u64;
-        let pts_step = u64::from(crate::rtp::CLOCK_HZ / fps);
+        let mut legacy_clock =
+            LegacyMediaClock::new(fps, source.audio_codec(), source.audio_sample_rate_hz());
         while !producer.stop.load(std::sync::atomic::Ordering::Acquire) {
             let tick = std::time::Instant::now();
             let seek = producer
@@ -347,26 +410,40 @@ pub fn start_shared_media(
                 *producer.error.lock().unwrap() = Some(error);
                 break;
             }
-            if let Some(frame) = source.next_frame() {
-                let audio = source.next_audio();
-                let shared_frame = SharedFrame { frame, audio };
-                producer
-                    .frames_seen
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-                if shared_frame.frame.key_frame
-                    && crate::pusher::contains_codec_config(
-                        &shared_frame.frame.data,
-                        producer.video_codec,
-                    )
-                {
-                    *producer.latest_config_keyframe.lock().unwrap() = Some(shared_frame.clone());
+            let mut emitted = false;
+            if timed_source {
+                if let Some(event) = source.next_media_event() {
+                    emitted = true;
+                    publish_media_event(&producer, event);
+                } else if !source.is_live() {
+                    if let Some(error) = source.take_error() {
+                        *producer.error.lock().unwrap() = Some(error);
+                    }
+                    break;
                 }
-                let _ = producer.frames.send(shared_frame);
-                pts_90k = pts_90k.wrapping_add(pts_step);
+            } else if let Some(frame) = source.next_frame() {
+                // 旧入口一次取一帧，再取该视频窗内的音频包；时间戳只在这里补一次。
+                let video = legacy_clock.video(frame.data, source.codec(), frame.key_frame);
+                publish_media_event(&producer, MediaEvent::Video(video));
+                for packet in source.next_audio() {
+                    publish_media_event(
+                        &producer,
+                        MediaEvent::Audio(legacy_clock.audio(packet, None)),
+                    );
+                }
+                emitted = true;
             } else if !source.is_live() {
+                if let Some(error) = source.take_error() {
+                    *producer.error.lock().unwrap() = Some(error);
+                }
                 break;
             }
-            if let Some(remaining) = interval.checked_sub(tick.elapsed()) {
+            if timed_source {
+                // 编码源本身负责输出节奏；总线不再按 fps 二次节流。
+                if !emitted {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            } else if let Some(remaining) = interval.checked_sub(tick.elapsed()) {
                 std::thread::sleep(remaining);
             }
         }
@@ -380,12 +457,25 @@ pub fn start_shared_media(
     media
 }
 
+fn publish_media_event(producer: &std::sync::Arc<SharedMedia>, event: MediaEvent) {
+    if let MediaEvent::Video(video) = &event {
+        producer
+            .frames_seen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if video.key_frame && crate::pusher::contains_codec_config(&video.data, video.codec) {
+            *producer.latest_config_keyframe.lock().unwrap() = Some(video.clone());
+        }
+    }
+    let _ = producer.events.send(event);
+}
+
 impl SharedMedia {
     /// 为一路 RTP 推流建立独立消费者；发生积压时从下一关键帧恢复。
     pub fn subscribe(self: &std::sync::Arc<Self>) -> SharedVideoSource {
         SharedVideoSource {
             media: std::sync::Arc::clone(self),
-            frames: self.frames.subscribe(),
+            events: self.events.subscribe(),
+            pending_event: None,
             pending_audio: Vec::new(),
             bootstrap: self.latest_config_keyframe.lock().unwrap().clone(),
             need_key_frame: true,
@@ -435,8 +525,16 @@ impl SharedMedia {
         self.latest_config_keyframe
             .lock()
             .ok()
-            .and_then(|frame| frame.clone())
-            .map(|frame| (frame.frame, self.video_codec))
+            .and_then(|video| video.clone())
+            .map(|video| {
+                (
+                    Frame {
+                        data: video.data,
+                        key_frame: video.key_frame,
+                    },
+                    video.codec,
+                )
+            })
     }
 
     fn seek(&self, permille: u32) {
@@ -496,40 +594,100 @@ impl Drop for SharedMedia {
 /// [`SharedMedia`] 的单路 RTP 读取端。
 pub struct SharedVideoSource {
     media: std::sync::Arc<SharedMedia>,
-    frames: tokio::sync::broadcast::Receiver<SharedFrame>,
-    pending_audio: Vec<Vec<u8>>,
-    bootstrap: Option<SharedFrame>,
+    events: tokio::sync::broadcast::Receiver<MediaEvent>,
+    pending_event: Option<MediaEvent>,
+    pending_audio: Vec<TimedAudioAu>,
+    bootstrap: Option<TimedVideoAu>,
     need_key_frame: bool,
 }
 
 impl VideoSource for SharedVideoSource {
-    fn next_frame(&mut self) -> Option<Frame> {
+    fn supports_timed_events(&self) -> bool {
+        true
+    }
+
+    fn timed_events_are_paced(&self) -> bool {
+        // SharedMedia 的生产端已经按其来源的节奏发布事件；订阅端不能再次
+        // 用同一批 PTS 做墙钟等待。实时共享源即使不等待，也由 pusher 的
+        // `is_live` 分支直接按到达发送。
+        true
+    }
+
+    fn next_media_event(&mut self) -> Option<MediaEvent> {
         loop {
-            if let Some(packet) = self.bootstrap.take() {
-                self.need_key_frame = false;
-                self.pending_audio = packet.audio;
-                return Some(packet.frame);
-            }
-            match self.frames.try_recv() {
-                Ok(packet) => {
-                    if self.need_key_frame && !packet.frame.key_frame {
+            let event = if let Some(event) = self.pending_event.take() {
+                Some(event)
+            } else if let Some(video) = self.bootstrap.take() {
+                // 启动补发只带视频参数集；不能把该关键帧产生时的旧音频一并补发。
+                Some(MediaEvent::Video(video))
+            } else {
+                match self.events.try_recv() {
+                    Ok(event) => Some(event),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        self.need_key_frame = true;
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => None,
+                }
+            }?;
+            match event {
+                MediaEvent::Video(video) => {
+                    if self.need_key_frame
+                        && (!video.key_frame
+                            || !crate::pusher::contains_codec_config(&video.data, video.codec))
+                    {
                         continue;
                     }
                     self.need_key_frame = false;
-                    self.pending_audio = packet.audio;
-                    return Some(packet.frame);
+                    return Some(MediaEvent::Video(video));
                 }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                MediaEvent::Audio(audio) => {
+                    // 在首个完整视频关键帧之前，音频事件没有可用的解码起点。
+                    if self.need_key_frame {
+                        continue;
+                    }
+                    return Some(MediaEvent::Audio(audio));
+                }
+                discontinuity @ MediaEvent::Discontinuity { .. } => {
                     self.need_key_frame = true;
+                    return Some(discontinuity);
                 }
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return None,
+            }
+        }
+    }
+
+    fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            match self.next_media_event()? {
+                MediaEvent::Video(video) => {
+                    return Some(Frame {
+                        data: video.data,
+                        key_frame: video.key_frame,
+                    });
+                }
+                MediaEvent::Audio(audio) => self.pending_audio.push(audio),
+                MediaEvent::Discontinuity { .. } => self.need_key_frame = true,
             }
         }
     }
 
     fn next_audio(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.pending_audio)
+        let mut out: Vec<Vec<u8>> = self
+            .pending_audio
+            .drain(..)
+            .map(|audio| audio.data)
+            .collect();
+        while let Some(event) = self.next_media_event() {
+            match event {
+                MediaEvent::Audio(audio) => out.push(audio.data),
+                other => {
+                    self.pending_event = Some(other);
+                    break;
+                }
+            }
+        }
+        out
     }
 
     fn has_audio(&self) -> bool {
@@ -632,6 +790,11 @@ pub struct FileSource {
     audio_per_frame: usize,
     /// true=循环直播文件，false=有限历史文件。
     looping: bool,
+    /// 历史容器文件按源自身 PTS 建立的事件序列；普通裸流/旧入口保持 None。
+    historical_events: Option<Vec<MediaEvent>>,
+    historical_event_cursor: usize,
+    historical_pending_event: Option<MediaEvent>,
+    historical_pending_audio: Vec<TimedAudioAu>,
 }
 
 impl FileSource {
@@ -650,6 +813,69 @@ impl FileSource {
         if paths.is_empty() {
             return Err(Error::Media("历史录像文件列表为空".into()));
         }
+        let mut source = Self::from_paths_once_legacy(paths)?;
+        // 裸 Annex-B 文件没有可验证的源时基，保留原有调用兼容；容器历史必须
+        // 由 ffprobe 提供自身 PTS，不能用当前设备 FPS 猜测播放时长。
+        if paths.iter().any(|path| looks_like_annexb(path)) {
+            return Ok(source);
+        }
+
+        let mut all_events = Vec::new();
+        let mut segment_offset_90k = 0_u64;
+        let mut expected_frames = 0_usize;
+        for path in paths {
+            let path_str = path
+                .to_str()
+                .ok_or_else(|| Error::Media("历史录像路径非 UTF-8".into()))?;
+            let annexb = prepare_video_source(path_str)?;
+            let bytes = std::fs::read(&annexb).map_err(Error::Io)?;
+            let nals = split_annex_b(&bytes);
+            let codec = detect_codec(&nals);
+            let frames = group_into_frames(nals, codec);
+            expected_frames = expected_frames.saturating_add(frames.len());
+            let segment = probe_historical_segment(path_str)?;
+            if segment.codec != codec {
+                return Err(Error::Media(format!(
+                    "历史视频编码转换不一致: 源 {:?}, Annex-B {:?}",
+                    segment.codec, codec
+                )));
+            }
+            if segment.video.len() != frames.len() {
+                return Err(Error::Media(format!(
+                    "历史视频 PTS 帧数与 Annex-B 帧数不一致: {} != {}",
+                    segment.video.len(),
+                    frames.len()
+                )));
+            }
+            let mut segment_events = build_historical_events(&segment, frames)?;
+            let segment_duration = segment_events
+                .iter()
+                .map(|event| event.pts_90k().saturating_add(event_duration_90k(event)))
+                .max()
+                .unwrap_or(0);
+            for event in &mut segment_events {
+                add_event_offset(event, segment_offset_90k)?;
+            }
+            segment_offset_90k = segment_offset_90k.saturating_add(segment_duration);
+            all_events.extend(segment_events);
+        }
+        if source.frames.len() != expected_frames {
+            return Err(Error::Media(format!(
+                "历史视频合并后帧数不一致: {} != {}",
+                source.frames.len(),
+                expected_frames
+            )));
+        }
+        all_events
+            .sort_by_key(|event| (event.pts_90k(), matches!(event, MediaEvent::Audio(_)) as u8));
+        source.historical_events = Some(all_events);
+        source.historical_event_cursor = 0;
+        source.historical_pending_event = None;
+        source.historical_pending_audio.clear();
+        Ok(source)
+    }
+
+    fn from_paths_once_legacy(paths: &[std::path::PathBuf]) -> Result<Self> {
         let mut bytes = Vec::new();
         for path in paths {
             let path = path
@@ -705,6 +931,10 @@ impl FileSource {
             audio_cursor: 0,
             audio_per_frame: 0,
             looping: true,
+            historical_events: None,
+            historical_event_cursor: 0,
+            historical_pending_event: None,
+            historical_pending_audio: Vec::new(),
         })
     }
 
@@ -719,8 +949,560 @@ impl FileSource {
     }
 }
 
+#[derive(Debug, Clone)]
+struct HistoricalVideoTiming {
+    pts_90k: i128,
+    duration_90k: u64,
+    key_frame: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalAudioTiming {
+    pts_90k: i128,
+    duration_90k: u64,
+    sample_rate_hz: u32,
+    sample_count: u32,
+    codec: crate::ps::AudioCodec,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalSegment {
+    codec: crate::ps::VideoCodec,
+    video: Vec<HistoricalVideoTiming>,
+    audio: Vec<HistoricalAudioTiming>,
+}
+
+fn looks_like_annexb(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0_u8; 8];
+    let count = file.read(&mut head).unwrap_or(0);
+    starts_with_annexb(&head[..count])
+}
+
+fn history_ffprobe_bin() -> Option<String> {
+    use std::path::PathBuf;
+    use std::process::Command;
+    let mut candidates = Vec::<PathBuf>::new();
+    if let Ok(path) = std::env::var("FFPROBE_BIN") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(ffmpeg) = ffmpeg_bin() {
+        if let Some(parent) = std::path::Path::new(&ffmpeg).parent() {
+            candidates.push(parent.join(if cfg!(target_os = "windows") {
+                "ffprobe.exe"
+            } else {
+                "ffprobe"
+            }));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for name in if cfg!(target_os = "windows") {
+                ["ffprobe.exe", "ffprobe"]
+            } else {
+                ["ffprobe", "ffprobe.exe"]
+            } {
+                candidates.push(parent.join(name));
+                candidates.push(parent.join("resources").join(name));
+                candidates.push(parent.join("../Resources").join(name));
+            }
+        }
+    }
+    candidates.extend([
+        PathBuf::from("ffprobe"),
+        PathBuf::from("/opt/homebrew/bin/ffprobe"),
+        PathBuf::from("/usr/local/bin/ffprobe"),
+        PathBuf::from("/opt/local/bin/ffprobe"),
+        PathBuf::from("/usr/bin/ffprobe"),
+    ]);
+    candidates.into_iter().find_map(|candidate| {
+        let executable = candidate.to_string_lossy().into_owned();
+        Command::new(&executable)
+            .arg("-version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| executable)
+    })
+}
+
+fn run_history_ffprobe(path: &str, args: &[&str]) -> Result<serde_json::Value> {
+    use std::process::Command;
+    let ffprobe = history_ffprobe_bin()
+        .ok_or_else(|| Error::Media(format!("历史录像需要 ffprobe 读取源时间戳: {path}")))?;
+    let output = Command::new(ffprobe)
+        .args(["-v", "error"])
+        .args(args)
+        .arg(path)
+        .output()
+        .map_err(|error| Error::Media(format!("启动 ffprobe 失败: {error}")))?;
+    if !output.status.success() {
+        return Err(Error::Media(format!(
+            "ffprobe 历史录像失败({path}): {}",
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("未知错误")
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| Error::Media(format!("解析历史录像 ffprobe JSON 失败: {error}")))
+}
+
+fn json_i128(value: &serde_json::Value, key: &str) -> Option<i128> {
+    let value = value.get(key)?;
+    value
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| value.as_u64().map(i128::from))
+        .or_else(|| value.as_str()?.parse::<i128>().ok())
+}
+
+fn json_u32(value: &serde_json::Value, key: &str) -> Option<u32> {
+    let value = value.get(key)?;
+    value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .or_else(|| value.as_str()?.parse::<u32>().ok())
+}
+
+fn json_bool(value: &serde_json::Value, key: &str) -> bool {
+    json_i128(value, key).unwrap_or(0) != 0
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str()
+}
+
+fn parse_rational(value: &str) -> Option<(u64, u64)> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.parse::<u64>().ok()?;
+    let denominator = denominator.parse::<u64>().ok()?;
+    (numerator > 0 && denominator > 0).then_some((numerator, denominator))
+}
+
+fn stream_time_base(stream: &serde_json::Value) -> Result<(u64, u64)> {
+    let value = json_string(stream, "time_base")
+        .ok_or_else(|| Error::Media("历史录像流缺少 time_base".into()))?;
+    parse_rational(value).ok_or_else(|| Error::Media(format!("历史录像 time_base 无效: {value}")))
+}
+
+fn rescale_timestamp(value: i128, numerator: u64, denominator: u64) -> Result<i128> {
+    let scaled = value
+        .checked_mul(i128::from(MEDIA_CLOCK_HZ))
+        .and_then(|value| value.checked_mul(i128::from(numerator)))
+        .ok_or_else(|| Error::Media("历史录像时间戳超出内部范围".into()))?;
+    let denominator = i128::from(denominator);
+    let mut result = scaled / denominator;
+    let remainder = scaled % denominator;
+    if remainder.abs() * 2 >= denominator {
+        result += if scaled.is_negative() { -1 } else { 1 };
+    }
+    Ok(result)
+}
+
+fn rescale_samples(
+    value: i128,
+    numerator: u64,
+    denominator: u64,
+    sample_rate_hz: u32,
+) -> Result<u32> {
+    let scaled = value
+        .checked_mul(i128::from(numerator))
+        .and_then(|value| value.checked_mul(i128::from(sample_rate_hz)))
+        .ok_or_else(|| Error::Media("历史录像音频样本数超出内部范围".into()))?;
+    let denominator = i128::from(denominator);
+    let sample_count = (scaled / denominator).max(0);
+    u32::try_from(sample_count).map_err(|_| Error::Media("历史录像音频样本数超出 u32 范围".into()))
+}
+
+fn value_array<'a>(value: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn probe_historical_segment(path: &str) -> Result<HistoricalSegment> {
+    let video_json = run_history_ffprobe(
+        path,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_streams",
+            "-show_frames",
+            "-show_entries",
+            "stream=codec_name,codec_type,has_b_frames,time_base,duration_ts,r_frame_rate:frame=key_frame,best_effort_timestamp,pkt_pts,pkt_dts,pkt_duration,pict_type",
+            "-of",
+            "json",
+        ],
+    )?;
+    let stream = value_array(&video_json, "streams")
+        .first()
+        .ok_or_else(|| Error::Media(format!("历史录像没有视频流: {path}")))?;
+    let codec = match json_string(stream, "codec_name") {
+        Some("h264") => crate::ps::VideoCodec::H264,
+        Some("hevc") | Some("h265") => crate::ps::VideoCodec::H265,
+        Some(codec) => return Err(Error::Media(format!("历史录像视频编码不支持: {codec}"))),
+        None => return Err(Error::Media("历史录像视频流缺少 codec_name".into())),
+    };
+    if json_i128(stream, "has_b_frames").unwrap_or(0) > 0 {
+        return Err(Error::Media(
+            "历史录像包含 B 帧，当前历史时间轴不支持按显示顺序回放".into(),
+        ));
+    }
+    let (time_base_num, time_base_den) = stream_time_base(stream)?;
+    let frame_values = value_array(&video_json, "frames");
+    if frame_values.is_empty() {
+        return Err(Error::Media(format!("历史录像没有可读取的视频帧: {path}")));
+    }
+    let frame_rate = json_string(stream, "r_frame_rate").and_then(parse_rational);
+    let fallback_duration = frame_rate.and_then(|(numerator, denominator)| {
+        rescale_timestamp(i128::from(denominator), 1, numerator)
+            .ok()
+            .and_then(|duration| u64::try_from(duration).ok())
+    });
+    let stream_duration = json_i128(stream, "duration_ts")
+        .map(|duration| rescale_timestamp(duration, time_base_num, time_base_den))
+        .transpose()?;
+    let mut raw_pts = Vec::with_capacity(frame_values.len());
+    let mut key_frames = Vec::with_capacity(frame_values.len());
+    let mut raw_durations = Vec::with_capacity(frame_values.len());
+    for frame in frame_values {
+        if json_string(frame, "pict_type") == Some("B") {
+            return Err(Error::Media(
+                "历史录像包含 B 帧，当前历史时间轴不支持按显示顺序回放".into(),
+            ));
+        }
+        let pts = json_i128(frame, "best_effort_timestamp")
+            .or_else(|| json_i128(frame, "pkt_pts"))
+            .or_else(|| json_i128(frame, "pkt_dts"))
+            .ok_or_else(|| Error::Media("历史录像视频帧缺少 PTS".into()))?;
+        raw_pts.push(pts);
+        key_frames.push(json_bool(frame, "key_frame"));
+        raw_durations.push(json_i128(frame, "pkt_duration"));
+    }
+    let mut video = Vec::with_capacity(raw_pts.len());
+    let mut previous_pts = None;
+    for index in 0..raw_pts.len() {
+        if let Some(previous) = previous_pts {
+            if raw_pts[index] <= previous {
+                return Err(Error::Media(
+                    "历史录像视频 PTS 非递增，可能包含未支持的 B 帧".into(),
+                ));
+            }
+        }
+        previous_pts = Some(raw_pts[index]);
+        let duration_90k = raw_durations[index]
+            .filter(|duration| *duration > 0)
+            .map(|duration| rescale_timestamp(duration, time_base_num, time_base_den))
+            .transpose()?
+            .and_then(|duration| u64::try_from(duration).ok())
+            .filter(|duration| *duration > 0)
+            .or_else(|| {
+                raw_pts
+                    .get(index + 1)
+                    .map(|next| next - raw_pts[index])
+                    .and_then(|duration| {
+                        rescale_timestamp(duration, time_base_num, time_base_den)
+                            .ok()
+                            .and_then(|duration| u64::try_from(duration).ok())
+                    })
+            })
+            .or_else(|| {
+                let duration = stream_duration?;
+                let pts = rescale_timestamp(raw_pts[index], time_base_num, time_base_den).ok()?;
+                u64::try_from(duration - pts).ok()
+            })
+            .or(fallback_duration)
+            .filter(|duration| *duration > 0)
+            .ok_or_else(|| Error::Media("历史录像视频帧缺少有效时长".into()))?;
+        let pts_90k = rescale_timestamp(raw_pts[index], time_base_num, time_base_den)?;
+        video.push(HistoricalVideoTiming {
+            pts_90k,
+            duration_90k,
+            key_frame: key_frames[index],
+        });
+    }
+    let audio = probe_historical_audio(path)?;
+    Ok(HistoricalSegment {
+        codec,
+        video,
+        audio,
+    })
+}
+
+fn probe_historical_audio(path: &str) -> Result<Vec<HistoricalAudioTiming>> {
+    let audio_json = run_history_ffprobe(
+        path,
+        &[
+            "-select_streams",
+            "a:0",
+            "-show_streams",
+            "-show_packets",
+            "-show_entries",
+            "stream=codec_name,codec_type,sample_rate,time_base:packet=pts,dts,duration,size",
+            "-of",
+            "json",
+        ],
+    )?;
+    let Some(stream) = value_array(&audio_json, "streams").first() else {
+        return Ok(Vec::new());
+    };
+    let codec = match json_string(stream, "codec_name") {
+        Some("aac") => crate::ps::AudioCodec::Aac,
+        Some("pcm_alaw") | Some("alaw") => crate::ps::AudioCodec::G711A,
+        Some("pcm_mulaw") | Some("mulaw") => crate::ps::AudioCodec::G711U,
+        Some("opus") => crate::ps::AudioCodec::Opus,
+        Some(codec) => return Err(Error::Media(format!("历史录像音频编码不支持: {codec}"))),
+        None => return Err(Error::Media("历史录像音频流缺少 codec_name".into())),
+    };
+    let sample_rate_hz = json_u32(stream, "sample_rate")
+        .ok_or_else(|| Error::Media("历史录像音频流缺少 sample_rate".into()))?;
+    if sample_rate_hz == 0 {
+        return Err(Error::Media("历史录像音频采样率无效".into()));
+    }
+    let (time_base_num, time_base_den) = stream_time_base(stream)?;
+    let packet_values = value_array(&audio_json, "packets");
+    if packet_values.is_empty() {
+        return Err(Error::Media("历史录像音频流没有可读取的音频包".into()));
+    }
+    let mut packets = Vec::with_capacity(packet_values.len());
+    for packet in packet_values {
+        let pts = json_i128(packet, "pts")
+            .or_else(|| json_i128(packet, "dts"))
+            .ok_or_else(|| Error::Media("历史录像音频包缺少 PTS".into()))?;
+        let size = json_u32(packet, "size")
+            .ok_or_else(|| Error::Media("历史录像音频包缺少 size".into()))?;
+        let duration_units = json_i128(packet, "duration");
+        let sample_count = duration_units
+            .filter(|duration| *duration > 0)
+            .map(|duration| rescale_samples(duration, time_base_num, time_base_den, sample_rate_hz))
+            .transpose()?
+            .filter(|count| *count > 0)
+            .unwrap_or_else(|| crate::ps::AudioCodec::default_sample_count(codec));
+        let duration_90k = duration_units
+            .filter(|duration| *duration > 0)
+            .map(|duration| rescale_timestamp(duration, time_base_num, time_base_den))
+            .transpose()?
+            .and_then(|duration| u64::try_from(duration).ok())
+            .filter(|duration| *duration > 0)
+            .unwrap_or_else(|| {
+                crate::ps::AudioCodec::duration_90k_for_samples(codec, sample_rate_hz, sample_count)
+            });
+        packets.push((
+            pts,
+            duration_90k,
+            sample_rate_hz,
+            sample_count,
+            usize::try_from(size).map_err(|_| Error::Media("历史录像音频包过大".into()))?,
+        ));
+    }
+    let payloads = extract_historical_audio(path, codec, &packets)?;
+    if payloads.len() != packets.len() {
+        return Err(Error::Media(format!(
+            "历史录像音频包数与抽取结果不一致: {} != {}",
+            packets.len(),
+            payloads.len()
+        )));
+    }
+    Ok(packets
+        .into_iter()
+        .zip(payloads)
+        .map(
+            |((pts, duration_90k, sample_rate_hz, sample_count, _), data)| {
+                Ok(HistoricalAudioTiming {
+                    pts_90k: rescale_timestamp(pts, time_base_num, time_base_den)?,
+                    duration_90k,
+                    sample_rate_hz,
+                    sample_count,
+                    codec,
+                    data,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>>>()?)
+}
+
+fn extract_historical_audio(
+    path: &str,
+    codec: crate::ps::AudioCodec,
+    packets: &[(i128, u64, u32, u32, usize)],
+) -> Result<Vec<Vec<u8>>> {
+    use std::process::Command;
+    let ffmpeg = ffmpeg_bin()
+        .ok_or_else(|| Error::Media(format!("历史录像包含音频，需要 ffmpeg 抽取编码包: {path}")))?;
+    let nonce = now_ms().wrapping_add(rand::random::<u32>() as u64);
+    let (format, suffix) = match codec {
+        crate::ps::AudioCodec::Aac => ("adts", "aac"),
+        crate::ps::AudioCodec::G711A => ("alaw", "alaw"),
+        crate::ps::AudioCodec::G711U => ("mulaw", "mulaw"),
+        crate::ps::AudioCodec::Opus => ("data", "opus"),
+    };
+    let output_path = std::env::temp_dir().join(format!("uvp-history-audio-{nonce}.{suffix}"));
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(path)
+        .args([
+            "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a", "copy", "-f", format,
+        ])
+        .arg(&output_path)
+        .output()
+        .map_err(|error| Error::Media(format!("启动 ffmpeg 抽取历史音频失败: {error}")))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        return Err(Error::Media(format!(
+            "ffmpeg 抽取历史音频失败({path}): {}",
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("未知错误")
+        )));
+    }
+    let bytes = std::fs::read(&output_path).map_err(Error::Io)?;
+    let _ = std::fs::remove_file(&output_path);
+    match codec {
+        crate::ps::AudioCodec::Aac => split_adts_frames(&bytes),
+        crate::ps::AudioCodec::G711A
+        | crate::ps::AudioCodec::G711U
+        | crate::ps::AudioCodec::Opus => split_sized_packets(&bytes, packets),
+    }
+}
+
+fn split_sized_packets(
+    bytes: &[u8],
+    packets: &[(i128, u64, u32, u32, usize)],
+) -> Result<Vec<Vec<u8>>> {
+    let expected = packets.iter().try_fold(0_usize, |total, packet| {
+        total
+            .checked_add(packet.4)
+            .ok_or_else(|| Error::Media("历史录像音频总大小超出内部范围".into()))
+    })?;
+    if bytes.len() != expected {
+        return Err(Error::Media(format!(
+            "历史录像音频抽取大小与 packet size 不一致: {} != {}",
+            bytes.len(),
+            expected
+        )));
+    }
+    let mut offset = 0_usize;
+    Ok(packets
+        .iter()
+        .map(|packet| {
+            let end = offset + packet.4;
+            let data = bytes[offset..end].to_vec();
+            offset = end;
+            data
+        })
+        .collect::<Vec<_>>())
+}
+
+fn split_adts_frames(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut offset = 0_usize;
+    let mut frames = Vec::new();
+    while offset < bytes.len() {
+        if bytes.len().saturating_sub(offset) < 7
+            || bytes[offset] != 0xff
+            || (bytes[offset + 1] & 0xf6) != 0xf0
+        {
+            return Err(Error::Media("历史录像 AAC 抽取结果不是有效 ADTS".into()));
+        }
+        let header_len = if bytes[offset + 1] & 1 == 0 { 9 } else { 7 };
+        let frame_len = (usize::from(bytes[offset + 3] & 0x03) << 11)
+            | (usize::from(bytes[offset + 4]) << 3)
+            | usize::from(bytes[offset + 5] >> 5);
+        if frame_len < header_len || offset + frame_len > bytes.len() {
+            return Err(Error::Media("历史录像 AAC ADTS 帧长度无效".into()));
+        }
+        frames.push(bytes[offset..offset + frame_len].to_vec());
+        offset += frame_len;
+    }
+    Ok(frames)
+}
+
+fn build_historical_events(
+    segment: &HistoricalSegment,
+    frames: Vec<Frame>,
+) -> Result<Vec<MediaEvent>> {
+    let first_video_pts = segment
+        .video
+        .first()
+        .map(|video| video.pts_90k)
+        .ok_or_else(|| Error::Media("历史录像没有视频时间戳".into()))?;
+    let first_audio_pts = segment.audio.first().map(|audio| audio.pts_90k);
+    let segment_base = first_audio_pts
+        .map(|audio| audio.min(first_video_pts))
+        .unwrap_or(first_video_pts);
+    let mut events = Vec::with_capacity(segment.video.len() + segment.audio.len());
+    for (frame, timing) in frames.into_iter().zip(&segment.video) {
+        let pts_90k = u64::try_from(timing.pts_90k - segment_base)
+            .map_err(|_| Error::Media("历史录像视频 PTS 归一化失败".into()))?;
+        events.push(MediaEvent::Video(TimedVideoAu::new(
+            frame.data,
+            segment.codec,
+            frame.key_frame || timing.key_frame,
+            pts_90k,
+            timing.duration_90k,
+        )));
+    }
+    for audio in &segment.audio {
+        let pts_90k = u64::try_from(audio.pts_90k - segment_base)
+            .map_err(|_| Error::Media("历史录像音频 PTS 归一化失败".into()))?;
+        events.push(MediaEvent::Audio(TimedAudioAu::with_duration(
+            audio.data.clone(),
+            audio.codec,
+            audio.sample_rate_hz,
+            audio.sample_count,
+            pts_90k,
+            audio.duration_90k,
+        )));
+    }
+    events.sort_by_key(|event| (event.pts_90k(), matches!(event, MediaEvent::Audio(_)) as u8));
+    Ok(events)
+}
+
+fn event_duration_90k(event: &MediaEvent) -> u64 {
+    match event {
+        MediaEvent::Video(video) => video.duration_90k,
+        MediaEvent::Audio(audio) => audio.duration_90k,
+        MediaEvent::Discontinuity { .. } => 0,
+    }
+}
+
+fn add_event_offset(event: &mut MediaEvent, offset_90k: u64) -> Result<()> {
+    let pts = event
+        .pts_90k()
+        .checked_add(offset_90k)
+        .ok_or_else(|| Error::Media("历史录像多片段时间轴超出内部范围".into()))?;
+    match event {
+        MediaEvent::Video(video) => video.pts_90k = pts,
+        MediaEvent::Audio(audio) => audio.pts_90k = pts,
+        MediaEvent::Discontinuity { pts_90k } => *pts_90k = pts,
+    }
+    Ok(())
+}
+
 impl VideoSource for FileSource {
     fn next_frame(&mut self) -> Option<Frame> {
+        if self.historical_events.is_some() {
+            loop {
+                match self.next_historical_event()? {
+                    MediaEvent::Video(video) => {
+                        return Some(Frame {
+                            data: video.data,
+                            key_frame: video.key_frame,
+                        });
+                    }
+                    MediaEvent::Audio(audio) => self.historical_pending_audio.push(audio),
+                    MediaEvent::Discontinuity { .. } => {}
+                }
+            }
+        }
         if self.frames.is_empty() {
             return None;
         }
@@ -736,11 +1518,22 @@ impl VideoSource for FileSource {
     }
 
     fn has_audio(&self) -> bool {
-        !self.audio.is_empty()
+        self.historical_events
+            .as_ref()
+            .map(|events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, MediaEvent::Audio(_)))
+            })
+            .unwrap_or(!self.audio.is_empty())
     }
 
     fn seek(&mut self, permille: u32) {
         if self.frames.is_empty() {
+            return;
+        }
+        if self.historical_events.is_some() {
+            self.seek_historical(permille);
             return;
         }
         // 千分比 → 帧游标;从最近的关键帧起播,避免解码花屏。
@@ -761,6 +1554,23 @@ impl VideoSource for FileSource {
     }
 
     fn next_audio(&mut self) -> Vec<Vec<u8>> {
+        if self.historical_events.is_some() {
+            let mut out: Vec<Vec<u8>> = self
+                .historical_pending_audio
+                .drain(..)
+                .map(|audio| audio.data)
+                .collect();
+            while let Some(event) = self.next_historical_event() {
+                match event {
+                    MediaEvent::Audio(audio) => out.push(audio.data),
+                    other => {
+                        self.historical_pending_event = Some(other);
+                        break;
+                    }
+                }
+            }
+            return out;
+        }
         if self.audio.is_empty() {
             return Vec::new();
         }
@@ -772,14 +1582,112 @@ impl VideoSource for FileSource {
         out
     }
 
+    fn supports_timed_events(&self) -> bool {
+        self.historical_events.is_some()
+    }
+
+    fn audio_sample_rate_hz(&self) -> u32 {
+        self.historical_events
+            .as_ref()
+            .and_then(|events| {
+                events.iter().find_map(|event| match event {
+                    MediaEvent::Audio(audio) => Some(audio.sample_rate_hz),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| self.audio_codec().default_sample_rate_hz())
+    }
+
+    fn audio_codec(&self) -> crate::ps::AudioCodec {
+        self.historical_events
+            .as_ref()
+            .and_then(|events| {
+                events.iter().find_map(|event| match event {
+                    MediaEvent::Audio(audio) => Some(audio.codec),
+                    _ => None,
+                })
+            })
+            .unwrap_or(crate::ps::AudioCodec::G711A)
+    }
+
+    fn next_media_event(&mut self) -> Option<MediaEvent> {
+        if self.historical_events.is_some() {
+            return self.next_historical_event();
+        }
+        let frame = self.next_frame()?;
+        Some(MediaEvent::Video(TimedVideoAu::new(
+            frame.data,
+            self.codec,
+            frame.key_frame,
+            0,
+            0,
+        )))
+    }
+
     fn codec(&self) -> crate::ps::VideoCodec {
         self.codec
+    }
+}
+
+impl FileSource {
+    fn next_historical_event(&mut self) -> Option<MediaEvent> {
+        if let Some(event) = self.historical_pending_event.take() {
+            return Some(event);
+        }
+        let events = self.historical_events.as_ref()?;
+        let event = events.get(self.historical_event_cursor)?.clone();
+        self.historical_event_cursor += 1;
+        Some(event)
+    }
+
+    fn seek_historical(&mut self, permille: u32) {
+        let Some(events) = self.historical_events.as_ref() else {
+            return;
+        };
+        let duration = events
+            .iter()
+            .map(|event| event.pts_90k().saturating_add(event_duration_90k(event)))
+            .max()
+            .unwrap_or(0);
+        let target = duration.saturating_mul(u64::from(permille.min(1000))) / 1000;
+        let candidate = events
+            .iter()
+            .enumerate()
+            .find(|(_, event)| matches!(event, MediaEvent::Video(video) if video.pts_90k >= target))
+            .map(|(index, _)| index)
+            .or_else(|| {
+                events
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, event)| matches!(event, MediaEvent::Video(_)))
+                    .map(|(index, _)| index)
+            })
+            .unwrap_or(events.len());
+        self.historical_event_cursor = if candidate == events.len() {
+            events.len()
+        } else {
+            (0..=candidate)
+                .rev()
+                .find(|&index| {
+                    matches!(events[index], MediaEvent::Video(ref video) if video.key_frame)
+                })
+                .unwrap_or(candidate)
+        };
+        self.historical_pending_event = None;
+        self.historical_pending_audio.clear();
     }
 }
 
 /// 从 NAL 流探测视频编码。H.265 存在 VPS(nal_type=32),H.264 无此类型;
 /// 以此区分。NAL 头首字节 = bytes[3](起始码后),H.265 type=(b>>1)&0x3F。
 fn detect_codec(nals: &[Nal<'_>]) -> crate::ps::VideoCodec {
+    // H.264 的非 IDR slice 头(例如 0x41)右移一位后也等于 H.265 VPS
+    // 类型 32；先用 H.264 的 VCL/参数集类型排除这个重叠，否则普通 H.264
+    // 码流会被误判为 H.265，进而无法正确切帧。
+    if nals.iter().any(|nal| matches!(nal.nal_type, 1 | 5 | 7 | 8)) {
+        return crate::ps::VideoCodec::H264;
+    }
     for nal in nals {
         if let Some(&b) = nal.bytes.get(3) {
             let h265_type = (b >> 1) & 0x3F;
@@ -1444,6 +2352,65 @@ mod tests {
         panic!("共享媒体未保存可解码关键帧");
     }
 
+    struct ErrorAtSharedMediaEof {
+        timed: bool,
+        error: Option<String>,
+    }
+
+    impl VideoSource for ErrorAtSharedMediaEof {
+        fn next_frame(&mut self) -> Option<Frame> {
+            if self.timed {
+                None
+            } else {
+                self.error = Some("legacy source read failed".into());
+                None
+            }
+        }
+
+        fn supports_timed_events(&self) -> bool {
+            self.timed
+        }
+
+        fn next_media_event(&mut self) -> Option<MediaEvent> {
+            if self.timed {
+                self.error = Some("timed source read failed".into());
+            }
+            None
+        }
+
+        fn is_live(&self) -> bool {
+            false
+        }
+
+        fn take_error(&mut self) -> Option<String> {
+            self.error.take()
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_media有限源末次读取错误对订阅侧可见() {
+        for timed in [true, false] {
+            let media =
+                start_shared_media(Box::new(ErrorAtSharedMediaEof { timed, error: None }), 25);
+            for _ in 0..100 {
+                if !media.is_alive() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let error = media.capture_error().expect("共享媒体应复制源末次读取错误");
+            assert_eq!(
+                error,
+                if timed {
+                    "timed source read failed"
+                } else {
+                    "legacy source read failed"
+                }
+            );
+            media.stop();
+        }
+    }
+
     #[test]
     fn 空源不产帧() {
         let mut n = NoneSource;
@@ -1485,6 +2452,101 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需系统 ffmpeg + ffprobe；验证历史 MP4 的源 PTS 与 AAC 音频事件"]
+    fn 历史MP4按源PTS保留AAC事件() {
+        use std::process::Command;
+
+        let ffmpeg = ffmpeg_bin().expect("需要 ffmpeg");
+        assert!(history_ffprobe_bin().is_some(), "需要 ffprobe");
+        let path = std::env::temp_dir().join(format!(
+            "uvp-history-timed-{}-{}.mp4",
+            now_ms(),
+            rand::random::<u32>()
+        ));
+        let output = Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=5:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=8000:duration=1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-bf",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "32k",
+                "-ar",
+                "8000",
+                "-ac",
+                "1",
+                "-shortest",
+            ])
+            .arg(&path)
+            .output()
+            .expect("启动 ffmpeg 失败");
+        assert!(
+            output.status.success(),
+            "生成历史 MP4 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut source = FileSource::from_paths_once(std::slice::from_ref(&path))
+            .expect("历史 MP4 应能按自身 PTS 加载");
+        assert!(source.supports_timed_events());
+        assert!(source.has_audio());
+        assert_eq!(source.audio_codec(), crate::ps::AudioCodec::Aac);
+        assert_eq!(source.audio_sample_rate_hz(), 8_000);
+
+        let mut video_pts = Vec::new();
+        let mut audio = Vec::new();
+        while let Some(event) = source.next_media_event() {
+            match event {
+                MediaEvent::Video(video) => video_pts.push((video.pts_90k, video.duration_90k)),
+                MediaEvent::Audio(audio_au) => audio.push(audio_au),
+                MediaEvent::Discontinuity { .. } => unreachable!("历史 MP4 不应产生断点事件"),
+            }
+        }
+        assert_eq!(video_pts.len(), 5, "5fps*1s 应有 5 个视频访问单元");
+        assert!(video_pts
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 == 18_000));
+        assert!(video_pts.iter().all(|(_, duration)| *duration == 18_000));
+        assert!(audio.len() >= 8, "1s/1024@8k 至少应有 8 个 AAC 包");
+        assert_eq!(audio[0].pts_90k, 0, "音频 priming PTS 归一化后应从零开始");
+        assert!(audio.iter().all(|audio| {
+            audio.codec == crate::ps::AudioCodec::Aac
+                && audio.sample_rate_hz == 8_000
+                && (1..=1_024).contains(&audio.sample_count)
+                && audio.duration_90k
+                    == crate::ps::AudioCodec::duration_90k_for_samples(
+                        audio.codec,
+                        audio.sample_rate_hz,
+                        audio.sample_count,
+                    )
+                && !audio.data.is_empty()
+        }));
+        assert!(audio
+            .windows(2)
+            .all(|pair| pair[1].pts_90k - pair[0].pts_90k == 11_520));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn 轻量源按码率产帧() {
         // 200kbps @ 25fps → 每帧 200*1000/8/25 = 1000 字节。
         let mut s = LightSource::new(200, 25);
@@ -1502,6 +2564,130 @@ mod tests {
         let mut s = LightSource::new(1, 25); // 极低码率 → 命中 64 字节下限
         let f = s.next_frame().unwrap();
         assert_eq!(f.data.len(), 64 + 5);
+    }
+
+    #[test]
+    fn 定时音频访问单元按采样数换算90k时钟() {
+        let aac_8k =
+            TimedAudioAu::from_samples(vec![0x01], crate::ps::AudioCodec::Aac, 8_000, 1_024, 0);
+        let aac_16k =
+            TimedAudioAu::from_samples(vec![0x01], crate::ps::AudioCodec::Aac, 16_000, 1_024, 0);
+        let g711 = TimedAudioAu::from_samples(
+            vec![0x01; 160],
+            crate::ps::AudioCodec::G711A,
+            8_000,
+            160,
+            0,
+        );
+        assert_eq!(aac_8k.duration_90k, 11_520);
+        assert_eq!(aac_16k.duration_90k, 5_760);
+        assert_eq!(g711.duration_90k, 1_800);
+    }
+
+    #[test]
+    fn 非整除采样率用余数累计避免长期漂移() {
+        let mut clock = SampleClock::new(44_100).unwrap();
+        let mut ticks = 0_u64;
+        for _ in 0..(44_100 / 1_024) {
+            ticks += clock.duration_for_samples(1_024);
+        }
+        ticks += clock.duration_for_samples(44_100 % 1_024);
+        assert_eq!(ticks, 90_000);
+        assert!(clock.remainder() < 44_100);
+    }
+
+    #[test]
+    fn 虚拟时钟连续十分钟累计时间不漂移() {
+        let mut video_clock = LegacyMediaClock::new(29, crate::ps::AudioCodec::G711A, 8_000);
+        let mut video_ticks = 0_u64;
+        for _ in 0..(29 * 600) {
+            video_ticks += video_clock
+                .video(Vec::new(), crate::ps::VideoCodec::H264, false)
+                .duration_90k;
+        }
+        assert_eq!(video_ticks, 54_000_000);
+
+        let mut audio_clock = SampleClock::new(44_100).unwrap();
+        let mut audio_ticks = 0_u64;
+        let total_samples = 44_100_u64 * 600;
+        let full_aus = total_samples / 1_024;
+        for _ in 0..full_aus {
+            audio_ticks += audio_clock.duration_for_samples(1_024);
+        }
+        audio_ticks += audio_clock.duration_for_samples((total_samples % 1_024) as u32);
+        assert_eq!(audio_ticks, 54_000_000);
+    }
+
+    struct TimedEventsSource {
+        events: std::collections::VecDeque<MediaEvent>,
+    }
+
+    impl VideoSource for TimedEventsSource {
+        fn next_frame(&mut self) -> Option<Frame> {
+            None
+        }
+
+        fn supports_timed_events(&self) -> bool {
+            true
+        }
+
+        fn next_media_event(&mut self) -> Option<MediaEvent> {
+            self.events.pop_front()
+        }
+
+        fn is_live(&self) -> bool {
+            false
+        }
+
+        fn has_audio(&self) -> bool {
+            true
+        }
+
+        fn audio_codec(&self) -> crate::ps::AudioCodec {
+            crate::ps::AudioCodec::G711A
+        }
+    }
+
+    #[test]
+    fn 事件总线新订阅者只缓存视频关键帧而不重放旧音频() {
+        let events = std::collections::VecDeque::from([
+            MediaEvent::Video(TimedVideoAu::new(
+                vec![
+                    0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,
+                ],
+                crate::ps::VideoCodec::H264,
+                true,
+                90_000,
+                3_600,
+            )),
+            MediaEvent::Audio(TimedAudioAu::from_samples(
+                vec![0xD5; 160],
+                crate::ps::AudioCodec::G711A,
+                8_000,
+                160,
+                90_000,
+            )),
+        ]);
+        let media = start_shared_media(Box::new(TimedEventsSource { events }), 25);
+        for _ in 0..100 {
+            if media.latest_config_frame().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for _ in 0..100 {
+            if !media.is_alive() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut subscriber = media.subscribe();
+        let first = subscriber
+            .next_media_event()
+            .expect("新订阅者应从参数集关键帧开始");
+        assert!(matches!(first, MediaEvent::Video(ref video) if video.pts_90k == 90_000));
+        assert!(subscriber.next_media_event().is_none());
+        media.stop();
     }
 
     /// 回归测试:缓冲区末尾以 IDR 起始码结束时,SPS+PPS 不得被单独发出。

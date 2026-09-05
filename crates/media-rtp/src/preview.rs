@@ -1,11 +1,29 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// 从唯一 H.264 采集流切出的完整访问单元。
+use crate::ps::VideoCodec;
+
+static NEXT_CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate the next application-wide capture generation.
+///
+/// Camera, screen, and file preview paths must share this allocator so a
+/// delayed frame from an older source cannot be accepted after a source
+/// switch. The first generation is one; zero is reserved for the empty bus.
+pub fn next_capture_generation() -> u64 {
+    NEXT_CAPTURE_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1)
+}
+
+/// 从唯一视频采集流切出的完整访问单元。
 #[derive(Debug, Clone)]
 pub struct CapturedAccessUnit {
     pub generation: u64,
     pub sequence: u64,
     pub data: Vec<u8>,
+    /// 该访问单元实际携带的 Annex-B 视频编码。
+    pub codec: VideoCodec,
     pub key_frame: bool,
     pub config_keyframe: bool,
     /// 主采集 stdout 切出完整 AU 的 Unix 毫秒时刻。
@@ -22,16 +40,47 @@ impl CapturedAccessUnit {
         key_frame: bool,
         captured_at_ms: u64,
     ) -> Self {
-        let config_keyframe = h264_nal_types(&data, |nal_type| matches!(nal_type, 5 | 7 | 8));
-        let has_idr = h264_nal_types(&data, |nal_type| nal_type == 5);
-        let has_sps = h264_nal_types(&data, |nal_type| nal_type == 7);
-        let has_pps = h264_nal_types(&data, |nal_type| nal_type == 8);
-        Self {
+        Self::with_codec(
             generation,
             sequence,
             data,
             key_frame,
-            config_keyframe: config_keyframe && has_idr && has_sps && has_pps,
+            captured_at_ms,
+            VideoCodec::H264,
+        )
+    }
+
+    /// 构造带实际编码标记的访问单元；预览 worker 据此选择解码输入格式。
+    pub fn with_codec(
+        generation: u64,
+        sequence: u64,
+        data: Vec<u8>,
+        key_frame: bool,
+        captured_at_ms: u64,
+        codec: VideoCodec,
+    ) -> Self {
+        let config_keyframe = match codec {
+            VideoCodec::H264 => {
+                let has_idr = h264_nal_types(&data, |nal_type| nal_type == 5);
+                let has_sps = h264_nal_types(&data, |nal_type| nal_type == 7);
+                let has_pps = h264_nal_types(&data, |nal_type| nal_type == 8);
+                has_idr && has_sps && has_pps
+            }
+            VideoCodec::H265 => {
+                let has_irap = hevc_nal_types(&data, |nal_type| (16..=21).contains(&nal_type));
+                let has_vps = hevc_nal_types(&data, |nal_type| nal_type == 32);
+                let has_sps = hevc_nal_types(&data, |nal_type| nal_type == 33);
+                let has_pps = hevc_nal_types(&data, |nal_type| nal_type == 34);
+                has_irap && has_vps && has_sps && has_pps
+            }
+        };
+        Self {
+            generation,
+            sequence,
+            data,
+            codec,
+            key_frame,
+            config_keyframe,
             captured_at_ms,
             captured_at_mono: Instant::now(),
         }
@@ -115,11 +164,28 @@ pub trait PreviewSink: Send + Sync {
 }
 
 /// 遍历 Annex-B NAL；只返回是否至少命中一次 predicate。
-fn h264_nal_types(mut data: &[u8], mut predicate: impl FnMut(u8) -> bool) -> bool {
+fn h264_nal_types(data: &[u8], predicate: impl FnMut(u8) -> bool) -> bool {
+    codec_nal_types(data, VideoCodec::H264, predicate)
+}
+
+fn hevc_nal_types(data: &[u8], predicate: impl FnMut(u8) -> bool) -> bool {
+    codec_nal_types(data, VideoCodec::H265, predicate)
+}
+
+fn codec_nal_types(
+    mut data: &[u8],
+    codec: VideoCodec,
+    mut predicate: impl FnMut(u8) -> bool,
+) -> bool {
     while let Some((offset, start_len)) = find_start_code(data) {
-        data = &data[offset + start_len..];
+        let nal_offset = offset + start_len;
+        data = &data[nal_offset..];
         if let Some(header) = data.first() {
-            if predicate(header & 0x1f) {
+            let nal_type = match codec {
+                VideoCodec::H264 => header & 0x1f,
+                VideoCodec::H265 => (header >> 1) & 0x3f,
+            };
+            if predicate(nal_type) {
                 return true;
             }
         }
@@ -181,6 +247,10 @@ mod tests {
         vec![0, 0, 0, 1, kind, payload]
     }
 
+    fn hevc_nal(kind: u8, payload: u8) -> Vec<u8> {
+        vec![0, 0, 0, 1, kind << 1, 1, payload]
+    }
+
     #[test]
     fn captured_access_unit只把_sps_pps_idr_组合识别为配置关键帧() {
         let mut config = nal(7, 1);
@@ -190,6 +260,30 @@ mod tests {
 
         assert!(!CapturedAccessUnit::new(7, 2, nal(5, 3), true, 11).config_keyframe);
         assert!(!CapturedAccessUnit::new(7, 3, nal(1, 3), false, 12).config_keyframe);
+    }
+
+    #[test]
+    fn captured_access_unit按编码识别_hevc_vps_sps_pps_关键帧() {
+        let mut config = hevc_nal(32, 1);
+        config.extend(hevc_nal(33, 2));
+        config.extend(hevc_nal(34, 3));
+        config.extend(hevc_nal(19, 4));
+
+        let access_unit =
+            CapturedAccessUnit::with_codec(7, 4, config, true, 13, crate::ps::VideoCodec::H265);
+        assert_eq!(access_unit.codec, crate::ps::VideoCodec::H265);
+        assert!(access_unit.config_keyframe);
+        assert!(
+            !CapturedAccessUnit::with_codec(
+                7,
+                5,
+                hevc_nal(19, 4),
+                true,
+                14,
+                crate::ps::VideoCodec::H265,
+            )
+            .config_keyframe
+        );
     }
 
     #[test]

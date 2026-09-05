@@ -2,6 +2,11 @@
 // 平台密码与其它联调参数一并保存在 Rust ConfigStore；localStorage 只用于一次性迁移。
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  DEFAULT_MEDIA_PROFILE,
+  normalizeMediaProfile,
+  type MediaProfile,
+} from "./media-profile.ts";
 
 export type SignalingTransport = "UDP" | "TCP";
 export type GbVersion = "V2016" | "V2022";
@@ -31,7 +36,6 @@ export interface DeviceSettings {
   register_expires_secs: number;
   heartbeat_interval_secs: number;
   heartbeat_fail_threshold: number;
-  video_fps: number;
 }
 
 export interface NetworkSettings {
@@ -50,8 +54,10 @@ export interface CatalogNodeConfig {
   status: "ON" | "OFF";
 }
 
-export interface DesktopConfigV1 {
-  schema_version: 1;
+export interface DesktopConfigV2 {
+  schema_version: 2;
+  config_revision: number;
+  media: MediaProfile;
   active_profile_id: string;
   profiles: PlatformProfile[];
   device: DeviceSettings;
@@ -59,12 +65,16 @@ export interface DesktopConfigV1 {
   catalog_tree: CatalogNodeConfig[];
 }
 
+/** @deprecated Rust 配置已统一为 V2；保留类型别名兼容旧的前端调用方。 */
+export type DesktopConfigV1 = DesktopConfigV2;
+
 export interface CapabilitySnapshot {
   signaling_udp: boolean;
   signaling_tcp: boolean;
 }
 
 export interface EffectiveDeviceConfig {
+  media: MediaProfile;
   profile: PlatformProfile;
   device: DeviceSettings;
   network: NetworkSettings;
@@ -104,7 +114,7 @@ const OWNED_LEGACY_KEYS = [
   ...LEGACY_SETTING_KEYS,
 ] as const;
 
-const config = ref<DesktopConfigV1 | null>(null);
+const config = ref<DesktopConfigV2 | null>(null);
 const loading = ref(false);
 const error = ref("");
 
@@ -122,10 +132,13 @@ function stringValue(value: unknown, fallback: string): string {
 }
 
 function positiveInt(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value) : NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function migrateLegacy(base: DesktopConfigV1): DesktopConfigV1 | null {
+function migrateLegacy(base: DesktopConfigV2): DesktopConfigV2 | null {
   const rawProfiles = localStorage.getItem(LEGACY_PROFILE_KEY);
   const rawDevice = localStorage.getItem(LEGACY_DEVICE_KEY);
   const hasLegacy = rawProfiles !== null
@@ -168,7 +181,12 @@ function migrateLegacy(base: DesktopConfigV1): DesktopConfigV1 | null {
   let legacyDevice: Record<string, unknown> = {};
   let legacyProtocol: Record<string, unknown> = {};
   let legacyNetwork: Record<string, unknown> = {};
-  try { legacyDevice = readJson(LEGACY_DEVICE_KEY) ?? readJson("uvp_settings_device") ?? {}; } catch { /* 保留默认 */ }
+  try {
+    legacyDevice = {
+      ...(readJson("uvp_settings_device") ?? {}),
+      ...(readJson(LEGACY_DEVICE_KEY) ?? {}),
+    };
+  } catch { /* 保留默认 */ }
   try { legacyProtocol = readJson("uvp_settings_protocol") ?? {}; } catch { /* 保留默认 */ }
   try { legacyNetwork = readJson("uvp_settings_network") ?? {}; } catch { /* 保留默认 */ }
 
@@ -179,51 +197,76 @@ function migrateLegacy(base: DesktopConfigV1): DesktopConfigV1 | null {
   const firstLegacyProfile = legacyProfiles[0];
 
   return {
-      schema_version: 1,
-      active_profile_id: activeProfileId,
-      profiles,
-      device: {
-        ...base.device,
-        device_id: stringValue(legacyDevice.device_id, stringValue(firstLegacyProfile?.device_id, base.device.device_id)),
-        device_name: stringValue(legacyDevice.device_name, base.device.device_name),
-        manufacturer: stringValue(legacyDevice.manufacturer, base.device.manufacturer),
-        model: stringValue(legacyDevice.model, base.device.model),
-        firmware: stringValue(legacyDevice.firmware, base.device.firmware),
-        channel_name: stringValue(legacyDevice.channel_name, base.device.channel_name),
-        register_expires_secs: positiveInt(legacyProtocol.register_expires_secs, base.device.register_expires_secs),
-        heartbeat_interval_secs: positiveInt(legacyProtocol.heartbeat_interval_secs, base.device.heartbeat_interval_secs),
-        heartbeat_fail_threshold: positiveInt(legacyProtocol.heartbeat_fail_threshold, base.device.heartbeat_fail_threshold),
-        video_fps: positiveInt(legacyDevice.video_fps, base.device.video_fps),
-      },
-      network: {
-        bind_mode: legacyNetwork.bind_mode === "specific" ? "specific" : base.network.bind_mode,
-        bind_address: typeof legacyNetwork.bind_address === "string"
-          ? legacyNetwork.bind_address
-          : base.network.bind_address,
-        sip_trace: typeof legacyNetwork.sip_trace === "boolean"
-          ? legacyNetwork.sip_trace
-          : base.network.sip_trace,
-      },
-      catalog_tree: base.catalog_tree ?? [],
+    ...base,
+    schema_version: 2,
+    active_profile_id: activeProfileId,
+    profiles,
+    media: normalizeMediaProfile({
+      ...base.media,
+      video_fps: legacyDevice.video_fps,
+    }, normalizeMediaProfile(base.media, DEFAULT_MEDIA_PROFILE)),
+    device: {
+      ...base.device,
+      device_id: stringValue(legacyDevice.device_id, stringValue(firstLegacyProfile?.device_id, base.device.device_id)),
+      device_name: stringValue(legacyDevice.device_name, base.device.device_name),
+      manufacturer: stringValue(legacyDevice.manufacturer, base.device.manufacturer),
+      model: stringValue(legacyDevice.model, base.device.model),
+      firmware: stringValue(legacyDevice.firmware, base.device.firmware),
+      channel_name: stringValue(legacyDevice.channel_name, base.device.channel_name),
+      register_expires_secs: positiveInt(legacyProtocol.register_expires_secs, base.device.register_expires_secs),
+      heartbeat_interval_secs: positiveInt(legacyProtocol.heartbeat_interval_secs, base.device.heartbeat_interval_secs),
+      heartbeat_fail_threshold: positiveInt(legacyProtocol.heartbeat_fail_threshold, base.device.heartbeat_fail_threshold),
+    },
+    network: {
+      bind_mode: legacyNetwork.bind_mode === "specific" ? "specific" : base.network.bind_mode,
+      bind_address: typeof legacyNetwork.bind_address === "string"
+        ? legacyNetwork.bind_address
+        : base.network.bind_address,
+      sip_trace: typeof legacyNetwork.sip_trace === "boolean"
+        ? legacyNetwork.sip_trace
+        : base.network.sip_trace,
+    },
+    catalog_tree: base.catalog_tree ?? [],
   };
 }
 
-function applyConfig(next: DesktopConfigV1): DesktopConfigV1 {
+function applyConfig(next: DesktopConfigV2): DesktopConfigV2 {
   config.value = next;
   error.value = "";
   return next;
 }
 
-export async function loadDesktopConfig(): Promise<DesktopConfigV1> {
+function clearLegacyKeys() {
+  if (typeof localStorage === "undefined") return;
+  for (const key of OWNED_LEGACY_KEYS) localStorage.removeItem(key);
+}
+
+export function isRevisionConflict(cause: unknown): boolean {
+  const message = String(cause).toLowerCase();
+  return message.includes("版本冲突") || message.includes("revision") || message.includes("conflict");
+}
+
+async function refreshAfterRevisionConflict(cause: unknown) {
+  if (!isRevisionConflict(cause)) return;
+  try {
+    const latest = await invoke<DesktopConfigV2>("get_desktop_config");
+    applyConfig(latest);
+  } catch {
+    // 原始保存错误仍需返回；读取失败时保留当前快照，交给页面提示用户重试。
+  }
+  error.value = String(cause);
+}
+
+export async function loadDesktopConfig(): Promise<DesktopConfigV2> {
   loading.value = true;
   try {
-    const loaded = await invoke<DesktopConfigV1>("get_desktop_config");
+    const loaded = await invoke<DesktopConfigV2>("get_desktop_config");
     const migration = migrateLegacy(loaded);
     if (!migration) return applyConfig(loaded);
 
     // 保存成功是迁移提交点；异常时不会执行下面的删除，旧数据可继续重试。
-    const saved = await invoke<DesktopConfigV1>("save_desktop_config", { config: migration });
-    for (const key of OWNED_LEGACY_KEYS) localStorage.removeItem(key);
+    const saved = await invoke<DesktopConfigV2>("save_desktop_config", { config: migration });
+    clearLegacyKeys();
     return applyConfig(saved);
   } catch (cause) {
     error.value = String(cause);
@@ -233,19 +276,36 @@ export async function loadDesktopConfig(): Promise<DesktopConfigV1> {
   }
 }
 
-export async function saveDesktopConfig(next: DesktopConfigV1): Promise<DesktopConfigV1> {
+export async function saveDesktopConfig(next: DesktopConfigV2): Promise<DesktopConfigV2> {
   try {
-    const saved = await invoke<DesktopConfigV1>("save_desktop_config", { config: next });
+    const saved = await invoke<DesktopConfigV2>("save_desktop_config", { config: next });
     return applyConfig(saved);
   } catch (cause) {
     error.value = String(cause);
+    await refreshAfterRevisionConflict(cause);
     throw cause;
   }
 }
 
-export async function resetDesktopConfig(): Promise<DesktopConfigV1> {
+export async function saveMediaConfig(media: MediaProfile, expectedRevision?: number): Promise<DesktopConfigV2> {
+  if (!config.value) throw new Error("桌面端配置尚未加载");
   try {
-    const reset = await invoke<DesktopConfigV1>("reset_desktop_config");
+    const saved = await invoke<DesktopConfigV2>("save_media_config", {
+      media,
+      expectedRevision: expectedRevision ?? config.value.config_revision,
+    });
+    return applyConfig(saved);
+  } catch (cause) {
+    error.value = String(cause);
+    await refreshAfterRevisionConflict(cause);
+    throw cause;
+  }
+}
+
+export async function resetDesktopConfig(): Promise<DesktopConfigV2> {
+  try {
+    const reset = await invoke<DesktopConfigV2>("reset_desktop_config");
+    clearLegacyKeys();
     return applyConfig(reset);
   } catch (cause) {
     error.value = String(cause);
@@ -300,7 +360,7 @@ export function usePlatform() {
 
   return {
     config, profiles, activeId, active, loading, error,
-    loadDesktopConfig, saveDesktopConfig, resetDesktopConfig,
+    loadDesktopConfig, saveDesktopConfig, saveMediaConfig, resetDesktopConfig,
     setActive, addProfile, updateProfile, removeProfile, passwordFor,
   };
 }

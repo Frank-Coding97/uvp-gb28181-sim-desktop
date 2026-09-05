@@ -34,6 +34,7 @@ fn cfg() -> DeviceConfig {
             firmware: "1.0".into(),
         },
         video_source: None,
+        media_profile: None,
         video_fps: 25,
         light_bitrate_kbps: None,
     }

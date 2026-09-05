@@ -24,6 +24,7 @@ import {
 } from "@vicons/ionicons5";
 import { persistForm, useDevice } from "../device";
 import { usePlatform } from "../platform";
+import { buildLiveSourceUri, liveSourceAudio } from "../media-profile";
 import { usePreviewSession } from "../composables/preview/session";
 
 type MediaMode = "camera" | "screen" | "file";
@@ -54,6 +55,13 @@ interface LiveSourceCatalog {
 interface DeviceErrorEvent {
   scope?: string;
   message?: string;
+}
+
+type MediaPreparationPhase = "idle" | "preparing" | "ready" | "cancelled" | "failed";
+
+interface MediaPreparationEvent {
+  phase: Exclude<MediaPreparationPhase, "idle">;
+  message: string;
 }
 
 type SubscriptionKind = "MobilePosition" | "Catalog" | "Alarm" | "PTZPosition";
@@ -130,9 +138,11 @@ let unlistenCaptureState: UnlistenFn | null = null;
 let unlistenDeviceError: UnlistenFn | null = null;
 let unlistenSub: UnlistenFn | null = null;
 let unlistenPlatformCommand: UnlistenFn | null = null;
+let unlistenMediaPreparation: UnlistenFn | null = null;
 let runtimeRefreshTimer: number | null = null;
 let recordingRefreshTimer: number | null = null;
 const recordingPhase = ref<"idle" | "starting" | "recording" | "finalizing" | "failed">("idle");
+const mediaPreparation = ref<{ phase: MediaPreparationPhase; message: string }>({ phase: "idle", message: "" });
 const recordingLabel = computed(() => ({
   idle: deviceLive.value ? "可录制" : "设备未启动",
   starting: "等待关键帧",
@@ -424,14 +434,15 @@ function cancelEdit() {
 
 function syncLiveSource() {
   sourceProbe.value = "";
+  const audioSource = liveSourceAudio(form.value.video_source);
   if (mediaMode.value === "camera") {
     form.value.video_source = selectedCamera.value === null
       ? ""
-      : `live:camera:${selectedCamera.value}?audio=none&audio_codec=g711a`;
+      : buildLiveSourceUri("camera", selectedCamera.value, audioSource);
   } else if (mediaMode.value === "screen") {
     form.value.video_source = selectedScreen.value === null
       ? ""
-      : `live:screen:${selectedScreen.value}?audio=none&audio_codec=g711a&width=1280&height=720&bitrate=2500&codec=h264`;
+      : buildLiveSourceUri("screen", selectedScreen.value, audioSource);
   }
   persistForm();
 }
@@ -495,6 +506,16 @@ async function probeSource() {
     sourceProbe.value = result.message;
   } catch (error) {
     sourceProbe.value = `采集测试失败：${String(error)}`;
+  }
+}
+
+async function cancelMediaPreparation() {
+  if (mediaPreparation.value.phase !== "preparing") return;
+  try {
+    await invoke<string>("cancel_media_preparation");
+    mediaPreparation.value = { phase: "cancelled", message: "正在取消媒体准备…" };
+  } catch (error) {
+    message.error(`取消媒体准备失败：${String(error)}`);
   }
 }
 
@@ -613,6 +634,9 @@ onMounted(async () => {
     }
     void refreshRuntimeState();
   });
+  unlistenMediaPreparation = await listen<MediaPreparationEvent>("media_preparation", (event) => {
+    mediaPreparation.value = event.payload;
+  });
   unlistenPlatformCommand = await listen<CmdEntry>("platform_command", scheduleRuntimeRefresh);
   const [runtime] = await Promise.all([reconcile(), refreshSources(false)]);
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
@@ -642,6 +666,7 @@ onUnmounted(() => {
   unlistenCaptureState?.();
   unlistenDeviceError?.();
   unlistenSub?.();
+  unlistenMediaPreparation?.();
   unlistenPlatformCommand?.();
   if (runtimeRefreshTimer) clearTimeout(runtimeRefreshTimer);
   if (recordingRefreshTimer) clearInterval(recordingRefreshTimer);
@@ -736,6 +761,11 @@ onUnmounted(() => {
             <template #icon><n-icon><RefreshOutline /></n-icon></template>
           </n-button>
           <n-button size="small" secondary :disabled="deviceLive || !form.video_source.startsWith('live:')" @click="probeSource">测试采集</n-button>
+        </div>
+        <div v-if="mediaPreparation.phase !== 'idle'" class="media-preparation" :class="mediaPreparation.phase">
+          <span v-if="mediaPreparation.phase === 'preparing'" class="preparation-spinner" aria-hidden="true" />
+          <span class="preparation-message">{{ mediaPreparation.message }}</span>
+          <n-button v-if="mediaPreparation.phase === 'preparing'" size="tiny" quaternary @click="cancelMediaPreparation">取消准备</n-button>
         </div>
         <div v-if="sourceProbe" class="source-feedback">{{ sourceProbe }}</div>
       </section>
@@ -1031,6 +1061,12 @@ onUnmounted(() => {
 .source-picker { min-width: 0; }
 .file-source { width: 100%; height: 30px; overflow: hidden; padding: 0 9px; border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-secondary); background: #fff; cursor: pointer; font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .source-feedback { overflow: hidden; color: var(--text-secondary); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.media-preparation { display: flex; align-items: center; gap: 7px; min-width: 0; min-height: 25px; padding: 4px 8px; border-radius: 6px; background: var(--accent-dim); color: var(--text-secondary); font-size: 10.5px; }
+.media-preparation.ready { background: color-mix(in srgb, var(--success) 10%, transparent); color: var(--success); }
+.media-preparation.cancelled, .media-preparation.failed { background: color-mix(in srgb, var(--error) 10%, transparent); color: var(--error); }
+.preparation-message { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preparation-spinner { width: 12px; height: 12px; flex: 0 0 auto; border: 2px solid color-mix(in srgb, var(--accent) 25%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: media-preparation-spin .8s linear infinite; }
+@keyframes media-preparation-spin { to { transform: rotate(360deg); } }
 
 .config-actions { display: flex; gap: 4px; }
 .sip-profile-switcher { display: grid; grid-template-columns: minmax(0, 1fr) 28px 28px; align-items: center; gap: 6px; margin-top: 8px; }

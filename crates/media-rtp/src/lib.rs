@@ -8,8 +8,11 @@
 //! - `source`:视频源抽象(空媒体 / 真实文件循环)
 //! - `pusher`:把视频源→PS→RTP 按帧率推流的驱动
 
+pub mod file_profile;
 pub mod preview;
+pub mod preview_source;
 pub mod preview_worker;
+pub mod profile;
 pub use preview::{CapturedAccessUnit, PreviewJpeg, PreviewPhase, PreviewSink, PreviewStatus};
 pub use preview_worker::{
     preview_worker_args, spawn_preview_worker, PreviewControl, PreviewSendResult,
@@ -27,7 +30,8 @@ pub use source::{
     ffmpeg_bin, frame_to_jpeg, list_live_sources, prepare_video_source, start_shared_media,
     FileSource, Frame, LightSource, LiveAudioCodec, LiveAudioSource, LiveAvDevice,
     LiveScreenDevice, LiveSource, LiveSourceCatalog, LiveSourceSpec, LiveVideoCodec,
-    LiveVideoProfile, NoneSource, SharedMedia, SharedVideoSource, VideoSource,
+    LiveVideoProfile, MediaEvent, NoneSource, SharedMedia, SharedVideoSource, TimedAudioAu,
+    TimedVideoAu, VideoSource,
 };
 
 /// RTP 发送模式。

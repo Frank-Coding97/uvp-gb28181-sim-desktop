@@ -155,6 +155,8 @@ pub struct DeviceConfig {
     pub video_source: Option<String>,
     /// 推流帧率(fps)。
     pub video_fps: u32,
+    /// Explicit desktop encoding profile; absent for legacy CLI/scenario callers.
+    pub media_profile: Option<media_rtp::profile::MediaProfile>,
     /// B 档轻量伪流码率(kbps);Some 且无 video_source 时用 LightSource。
     pub light_bitrate_kbps: Option<u32>,
     /// GB28181 协议版本(影响 MANSCDP 应答字段集,2022 默认)。
@@ -251,6 +253,7 @@ pub struct DeviceSimulator {
     preview_sink: std::sync::Mutex<Option<Arc<dyn media_rtp::PreviewSink>>>,
     /// 注册后启动的唯一采集源；平台点播只订阅它，不再重复打开摄像头/文件。
     shared_media: tokio::sync::Mutex<Option<Arc<media_rtp::SharedMedia>>>,
+    prepared_file: std::sync::Mutex<Option<media_rtp::file_profile::PreparedFileProfile>>,
     /// 可选的本地录像状态机，桌面端从 app_data_dir 注入。
     recording_service: std::sync::Mutex<Option<Arc<crate::recording::RecordingService>>>,
     ids: DialogIds,
@@ -357,7 +360,7 @@ fn epoch_millis() -> u64 {
 fn initial_runtime_config(
     config: &DeviceConfig,
 ) -> gb28181_protocol::manscdp::ConfigDownloadResponse {
-    gb28181_protocol::manscdp::ConfigDownloadResponse::by_type(
+    let mut response = gb28181_protocol::manscdp::ConfigDownloadResponse::by_type(
         config.device_id.as_str(),
         1,
         "BasicParam/VideoParamOpt/VideoRecordPlan/VideoAlarmRecord/PictureMask/FrameMirror/AlarmReport/OSDConfig/SnapShotConfig/VideoParamAttribute/SVACEncodeConfig/SVACDecodeConfig",
@@ -366,7 +369,22 @@ fn initial_runtime_config(
         config.heartbeat_interval_secs as u32,
         config.heartbeat_fail_threshold,
         "1920*1080",
-    )
+    );
+    if let Some(attribute) = response.video_param_attribute.as_mut() {
+        for item in &mut attribute.items {
+            item.frame_rate = config.video_fps.to_string();
+            if let Some(media) = &config.media_profile {
+                item.video_format = match media.video_codec {
+                    media_rtp::profile::MediaVideoCodec::H264 => "H.264",
+                    media_rtp::profile::MediaVideoCodec::H265 => "H.265",
+                }.into();
+                item.resolution = format!("{}*{}", media.width, media.height);
+                item.frame_rate = media.video_fps.to_string();
+                item.video_bit_rate = Some(media.bitrate_kbps.to_string());
+            }
+        }
+    }
+    response
 }
 
 /// 活跃的推流会话(推流任务句柄 + 停止信号)。
@@ -402,6 +420,7 @@ impl DeviceSimulator {
             config,
             preview_sink: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
+            prepared_file: std::sync::Mutex::new(None),
             recording_service: std::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
@@ -434,6 +453,7 @@ impl DeviceSimulator {
             config,
             preview_sink: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
+            prepared_file: std::sync::Mutex::new(None),
             recording_service: std::sync::Mutex::new(None),
             ids: DialogIds::new(),
             cseq: AtomicU32::new(1),
@@ -651,6 +671,10 @@ impl DeviceSimulator {
     }
 
     fn apply_device_config(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<bool> {
+        // Encoding changes must be applied to the capture pipeline, never just the query DTO.
+        if ctrl.cfg_video_param_attribute.is_some() {
+            return Err(Error::Gb28181("媒体参数需停止设备后在音视频配置中修改".into()));
+        }
         let mut current = self
             .runtime_config
             .lock()
@@ -699,10 +723,6 @@ impl DeviceSimulator {
             current.osd_config = Some(value.clone());
             changed = true;
         }
-        if let Some(value) = &ctrl.cfg_video_param_attribute {
-            current.video_param_attribute = Some(value.clone());
-            changed = true;
-        }
         if let Some(value) = &ctrl.cfg_svac_encode {
             current.svac_encode_config = Some(value.clone());
             changed = true;
@@ -723,8 +743,23 @@ impl DeviceSimulator {
         *self.preview_sink.lock().unwrap() = sink;
     }
 
+    /// Install a verified immutable file output prepared before REGISTER.
+    pub fn install_prepared_file(&self, prepared: media_rtp::file_profile::PreparedFileProfile) -> std::result::Result<(), String> {
+        if self.config.media_profile.as_ref() != Some(prepared.profile()) {
+            return Err("文件准备结果与设备媒体配置不一致".into());
+        }
+        *self.prepared_file.lock().map_err(|_| "文件准备状态锁异常")? = Some(prepared);
+        Ok(())
+    }
+
     /// 注册成功后启动唯一媒体采集源。采集失败不影响 SIP 注册，但会通过观察者上报。
     async fn start_shared_media(&self) -> Result<bool> {
+        if let Some(profile) = &self.config.media_profile {
+            profile.validate().map_err(Error::Media)?;
+            if profile.video_fps != self.config.video_fps {
+                return Err(Error::Media("媒体配置与兼容FPS冲突".into()));
+            }
+        }
         {
             let mut active = self.shared_media.lock().await;
             if active.as_ref().is_some_and(|media| media.is_alive()) {
@@ -745,12 +780,27 @@ impl DeviceSimulator {
             return self.wait_for_media_ready().await;
         };
         let fps = self.config.video_fps;
+        let profile = self.config.media_profile.clone();
+        let prepared = self.prepared_file.lock().map_err(|_| Error::Media("文件准备状态锁异常".into()))?.clone();
         let preview = self.preview_sink.lock().unwrap().clone();
         let source = tokio::task::spawn_blocking(move || {
             if path.starts_with("live:") {
-                media_rtp::LiveSource::capture(&path, fps, preview)
+                let capture = match profile {
+                    Some(profile) => media_rtp::LiveSource::capture_with_profile(&path, profile, preview),
+                    None => media_rtp::LiveSource::capture(&path, fps, preview),
+                };
+                capture
                     .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
                     .map_err(|error| Error::Media(format!("实时采集失败: {error}")))
+            } else if profile.is_some() {
+                let source = prepared.ok_or_else(|| Error::Media("文件尚未按媒体配置准备，请重新启动设备".into()))?
+                    .open_source(true).map_err(Error::Media)?;
+                let source: Box<dyn media_rtp::VideoSource> = Box::new(source);
+                match preview {
+                    Some(sink) => media_rtp::preview_source::PreviewingSource::new(source, fps, sink)
+                        .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>),
+                    None => Ok(source),
+                }
             } else {
                 media_rtp::FileSource::from_path_av(&path, fps)
                     .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
@@ -2501,6 +2551,15 @@ impl DeviceSimulator {
     /// 语义:模拟器接受并回 Result=OK;强制关键帧会触发当前推流立即发关键帧
     ///(当前 FileSource/LightSource 本就周期性带关键帧,记录日志即可)。
     async fn handle_control(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<String> {
+        if ctrl.cfg_video_param_attribute.is_some() {
+            let response = gb28181_protocol::manscdp::ControlResponse {
+                cmd_type: "DeviceConfig".into(),
+                sn: ctrl.sn,
+                device_id: ctrl.device_id.clone(),
+                result: "ERROR".into(),
+            };
+            return Ok(response.to_xml()?);
+        }
         tracing::info!(kind = %ctrl.kind(), sn = ctrl.sn, "收到设备控制");
         if let Some(ptz) = &ctrl.ptz_cmd {
             // PTZ 8 字节码:识别预置位设置/调用/删除并更新预置位表;其余为方向/变倍。
@@ -3378,6 +3437,36 @@ mod tests {
     use super::*;
     use sip_core::{Headers, Response, SipMessage};
 
+    #[tokio::test]
+    async fn media_remote_config_rejection_returns_error_without_mutation() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        let before = sim.runtime_config.lock().unwrap().clone();
+        let mut ctrl = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>19</SN><DeviceID>d</DeviceID></Control>"
+        ).unwrap();
+        ctrl.cfg_video_param_attribute = before.video_param_attribute.clone();
+        let xml = sim.handle_control(&ctrl).await.unwrap();
+        assert!(xml.contains("<Result>ERROR</Result>"));
+        assert_eq!(sim.runtime_config.lock().unwrap().clone(), before);
+    }
+
+    #[test]
+    fn media_profile_runtime_query_uses_selected_values() {
+        let mut config = test_cfg("127.0.0.1", 5060);
+        config.video_fps = 20;
+        config.media_profile = Some(media_rtp::profile::MediaProfile {
+            width: 640, height: 480, video_fps: 20, bitrate_kbps: 600,
+            video_codec: media_rtp::profile::MediaVideoCodec::H265,
+            ..Default::default()
+        });
+        let response = initial_runtime_config(&config);
+        let item = &response.video_param_attribute.unwrap().items[0];
+        assert_eq!(item.video_format, "H.265");
+        assert_eq!(item.resolution, "640*480");
+        assert_eq!(item.frame_rate, "20");
+        assert_eq!(item.video_bit_rate.as_deref(), Some("600"));
+    }
+
     fn test_cfg(host: &str, port: u16) -> DeviceConfig {
         DeviceConfig {
             device_id: DeviceId::new("34020000001320000001").unwrap(),
@@ -3399,6 +3488,7 @@ mod tests {
                 firmware: "0.1.0".into(),
             },
             video_source: None,
+            media_profile: None,
             video_fps: 30,
             light_bitrate_kbps: None,
             gb_version: common::GbVersion::V2022,
@@ -4816,6 +4906,9 @@ mod tests {
                     kind: RecordingKind::Manual,
                     path,
                     size_bytes: 5,
+                    video_codec: None,
+                    audio_codec: None,
+                    audio_sample_rate_hz: None,
                 })
                 .unwrap();
         }

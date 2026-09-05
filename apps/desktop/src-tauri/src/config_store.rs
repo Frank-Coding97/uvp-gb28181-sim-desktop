@@ -10,7 +10,8 @@ use std::{
 use common::{DeviceId, GbVersion, SignalingEncoding, Transport};
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+use media_rtp::profile::MediaProfile;
 
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
@@ -22,32 +23,142 @@ impl ConfigStore {
         Self { path }
     }
 
-    pub fn load(&self) -> Result<DesktopConfigV1, String> {
+    pub fn load(&self) -> Result<DesktopConfigV2, String> {
         if !self.path.exists() {
-            return Ok(DesktopConfigV1::default());
+            return Ok(DesktopConfigV2::default());
         }
         let bytes = fs::read(&self.path)
             .map_err(|error| format!("读取配置失败 {}: {error}", self.path.display()))?;
-        let config: DesktopConfigV1 = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| format!("配置 JSON 损坏 {}: {error}", self.path.display()))?;
+        let schema = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("配置缺少有效 schema_version")?;
+        let config: DesktopConfigV2 = match schema {
+            1 => {
+                let old: DesktopConfigV1 = serde_json::from_value(value)
+                    .map_err(|error| format!("旧配置解码失败: {error}"))?;
+                let migrated = old.migrate();
+                migrated.validate()?;
+                let backup = self.path.with_extension("v1-backup.json");
+                let mut backup_options = OpenOptions::new();
+                backup_options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    backup_options.mode(0o600);
+                }
+                match backup_options.open(&backup) {
+                    Ok(mut file) => {
+                        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                            drop(file);
+                            let _ = fs::remove_file(&backup);
+                            return Err(format!("备份旧配置失败: {error}"));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if fs::read(&backup).map_err(|error| error.to_string())? != bytes {
+                            return Err("旧配置备份已存在且内容不同，未覆盖配置".into());
+                        }
+                    }
+                    Err(error) => return Err(format!("备份旧配置失败: {error}")),
+                }
+                self.write_config(&migrated)?;
+                migrated
+            }
+            2 => serde_json::from_value(value).map_err(|error| format!("配置解码失败: {error}"))?,
+            other => return Err(format!("不支持的配置版本: {other}")),
+        };
         config
             .validate()
             .map_err(|error| format!("配置校验失败 {}: {error}", self.path.display()))?;
         Ok(config)
     }
 
-    pub fn save(&self, config: &DesktopConfigV1) -> Result<DesktopConfigV1, String> {
-        config
-            .validate()
-            .map_err(|error| format!("配置校验失败: {error}"))?;
-        let bytes = serde_json::to_vec_pretty(config)
-            .map_err(|error| format!("配置序列化失败: {error}"))?;
-        self.atomic_write(&bytes)?;
-        Ok(config.clone())
+    /// Caller serializes load/compare/write using AppState.config_io.
+    pub fn save(&self, config: &DesktopConfigV2) -> Result<DesktopConfigV2, String> {
+        config.validate()?;
+        let current = self.load()?;
+        if current.config_revision != config.config_revision {
+            return Err(format!(
+                "配置版本冲突：当前版本 {}，请重新读取后保存",
+                current.config_revision
+            ));
+        }
+        let mut next = config.clone();
+        next.config_revision = current
+            .config_revision
+            .checked_add(1)
+            .ok_or("配置版本溢出")?;
+        self.write_config(&next)?;
+        self.load()
     }
 
-    pub fn reset(&self) -> Result<DesktopConfigV1, String> {
-        self.save(&DesktopConfigV1::default())
+    pub fn save_media(
+        &self,
+        media: MediaProfile,
+        expected_revision: u64,
+    ) -> Result<DesktopConfigV2, String> {
+        media.validate()?;
+        let mut current = self.load()?;
+        if current.config_revision != expected_revision {
+            return Err("配置版本冲突，请重新读取后保存".into());
+        }
+        current.media = media;
+        self.save(&current)
+    }
+
+    fn write_config(&self, config: &DesktopConfigV2) -> Result<(), String> {
+        config.validate()?;
+        let bytes = serde_json::to_vec_pretty(config)
+            .map_err(|error| format!("配置序列化失败: {error}"))?;
+        self.atomic_write(&bytes)
+    }
+
+    pub fn reset(&self) -> Result<DesktopConfigV2, String> {
+        // Explicit recovery remains possible when a known configuration is damaged.
+        // Future schemas are never overwritten by an older application.
+        let raw = if self.path.exists() {
+            Some(fs::read(&self.path).map_err(|error| format!("读取待重置配置失败: {error}"))?)
+        } else {
+            None
+        };
+        let value = raw
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+        if value
+            .as_ref()
+            .and_then(|value| value["schema_version"].as_u64())
+            .is_some_and(|version| version > u64::from(CONFIG_SCHEMA_VERSION))
+        {
+            return Err("不支持的配置版本，未覆盖未来版本配置".into());
+        }
+        let revision = match self.load() {
+            Ok(current) => current
+                .config_revision
+                .checked_add(1)
+                .ok_or("配置版本溢出")?,
+            Err(_) => {
+                let last = value
+                    .as_ref()
+                    .and_then(|value| value["config_revision"].as_u64())
+                    .unwrap_or(0);
+                let recovery_revision = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|error| error.to_string())?
+                    .as_millis() as u64;
+                last.max(recovery_revision)
+                    .checked_add(1)
+                    .ok_or("配置版本溢出")?
+            }
+        };
+        let reset = DesktopConfigV2 {
+            config_revision: revision,
+            ..DesktopConfigV2::default()
+        };
+        self.write_config(&reset)?;
+        self.load()
     }
 
     fn atomic_write(&self, bytes: &[u8]) -> Result<(), String> {
@@ -109,8 +220,10 @@ impl ConfigStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DesktopConfigV1 {
+pub struct DesktopConfigV2 {
     pub schema_version: u32,
+    pub config_revision: u64,
+    pub media: MediaProfile,
     pub active_profile_id: String,
     pub profiles: Vec<PlatformProfileConfig>,
     pub device: DeviceSettings,
@@ -118,6 +231,42 @@ pub struct DesktopConfigV1 {
     /// 目录树持久化真相；空表示启动时生成默认目录。
     #[serde(default)]
     pub catalog_tree: Vec<CatalogNodeConfig>,
+}
+
+/// Kept private: only schema 1 on-disk input uses the legacy FPS location.
+#[derive(Deserialize)]
+struct DesktopConfigV1 {
+    active_profile_id: String,
+    profiles: Vec<PlatformProfileConfig>,
+    device: LegacyDeviceSettings,
+    network: NetworkSettings,
+    #[serde(default)]
+    catalog_tree: Vec<CatalogNodeConfig>,
+}
+
+#[derive(Deserialize)]
+struct LegacyDeviceSettings {
+    video_fps: u32,
+    #[serde(flatten)]
+    settings: DeviceSettings,
+}
+
+impl DesktopConfigV1 {
+    fn migrate(self) -> DesktopConfigV2 {
+        DesktopConfigV2 {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            config_revision: 0,
+            media: MediaProfile {
+                video_fps: self.device.video_fps,
+                ..MediaProfile::default()
+            },
+            active_profile_id: self.active_profile_id,
+            profiles: self.profiles,
+            device: self.device.settings,
+            network: self.network,
+            catalog_tree: self.catalog_tree,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,7 +339,6 @@ pub struct DeviceSettings {
     pub register_expires_secs: u32,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_fail_threshold: u32,
-    pub video_fps: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -221,6 +369,7 @@ pub struct StartDeviceInput {
 pub struct ResolvedStartConfig {
     pub profile: PlatformProfileConfig,
     pub device: DeviceSettings,
+    pub media: MediaProfile,
     pub network: NetworkSettings,
     pub password: String,
     pub video_source: Option<String>,
@@ -256,6 +405,7 @@ impl Default for CapabilitySnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EffectiveDeviceConfig {
+    pub media: MediaProfile,
     pub profile: PlatformProfileConfig,
     pub device: DeviceSettings,
     pub network: NetworkSettings,
@@ -266,10 +416,12 @@ pub struct EffectiveDeviceConfig {
     pub capabilities: CapabilitySnapshot,
 }
 
-impl Default for DesktopConfigV1 {
+impl Default for DesktopConfigV2 {
     fn default() -> Self {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
+            config_revision: 0,
+            media: MediaProfile::default(),
             active_profile_id: "local".into(),
             profiles: vec![PlatformProfileConfig {
                 id: "local".into(),
@@ -293,7 +445,6 @@ impl Default for DesktopConfigV1 {
                 register_expires_secs: 86_400,
                 heartbeat_interval_secs: 60,
                 heartbeat_fail_threshold: 3,
-                video_fps: 30,
             },
             network: NetworkSettings {
                 bind_mode: BindMode::Auto,
@@ -305,7 +456,7 @@ impl Default for DesktopConfigV1 {
     }
 }
 
-impl DesktopConfigV1 {
+impl DesktopConfigV2 {
     pub fn active_profile(&self) -> Option<&PlatformProfileConfig> {
         self.profiles
             .iter()
@@ -367,9 +518,7 @@ impl DesktopConfigV1 {
         if self.device.heartbeat_fail_threshold == 0 {
             return Err("连续心跳失败阈值必须大于 0".into());
         }
-        if !(1..=120).contains(&self.device.video_fps) {
-            return Err("视频帧率必须在 1..=120 之间".into());
-        }
+        self.media.validate()?;
         if self.network.bind_mode == BindMode::Specific
             && self.network.bind_address.parse::<IpAddr>().is_err()
         {
@@ -406,6 +555,7 @@ impl DesktopConfigV1 {
         Ok(ResolvedStartConfig {
             profile,
             device: self.device.clone(),
+            media: self.media.clone(),
             network: self.network.clone(),
             password: input.password,
             video_source: input.video_source,
@@ -425,24 +575,116 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir()
             .join(format!(
-                "uvp-desktop-config-test-{}-{nonce}",
+                "uvp-desktop-config-test-{}-{nonce}-{sequence}",
                 std::process::id()
             ))
             .join(name)
     }
 
     #[test]
+    fn media_explicit_reset_recovers_damage_but_preserves_future_schema() {
+        let path = temp_config_path("desktop-config-v1.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = ConfigStore::new(path.clone());
+        fs::write(&path, b"{broken").unwrap();
+        let reset = store.reset().unwrap();
+        assert!(reset.config_revision > 1);
+        assert_eq!(reset.media, MediaProfile::default());
+        let mut bad = serde_json::to_value(&reset).unwrap();
+        bad["media"]["video_fps"] = 0.into();
+        fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(store.reset().unwrap().config_revision > reset.config_revision);
+        let future = br#"{"schema_version":99}"#;
+        fs::write(&path, future).unwrap();
+        assert!(store.reset().is_err());
+        assert_eq!(fs::read(&path).unwrap(), future);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn media_save_rejects_stale_snapshots_and_preserves_other_fields() {
+        let path = temp_config_path("desktop-config-v1.json");
+        let store = ConfigStore::new(path.clone());
+        let original = store.load().unwrap();
+        let mut updated = original.clone();
+        updated.device.device_name = "Latest".into();
+        let saved = store.save(&updated).unwrap();
+        assert_eq!(saved.config_revision, 1);
+        assert!(store.save(&original).unwrap_err().contains("冲突"));
+        assert!(store.save_media(MediaProfile::default(), 0).is_err());
+        let mut media = saved.media.clone();
+        media.video_fps = 20;
+        let next = store.save_media(media.clone(), 1).unwrap();
+        assert_eq!(next.media, media);
+        assert_eq!(next.device.device_name, "Latest");
+        assert_eq!(next.config_revision, 2);
+        let reset = store.reset().unwrap();
+        assert_eq!(reset.config_revision, 3);
+        assert_eq!(reset.media.video_fps, 25);
+        assert!(store.save(&next).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn media_unknown_schema_and_backup_failure_preserve_original() {
+        let path = temp_config_path("desktop-config-v1.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = ConfigStore::new(path.clone());
+        let future = br#"{"schema_version":99}"#;
+        fs::write(&path, future).unwrap();
+        assert!(store.load().unwrap_err().contains("99"));
+        assert_eq!(fs::read(&path).unwrap(), future);
+        let mut old = serde_json::to_value(DesktopConfigV2::default()).unwrap();
+        old["schema_version"] = 1.into();
+        old["device"]["video_fps"] = 30.into();
+        let bytes = serde_json::to_vec(&old).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        fs::create_dir(path.with_extension("v1-backup.json")).unwrap();
+        assert!(store.load().is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn media_v1_migration_preserves_values_and_backup() {
+        let path = temp_config_path("desktop-config-v1.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut old = serde_json::to_value(DesktopConfigV2::default()).unwrap();
+        old["schema_version"] = 1.into();
+        old.as_object_mut().unwrap().remove("media");
+        old.as_object_mut().unwrap().remove("config_revision");
+        old["device"]["video_fps"] = 17.into();
+        old["device"]["device_name"] = "Preserved".into();
+        let bytes = serde_json::to_vec_pretty(&old).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let store = ConfigStore::new(path.clone());
+        let loaded = serde_json::to_value(store.load().unwrap()).unwrap();
+        assert_eq!(loaded["schema_version"], 2);
+        assert_eq!(loaded["media"]["video_fps"], 17);
+        assert_eq!(loaded["device"]["device_name"], "Preserved");
+        assert!(loaded["device"].get("video_fps").is_none());
+        assert_eq!(
+            fs::read(path.with_extension("v1-backup.json")).unwrap(),
+            bytes
+        );
+        assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(), loaded);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn 默认配置通过校验且平台密码可持久化() {
-        let config = DesktopConfigV1::default();
+        let config = DesktopConfigV2::default();
         config.validate().unwrap();
 
         let json = serde_json::to_string(&config).unwrap().to_ascii_lowercase();
         assert!(json.contains("password"));
         assert!(!json.contains("authorization"));
         assert_eq!(config.profiles[0].password, "");
-        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.schema_version, 2);
         assert_eq!(config.device.register_expires_secs, 86_400);
     }
 
@@ -450,7 +692,7 @@ mod tests {
     fn 平台密码round_trip且旧配置缺字段时兼容() {
         let path = temp_config_path("desktop-config-v1.json");
         let store = ConfigStore::new(path.clone());
-        let mut config = DesktopConfigV1::default();
+        let mut config = DesktopConfigV2::default();
         config.profiles[0].password = "remember-me".into();
 
         store.save(&config).unwrap();
@@ -461,14 +703,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("password");
-        let loaded: DesktopConfigV1 = serde_json::from_value(legacy).unwrap();
+        let loaded: DesktopConfigV2 = serde_json::from_value(legacy).unwrap();
         assert_eq!(loaded.profiles[0].password, "");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn 平台id与域分别保留() {
-        let mut config = DesktopConfigV1::default();
+        let mut config = DesktopConfigV2::default();
         let profile = &mut config.profiles[0];
         profile.server_id = "34020000002000000001".into();
         profile.server_domain = "3402000000".into();
@@ -480,15 +722,15 @@ mod tests {
 
     #[test]
     fn 非法身份注册周期和网络地址被拒绝() {
-        let mut invalid_id = DesktopConfigV1::default();
+        let mut invalid_id = DesktopConfigV2::default();
         invalid_id.profiles[0].server_id = "123".into();
         assert!(invalid_id.validate().unwrap_err().contains("平台 ID"));
 
-        let mut invalid_expires = DesktopConfigV1::default();
+        let mut invalid_expires = DesktopConfigV2::default();
         invalid_expires.device.register_expires_secs = 3_599;
         assert!(invalid_expires.validate().unwrap_err().contains("3600"));
 
-        let mut invalid_bind = DesktopConfigV1::default();
+        let mut invalid_bind = DesktopConfigV2::default();
         invalid_bind.network.bind_mode = BindMode::Specific;
         invalid_bind.network.bind_address = "not-an-ip".into();
         assert!(invalid_bind.validate().unwrap_err().contains("绑定地址"));
@@ -496,7 +738,7 @@ mod tests {
 
     #[test]
     fn tcp档案可保存但能力快照诚实() {
-        let mut config = DesktopConfigV1::default();
+        let mut config = DesktopConfigV2::default();
         config.profiles[0].transport = Transport::Tcp;
         config.validate().unwrap();
 
@@ -520,7 +762,7 @@ mod tests {
 
     #[test]
     fn dto保留类型化版本和编码() {
-        let config = DesktopConfigV1::default();
+        let config = DesktopConfigV2::default();
         assert_eq!(config.profiles[0].gb_version, GbVersion::V2022);
         assert_eq!(
             config.profiles[0].signaling_encoding,
@@ -532,10 +774,10 @@ mod tests {
     fn 配置文件round_trip且目录内无临时残留() {
         let path = temp_config_path("desktop-config-v1.json");
         let store = ConfigStore::new(path.clone());
-        let mut config = DesktopConfigV1::default();
+        let mut config = DesktopConfigV2::default();
         config.device.device_name = "Round Trip".into();
 
-        store.save(&config).unwrap();
+        let config = store.save(&config).unwrap();
         assert_eq!(store.load().unwrap(), config);
         let names = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
@@ -549,7 +791,7 @@ mod tests {
     fn 不存在返回默认值但不主动落盘() {
         let path = temp_config_path("desktop-config-v1.json");
         let store = ConfigStore::new(path.clone());
-        assert_eq!(store.load().unwrap(), DesktopConfigV1::default());
+        assert_eq!(store.load().unwrap(), DesktopConfigV2::default());
         assert!(!path.exists());
     }
 
@@ -570,23 +812,25 @@ mod tests {
     fn 无效保存不破坏旧文件且显式reset可恢复() {
         let path = temp_config_path("desktop-config-v1.json");
         let store = ConfigStore::new(path.clone());
-        let mut original = DesktopConfigV1::default();
+        let mut original = DesktopConfigV2::default();
         original.device.device_name = "Keep Me".into();
-        store.save(&original).unwrap();
+        let original = store.save(&original).unwrap();
 
         let mut invalid = original.clone();
         invalid.device.register_expires_secs = 1;
         assert!(store.save(&invalid).is_err());
         assert_eq!(store.load().unwrap(), original);
 
-        assert_eq!(store.reset().unwrap(), DesktopConfigV1::default());
-        assert_eq!(store.load().unwrap(), DesktopConfigV1::default());
+        let reset = store.reset().unwrap();
+        assert_eq!(reset.config_revision, original.config_revision + 1);
+        assert_eq!(reset.media, MediaProfile::default());
+        assert_eq!(store.load().unwrap(), reset);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn 启动输入只补充会话字段并解析已保存档案() {
-        let config = DesktopConfigV1::default();
+        let config = DesktopConfigV2::default();
         let resolved = config
             .resolve_start(StartDeviceInput {
                 profile_id: "local".into(),
@@ -604,7 +848,7 @@ mod tests {
 
     #[test]
     fn 启动拒绝未知档案和空密码() {
-        let config = DesktopConfigV1::default();
+        let config = DesktopConfigV2::default();
         let unknown = config.resolve_start(StartDeviceInput {
             profile_id: "missing".into(),
             password: "x".into(),
@@ -624,7 +868,7 @@ mod tests {
 
     #[test]
     fn 目录树随桌面配置持久化且旧配置缺字段兼容() {
-        let mut config = DesktopConfigV1::default();
+        let mut config = DesktopConfigV2::default();
         config.catalog_tree.push(CatalogNodeConfig {
             id: config.device.device_id.clone(),
             node_type: "Device".into(),
@@ -638,7 +882,7 @@ mod tests {
 
         let mut value = serde_json::to_value(config).unwrap();
         value.as_object_mut().unwrap().remove("catalog_tree");
-        let decoded: DesktopConfigV1 = serde_json::from_value(value).unwrap();
+        let decoded: DesktopConfigV2 = serde_json::from_value(value).unwrap();
         assert!(decoded.catalog_tree.is_empty());
     }
 }

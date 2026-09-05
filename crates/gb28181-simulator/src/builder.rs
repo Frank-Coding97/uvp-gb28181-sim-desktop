@@ -343,6 +343,7 @@ mod tests {
                 firmware: "0.1".into(),
             },
             video_source: None,
+            media_profile: None,
             video_fps: 30,
             light_bitrate_kbps: None,
             gb_version: common::GbVersion::V2022,

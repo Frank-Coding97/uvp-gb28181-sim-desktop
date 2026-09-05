@@ -4,7 +4,7 @@
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, OnceLock,
 };
 
@@ -26,7 +26,7 @@ mod config_store;
 mod preview_channel;
 mod preview_manager;
 use config_store::{
-    BindMode, CatalogNodeConfig, ConfigStore, DesktopConfigV1, EffectiveDeviceConfig,
+    BindMode, CatalogNodeConfig, ConfigStore, DesktopConfigV2, EffectiveDeviceConfig,
     StartDeviceInput,
 };
 use preview_channel::DesktopPreviewBus;
@@ -40,6 +40,9 @@ struct AppState {
     recording_store: OnceLock<Arc<RecordingStore>>,
     /// 配置文件读写串行化，避免并发保存与读取看到半次操作。
     config_io: Mutex<()>,
+    /// Independent cancellation path: preparation holds the device startup lock.
+    media_preparation: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    shutting_down: AtomicBool,
     /// 当前压测句柄；任务完全退出前始终占用槽位。
     stress: Mutex<Option<StressHandle>>,
     /// 分配单调递增的压测 ID,防止旧任务事件污染新任务状态。
@@ -76,7 +79,90 @@ struct DeviceHandle {
     effective_config: EffectiveDeviceConfig,
 }
 
+/// Reserve startup before awaiting the device lock, and keep cancellation live
+/// until REGISTER is committed. Dropping an unsuccessful startup releases it.
+struct DeviceStartup<'a> {
+    state: &'a AppState,
+    cancel: Arc<AtomicBool>,
+}
+
+impl DeviceStartup<'_> {
+    fn commit(&self, register: impl FnOnce()) -> Result<(), String> {
+        let mut pending = self
+            .state
+            .media_preparation
+            .lock()
+            .map_err(|_| "媒体准备状态锁异常")?;
+        if self.cancel.load(Ordering::Acquire) || self.state.shutting_down.load(Ordering::Acquire) {
+            return Err("设备启动已取消或应用正在退出".into());
+        }
+        if !pending
+            .as_ref()
+            .is_some_and(|token| Arc::ptr_eq(token, &self.cancel))
+        {
+            return Err("设备启动状态已失效".into());
+        }
+        register();
+        *pending = None;
+        Ok(())
+    }
+}
+
+impl Drop for DeviceStartup<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.state.media_preparation.lock() {
+            if pending
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &self.cancel))
+            {
+                *pending = None;
+            }
+        }
+    }
+}
+
 impl AppState {
+    fn begin_device_start(&self) -> Result<DeviceStartup<'_>, String> {
+        let mut pending = self
+            .media_preparation
+            .lock()
+            .map_err(|_| "媒体准备状态锁异常")?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("应用正在退出".into());
+        }
+        if pending.is_some() {
+            return Err("设备正在启动，请等待或取消当前启动".into());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        *pending = Some(cancel.clone());
+        Ok(DeviceStartup {
+            state: self,
+            cancel,
+        })
+    }
+
+    fn ensure_config_writable(&self, device_running: bool) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("应用正在退出，不能修改配置".into());
+        }
+        if device_running {
+            return Err("设备运行中，不能修改配置；请先停止设备".into());
+        }
+        Ok(())
+    }
+
+    fn cancel_file_preparation(&self) -> Result<(), String> {
+        let preparation = self
+            .media_preparation
+            .lock()
+            .map_err(|_| "媒体准备状态锁异常")?;
+        let cancel = preparation
+            .as_ref()
+            .ok_or("文件准备已结束，当前没有可取消的启动")?;
+        cancel.store(true, Ordering::Release);
+        Ok(())
+    }
+
     fn new() -> Self {
         let preview_bus = Arc::new(DesktopPreviewBus::new());
         let preview_manager = Arc::new(PreviewManager::new(Arc::clone(&preview_bus)));
@@ -84,6 +170,8 @@ impl AppState {
             config_store: OnceLock::new(),
             recording_store: OnceLock::new(),
             config_io: Mutex::new(()),
+            media_preparation: std::sync::Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
             metrics: Mutex::new(None),
@@ -371,7 +459,7 @@ fn engine_version() -> String {
 async fn get_desktop_config(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<DesktopConfigV1, String> {
+) -> Result<DesktopConfigV2, String> {
     let store = app_config_store(&state, &app)?;
     let _io = state.config_io.lock().await;
     tokio::task::spawn_blocking(move || store.load())
@@ -381,14 +469,12 @@ async fn get_desktop_config(
 
 #[tauri::command]
 async fn save_desktop_config(
-    config: DesktopConfigV1,
+    config: DesktopConfigV2,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<DesktopConfigV1, String> {
+) -> Result<DesktopConfigV2, String> {
     let device = state.device.lock().await;
-    if device.is_some() {
-        return Err("设备运行中，不能修改配置；请先停止设备".into());
-    }
+    state.ensure_config_writable(device.is_some())?;
     let store = app_config_store(&state, &app)?;
     let _io = state.config_io.lock().await;
     tokio::task::spawn_blocking(move || store.save(&config))
@@ -397,14 +483,28 @@ async fn save_desktop_config(
 }
 
 #[tauri::command]
+async fn save_media_config(
+    media: media_rtp::profile::MediaProfile,
+    expected_revision: u64,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopConfigV2, String> {
+    let device = state.device.lock().await;
+    state.ensure_config_writable(device.is_some())?;
+    let store = app_config_store(&state, &app)?;
+    let _io = state.config_io.lock().await;
+    tokio::task::spawn_blocking(move || store.save_media(media, expected_revision))
+        .await
+        .map_err(|error| format!("保存媒体配置任务异常: {error}"))?
+}
+
+#[tauri::command]
 async fn reset_desktop_config(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<DesktopConfigV1, String> {
+) -> Result<DesktopConfigV2, String> {
     let device = state.device.lock().await;
-    if device.is_some() {
-        return Err("设备运行中，不能重置配置；请先停止设备".into());
-    }
+    state.ensure_config_writable(device.is_some())?;
     let store = app_config_store(&state, &app)?;
     let _io = state.config_io.lock().await;
     tokio::task::spawn_blocking(move || store.reset())
@@ -1010,6 +1110,11 @@ fn discover_local_ip(server: &str) -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
+#[tauri::command]
+fn cancel_media_preparation(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.cancel_file_preparation()
+}
+
 /// 启动一台设备:注册 + 心跳 + 入站应答,后台常驻。状态经 `device_state` 事件推送。
 #[tauri::command]
 async fn start_device(
@@ -1017,7 +1122,11 @@ async fn start_device(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
+    let startup = state.begin_device_start()?;
     let mut guard = state.device.lock().await;
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Err("应用正在退出".into());
+    }
     if guard.is_some() {
         return Err("已有设备在运行,请先停止".into());
     }
@@ -1142,29 +1251,62 @@ async fn start_device(
             firmware: resolved.device.firmware.clone(),
         },
         video_source: resolved.video_source.clone(),
-        video_fps: resolved.device.video_fps,
+        video_fps: resolved.media.video_fps,
+        media_profile: Some(resolved.media.clone()),
         light_bitrate_kbps: None,
         gb_version: resolved.profile.gb_version,
         signaling_encoding: resolved.profile.signaling_encoding,
     };
 
-    // 预热视频源:容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会阻塞
-    // 200 OK 与首包推流,导致平台收流超时。这里在设备上线前先转好、缓存,
-    // INVITE 时命中缓存瞬时加载。ffmpeg 是阻塞调用,放 spawn_blocking。
-    // 实时采集(live:)无文件可预热,跳过;仅对文件源(C 档容器)做转封装预热。
-    if let Some(ref vs) = resolved.video_source {
-        if !vs.trim().is_empty() && !vs.trim().starts_with("live:") {
-            let vs = vs.clone();
-            let prepared =
-                tokio::task::spawn_blocking(move || gb28181_simulator::prepare_video_source(&vs))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            if let Err(e) = prepared {
-                return Err(format!("视频源准备失败:{e}"));
+    // Prepare the immutable output before REGISTER; INVITE only subscribes to it.
+    let prepared_file = if let Some(path) = resolved.video_source.as_ref()
+        .filter(|path| !path.trim().is_empty() && !path.starts_with("live:"))
+    {
+        let cancel = startup.cancel.clone();
+        if state.shutting_down.load(Ordering::Acquire) {
+            cancel.store(true, Ordering::Release);
+        }
+        let _ = app.emit("media_preparation", serde_json::json!({"phase":"preparing", "message":"正在准备文件音视频"}));
+        let prepare_app = app.clone();
+        let source_path = std::path::PathBuf::from(path);
+        let profile = resolved.media.clone();
+        let task_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let progress = move |progress: media_rtp::file_profile::FilePreparationProgress| {
+                use media_rtp::file_profile::FilePreparationPhase;
+                let message = match progress.phase {
+                    FilePreparationPhase::HashingSource => "正在检查源文件",
+                    FilePreparationPhase::CheckingCache => "正在检查文件缓存",
+                    FilePreparationPhase::Transcoding => "正在按所选参数转换音视频",
+                    FilePreparationPhase::Extracting => "正在建立音视频索引",
+                    FilePreparationPhase::Probing => "正在验证输出音视频",
+                    FilePreparationPhase::Publishing => "正在保存准备结果",
+                    FilePreparationPhase::Complete => "文件音视频准备完成",
+                };
+                let _ = prepare_app.emit("media_preparation", serde_json::json!({"phase":"preparing", "message":message}));
+            };
+            media_rtp::file_profile::prepare_file_profile(&source_path, &profile, &task_cancel, Some(&progress))
+        }).await;
+        let result = result.map_err(|error| format!("文件准备任务异常: {error}")).and_then(|result| result);
+        if cancel.load(Ordering::Acquire) {
+            let _ = app.emit("media_preparation", serde_json::json!({"phase":"cancelled", "message":"已取消文件准备"}));
+            return Err("已取消文件准备".into());
+        }
+        match result {
+            Ok(prepared) => {
+                let _ = app.emit("media_preparation", serde_json::json!({"phase":"ready", "message":"文件音视频准备完成"}));
+                Some(prepared)
+            }
+            Err(error) => {
+                let _ = app.emit("media_preparation", serde_json::json!({"phase":"failed", "message":error}));
+                return Err(format!("视频源准备失败: {error}"));
             }
         }
-    }
+    } else { None };
 
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Err("应用正在退出".into());
+    }
     // 共享 UDP 传输 + 本端地址发现。
     let bind_host = match resolved.network.bind_mode {
         BindMode::Auto => "0.0.0.0".to_string(),
@@ -1189,6 +1331,9 @@ async fn start_device(
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
     let sim = Arc::new(DeviceSimulator::with_observer(cfg, observer));
+    if let Some(prepared) = prepared_file {
+        sim.install_prepared_file(prepared)?;
+    }
     sim.install_recording_store(app_recording_store(&state, &app)?);
     sim.set_preview_sink(Some(
         state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
@@ -1208,6 +1353,7 @@ async fn start_device(
     }
 
     let effective_config = EffectiveDeviceConfig {
+        media: resolved.media.clone(),
         profile: resolved.profile.clone(),
         device: resolved.device.clone(),
         network: resolved.network.clone(),
@@ -1222,22 +1368,24 @@ async fn start_device(
     let sim_run = sim.clone();
     let tp_run = udp.clone();
     let host_run = local_host.clone();
-    tokio::spawn(async move {
-        sim_run
-            .run(tp_run, host_run, local_port, async move {
-                let _ = stop_rx.await;
-            })
-            .await;
-    });
+    startup.commit(|| {
+        tokio::spawn(async move {
+            sim_run
+                .run(tp_run, host_run, local_port, async move {
+                    let _ = stop_rx.await;
+                })
+                .await;
+        });
 
-    *guard = Some(DeviceHandle {
-        sim,
-        transport: udp,
-        local_host,
-        local_port,
-        stop_tx,
-        effective_config,
-    });
+        *guard = Some(DeviceHandle {
+            sim,
+            transport: udp,
+            local_host,
+            local_port,
+            stop_tx,
+            effective_config,
+        });
+    })?;
     Ok("设备已启动".into())
 }
 
@@ -1253,6 +1401,9 @@ struct RecordingEntryDto {
     kind: RecordingKind,
     path: String,
     size_bytes: u64,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    audio_sample_rate_hz: Option<u32>,
 }
 
 impl From<RecordingEntry> for RecordingEntryDto {
@@ -1268,6 +1419,9 @@ impl From<RecordingEntry> for RecordingEntryDto {
             kind: entry.kind,
             path: entry.path.to_string_lossy().into_owned(),
             size_bytes: entry.size_bytes,
+            video_codec: entry.video_codec,
+            audio_codec: entry.audio_codec,
+            audio_sample_rate_hz: entry.audio_sample_rate_hz,
         }
     }
 }
@@ -1534,7 +1688,7 @@ fn protocol_to_config(node: &gb28181_protocol::id_codec::CatalogNode) -> Catalog
     }
 }
 
-async fn load_catalog_config(state: &AppState, app: &AppHandle) -> Result<DesktopConfigV1, String> {
+async fn load_catalog_config(state: &AppState, app: &AppHandle) -> Result<DesktopConfigV2, String> {
     let store = app_config_store(state, app)?;
     let _io = state.config_io.lock().await;
     tokio::task::spawn_blocking(move || store.load())
@@ -1543,7 +1697,7 @@ async fn load_catalog_config(state: &AppState, app: &AppHandle) -> Result<Deskto
 }
 
 fn catalog_nodes_from_config(
-    config: &DesktopConfigV1,
+    config: &DesktopConfigV2,
 ) -> Result<Vec<gb28181_protocol::id_codec::CatalogNode>, String> {
     if !config.catalog_tree.is_empty() {
         return config
@@ -1834,6 +1988,7 @@ pub fn run() {
             engine_version,
             get_desktop_config,
             save_desktop_config,
+            save_media_config,
             reset_desktop_config,
             validate_scenario,
             start_stress,
@@ -1846,6 +2001,7 @@ pub fn run() {
             stop_binary_preview,
             retry_binary_preview,
             start_device,
+            cancel_media_preparation,
             stop_device,
             get_recordings,
             get_recording_state,
@@ -1871,31 +2027,28 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Tauri 应用启动失败")
         .run(|app_handle, event| {
-            // 退出时必须把采集停掉。macOS 上父进程被杀不会带走子进程，
-            // 留下的 FFmpeg 会一直占着摄像头，下次启动就只能拿到一帧静止画面。
-            if matches!(
-                event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
-                let (device, preview_manager) = {
-                    let state = app_handle.state::<AppState>();
-                    (
-                        state
-                            .device
-                            .try_lock()
-                            .ok()
-                            .and_then(|mut guard| guard.take()),
-                        Arc::clone(&state.preview_manager),
-                    )
-                };
-                if let Some(handle) = device {
-                    if let Some(service) = handle.sim.recording_service() {
-                        let _ = tauri::async_runtime::block_on(service.stop());
-                    }
-                    tauri::async_runtime::block_on(handle.sim.stop_shared_media());
-                    let _ = handle.stop_tx.send(());
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let state = app_handle.state::<AppState>();
+                if state.shutting_down.swap(true, Ordering::AcqRel) {
+                    return;
                 }
-                tauri::async_runtime::block_on(preview_manager.shutdown());
+                // Keep the event loop alive while preparation/capture children are reaped.
+                api.prevent_exit();
+                let _ = state.cancel_file_preparation();
+                let app = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<AppState>();
+                    let device = state.device.lock().await.take();
+                    if let Some(handle) = device {
+                        if let Some(service) = handle.sim.recording_service() {
+                            let _ = service.stop().await;
+                        }
+                        handle.sim.stop_shared_media().await;
+                        let _ = handle.stop_tx.send(());
+                    }
+                    state.preview_manager.shutdown().await;
+                    app.exit(0);
+                });
             }
         });
 }
@@ -1903,6 +2056,45 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn media_preparation_cancel_does_not_wait_for_device_lock() {
+        let state = AppState::new();
+        let _startup_guard = state.device.lock().await;
+        let token = Arc::new(AtomicBool::new(false));
+        *state.media_preparation.lock().unwrap() = Some(token.clone());
+        state.cancel_file_preparation().unwrap();
+        assert!(token.load(Ordering::Acquire));
+        *state.media_preparation.lock().unwrap() = None;
+        assert!(state.cancel_file_preparation().is_err());
+    }
+
+    #[test]
+    fn media_start_cancel_remains_effective_until_registration_commit() {
+        let state = AppState::new();
+        let startup = state.begin_device_start().unwrap();
+        assert!(state.begin_device_start().is_err());
+        // Preparation has finished; cancellation must still prevent REGISTER.
+        state.cancel_file_preparation().unwrap();
+        let mut registered = false;
+        assert!(startup.commit(|| registered = true).is_err());
+        assert!(!registered);
+        drop(startup);
+        let retry = state.begin_device_start().unwrap();
+        retry.commit(|| registered = true).unwrap();
+        assert!(registered);
+        assert!(state.cancel_file_preparation().is_err());
+    }
+
+    #[test]
+    fn media_shutdown_rejects_config_writes_and_pending_registration() {
+        let state = AppState::new();
+        let startup = state.begin_device_start().unwrap();
+        state.shutting_down.store(true, Ordering::Release);
+        assert!(state.ensure_config_writable(false).is_err());
+        assert!(startup.commit(|| panic!("must not register")).is_err());
+        assert!(state.begin_device_start().is_err());
+    }
 
     #[test]
     fn tcc拒绝映射为可执行系统设置提示() {

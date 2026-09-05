@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::Condvar;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -11,8 +13,9 @@ use common::{Error, Result};
 use super::{drain_frames, ffmpeg_bin, Frame, FrameSender, VideoSource, G711_PACKET_BYTES};
 use crate::preview::{CapturedAccessUnit, PreviewSink};
 use crate::preview_worker::{
-    spawn_preview_worker, PreviewControl, PreviewWorkerHandle, PreviewWorkerInput,
+    spawn_preview_worker_with_codec, PreviewControl, PreviewWorkerHandle, PreviewWorkerInput,
 };
+use crate::profile::{MediaAudioCodec, MediaProfile, MediaVideoCodec};
 
 const DEFAULT_SCREEN_WIDTH: u32 = 1280;
 const DEFAULT_SCREEN_HEIGHT: u32 = 720;
@@ -24,7 +27,6 @@ const MIN_SCREEN_BITRATE_KBPS: u32 = 128;
 const MAX_SCREEN_BITRATE_KBPS: u32 = 20_000;
 const STDERR_TAIL_LINES: usize = 32;
 type StderrCapture = (Arc<Mutex<VecDeque<String>>>, JoinHandle<()>);
-static NEXT_CAMERA_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Video codec actually available for native live-screen capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +52,14 @@ impl LiveVideoCodec {
         match self {
             Self::H264 => "h264",
             Self::H265 => "h265",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const fn ffmpeg_format(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::H265 => "hevc",
         }
     }
 
@@ -99,6 +109,80 @@ impl LiveVideoProfile {
             )));
         }
         Ok(())
+    }
+}
+
+/// Internal live-capture profile resolved from the persisted media settings.
+///
+/// `LiveVideoProfile` predates the unified media settings and remains part of the
+/// legacy screen URI.  Keeping this separate lets old callers retain their
+/// behavior while the desktop entry point uses the complete media profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveCaptureProfile {
+    width: u32,
+    height: u32,
+    video_fps: u32,
+    bitrate_kbps: u32,
+    keyframe_interval_seconds: u32,
+    video_codec: LiveVideoCodec,
+    audio_codec: LiveAudioCodec,
+    audio_sample_rate_hz: u32,
+}
+
+impl LiveCaptureProfile {
+    fn from_media(profile: &MediaProfile) -> Result<Self> {
+        profile.validate().map_err(Error::Media)?;
+        let video_codec = match profile.video_codec {
+            MediaVideoCodec::H264 => LiveVideoCodec::H264,
+            MediaVideoCodec::H265 => LiveVideoCodec::H265,
+        };
+        let audio_codec = match profile.audio_codec {
+            MediaAudioCodec::G711A => LiveAudioCodec::G711A,
+            MediaAudioCodec::G711U => LiveAudioCodec::G711U,
+            MediaAudioCodec::Aac => LiveAudioCodec::Aac,
+        };
+        Ok(Self {
+            width: profile.width,
+            height: profile.height,
+            video_fps: profile.video_fps.max(1),
+            bitrate_kbps: profile.bitrate_kbps,
+            keyframe_interval_seconds: profile.keyframe_interval_seconds,
+            video_codec,
+            audio_codec,
+            audio_sample_rate_hz: profile.effective_audio_sample_rate_hz(),
+        })
+    }
+
+    fn legacy_camera(fps: u32, audio_codec: LiveAudioCodec) -> Self {
+        Self {
+            width: DEFAULT_SCREEN_WIDTH,
+            height: DEFAULT_SCREEN_HEIGHT,
+            video_fps: fps.max(1),
+            bitrate_kbps: DEFAULT_SCREEN_BITRATE_KBPS,
+            keyframe_interval_seconds: 1,
+            video_codec: LiveVideoCodec::H264,
+            audio_codec,
+            audio_sample_rate_hz: audio_codec.sample_rate() as u32,
+        }
+    }
+
+    fn legacy_screen(profile: LiveVideoProfile, fps: u32, audio_codec: LiveAudioCodec) -> Self {
+        Self {
+            width: profile.width,
+            height: profile.height,
+            video_fps: fps.max(1),
+            bitrate_kbps: profile.bitrate_kbps,
+            keyframe_interval_seconds: 1,
+            video_codec: profile.codec,
+            audio_codec,
+            audio_sample_rate_hz: audio_codec.sample_rate() as u32,
+        }
+    }
+
+    fn keyframe_interval_frames(self) -> u32 {
+        self.video_fps
+            .saturating_mul(self.keyframe_interval_seconds)
+            .max(1)
     }
 }
 
@@ -175,18 +259,35 @@ impl LiveAudioCodec {
         }
     }
 
-    const fn frame_duration_90k(self) -> u32 {
+    const fn frame_samples(self) -> u32 {
         match self {
-            Self::Aac => 1_920,
-            Self::G711A | Self::G711U | Self::Opus => 1_800,
+            Self::Aac => 1_024,
+            Self::G711A | Self::G711U => 160,
+            Self::Opus => 960,
         }
     }
 
-    fn append_ffmpeg_output(self, command: &mut Command, output: &str) {
+    const fn frame_duration_90k_at(self, sample_rate_hz: u32) -> u32 {
+        let sample_rate_hz = if sample_rate_hz == 0 {
+            1
+        } else {
+            sample_rate_hz
+        };
+        (crate::rtp::CLOCK_HZ * self.frame_samples()) / sample_rate_hz
+    }
+
+    fn append_ffmpeg_output_with_sample_rate(
+        self,
+        command: &mut Command,
+        sample_rate_hz: u32,
+        bitrate_kbps: u32,
+        output: &str,
+    ) {
         command.args(["-c:a", self.ffmpeg_encoder()]);
         match self {
             Self::Aac => {
-                command.args(["-profile:a", "aac_low", "-b:a", "64k"]);
+                let bitrate = format!("{bitrate_kbps}k");
+                command.args(["-profile:a", "aac_low", "-b:a", &bitrate]);
             }
             Self::Opus => {
                 command.args([
@@ -202,7 +303,7 @@ impl LiveAudioCodec {
             }
             Self::G711A | Self::G711U => {}
         }
-        let sample_rate = self.sample_rate().to_string();
+        let sample_rate = sample_rate_hz.max(1).to_string();
         command.args([
             "-ar",
             &sample_rate,
@@ -720,6 +821,71 @@ fn enumerate_avfoundation(ffmpeg: &str) -> Result<(Vec<LiveAvDevice>, Vec<LiveAv
 }
 
 #[cfg(target_os = "macos")]
+fn resolve_sck_microphone_device_id(ffmpeg: Option<&str>, index: u32) -> Result<String> {
+    let ffmpeg = ffmpeg.ok_or_else(|| {
+        Error::Media(format!(
+            "AVFoundation microphone index {index} cannot be resolved without FFmpeg device enumeration"
+        ))
+    })?;
+    let (_, microphones) = enumerate_avfoundation(ffmpeg).map_err(|error| {
+        Error::Media(format!(
+            "failed to enumerate AVFoundation microphones for index {index}: {error}"
+        ))
+    })?;
+    let mut selected = microphones
+        .iter()
+        .filter(|microphone| microphone.index == index);
+    let av_name = match (selected.next(), selected.next()) {
+        (None, _) => {
+            return Err(Error::Media(format!(
+                "AVFoundation microphone index {index} is not available"
+            )))
+        }
+        (Some(_), Some(_)) => {
+            return Err(Error::Media(format!(
+                "AVFoundation microphone index {index} is ambiguous"
+            )))
+        }
+        (Some(microphone), None) => microphone.name.as_str(),
+    };
+    let devices = screencapturekit::audio_devices::AudioInputDevice::list();
+    let sck_devices = devices
+        .iter()
+        .map(|device| (device.name.as_str(), device.id.as_str()))
+        .collect::<Vec<_>>();
+    map_sck_microphone_device_id(index, Some(av_name), &sck_devices)
+}
+
+fn map_sck_microphone_device_id(
+    index: u32,
+    av_name: Option<&str>,
+    sck_devices: &[(&str, &str)],
+) -> Result<String> {
+    let Some(av_name) = av_name else {
+        return Err(Error::Media(format!(
+            "AVFoundation microphone index {index} is not available"
+        )));
+    };
+    let mut matches = sck_devices.iter().filter(|(name, _)| *name == av_name);
+    let Some((_, id)) = matches.next() else {
+        return Err(Error::Media(format!(
+            "ScreenCaptureKit microphone '{av_name}' for AVFoundation index {index} is not available"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(Error::Media(format!(
+            "ScreenCaptureKit microphone '{av_name}' for AVFoundation index {index} is ambiguous"
+        )));
+    }
+    if id.is_empty() {
+        return Err(Error::Media(format!(
+            "ScreenCaptureKit microphone '{av_name}' for AVFoundation index {index} has no device ID"
+        )));
+    }
+    Ok((*id).to_string())
+}
+
+#[cfg(target_os = "macos")]
 fn is_virtual_screen_input(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
     normalized.contains("capture screen") || normalized.contains("screen capture")
@@ -744,8 +910,10 @@ pub struct LiveSource {
     audio_enabled: bool,
     audio_credit_90k: u32,
     audio_codec: LiveAudioCodec,
+    audio_sample_rate_hz: u32,
     fps: u32,
     codec: LiveVideoCodec,
+    timed_events: Option<Arc<LiveEventQueue>>,
     children: Vec<Child>,
     worker_threads: Vec<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
@@ -768,6 +936,384 @@ struct LatestFrameQueue {
     dropped: AtomicBool,
     /// 累计入队帧数，仅用于诊断：能区分"没读到字节"和"读到了但切不出帧"。
     pushed: std::sync::atomic::AtomicU64,
+}
+
+/// A bounded queue for the timed events produced by a profile-driven live source.
+///
+/// The legacy `Frame` queue remains in place for old callers.  The timed queue
+/// carries the same encoded AU with its real capture timeline so the shared
+/// media producer can consume it without synthesizing a second FPS clock.
+struct LiveEventQueue {
+    events: Mutex<VecDeque<crate::source::MediaEvent>>,
+    capacity: usize,
+    dropped: AtomicBool,
+    dropped_pts_90k: std::sync::atomic::AtomicU64,
+}
+
+/// 采集后端的统一零点。ScreenCaptureKit 的 PTS 是 CoreMedia 的绝对时间，
+/// 推流事件需要相对本次 source 启动的 90kHz 时间轴；所有可用的 SCK
+/// 视频/音频时间戳都经过同一个 origin 归一化，避免两个回调各自从零开始。
+#[derive(Default)]
+struct LiveCaptureClock {
+    origin_90k: Mutex<Option<u64>>,
+}
+
+impl LiveCaptureClock {
+    fn with_origin(origin_90k: u64) -> Self {
+        Self {
+            origin_90k: Mutex::new(Some(origin_90k)),
+        }
+    }
+
+    fn normalize(&self, capture_pts_90k: u64) -> u64 {
+        let Ok(mut origin) = self.origin_90k.lock() else {
+            return capture_pts_90k;
+        };
+        let base = *origin.get_or_insert(capture_pts_90k);
+        capture_pts_90k.saturating_sub(base)
+    }
+}
+
+/// FFmpeg's encoder stats for a camera may arrive on the video and audio
+/// pipes in either order.  Wait for the first AU on both streams before
+/// choosing the shared origin so AAC's negative priming PTS is retained even
+/// when the video reader wins the scheduling race.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum CameraTimingStream {
+    Video,
+    Audio,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct CameraTimingState {
+    first_video_pts: Option<i128>,
+    first_audio_pts: Option<i128>,
+    origin_pts: Option<i128>,
+}
+
+#[cfg(target_os = "macos")]
+struct CameraTimingClock {
+    state: Mutex<CameraTimingState>,
+    ready: Condvar,
+    has_audio: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl CameraTimingClock {
+    fn new(has_audio: bool) -> Self {
+        Self {
+            state: Mutex::new(CameraTimingState::default()),
+            ready: Condvar::new(),
+            has_audio,
+        }
+    }
+
+    fn observe(&self, stream: CameraTimingStream, pts: i128) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        match stream {
+            CameraTimingStream::Video => {
+                state.first_video_pts.get_or_insert(pts);
+            }
+            CameraTimingStream::Audio => {
+                state.first_audio_pts.get_or_insert(pts);
+            }
+        }
+        if state.origin_pts.is_none()
+            && state.first_video_pts.is_some()
+            && (!self.has_audio || state.first_audio_pts.is_some())
+        {
+            state.origin_pts = match (state.first_video_pts, state.first_audio_pts) {
+                (Some(video), Some(audio)) => Some(video.min(audio)),
+                (Some(video), None) => Some(video),
+                (None, Some(audio)) => Some(audio),
+                (None, None) => None,
+            };
+            self.ready.notify_all();
+        }
+    }
+
+    fn notify_failure(&self) {
+        self.ready.notify_all();
+    }
+
+    fn normalize(&self, pts: i128) -> std::result::Result<u64, String> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err("camera timing clock lock was poisoned".into());
+        };
+        if state.origin_pts.is_none() && self.has_audio {
+            // The first video/audio stats lines establish one source-wide
+            // origin. A missing stream is a source error, never a reason to
+            // synthesize a zero timestamp.
+            if let Ok((guard, _)) =
+                self.ready
+                    .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                        state.origin_pts.is_none()
+                    })
+            {
+                state = guard;
+            } else {
+                return Err("camera timing clock wait failed".into());
+            }
+        }
+        let origin = state.origin_pts.ok_or_else(|| {
+            "camera encoder stats did not provide the first video/audio PTS within 5 seconds"
+                .to_string()
+        })?;
+        Ok(u64::try_from(pts.saturating_sub(origin).max(0)).unwrap_or(u64::MAX))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ScreenRawFrame {
+    data: Vec<u8>,
+    pts_90k: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenFrameAction {
+    /// The sample buffer contains a newly generated image.
+    Fresh,
+    /// ScreenCaptureKit reported no display change; reuse the last image.
+    Idle,
+    /// The sample must not enter the encoder as normal screen content.
+    Ignore,
+}
+
+#[cfg(target_os = "macos")]
+fn screen_frame_action(status: Option<screencapturekit::cm::SCFrameStatus>) -> ScreenFrameAction {
+    match status {
+        Some(screencapturekit::cm::SCFrameStatus::Complete)
+        | Some(screencapturekit::cm::SCFrameStatus::Started) => ScreenFrameAction::Fresh,
+        Some(screencapturekit::cm::SCFrameStatus::Idle) => ScreenFrameAction::Idle,
+        Some(
+            screencapturekit::cm::SCFrameStatus::Blank
+            | screencapturekit::cm::SCFrameStatus::Suspended
+            | screencapturekit::cm::SCFrameStatus::Stopped,
+        )
+        | None => ScreenFrameAction::Ignore,
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ScreenFrameState {
+    last_complete_bgra: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "macos")]
+impl ScreenFrameState {
+    fn accept(
+        &mut self,
+        action: ScreenFrameAction,
+        fresh_bgra: Option<Vec<u8>>,
+        pts_90k: Option<u64>,
+    ) -> Option<ScreenRawFrame> {
+        match action {
+            ScreenFrameAction::Fresh => {
+                let data = fresh_bgra?;
+                self.last_complete_bgra = Some(data.clone());
+                Some(ScreenRawFrame { data, pts_90k })
+            }
+            ScreenFrameAction::Idle => {
+                let pts_90k = pts_90k?;
+                let data = self.last_complete_bgra.clone()?;
+                Some(ScreenRawFrame {
+                    data,
+                    pts_90k: Some(pts_90k),
+                })
+            }
+            ScreenFrameAction::Ignore => {
+                // Blank, suspended, stopped, and unknown samples mark the
+                // previous image as no longer safe to repeat. A later Idle
+                // sample must wait for a new complete image instead of
+                // resurrecting stale screen content.
+                self.last_complete_bgra = None;
+                None
+            }
+        }
+    }
+}
+
+fn time_value_to_90k(value: i64, timescale: i32, valid: bool) -> Option<u64> {
+    if !valid || value < 0 || timescale <= 0 {
+        return None;
+    }
+    let ticks = u128::try_from(value).ok()? * u128::from(crate::source::MEDIA_CLOCK_HZ);
+    Some((ticks / u128::from(timescale as u32)) as u64)
+}
+
+/// Read the CoreMedia host clock before a ScreenCaptureKit stream starts.
+/// ScreenCaptureKit sample PTS and this clock share the host-time domain, so
+/// the value is a stable source origin even when audio/video callbacks arrive
+/// in either order.
+#[cfg(target_os = "macos")]
+fn core_media_host_time_90k() -> Option<u64> {
+    let clock = screencapturekit::cm::CMClock::host_time_clock();
+    let time = unsafe { cm_clock_get_time(clock.as_ptr()) };
+    time_value_to_90k(time.value, time.timescale, (time.flags & 1) != 0)
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    #[link_name = "CMClockGetTime"]
+    fn cm_clock_get_time(clock: *const std::ffi::c_void) -> screencapturekit::cm::CMTime;
+}
+
+impl LiveEventQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            events: Mutex::new(VecDeque::with_capacity(capacity.max(1))),
+            capacity: capacity.max(1),
+            dropped: AtomicBool::new(false),
+            dropped_pts_90k: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn push(&self, event: crate::source::MediaEvent) {
+        let Ok(mut events) = self.events.lock() else {
+            return;
+        };
+        if events.len() >= self.capacity {
+            self.dropped_pts_90k
+                .store(event.pts_90k(), Ordering::Release);
+            events.clear();
+            self.dropped.store(true, Ordering::Release);
+        }
+        events.push_back(event);
+    }
+
+    fn pop(&self) -> Option<crate::source::MediaEvent> {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|mut events| events.pop_front())
+    }
+
+    fn take_dropped_pts(&self) -> Option<u64> {
+        self.dropped
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.dropped_pts_90k.load(Ordering::Acquire))
+    }
+}
+
+struct LiveAudioTimeline {
+    pts_90k: u64,
+    clock: crate::source::SampleClock,
+}
+
+impl LiveAudioTimeline {
+    fn new(sample_rate_hz: u32) -> Option<Self> {
+        Some(Self {
+            pts_90k: 0,
+            clock: crate::source::SampleClock::new(sample_rate_hz)?,
+        })
+    }
+}
+
+/// First normalized SCK audio timestamp. Encoded audio arrives on a separate
+/// FFmpeg reader thread, so keep the capture origin until the first output AU
+/// is available instead of letting that reader start its sample clock at zero.
+#[derive(Default)]
+struct LiveAudioCaptureOrigin {
+    first_capture_pts_90k: Mutex<Option<u64>>,
+}
+
+impl LiveAudioCaptureOrigin {
+    fn observe(&self, capture_pts_90k: Option<u64>) {
+        let Some(capture_pts_90k) = capture_pts_90k else {
+            return;
+        };
+        if let Ok(mut first) = self.first_capture_pts_90k.lock() {
+            first.get_or_insert(capture_pts_90k);
+        }
+    }
+
+    fn first(&self) -> Option<u64> {
+        self.first_capture_pts_90k
+            .lock()
+            .ok()
+            .and_then(|first| *first)
+    }
+}
+
+fn sck_audio_capture_origin(
+    origin: Option<&LiveAudioCaptureOrigin>,
+) -> std::result::Result<Option<u64>, String> {
+    match origin {
+        Some(origin) => origin
+            .first()
+            .map(Some)
+            .ok_or_else(|| "SCK audio encoder output arrived before a capture PTS".into()),
+        None => Ok(None),
+    }
+}
+
+#[cfg(target_os = "macos")]
+const fn uses_sck_microphone_capture(timed: bool, audio: LiveAudioSource) -> bool {
+    timed && matches!(audio, LiveAudioSource::Microphone(_))
+}
+
+fn audio_packet_sample_count(codec: LiveAudioCodec, data: &[u8]) -> u32 {
+    match codec {
+        LiveAudioCodec::Aac => {
+            // ADTS `number_of_raw_data_blocks_in_frame` is a zero-based
+            // count; FFmpeg normally emits one block, but preserving the
+            // header keeps PTS correct if it coalesces AAC frames.
+            data.get(6)
+                .map_or(1, |header| u32::from(header & 0x03) + 1)
+                .saturating_mul(1_024)
+        }
+        LiveAudioCodec::G711A | LiveAudioCodec::G711U => 160,
+        LiveAudioCodec::Opus => 960,
+    }
+}
+
+fn push_timed_audio(
+    events: Option<&Arc<LiveEventQueue>>,
+    timeline: Option<&Arc<Mutex<LiveAudioTimeline>>>,
+    packet: Vec<u8>,
+    codec: LiveAudioCodec,
+) {
+    push_timed_audio_at(events, timeline, packet, codec, None);
+}
+
+fn push_timed_audio_at(
+    events: Option<&Arc<LiveEventQueue>>,
+    timeline: Option<&Arc<Mutex<LiveAudioTimeline>>>,
+    packet: Vec<u8>,
+    codec: LiveAudioCodec,
+    capture_pts_90k: Option<u64>,
+) {
+    let (Some(events), Some(timeline)) = (events, timeline) else {
+        return;
+    };
+    let Ok(mut timeline) = timeline.lock() else {
+        return;
+    };
+    let sample_count = audio_packet_sample_count(codec, &packet);
+    let duration = timeline.clock.duration_for_samples(sample_count);
+    // SCK audio can carry a CoreMedia timestamp. Keep a forward-only timeline:
+    // an out-of-order callback must not make downstream PTS go backwards, while
+    // a genuine capture gap remains visible as a larger PTS delta.
+    let pts_90k = capture_pts_90k.map_or(timeline.pts_90k, |capture_pts| {
+        capture_pts.max(timeline.pts_90k)
+    });
+    timeline.pts_90k = pts_90k.saturating_add(duration);
+    events.push(crate::source::MediaEvent::Audio(
+        crate::source::TimedAudioAu::with_duration(
+            packet,
+            codec.ps_codec(),
+            timeline.clock.sample_rate_hz(),
+            sample_count,
+            pts_90k,
+            duration,
+        ),
+    ));
 }
 
 impl LatestFrameQueue {
@@ -820,38 +1366,103 @@ struct EncodedFrameHub {
     preview: Option<PreviewWorkerInput>,
     generation: u64,
     sequence: std::sync::atomic::AtomicU64,
+    timed_events: Option<Arc<LiveEventQueue>>,
+    video_fps: u32,
+    codec: LiveVideoCodec,
+    last_timed_pts_90k: Mutex<Option<u64>>,
 }
 
 impl EncodedFrameHub {
+    #[cfg(test)]
     fn new(
         primary: Arc<LatestFrameQueue>,
         preview: Option<PreviewWorkerInput>,
         generation: u64,
+    ) -> Self {
+        Self::new_with_timing(primary, preview, generation, None, 30, LiveVideoCodec::H264)
+    }
+
+    fn new_with_timing(
+        primary: Arc<LatestFrameQueue>,
+        preview: Option<PreviewWorkerInput>,
+        generation: u64,
+        timed_events: Option<Arc<LiveEventQueue>>,
+        video_fps: u32,
+        codec: LiveVideoCodec,
     ) -> Self {
         Self {
             primary,
             preview,
             generation,
             sequence: std::sync::atomic::AtomicU64::new(0),
+            timed_events,
+            video_fps: video_fps.max(1),
+            codec,
+            last_timed_pts_90k: Mutex::new(None),
         }
     }
 }
 
 impl FrameSender for EncodedFrameHub {
     fn send_frame(&self, frame: Frame) {
+        self.send_frame_at(frame, None);
+    }
+}
+
+impl EncodedFrameHub {
+    fn send_frame_at(&self, frame: Frame, capture_pts_90k: Option<u64>) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let captured_at_ms = crate::source::now_ms();
         let preview_frame = self.preview.as_ref().map(|_| {
-            CapturedAccessUnit::new(
+            CapturedAccessUnit::with_codec(
                 self.generation,
                 sequence,
                 frame.data.clone(),
                 frame.key_frame,
                 captured_at_ms,
+                self.codec.ps_codec(),
             )
         });
 
         // 这条顺序是硬合同：任何预览错误都发生在主路已经拿到 AU 之后。
+        if let Some(events) = &self.timed_events {
+            let frame_index = sequence - 1;
+            let sequence_pts_90k = frame_index.saturating_mul(crate::source::MEDIA_CLOCK_HZ)
+                / u64::from(self.video_fps);
+            let sequence_next_pts_90k =
+                sequence.saturating_mul(crate::source::MEDIA_CLOCK_HZ) / u64::from(self.video_fps);
+            let (pts_90k, duration_90k) = if let Some(capture_pts_90k) = capture_pts_90k {
+                if let Ok(mut last_pts) = self.last_timed_pts_90k.lock() {
+                    let pts_90k =
+                        last_pts.map_or(capture_pts_90k, |last| capture_pts_90k.max(last));
+                    let duration_90k = last_pts
+                        .map(|last| pts_90k.saturating_sub(last))
+                        .filter(|duration| *duration > 0)
+                        .unwrap_or_else(|| sequence_next_pts_90k.saturating_sub(sequence_pts_90k));
+                    *last_pts = Some(pts_90k);
+                    (pts_90k, duration_90k)
+                } else {
+                    (
+                        capture_pts_90k,
+                        sequence_next_pts_90k.saturating_sub(sequence_pts_90k),
+                    )
+                }
+            } else {
+                (
+                    sequence_pts_90k,
+                    sequence_next_pts_90k.saturating_sub(sequence_pts_90k),
+                )
+            };
+            events.push(crate::source::MediaEvent::Video(
+                crate::source::TimedVideoAu::new(
+                    frame.data.clone(),
+                    self.codec.ps_codec(),
+                    frame.key_frame,
+                    pts_90k,
+                    duration_90k,
+                ),
+            ));
+        }
         self.primary.push(frame);
         if let (Some(input), Some(access_unit)) = (&self.preview, preview_frame) {
             let _ = input.try_send(access_unit);
@@ -859,7 +1470,163 @@ impl FrameSender for EncodedFrameHub {
     }
 }
 
+/// H.265's FFmpeg subprocess may buffer bytes before the Annex-B reader sees
+/// them. Keep the SCK PTS FIFO beside the raw-frame FIFO and attach the next
+/// captured timestamp to each decoded output access unit.
+struct TimedFrameSender<'a> {
+    hub: &'a EncodedFrameHub,
+    pts: &'a Mutex<VecDeque<Option<u64>>>,
+    wait_for_pts: bool,
+    strict_timing: bool,
+    timing_error: Option<&'a Mutex<Option<String>>>,
+    timing_stop: Option<&'a AtomicBool>,
+    initial_timing_wait: AtomicBool,
+}
+
+impl FrameSender for TimedFrameSender<'_> {
+    fn send_frame(&self, frame: Frame) {
+        let capture_pts_90k = if self.strict_timing {
+            if self
+                .timing_stop
+                .is_some_and(|stop| stop.load(Ordering::Acquire))
+                && self
+                    .timing_error
+                    .and_then(|error| error.lock().ok()?.as_ref().cloned())
+                    .is_none()
+            {
+                return;
+            }
+            let timeout = if self.initial_timing_wait.swap(false, Ordering::AcqRel) {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(1)
+            };
+            match pop_strict_timing_pts(self.pts, timeout, self.timing_error) {
+                Ok(pts) => Some(pts),
+                Err(error) => {
+                    report_timing_error(self.timing_stop, self.timing_error, error);
+                    return;
+                }
+            }
+        } else {
+            pop_timing_pts(self.pts, self.wait_for_pts)
+        };
+        self.hub.send_frame_at(frame, capture_pts_90k);
+    }
+}
+
+/// The encoder stats pipe and the encoded AU pipe are independent file
+/// descriptors. Give the stats reader a short bounded window to publish the
+/// matching PTS. The legacy screen H.265 path may still use the sequence clock;
+/// profile-driven camera timing reports an error instead of consuming a late
+/// PTS for the next AU.
+fn pop_timing_pts(pts: &Mutex<VecDeque<Option<u64>>>, wait_for_pts: bool) -> Option<u64> {
+    let deadline = wait_for_pts.then(|| Instant::now() + Duration::from_millis(50));
+    loop {
+        let queued = pts.lock().ok().and_then(|mut pts| pts.pop_front());
+        if queued.is_some() {
+            return queued.flatten();
+        }
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn pop_strict_timing_pts(
+    pts: &Mutex<VecDeque<Option<u64>>>,
+    timeout: Duration,
+    timing_error: Option<&Mutex<Option<String>>>,
+) -> std::result::Result<u64, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(error) = timing_error.and_then(|error| error.lock().ok()?.as_ref().cloned()) {
+            return Err(error);
+        }
+        let queued = pts
+            .lock()
+            .map_err(|_| "camera timing PTS queue lock was poisoned".to_string())?
+            .pop_front();
+        if let Some(value) = queued {
+            return value.ok_or_else(|| "camera encoder emitted an invalid PTS stats line".into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "camera encoder PTS stats did not arrive within {}s",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn report_timing_error(
+    timing_stop: Option<&AtomicBool>,
+    timing_error: Option<&Mutex<Option<String>>>,
+    message: String,
+) {
+    if let Some(error) = timing_error {
+        if let Ok(mut error) = error.lock() {
+            if error.is_none() {
+                *error = Some(message);
+            }
+        }
+    }
+    if let Some(stop) = timing_stop {
+        stop.store(true, Ordering::Release);
+    }
+}
+
 impl LiveSource {
+    /// Parse a live URI and start it with the complete desktop media profile.
+    ///
+    /// The URI identifies the physical source and audio input only.  Video and
+    /// audio encoding settings come from `MediaProfile`, so a stale profile
+    /// embedded in a legacy screen URI cannot silently override the settings
+    /// saved by the desktop media page.
+    pub fn capture_with_profile(
+        uri: &str,
+        profile: MediaProfile,
+        preview: Option<Arc<dyn PreviewSink>>,
+    ) -> Result<Self> {
+        let capture_profile = LiveCaptureProfile::from_media(&profile)?;
+        let spec = LiveSourceSpec::parse(uri)?;
+        #[cfg(target_os = "macos")]
+        {
+            match spec {
+                LiveSourceSpec::Camera {
+                    video_index,
+                    audio_index,
+                    ..
+                } => Self::capture_camera_profile(
+                    video_index,
+                    audio_index,
+                    capture_profile,
+                    preview,
+                    true,
+                ),
+                LiveSourceSpec::Screen {
+                    display_id, audio, ..
+                } => {
+                    Self::capture_screen_profile(display_id, audio, capture_profile, preview, true)
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (capture_profile, preview);
+            match spec {
+                LiveSourceSpec::Camera { .. } => Err(Error::Media(
+                    "canonical camera capture is not supported on this platform".into(),
+                )),
+                LiveSourceSpec::Screen { .. } => Err(Error::Media(
+                    "canonical screen capture is not supported on this platform".into(),
+                )),
+            }
+        }
+    }
+
     /// Parse a complete live URI and start its platform backend.
     pub fn capture(uri: &str, fps: u32, preview: Option<Arc<dyn PreviewSink>>) -> Result<Self> {
         let spec = LiveSourceSpec::parse(uri)?;
@@ -904,17 +1671,25 @@ impl LiveSource {
         fps: u32,
         preview: Option<Arc<dyn PreviewSink>>,
     ) -> Result<Self> {
-        Self::capture_camera_inner(video_index, audio_index, audio_codec, fps, preview)
+        Self::capture_camera_profile(
+            video_index,
+            audio_index,
+            LiveCaptureProfile::legacy_camera(fps, audio_codec),
+            preview,
+            false,
+        )
     }
 
     #[cfg(target_os = "macos")]
-    fn capture_camera_inner(
+    fn capture_camera_profile(
         video_index: u32,
         audio_index: Option<u32>,
-        audio_codec: LiveAudioCodec,
-        fps: u32,
+        profile: LiveCaptureProfile,
         preview: Option<Arc<dyn PreviewSink>>,
+        timed: bool,
     ) -> Result<Self> {
+        let audio_codec = profile.audio_codec;
+        let fps = profile.video_fps;
         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
             Error::Media("macOS camera capture requires ffmpeg with AVFoundation support".into())
         })?;
@@ -924,19 +1699,91 @@ impl LiveSource {
         let input_fps = camera_input_fps(fps);
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let mut command = Command::new(&ffmpeg);
-        let camera_args = camera_command_args_for_test(video_index, audio_index, audio_codec, fps);
+        let mut camera_args = camera_command_args_for_profile(video_index, audio_index, &profile);
+        let mut timing_video_stats_reader: Option<std::fs::File> = None;
+        let mut timing_audio_stats_reader: Option<std::fs::File> = None;
+        let mut timing_stats_writers: Option<(std::fs::File, Option<std::fs::File>)> = None;
+        if timed {
+            append_camera_timing_stats_args(&mut camera_args);
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::process::CommandExt;
+
+                let (reader, writer) = create_camera_timing_stats_pipe()?;
+                let (audio_reader, audio_writer) = if audio_index.is_some() {
+                    let (reader, writer) = create_camera_timing_stats_pipe()?;
+                    (Some(reader), Some(writer))
+                } else {
+                    (None, None)
+                };
+                let video_writer_fd = writer.as_raw_fd();
+                let audio_writer_fd = audio_writer.as_ref().map(AsRawFd::as_raw_fd);
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::dup2(video_writer_fd, 3) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if video_writer_fd != 3 {
+                            libc::close(video_writer_fd);
+                        }
+                        if let Some(audio_writer_fd) = audio_writer_fd {
+                            if libc::dup2(audio_writer_fd, 4) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            if libc::fcntl(4, libc::F_SETFD, 0) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            if audio_writer_fd != 4 {
+                                libc::close(audio_writer_fd);
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+                timing_video_stats_reader = Some(reader);
+                timing_audio_stats_reader = audio_reader;
+                timing_stats_writers = Some((writer, audio_writer));
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(Error::Media(
+                    "camera timed profile requires a Unix timing stats pipe".into(),
+                ));
+            }
+        }
         command.args(&camera_args);
         if audio_index.is_some() {
             // One AVFoundation session owns both Continuity Camera tracks. A second
             // process can make an iPhone microphone stall while video is active.
             command.args(["-map", "0:a:0"]);
-            audio_codec.append_ffmpeg_output(&mut command, "pipe:2");
+            if timed {
+                command.args([
+                    "-stats_enc_post:a",
+                    "pipe:4",
+                    "-stats_enc_post_fmt:a",
+                    "{pts} {tb}",
+                ]);
+            }
+            audio_codec.append_ffmpeg_output_with_sample_rate(
+                &mut command,
+                profile.audio_sample_rate_hz,
+                32,
+                "pipe:2",
+            );
         }
         let video = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::Media(format!("failed to start {video_label}: {e}")))?;
+        // The child owns fd 3/4 after pre_exec duplicates them. Closing the
+        // parent writers is required so both stats readers observe child
+        // shutdown.
+        drop(timing_stats_writers);
 
         let mut startup = StartupChildren::new(video);
         let video_tail = if audio_index.is_some() {
@@ -950,17 +1797,76 @@ impl LiveSource {
         let producer_alive = Arc::new(AtomicBool::new(true));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
-        let generation = NEXT_CAMERA_GENERATION
-            .fetch_add(1, Ordering::Relaxed)
-            .max(1);
+        let generation = crate::preview::next_capture_generation();
         let (preview_input, preview_worker) = preview.map_or((None, None), |sink| {
-            let (input, worker) = spawn_preview_worker(ffmpeg.clone(), fps, generation, sink);
+            let (input, worker) = spawn_preview_worker_with_codec(
+                ffmpeg.clone(),
+                fps,
+                generation,
+                profile.video_codec.ps_codec(),
+                sink,
+            );
             (Some(input), Some(worker))
         });
         let preview_control = preview_worker.as_ref().map(PreviewWorkerHandle::control);
         let tx = Arc::new(LatestFrameQueue::new(2));
         let rx = Arc::clone(&tx);
-        let hub = EncodedFrameHub::new(Arc::clone(&tx), preview_input, generation);
+        let timed_events = timed.then(|| Arc::new(LiveEventQueue::new((fps * 8).max(64) as usize)));
+        let audio_timeline = timed_events.as_ref().and_then(|_| {
+            LiveAudioTimeline::new(profile.audio_sample_rate_hz)
+                .map(|timeline| Arc::new(Mutex::new(timeline)))
+        });
+        let hub = Arc::new(EncodedFrameHub::new_with_timing(
+            Arc::clone(&tx),
+            preview_input,
+            generation,
+            timed_events.clone(),
+            fps,
+            profile.video_codec,
+        ));
+        let timing_video_pts = timed.then(|| Arc::new(Mutex::new(VecDeque::<Option<u64>>::new())));
+        let timing_audio_pts = timed.then(|| Arc::new(Mutex::new(VecDeque::<Option<u64>>::new())));
+        let timing_clock = timed.then(|| Arc::new(CameraTimingClock::new(audio_index.is_some())));
+        if let Some(reader) = timing_video_stats_reader {
+            let timing_pts = timing_video_pts
+                .as_ref()
+                .expect("timed camera video stats must have a PTS queue")
+                .clone();
+            let timing_clock = timing_clock
+                .as_ref()
+                .expect("timed camera stats must have a clock")
+                .clone();
+            let timing_stop = Arc::clone(&stop_flag);
+            let timing_error = Arc::clone(&terminal_error);
+            startup.track(spawn_camera_timing_stats_reader(
+                reader,
+                timing_pts,
+                timing_clock,
+                CameraTimingStream::Video,
+                timing_stop,
+                timing_error,
+            ));
+        }
+        if let Some(reader) = timing_audio_stats_reader {
+            let timing_pts = timing_audio_pts
+                .as_ref()
+                .expect("timed camera audio stats must have a PTS queue")
+                .clone();
+            let timing_clock = timing_clock
+                .as_ref()
+                .expect("timed camera stats must have a clock")
+                .clone();
+            let timing_stop = Arc::clone(&stop_flag);
+            let timing_error = Arc::clone(&terminal_error);
+            startup.track(spawn_camera_timing_stats_reader(
+                reader,
+                timing_pts,
+                timing_clock,
+                CameraTimingStream::Audio,
+                timing_stop,
+                timing_error,
+            ));
+        }
         let mut stdout = startup.children[0]
             .stdout
             .take()
@@ -974,15 +1880,49 @@ impl LiveSource {
             let mut chunk = [0_u8; 32 * 1024];
             let mut total_bytes = 0_u64;
             let mut total_frames = 0_u64;
-            tracing::info!(generation, "camera H.264 stdout reader started");
+            let timed_sender = timing_video_pts.as_ref().map(|pts| TimedFrameSender {
+                hub: hub.as_ref(),
+                pts: pts.as_ref(),
+                wait_for_pts: true,
+                strict_timing: true,
+                timing_error: Some(video_error.as_ref()),
+                timing_stop: Some(video_stop.as_ref()),
+                initial_timing_wait: AtomicBool::new(true),
+            });
+            tracing::info!(
+                generation,
+                codec = profile.video_codec.as_str(),
+                "camera encoded stdout reader started"
+            );
             loop {
+                if video_stop.load(Ordering::Acquire) {
+                    break;
+                }
                 match stdout.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         ready.store(true, Ordering::Release);
                         total_bytes += n as u64;
                         pending.extend_from_slice(&chunk[..n]);
-                        drain_frames(&mut pending, &hub);
+                        match profile.video_codec {
+                            LiveVideoCodec::H264 => {
+                                if let Some(sender) = timed_sender.as_ref() {
+                                    drain_frames(&mut pending, sender);
+                                } else {
+                                    drain_frames(&mut pending, hub.as_ref());
+                                }
+                            }
+                            LiveVideoCodec::H265 => {
+                                if let Some(sender) = timed_sender.as_ref() {
+                                    drain_hevc_frames(&mut pending, sender);
+                                } else {
+                                    drain_hevc_frames(&mut pending, hub.as_ref());
+                                }
+                            }
+                        }
+                        if video_stop.load(Ordering::Acquire) {
+                            break;
+                        }
                         let drained = hub.primary.pushed_total();
                         if drained != total_frames && (drained <= 1 || drained % 150 == 0) {
                             tracing::info!(
@@ -1000,7 +1940,7 @@ impl LiveSource {
                 generation,
                 total_bytes,
                 total_frames,
-                "camera H.264 reader stopped"
+                "camera encoded reader stopped"
             );
             if !video_stop.load(Ordering::Acquire) {
                 if let Ok(mut error) = video_error.lock() {
@@ -1028,15 +1968,60 @@ impl LiveSource {
             let ready_thread = Arc::clone(&ready);
             let audio_stop = Arc::clone(&stop_flag);
             let audio_error = Arc::clone(&terminal_error);
+            let timed_audio_events = timed_events.clone();
+            let timed_audio_timeline = audio_timeline.clone();
+            let timed_audio_pts = timing_audio_pts.clone();
+            let initial_timing_wait = AtomicBool::new(true);
             let audio_reader = std::thread::spawn(move || {
                 let mut parser = EncodedAudioParser::new(audio_codec);
                 let mut chunk = [0_u8; 4096];
                 loop {
+                    if audio_stop.load(Ordering::Acquire) {
+                        break;
+                    }
                     match audio_pipe.read(&mut chunk) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             for packet in parser.push(&chunk[..n]) {
+                                if audio_stop.load(Ordering::Acquire) {
+                                    return;
+                                }
                                 ready_thread.store(true, Ordering::Release);
+                                let capture_pts_90k = match timed_audio_pts.as_ref() {
+                                    Some(pts) => {
+                                        let timeout =
+                                            if initial_timing_wait.swap(false, Ordering::AcqRel) {
+                                                Duration::from_secs(5)
+                                            } else {
+                                                Duration::from_secs(1)
+                                            };
+                                        match pop_strict_timing_pts(
+                                            pts,
+                                            timeout,
+                                            Some(audio_error.as_ref()),
+                                        ) {
+                                            Ok(pts) => Some(pts),
+                                            Err(error) => {
+                                                report_timing_error(
+                                                    Some(audio_stop.as_ref()),
+                                                    Some(audio_error.as_ref()),
+                                                    format!(
+                                                        "camera audio timing stats unavailable: {error}"
+                                                    ),
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                push_timed_audio_at(
+                                    timed_audio_events.as_ref(),
+                                    timed_audio_timeline.as_ref(),
+                                    packet.clone(),
+                                    audio_codec,
+                                    capture_pts_90k,
+                                );
                                 match audio_tx.try_send(packet) {
                                     Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
                                     Err(mpsc::TrySendError::Disconnected(_)) => return,
@@ -1079,8 +2064,10 @@ impl LiveSource {
             audio_enabled: audio_index.is_some(),
             audio_credit_90k: 0,
             audio_codec,
+            audio_sample_rate_hz: profile.audio_sample_rate_hz,
             fps,
-            codec: LiveVideoCodec::H264,
+            codec: profile.video_codec,
+            timed_events,
             children,
             worker_threads,
             stop_flag,
@@ -1103,14 +2090,54 @@ impl LiveSource {
         profile: LiveVideoProfile,
         fps: u32,
     ) -> Result<Self> {
+        Self::capture_screen_profile(
+            display_id,
+            audio,
+            LiveCaptureProfile::legacy_screen(profile, fps, audio_codec),
+            None,
+            false,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_screen_profile(
+        display_id: u32,
+        audio: LiveAudioSource,
+        profile: LiveCaptureProfile,
+        preview: Option<Arc<dyn PreviewSink>>,
+        timed: bool,
+    ) -> Result<Self> {
         use openh264::encoder::{Encoder, EncoderConfig, RateControlMode};
         use openh264::formats::{RgbSliceU8, YUVBuffer};
         use openh264::OpenH264API;
-        use screencapturekit::cm::{CMSampleBufferExt, SCFrameStatus};
+        use screencapturekit::cm::CMSampleBufferExt;
         use screencapturekit::cv::CVPixelBufferLockFlags;
         use screencapturekit::prelude::*;
 
-        profile.validate()?;
+        validate_screen_dimension(profile.width, "screen width")?;
+        validate_screen_dimension(profile.height, "screen height")?;
+        let long_side = profile.width.max(profile.height);
+        let short_side = profile.width.min(profile.height);
+        if long_side > MAX_SCREEN_LONG_SIDE || short_side > MAX_SCREEN_SHORT_SIDE {
+            return Err(Error::Media(format!(
+                "screen resolution {}x{} exceeds the OpenH264 limit of 3840x2160",
+                profile.width, profile.height
+            )));
+        }
+        if !(MIN_SCREEN_BITRATE_KBPS..=MAX_SCREEN_BITRATE_KBPS).contains(&profile.bitrate_kbps) {
+            return Err(Error::Media(format!(
+                "screen bitrate must be between {MIN_SCREEN_BITRATE_KBPS} and {MAX_SCREEN_BITRATE_KBPS} kbps"
+            )));
+        }
+        let use_sck_microphone = uses_sck_microphone_capture(timed, audio);
+        let microphone_device_id = match audio {
+            LiveAudioSource::Microphone(index) if use_sck_microphone => Some(
+                resolve_sck_microphone_device_id(ffmpeg_bin().as_deref(), index)?,
+            ),
+            _ => None,
+        };
+        let audio_codec = profile.audio_codec;
+        let fps = profile.video_fps;
         let width = profile.width as usize;
         let height = profile.height as usize;
         let rgb_buffer_len = width * height * 3;
@@ -1140,7 +2167,7 @@ impl LiveSource {
             .with_display(display)
             .with_excluding_windows(&[])
             .build();
-        let config = SCStreamConfiguration::new()
+        let mut config = SCStreamConfiguration::new()
             .with_width(profile.width)
             .with_height(profile.height)
             .with_pixel_format(PixelFormat::BGRA)
@@ -1148,27 +2175,85 @@ impl LiveSource {
             .with_fps(fps)
             .with_queue_depth(6)
             .with_captures_audio(matches!(audio, LiveAudioSource::System))
-            .with_sample_rate(audio_codec.sample_rate())
+            .with_captures_microphone(use_sck_microphone)
+            .with_sample_rate(profile.audio_sample_rate_hz as i32)
             .with_channel_count(1);
+        if use_sck_microphone && !config.captures_microphone() {
+            return Err(Error::Media(
+                "屏幕麦克风采集需要 macOS 15 或更高版本，并使用已启用麦克风能力的构建".into(),
+            ));
+        }
+        if let Some(device_id) = microphone_device_id.as_deref() {
+            config = config.with_microphone_capture_device_id(device_id);
+        }
 
         let tx = Arc::new(LatestFrameQueue::new(2));
         let rx = Arc::clone(&tx);
-        let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<u8>>(2);
+        let (raw_tx, raw_rx) = mpsc::sync_channel::<ScreenRawFrame>(2);
+        let screen_frame_state = Arc::new(Mutex::new(ScreenFrameState::default()));
         let video_ready = Arc::new(AtomicBool::new(false));
         let producer_alive = Arc::new(AtomicBool::new(true));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
+        let capture_clock = Arc::new(if timed {
+            let origin = core_media_host_time_90k().ok_or_else(|| {
+                Error::Media(
+                    "ScreenCaptureKit timed capture could not read the CoreMedia host clock".into(),
+                )
+            })?;
+            LiveCaptureClock::with_origin(origin)
+        } else {
+            LiveCaptureClock::default()
+        });
+        let generation = crate::preview::next_capture_generation();
+        let (preview_input, preview_worker) = match preview {
+            Some(sink) => match ffmpeg_bin() {
+                Some(ffmpeg) => {
+                    let (input, worker) = spawn_preview_worker_with_codec(
+                        ffmpeg,
+                        fps,
+                        generation,
+                        profile.video_codec.ps_codec(),
+                        sink,
+                    );
+                    (Some(input), Some(worker))
+                }
+                None => {
+                    sink.unavailable(
+                        "screen preview requires the bundled FFmpeg executable".into(),
+                    );
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
+        let preview_control = preview_worker.as_ref().map(PreviewWorkerHandle::control);
         let ready = Arc::clone(&video_ready);
         let encoder_stop = Arc::clone(&stop_flag);
         let encoder_alive = Arc::clone(&producer_alive);
         let mut screen_startup = StartupChildren::empty();
-        match profile.codec {
+        let timed_events = timed.then(|| Arc::new(LiveEventQueue::new((fps * 8).max(64) as usize)));
+        let audio_timeline = timed_events.as_ref().and_then(|_| {
+            LiveAudioTimeline::new(profile.audio_sample_rate_hz)
+                .map(|timeline| Arc::new(Mutex::new(timeline)))
+        });
+        let audio_capture_origin = timed.then(|| Arc::new(LiveAudioCaptureOrigin::default()));
+        let hub = Arc::new(EncodedFrameHub::new_with_timing(
+            Arc::clone(&tx),
+            preview_input,
+            generation,
+            timed_events.clone(),
+            fps,
+            profile.video_codec,
+        ));
+        match profile.video_codec {
             LiveVideoCodec::H264 => {
+                let keyframe_interval_frames = profile.keyframe_interval_frames();
                 let encoder_config = EncoderConfig::new()
                     .set_bitrate_bps(profile.bitrate_kbps * 1000)
                     .max_frame_rate(fps as f32)
                     .rate_control_mode(RateControlMode::Bitrate)
-                    .enable_skip_frame(true);
+                    .enable_skip_frame(false);
                 let mut encoder = Encoder::with_api_config(
                     OpenH264API::from_source(),
                     encoder_config,
@@ -1176,13 +2261,27 @@ impl LiveSource {
                 .map_err(|e| {
                     Error::Media(format!("failed to initialize OpenH264 screen encoder: {e}"))
                 })?;
+                let hub = Arc::clone(&hub);
+                let encoder_error = Arc::clone(&terminal_error);
                 let encoder_thread = std::thread::spawn(move || {
+                    let mut frame_index = 0_u32;
                     while !encoder_stop.load(Ordering::Acquire) {
-                        let bgra = match raw_rx.recv_timeout(Duration::from_millis(100)) {
+                        let raw_frame = match raw_rx.recv_timeout(Duration::from_millis(100)) {
                             Ok(frame) => frame,
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         };
+                        let capture_pts_90k = raw_frame.pts_90k;
+                        if timed && capture_pts_90k.is_none() {
+                            report_timing_error(
+                                Some(encoder_stop.as_ref()),
+                                Some(encoder_error.as_ref()),
+                                "screen capture video frame has no valid presentation timestamp"
+                                    .into(),
+                            );
+                            break;
+                        }
+                        let bgra = raw_frame.data;
                         let mut rgb = vec![0_u8; rgb_buffer_len];
                         for (pixel, out) in bgra.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
                             out[0] = pixel[2];
@@ -1191,16 +2290,24 @@ impl LiveSource {
                         }
                         let yuv =
                             YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (width, height)));
+                        if frame_index > 0 && frame_index % keyframe_interval_frames == 0 {
+                            encoder.force_intra_frame();
+                        }
                         let Ok(bitstream) = encoder.encode(&yuv) else {
+                            frame_index = frame_index.saturating_add(1);
                             continue;
                         };
+                        frame_index = frame_index.saturating_add(1);
                         let data = bitstream.to_vec();
                         if !data.is_empty() {
                             ready.store(true, Ordering::Release);
-                            tx.send_frame(Frame {
-                                key_frame: h264_is_keyframe(&data),
-                                data,
-                            });
+                            hub.send_frame_at(
+                                Frame {
+                                    key_frame: h264_is_keyframe(&data),
+                                    data,
+                                },
+                                capture_pts_90k,
+                            );
                         }
                     }
                     encoder_alive.store(false, Ordering::Release);
@@ -1213,38 +2320,8 @@ impl LiveSource {
                         "H.265 screen encoding requires the bundled FFmpeg executable".into(),
                     )
                 })?;
-                let size = format!("{}x{}", profile.width, profile.height);
-                let fps_text = fps.to_string();
-                let bitrate = format!("{}k", profile.bitrate_kbps);
                 let mut child = Command::new(&ffmpeg)
-                    .args([
-                        "-hide_banner",
-                        "-nostdin",
-                        "-f",
-                        "rawvideo",
-                        "-pixel_format",
-                        "bgra",
-                        "-video_size",
-                        &size,
-                        "-framerate",
-                        &fps_text,
-                        "-i",
-                        "pipe:0",
-                        "-an",
-                        "-c:v",
-                        "hevc_videotoolbox",
-                        "-allow_sw",
-                        "1",
-                        "-realtime",
-                        "1",
-                        "-b:v",
-                        &bitrate,
-                        "-g",
-                        &fps_text,
-                        "-f",
-                        "hevc",
-                        "pipe:1",
-                    ])
+                    .args(screen_hevc_command_args(&profile))
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -1263,6 +2340,8 @@ impl LiveSource {
                 screen_startup.track(stderr_thread);
                 let writer_tail = Arc::clone(&stderr_tail);
                 let reader_tail = Arc::clone(&stderr_tail);
+                let encoded_pts = Arc::new(Mutex::new(VecDeque::<Option<u64>>::new()));
+                let writer_pts = Arc::clone(&encoded_pts);
                 let writer_stop = Arc::clone(&stop_flag);
                 let writer_error = Arc::clone(&terminal_error);
                 let writer_thread = std::thread::spawn(move || {
@@ -1272,7 +2351,19 @@ impl LiveSource {
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         };
-                        if let Err(error) = std::io::Write::write_all(&mut stdin, &frame) {
+                        if timed && frame.pts_90k.is_none() {
+                            report_timing_error(
+                                Some(writer_stop.as_ref()),
+                                Some(writer_error.as_ref()),
+                                "screen capture video frame has no valid presentation timestamp"
+                                    .into(),
+                            );
+                            break;
+                        }
+                        if let Ok(mut pts) = writer_pts.lock() {
+                            pts.push_back(frame.pts_90k);
+                        }
+                        if let Err(error) = std::io::Write::write_all(&mut stdin, &frame.data) {
                             if let Ok(mut terminal) = writer_error.lock() {
                                 *terminal = Some(format!(
                                     "H.265 screen encoder input failed: {error}; stderr: {}",
@@ -1286,15 +2377,32 @@ impl LiveSource {
                 screen_startup.track(writer_thread);
                 let reader_stop = Arc::clone(&stop_flag);
                 let reader_error = Arc::clone(&terminal_error);
+                let hub = Arc::clone(&hub);
+                let reader_pts = Arc::clone(&encoded_pts);
                 let reader_thread = std::thread::spawn(move || {
                     let mut pending = Vec::with_capacity(512 * 1024);
                     let mut chunk = [0_u8; 64 * 1024];
+                    let timed_sender = TimedFrameSender {
+                        hub: hub.as_ref(),
+                        pts: reader_pts.as_ref(),
+                        wait_for_pts: timed,
+                        strict_timing: timed,
+                        timing_error: timed.then_some(reader_error.as_ref()),
+                        timing_stop: timed.then_some(reader_stop.as_ref()),
+                        initial_timing_wait: AtomicBool::new(timed),
+                    };
                     loop {
+                        if reader_stop.load(Ordering::Acquire) {
+                            break;
+                        }
                         match stdout.read(&mut chunk) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 pending.extend_from_slice(&chunk[..n]);
-                                drain_hevc_frames(&mut pending, tx.as_ref());
+                                drain_hevc_frames(&mut pending, &timed_sender);
+                                if reader_stop.load(Ordering::Acquire) {
+                                    break;
+                                }
                                 ready.store(true, Ordering::Release);
                             }
                         }
@@ -1325,36 +2433,87 @@ impl LiveSource {
             delegate_alive.store(false, Ordering::Release);
         });
         let mut stream = SCStream::new_with_delegate(&filter, &config, delegate);
+        let video_capture_clock = Arc::clone(&capture_clock);
+        let video_timing_stop = Arc::clone(&stop_flag);
+        let video_timing_error = Arc::clone(&terminal_error);
+        let video_frame_state = Arc::clone(&screen_frame_state);
         if stream
             .add_output_handler(
                 move |sample: CMSampleBuffer, _| {
-                    if sample
-                        .frame_status()
-                        .is_some_and(|s| s != SCFrameStatus::Complete)
+                    let frame_status = sample.frame_status();
+                    let action = screen_frame_action(frame_status);
+                    let action = if action == ScreenFrameAction::Ignore
+                        && frame_status.is_none()
+                        && !timed
                     {
+                        // The legacy API predates the status attachment. Keep
+                        // its existing image-buffer fallback, while the
+                        // profile-driven timed path remains strict.
+                        ScreenFrameAction::Fresh
+                    } else {
+                        action
+                    };
+                    if action == ScreenFrameAction::Ignore {
+                        if timed && frame_status.is_none() {
+                            report_timing_error(
+                                Some(video_timing_stop.as_ref()),
+                                Some(video_timing_error.as_ref()),
+                                "screen capture video sample has an unknown frame status".into(),
+                            );
+                        }
                         return;
                     }
-                    let Some(pixel_buffer) = sample.image_buffer() else {
+                    let capture_pts_90k = sample.presentation_timestamp();
+                    let capture_pts_90k = time_value_to_90k(
+                        capture_pts_90k.value,
+                        capture_pts_90k.timescale,
+                        capture_pts_90k.is_valid(),
+                    )
+                    .map(|pts| video_capture_clock.normalize(pts));
+                    if timed && capture_pts_90k.is_none() {
+                        report_timing_error(
+                            Some(video_timing_stop.as_ref()),
+                            Some(video_timing_error.as_ref()),
+                            "screen capture video sample has no valid presentation timestamp"
+                                .into(),
+                        );
+                        return;
+                    }
+                    let fresh_bgra = if action == ScreenFrameAction::Fresh {
+                        let Some(pixel_buffer) = sample.image_buffer() else {
+                            return;
+                        };
+                        let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+                            return;
+                        };
+                        if guard.width() != width || guard.height() != height {
+                            return;
+                        }
+                        let source = guard.as_slice();
+                        let stride = guard.bytes_per_row();
+                        let row_bytes = width * 4;
+                        if stride < row_bytes || source.len() < stride.saturating_mul(height) {
+                            return;
+                        }
+                        let mut packed = Vec::with_capacity(bgra_buffer_len);
+                        for y in 0..height {
+                            let start = y * stride;
+                            packed.extend_from_slice(&source[start..start + row_bytes]);
+                        }
+                        Some(packed)
+                    } else {
+                        // An Idle sample explicitly carries no newly
+                        // generated image. The previous complete BGRA buffer
+                        // is supplied by ScreenFrameState below.
+                        None
+                    };
+                    let Ok(mut state) = video_frame_state.lock() else {
                         return;
                     };
-                    let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+                    let Some(frame) = state.accept(action, fresh_bgra, capture_pts_90k) else {
                         return;
                     };
-                    if guard.width() != width || guard.height() != height {
-                        return;
-                    }
-                    let source = guard.as_slice();
-                    let stride = guard.bytes_per_row();
-                    let row_bytes = width * 4;
-                    if stride < row_bytes || source.len() < stride.saturating_mul(height) {
-                        return;
-                    }
-                    let mut packed = Vec::with_capacity(bgra_buffer_len);
-                    for y in 0..height {
-                        let start = y * stride;
-                        packed.extend_from_slice(&source[start..start + row_bytes]);
-                    }
-                    let _ = raw_tx.try_send(packed);
+                    let _ = raw_tx.try_send(frame);
                 },
                 SCStreamOutputType::Screen,
             )
@@ -1368,14 +2527,35 @@ impl LiveSource {
         let mut audio_rx = None;
         let mut microphone_ready = None;
         let mut microphone_tail = None;
+        let use_sck_audio = matches!(audio, LiveAudioSource::System) || use_sck_microphone;
         match audio {
-            LiveAudioSource::System => {
+            LiveAudioSource::System | LiveAudioSource::Microphone(_) if use_sck_audio => {
+                let output_type = match audio {
+                    LiveAudioSource::System => SCStreamOutputType::Audio,
+                    LiveAudioSource::Microphone(_) => SCStreamOutputType::Microphone,
+                    LiveAudioSource::None => unreachable!(),
+                };
+                let source_label = match audio {
+                    LiveAudioSource::System => "system audio".to_string(),
+                    LiveAudioSource::Microphone(index) => {
+                        format!("screen microphone index {index}")
+                    }
+                    LiveAudioSource::None => unreachable!(),
+                };
                 let (audio_tx, receiver) = mpsc::sync_channel(50);
                 match audio_codec {
                     LiveAudioCodec::G711A | LiveAudioCodec::G711U => {
-                        let packetizer =
-                            Arc::new(Mutex::new(G711Packetizer::new(audio_tx, audio_codec)));
+                        let packetizer = Arc::new(Mutex::new(G711Packetizer::new_with_timing(
+                            audio_tx,
+                            audio_codec,
+                            timed_events.clone(),
+                            audio_timeline.clone(),
+                        )));
                         let packetizer_handler = Arc::clone(&packetizer);
+                        let capture_clock = Arc::clone(&capture_clock);
+                        let audio_timing_stop = Arc::clone(&stop_flag);
+                        let audio_timing_error = Arc::clone(&terminal_error);
+                        let callback_label = source_label.clone();
                         if stream
                             .add_output_handler(
                                 move |sample: CMSampleBuffer, _| {
@@ -1385,6 +2565,24 @@ impl LiveSource {
                                     let Ok(mut packetizer) = packetizer_handler.lock() else {
                                         return;
                                     };
+                                    let capture_pts_90k = sample.presentation_timestamp();
+                                    let capture_pts_90k = time_value_to_90k(
+                                        capture_pts_90k.value,
+                                        capture_pts_90k.timescale,
+                                        capture_pts_90k.is_valid(),
+                                    )
+                                    .map(|pts| capture_clock.normalize(pts));
+                                    if timed && capture_pts_90k.is_none() {
+                                        report_timing_error(
+                                            Some(audio_timing_stop.as_ref()),
+                                            Some(audio_timing_error.as_ref()),
+                                            format!(
+                                                "screen capture {callback_label} sample has no valid presentation timestamp"
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                    packetizer.set_capture_pts(capture_pts_90k);
                                     for buffer in &list {
                                         for bytes in buffer.data().chunks_exact(4) {
                                             packetizer.push(f32::from_ne_bytes([
@@ -1393,24 +2591,26 @@ impl LiveSource {
                                         }
                                     }
                                 },
-                                SCStreamOutputType::Audio,
+                                output_type,
                             )
                             .is_none()
                         {
                             return Err(Error::Media(
-                                "ScreenCaptureKit rejected the system-audio output handler".into(),
+                                format!(
+                                    "ScreenCaptureKit rejected the {source_label} output handler"
+                                ),
                             ));
                         }
                     }
                     LiveAudioCodec::Aac | LiveAudioCodec::Opus => {
                         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
-                            Error::Media(
-                                "AAC/Opus system-audio encoding requires bundled FFmpeg".into(),
-                            )
+                            Error::Media(format!(
+                                "AAC/Opus {source_label} encoding requires bundled FFmpeg"
+                            ))
                         })?;
                         ensure_audio_encoder(&ffmpeg, audio_codec)?;
-                        let label = format!("system audio {} encoder", audio_codec.as_str());
-                        let sample_rate = audio_codec.sample_rate().to_string();
+                        let label = format!("{source_label} {} encoder", audio_codec.as_str());
+                        let sample_rate = profile.audio_sample_rate_hz.to_string();
                         let mut command = Command::new(&ffmpeg);
                         command.args([
                             "-hide_banner",
@@ -1427,7 +2627,12 @@ impl LiveSource {
                             "pipe:0",
                             "-vn",
                         ]);
-                        audio_codec.append_ffmpeg_output(&mut command, "pipe:1");
+                        audio_codec.append_ffmpeg_output_with_sample_rate(
+                            &mut command,
+                            profile.audio_sample_rate_hz,
+                            32,
+                            "pipe:1",
+                        );
                         let mut encoder = command
                             .stdin(Stdio::piped())
                             .stdout(Stdio::piped())
@@ -1447,12 +2652,37 @@ impl LiveSource {
                         screen_startup.track(stderr_thread);
                         let input = Arc::new(Mutex::new(stdin));
                         let callback_input = Arc::clone(&input);
+                        let capture_clock = Arc::clone(&capture_clock);
+                        let callback_audio_capture_origin = audio_capture_origin.clone();
+                        let audio_timing_stop = Arc::clone(&stop_flag);
+                        let audio_timing_error = Arc::clone(&terminal_error);
+                        let callback_label = source_label.clone();
                         if stream
                             .add_output_handler(
                                 move |sample: CMSampleBuffer, _| {
                                     let Some(list) = sample.audio_buffer_list() else {
                                         return;
                                     };
+                                    let capture_pts = sample.presentation_timestamp();
+                                    let capture_pts_90k = time_value_to_90k(
+                                        capture_pts.value,
+                                        capture_pts.timescale,
+                                        capture_pts.is_valid(),
+                                    )
+                                    .map(|pts| capture_clock.normalize(pts));
+                                    if timed && capture_pts_90k.is_none() {
+                                        report_timing_error(
+                                            Some(audio_timing_stop.as_ref()),
+                                            Some(audio_timing_error.as_ref()),
+                                            format!(
+                                                "screen capture {callback_label} sample has no valid presentation timestamp"
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                    if let Some(origin) = callback_audio_capture_origin.as_ref() {
+                                        origin.observe(capture_pts_90k);
+                                    }
                                     let Ok(mut input) = callback_input.lock() else {
                                         return;
                                     };
@@ -1462,13 +2692,15 @@ impl LiveSource {
                                         }
                                     }
                                 },
-                                SCStreamOutputType::Audio,
+                                output_type,
                             )
                             .is_none()
                         {
                             let _ = encoder.kill();
                             return Err(Error::Media(
-                                "ScreenCaptureKit rejected the system-audio output handler".into(),
+                                format!(
+                                    "ScreenCaptureKit rejected the {source_label} output handler"
+                                ),
                             ));
                         }
                         let ready = Arc::new(AtomicBool::new(false));
@@ -1476,6 +2708,9 @@ impl LiveSource {
                         let audio_stop = Arc::clone(&stop_flag);
                         let audio_error = Arc::clone(&terminal_error);
                         let reader_tail = Arc::clone(&tail);
+                        let timed_audio_events = timed_events.clone();
+                        let timed_audio_timeline = audio_timeline.clone();
+                        let timed_audio_origin = audio_capture_origin.clone();
                         let reader_thread = std::thread::spawn(move || {
                             let mut parser = EncodedAudioParser::new(audio_codec);
                             let mut chunk = [0_u8; 4096];
@@ -1485,6 +2720,26 @@ impl LiveSource {
                                     Ok(n) => {
                                         for packet in parser.push(&chunk[..n]) {
                                             ready_thread.store(true, Ordering::Release);
+                                            let capture_pts_90k = match sck_audio_capture_origin(
+                                                timed_audio_origin.as_deref(),
+                                            ) {
+                                                Ok(pts) => pts,
+                                                Err(error) => {
+                                                    report_timing_error(
+                                                        Some(audio_stop.as_ref()),
+                                                        Some(audio_error.as_ref()),
+                                                        error,
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                            push_timed_audio_at(
+                                                timed_audio_events.as_ref(),
+                                                timed_audio_timeline.as_ref(),
+                                                packet.clone(),
+                                                audio_codec,
+                                                capture_pts_90k,
+                                            );
                                             match audio_tx.try_send(packet) {
                                                 Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
                                                 Err(mpsc::TrySendError::Disconnected(_)) => return,
@@ -1510,6 +2765,7 @@ impl LiveSource {
                 }
                 audio_rx = Some(receiver);
             }
+            LiveAudioSource::System => unreachable!("system audio must use ScreenCaptureKit"),
             LiveAudioSource::Microphone(index) => {
                 let ffmpeg = ffmpeg_bin().ok_or_else(|| {
                     Error::Media("screen microphone capture requires bundled FFmpeg".into())
@@ -1527,7 +2783,12 @@ impl LiveSource {
                     &input,
                     "-vn",
                 ]);
-                audio_codec.append_ffmpeg_output(&mut command, "pipe:1");
+                audio_codec.append_ffmpeg_output_with_sample_rate(
+                    &mut command,
+                    profile.audio_sample_rate_hz,
+                    32,
+                    "pipe:1",
+                );
                 let microphone = command
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -1547,6 +2808,8 @@ impl LiveSource {
                 let ready_thread = Arc::clone(&ready);
                 let audio_stop = Arc::clone(&stop_flag);
                 let audio_error = Arc::clone(&terminal_error);
+                let timed_audio_events = timed_events.clone();
+                let timed_audio_timeline = audio_timeline.clone();
                 let reader_thread = std::thread::spawn(move || {
                     let mut parser = EncodedAudioParser::new(audio_codec);
                     let mut chunk = [0_u8; 4096];
@@ -1556,6 +2819,12 @@ impl LiveSource {
                             Ok(n) => {
                                 for packet in parser.push(&chunk[..n]) {
                                     ready_thread.store(true, Ordering::Release);
+                                    push_timed_audio(
+                                        timed_audio_events.as_ref(),
+                                        timed_audio_timeline.as_ref(),
+                                        packet.clone(),
+                                        audio_codec,
+                                    );
                                     match audio_tx.try_send(packet) {
                                         Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
                                         Err(mpsc::TrySendError::Disconnected(_)) => return,
@@ -1648,15 +2917,17 @@ impl LiveSource {
             audio_enabled: audio.is_enabled(),
             audio_credit_90k: 0,
             audio_codec,
+            audio_sample_rate_hz: profile.audio_sample_rate_hz,
             fps,
-            codec: profile.codec,
+            codec: profile.video_codec,
+            timed_events,
             children,
             worker_threads,
             stop_flag,
             producer_alive,
             terminal_error,
-            preview_worker: None,
-            preview_control: None,
+            preview_worker,
+            preview_control,
             screen_stream: Some(stream),
             last_key: None,
             consecutive_empty: 0,
@@ -1678,27 +2949,38 @@ fn cfr_output_args(output_fps: &str) -> [&str; 4] {
     ["-r", output_fps, "-fps_mode", "cfr"]
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn camera_command_args_for_test(
     video_index: u32,
     audio_index: Option<u32>,
-    _audio_codec: LiveAudioCodec,
+    audio_codec: LiveAudioCodec,
     fps: u32,
 ) -> Vec<String> {
-    let input_fps = camera_input_fps(fps);
+    let profile = LiveCaptureProfile::legacy_camera(fps, audio_codec);
+    camera_command_args_for_profile(video_index, audio_index, &profile)
+}
+
+#[cfg(target_os = "macos")]
+fn camera_command_args_for_profile(
+    video_index: u32,
+    audio_index: Option<u32>,
+    profile: &LiveCaptureProfile,
+) -> Vec<String> {
+    let input_fps = camera_input_fps(profile.video_fps);
     let input = audio_index.map_or_else(
         || format!("{video_index}:none"),
         |index| format!("{video_index}:{index}"),
     );
-    let output_fps = fps.max(1).to_string();
+    let output_fps = profile.video_fps.max(1).to_string();
     let cfr_args = cfr_output_args(&output_fps);
     let input_fps = input_fps.to_string();
-    let x264_params = format!(
-        "slices=1:sliced-threads=0:repeat-headers=1:keyint={}:min-keyint={}:scenecut=0:rc-lookahead=0",
-        fps.max(1),
-        fps.max(1)
+    let keyframe_interval = profile.keyframe_interval_frames().to_string();
+    let bitrate = format!("{}k", profile.bitrate_kbps);
+    let output_size = format!(
+        "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
+        profile.width, profile.height, profile.width, profile.height
     );
-    vec![
+    let mut args = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
         "-loglevel".into(),
@@ -1733,33 +3015,229 @@ fn camera_command_args_for_test(
         input,
         "-map".into(),
         "0:v:0".into(),
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "ultrafast".into(),
-        "-tune".into(),
-        "zerolatency".into(),
-        "-x264-params".into(),
-        x264_params,
-        "-bf".into(),
-        "0".into(),
-        "-refs".into(),
-        "1".into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
         "-vf".into(),
-        "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2"
-            .into(),
+        output_size,
+        "-b:v".into(),
+        bitrate,
         "-g".into(),
-        output_fps.clone(),
+        keyframe_interval,
         cfr_args[0].into(),
         cfr_args[1].into(),
         cfr_args[2].into(),
         cfr_args[3].into(),
         "-f".into(),
-        "h264".into(),
+        profile.video_codec.ffmpeg_format().into(),
         "-flush_packets".into(),
         "1".into(),
+        "pipe:1".into(),
+    ];
+    let encoder_args = match profile.video_codec {
+        LiveVideoCodec::H264 => vec![
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "ultrafast".into(),
+            "-tune".into(),
+            "zerolatency".into(),
+            "-x264-params".into(),
+            format!(
+                "slices=1:sliced-threads=0:repeat-headers=1:keyint={}:min-keyint={}:scenecut=0:rc-lookahead=0",
+                profile.keyframe_interval_frames(),
+                profile.keyframe_interval_frames()
+            ),
+            "-bf".into(),
+            "0".into(),
+            "-refs".into(),
+            "1".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ],
+        LiveVideoCodec::H265 => vec![
+            "-c:v".into(),
+            "hevc_videotoolbox".into(),
+            "-allow_sw".into(),
+            "1".into(),
+            "-realtime".into(),
+            "1".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ],
+    };
+    let bitrate_position = args
+        .iter()
+        .position(|arg| arg == "-b:v")
+        .expect("camera output must include a video bitrate");
+    args.splice(bitrate_position..bitrate_position, encoder_args);
+    args
+}
+
+#[cfg(target_os = "macos")]
+fn append_camera_timing_stats_args(args: &mut Vec<String>) {
+    let output_position = args
+        .iter()
+        .rposition(|arg| arg == "pipe:1")
+        .expect("camera output must be pipe:1");
+    args.splice(
+        output_position..output_position,
+        [
+            "-stats_enc_post:v".into(),
+            "pipe:3".into(),
+            "-stats_enc_post_fmt:v".into(),
+            "{pts} {tb}".into(),
+        ],
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn create_camera_timing_stats_pipe() -> Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(Error::Media(format!(
+            "failed to create camera timing stats pipe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: libc::pipe returned two owned descriptors; each is transferred
+    // exactly once into a File and closed by Drop.
+    let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(Error::Media(format!(
+                "failed to mark camera timing stats pipe close-on-exec: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok((reader, writer))
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_camera_timing_stats_reader(
+    reader: std::fs::File,
+    timing_pts: Arc<Mutex<VecDeque<Option<u64>>>>,
+    timing_clock: Arc<CameraTimingClock>,
+    stream: CameraTimingStream,
+    timing_stop: Arc<AtomicBool>,
+    timing_error: Arc<Mutex<Option<String>>>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let stream_name = match stream {
+            CameraTimingStream::Video => "video",
+            CameraTimingStream::Audio => "audio",
+        };
+        let mut saw_stats = false;
+        for line in BufReader::new(reader).lines().map_while(|line| line.ok()) {
+            let Some(value) = parse_ffmpeg_timing_stats_line(&line) else {
+                timing_clock.notify_failure();
+                report_timing_error(
+                    Some(timing_stop.as_ref()),
+                    Some(timing_error.as_ref()),
+                    format!("camera {stream_name} encoder emitted an invalid PTS stats line"),
+                );
+                return;
+            };
+            saw_stats = true;
+            timing_clock.observe(stream, value);
+            let normalized = match timing_clock.normalize(value) {
+                Ok(value) => value,
+                Err(error) => {
+                    timing_clock.notify_failure();
+                    report_timing_error(
+                        Some(timing_stop.as_ref()),
+                        Some(timing_error.as_ref()),
+                        format!("camera {stream_name} timing stats unavailable: {error}"),
+                    );
+                    return;
+                }
+            };
+            let Ok(mut pts) = timing_pts.lock() else {
+                timing_clock.notify_failure();
+                report_timing_error(
+                    Some(timing_stop.as_ref()),
+                    Some(timing_error.as_ref()),
+                    format!("camera {stream_name} timing PTS queue lock was poisoned"),
+                );
+                return;
+            };
+            if pts.len() >= 256 {
+                timing_clock.notify_failure();
+                report_timing_error(
+                    Some(timing_stop.as_ref()),
+                    Some(timing_error.as_ref()),
+                    format!("camera {stream_name} timing PTS queue overflowed"),
+                );
+                return;
+            }
+            pts.push_back(Some(normalized));
+        }
+        if !saw_stats && !timing_stop.load(Ordering::Acquire) {
+            timing_clock.notify_failure();
+            report_timing_error(
+                Some(timing_stop.as_ref()),
+                Some(timing_error.as_ref()),
+                format!("camera {stream_name} timing stats closed before the first PTS"),
+            );
+        }
+    })
+}
+
+fn parse_ffmpeg_timing_stats_line(line: &str) -> Option<i128> {
+    let mut fields = line.split_whitespace();
+    let pts = fields.next()?.parse::<i128>().ok()?;
+    let time_base = fields.next()?;
+    let (numerator, denominator) = time_base.split_once('/')?;
+    let numerator = numerator.parse::<i128>().ok()?;
+    let denominator = denominator.parse::<i128>().ok()?;
+    if numerator == 0 || denominator <= 0 {
+        return None;
+    }
+    pts.checked_mul(numerator)?
+        .checked_mul(i128::from(crate::source::MEDIA_CLOCK_HZ))?
+        .checked_div(denominator)
+}
+
+#[cfg(target_os = "macos")]
+fn screen_hevc_command_args(profile: &LiveCaptureProfile) -> Vec<String> {
+    let size = format!("{}x{}", profile.width, profile.height);
+    let fps = profile.video_fps.to_string();
+    let bitrate = format!("{}k", profile.bitrate_kbps);
+    let keyframe_interval = profile.keyframe_interval_frames().to_string();
+    vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pixel_format".into(),
+        "bgra".into(),
+        "-video_size".into(),
+        size,
+        "-framerate".into(),
+        fps.clone(),
+        "-i".into(),
+        "pipe:0".into(),
+        "-an".into(),
+        "-c:v".into(),
+        "hevc_videotoolbox".into(),
+        "-allow_sw".into(),
+        "1".into(),
+        "-realtime".into(),
+        "1".into(),
+        "-b:v".into(),
+        bitrate,
+        "-g".into(),
+        keyframe_interval.clone(),
+        "-keyint_min".into(),
+        keyframe_interval,
+        "-r".into(),
+        fps,
+        "-fps_mode".into(),
+        "cfr".into(),
+        "-f".into(),
+        "hevc".into(),
         "pipe:1".into(),
     ]
 }
@@ -2193,18 +3671,40 @@ struct G711Packetizer {
     pending: Vec<u8>,
     tx: mpsc::SyncSender<Vec<u8>>,
     codec: LiveAudioCodec,
+    timed_events: Option<Arc<LiveEventQueue>>,
+    timed_timeline: Option<Arc<Mutex<LiveAudioTimeline>>>,
+    next_capture_pts_90k: Option<u64>,
 }
 
 impl G711Packetizer {
-    fn new(tx: mpsc::SyncSender<Vec<u8>>, codec: LiveAudioCodec) -> Self {
+    fn new_with_timing(
+        tx: mpsc::SyncSender<Vec<u8>>,
+        codec: LiveAudioCodec,
+        timed_events: Option<Arc<LiveEventQueue>>,
+        timed_timeline: Option<Arc<Mutex<LiveAudioTimeline>>>,
+    ) -> Self {
         Self {
             pending: Vec::with_capacity(G711_PACKET_BYTES * 2),
             tx,
             codec,
+            timed_events,
+            timed_timeline,
+            next_capture_pts_90k: None,
         }
     }
 
     fn push(&mut self, sample: f32) {
+        self.push_with_capture_pts(sample, None);
+    }
+
+    fn set_capture_pts(&mut self, capture_pts_90k: Option<u64>) {
+        if self.pending.is_empty() && capture_pts_90k.is_some() {
+            self.next_capture_pts_90k = capture_pts_90k;
+        }
+    }
+
+    fn push_with_capture_pts(&mut self, sample: f32, capture_pts_90k: Option<u64>) {
+        self.set_capture_pts(capture_pts_90k);
         let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         let encoded = match self.codec {
             LiveAudioCodec::G711A => linear_to_alaw(pcm),
@@ -2215,6 +3715,26 @@ impl G711Packetizer {
         if self.pending.len() == G711_PACKET_BYTES {
             let packet =
                 std::mem::replace(&mut self.pending, Vec::with_capacity(G711_PACKET_BYTES * 2));
+            let capture_pts_90k = self.next_capture_pts_90k;
+            push_timed_audio_at(
+                self.timed_events.as_ref(),
+                self.timed_timeline.as_ref(),
+                packet.clone(),
+                self.codec,
+                capture_pts_90k,
+            );
+            self.next_capture_pts_90k = capture_pts_90k.map(|pts| {
+                pts.saturating_add(
+                    self.codec.frame_duration_90k_at(
+                        self.timed_timeline
+                            .as_ref()
+                            .and_then(|timeline| timeline.lock().ok())
+                            .map_or(self.codec.sample_rate() as u32, |timeline| {
+                                timeline.clock.sample_rate_hz()
+                            }),
+                    ) as u64,
+                )
+            });
             let _ = self.tx.try_send(packet);
         }
     }
@@ -2314,7 +3834,9 @@ impl VideoSource for LiveSource {
         while let Ok(packet) = receiver.try_recv() {
             self.audio_buf.push_back(packet);
         }
-        let frame_duration = self.audio_codec.frame_duration_90k();
+        let frame_duration = self
+            .audio_codec
+            .frame_duration_90k_at(self.audio_sample_rate_hz);
         self.audio_credit_90k = self
             .audio_credit_90k
             .saturating_add(crate::rtp::CLOCK_HZ / self.fps);
@@ -2330,6 +3852,28 @@ impl VideoSource for LiveSource {
         (0..count)
             .filter_map(|_| self.audio_buf.pop_front())
             .collect()
+    }
+
+    fn supports_timed_events(&self) -> bool {
+        self.timed_events.is_some()
+    }
+
+    fn timed_events_are_paced(&self) -> bool {
+        // Events are emitted by the capture/encoder callbacks as they arrive;
+        // the live pusher must not add a second wall-clock cadence.
+        self.timed_events.is_some()
+    }
+
+    fn next_media_event(&mut self) -> Option<crate::source::MediaEvent> {
+        let events = self.timed_events.as_ref()?;
+        if let Some(pts_90k) = events.take_dropped_pts() {
+            return Some(crate::source::MediaEvent::Discontinuity { pts_90k });
+        }
+        events.pop()
+    }
+
+    fn audio_sample_rate_hz(&self) -> u32 {
+        self.audio_sample_rate_hz
     }
 
     fn has_audio(&self) -> bool {
@@ -2577,6 +4121,10 @@ mod tests {
             let status = sink.latest_status.lock().unwrap().clone().unwrap();
             assert_eq!(status.phase, crate::preview::PreviewPhase::Playing);
             assert_eq!(status.recoveries, 2, "两种故障应各触发一次局部恢复");
+        } else {
+            let status = sink.latest_status.lock().unwrap().clone().unwrap();
+            assert_eq!(status.phase, crate::preview::PreviewPhase::Playing);
+            assert_eq!(status.recoveries, 0, "无故障运行不应消耗自动恢复次数");
         }
 
         drop(source);
@@ -2632,6 +4180,506 @@ mod tests {
     #[test]
     fn cfr输出必须显式指定目标帧率() {
         assert_eq!(cfr_output_args("30"), ["-r", "30", "-fps_mode", "cfr"]);
+    }
+
+    #[test]
+    fn 统一媒体配置必须映射为实时编码配置() {
+        let profile = crate::profile::MediaProfile {
+            width: 640,
+            height: 480,
+            video_fps: 15,
+            bitrate_kbps: 600,
+            keyframe_interval_seconds: 4,
+            video_codec: crate::profile::MediaVideoCodec::H265,
+            audio_codec: crate::profile::MediaAudioCodec::Aac,
+            audio_sample_rate_hz: 8_000,
+        };
+
+        let capture = LiveCaptureProfile::from_media(&profile).expect("配置应能映射");
+        assert_eq!(capture.width, 640);
+        assert_eq!(capture.height, 480);
+        assert_eq!(capture.video_fps, 15);
+        assert_eq!(capture.bitrate_kbps, 600);
+        assert_eq!(capture.keyframe_interval_seconds, 4);
+        assert_eq!(capture.video_codec, LiveVideoCodec::H265);
+        assert_eq!(capture.audio_codec, LiveAudioCodec::Aac);
+        assert_eq!(capture.audio_sample_rate_hz, 8_000);
+        assert_eq!(capture.keyframe_interval_frames(), 60);
+    }
+
+    #[test]
+    fn 统一媒体配置拒绝无效参数而不是静默回退() {
+        let profile = crate::profile::MediaProfile {
+            width: 1280,
+            height: 720,
+            video_fps: 25,
+            bitrate_kbps: 2000,
+            keyframe_interval_seconds: 1,
+            video_codec: crate::profile::MediaVideoCodec::H264,
+            audio_codec: crate::profile::MediaAudioCodec::Aac,
+            audio_sample_rate_hz: 44_100,
+        };
+
+        let error = LiveCaptureProfile::from_media(&profile).unwrap_err();
+        assert!(error.to_string().contains("audio sample rate"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 摄像头profile命令必须应用尺寸帧率码率GOP和编码() {
+        let profile = LiveCaptureProfile {
+            width: 640,
+            height: 480,
+            video_fps: 15,
+            bitrate_kbps: 600,
+            keyframe_interval_seconds: 4,
+            video_codec: LiveVideoCodec::H265,
+            audio_codec: LiveAudioCodec::Aac,
+            audio_sample_rate_hz: 8_000,
+        };
+        let args = camera_command_args_for_profile(0, None, &profile);
+        let command = args.join(" ");
+
+        assert!(command.contains("-vf scale=640:480:force_original_aspect_ratio=decrease"));
+        assert!(command.contains("-b:v 600k"));
+        assert!(command.contains("-g 60"));
+        assert!(command.contains("-r 15 -fps_mode cfr"));
+        assert!(command.contains("-c:v hevc_videotoolbox"));
+        assert!(command.ends_with("-f hevc -flush_packets 1 pipe:1"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 屏幕H265命令必须使用profile的输出节奏和关键帧周期() {
+        let profile = LiveCaptureProfile {
+            width: 1920,
+            height: 1080,
+            video_fps: 25,
+            bitrate_kbps: 4000,
+            keyframe_interval_seconds: 2,
+            video_codec: LiveVideoCodec::H265,
+            audio_codec: LiveAudioCodec::G711A,
+            audio_sample_rate_hz: 8_000,
+        };
+        let command = screen_hevc_command_args(&profile).join(" ");
+
+        assert!(command.contains("-video_size 1920x1080"));
+        assert!(command.contains("-framerate 25"));
+        assert!(command.contains("-b:v 4000k"));
+        assert!(command.contains("-g 50 -keyint_min 50"));
+        assert!(command.contains("-r 25 -fps_mode cfr"));
+        assert!(command.ends_with("-f hevc pipe:1"));
+    }
+
+    #[test]
+    fn AAC实时输出使用有效采样率和首版码率() {
+        let mut command = Command::new("ffmpeg");
+        LiveAudioCodec::Aac.append_ffmpeg_output_with_sample_rate(
+            &mut command,
+            8_000,
+            32,
+            "pipe:1",
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let joined = args.join(" ");
+        assert!(joined.contains("-b:a 32k"));
+        assert!(joined.contains("-ar 8000"));
+        assert!(joined.contains("-ac 1"));
+        assert!(joined.ends_with("-f adts pipe:1"));
+    }
+
+    #[test]
+    fn SCK固定原点在视频回调先到而音频更早时保留偏移() {
+        let clock = LiveCaptureClock::with_origin(90_000);
+
+        let video_pts = clock.normalize(99_000);
+        let audio_pts = clock.normalize(94_500);
+
+        assert_eq!(video_pts, 9_000);
+        assert_eq!(audio_pts, 4_500);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn SCK静止Idle只复用已有完整帧并保留有效PTS() {
+        let mut state = ScreenFrameState::default();
+
+        assert!(state
+            .accept(ScreenFrameAction::Idle, None, Some(9_000))
+            .is_none());
+
+        let first = state
+            .accept(
+                ScreenFrameAction::Fresh,
+                Some(vec![0x10, 0x20, 0x30, 0x40]),
+                Some(4_500),
+            )
+            .expect("完整帧应被接收");
+        let idle = state
+            .accept(ScreenFrameAction::Idle, None, Some(9_000))
+            .expect("已有完整帧后 Idle 应复用上一画面");
+
+        assert_eq!(idle.data, first.data);
+        assert_eq!(first.pts_90k, Some(4_500));
+        assert_eq!(idle.pts_90k, Some(9_000));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn SCK首帧前Idle或无效PTS不得冒充采集帧() {
+        let mut state = ScreenFrameState::default();
+        assert!(state.accept(ScreenFrameAction::Idle, None, None).is_none());
+        assert!(state
+            .accept(ScreenFrameAction::Idle, None, Some(9_000))
+            .is_none());
+
+        assert_eq!(screen_frame_action(None), ScreenFrameAction::Ignore);
+        assert_eq!(
+            screen_frame_action(Some(screencapturekit::cm::SCFrameStatus::Blank)),
+            ScreenFrameAction::Ignore
+        );
+        assert_eq!(
+            screen_frame_action(Some(screencapturekit::cm::SCFrameStatus::Suspended)),
+            ScreenFrameAction::Ignore
+        );
+
+        state
+            .accept(ScreenFrameAction::Fresh, Some(vec![1, 2, 3]), Some(1_000))
+            .expect("先建立一个可复用的完整帧");
+        assert!(state
+            .accept(ScreenFrameAction::Ignore, None, Some(2_000))
+            .is_none());
+        assert!(state
+            .accept(ScreenFrameAction::Idle, None, Some(3_000))
+            .is_none());
+        assert!(state
+            .accept(ScreenFrameAction::Fresh, Some(vec![4, 5, 6]), Some(4_000))
+            .is_some());
+        assert!(state
+            .accept(ScreenFrameAction::Idle, None, Some(5_000))
+            .is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn SCKStarted作为首个有效内容帧建立Idle复用基准() {
+        let mut state = ScreenFrameState::default();
+        assert_eq!(
+            screen_frame_action(Some(screencapturekit::cm::SCFrameStatus::Started)),
+            ScreenFrameAction::Fresh
+        );
+        state
+            .accept(ScreenFrameAction::Fresh, Some(vec![1, 2, 3]), Some(1_000))
+            .expect("Started 内容帧应建立缓存");
+        assert!(state
+            .accept(ScreenFrameAction::Idle, None, Some(2_000))
+            .is_some());
+    }
+
+    #[test]
+    fn SCK固定原点在音频回调先到而视频更晚时保留偏移() {
+        let clock = LiveCaptureClock::with_origin(90_000);
+
+        let audio_pts = clock.normalize(94_500);
+        let video_pts = clock.normalize(99_000);
+
+        assert_eq!(audio_pts, 4_500);
+        assert_eq!(video_pts, 9_000);
+    }
+
+    #[test]
+    fn SCK固定原点对回调乱序给出相同时间线() {
+        let first_order = LiveCaptureClock::with_origin(90_000);
+        let first = [first_order.normalize(99_000), first_order.normalize(94_500)];
+
+        let reverse_order = LiveCaptureClock::with_origin(90_000);
+        let second = [
+            reverse_order.normalize(94_500),
+            reverse_order.normalize(99_000),
+        ];
+
+        assert_eq!(first, [9_000, 4_500]);
+        assert_eq!(second, [4_500, 9_000]);
+        assert_eq!(
+            first.iter().copied().sum::<u64>(),
+            second.iter().copied().sum::<u64>()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn CoreMedia_host_clock可以提供有效的90k原点() {
+        assert!(core_media_host_time_90k().is_some_and(|origin| origin > 0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires macOS 15+ SDK and runtime; checks the real Swift bridge without capturing audio"]
+    fn screen_microphone_bridge_enables_capture() {
+        let config =
+            screencapturekit::prelude::SCStreamConfiguration::new().with_captures_microphone(true);
+        assert!(
+            config.captures_microphone(),
+            "microphone API was compiled as a no-op"
+        );
+    }
+
+    #[test]
+    fn 麦克风映射不依赖枚举顺序而要求唯一名称() {
+        let sck_devices = [("麦克风 B", "sck-b"), ("麦克风 A", "sck-a")];
+        assert_eq!(
+            map_sck_microphone_device_id(7, Some("麦克风 A"), &sck_devices).unwrap(),
+            "sck-a"
+        );
+    }
+
+    #[test]
+    fn 麦克风映射找不到或重名返回具体错误() {
+        let missing =
+            map_sck_microphone_device_id(7, Some("不存在的麦克风"), &[("麦克风 A", "sck-a")])
+                .unwrap_err();
+        assert!(missing.to_string().contains("不存在的麦克风"));
+
+        let duplicate = map_sck_microphone_device_id(
+            7,
+            Some("麦克风 A"),
+            &[("麦克风 A", "sck-a"), ("麦克风 A", "sck-a-2")],
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("ambiguous"));
+
+        let missing_av =
+            map_sck_microphone_device_id(7, None, &[("麦克风 A", "sck-a")]).unwrap_err();
+        assert!(missing_av
+            .to_string()
+            .contains("AVFoundation microphone index 7"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 定时屏幕麦克风走SCK带PTS输出而非直接拒绝() {
+        assert!(uses_sck_microphone_capture(
+            true,
+            LiveAudioSource::Microphone(2)
+        ));
+        assert!(!uses_sck_microphone_capture(
+            false,
+            LiveAudioSource::Microphone(2)
+        ));
+    }
+
+    #[test]
+    fn ffmpeg编码统计行按timebase转换为90k时钟() {
+        assert_eq!(parse_ffmpeg_timing_stats_line("0 1/25"), Some(0));
+        assert_eq!(parse_ffmpeg_timing_stats_line("7 1/25"), Some(25_200));
+        assert_eq!(parse_ffmpeg_timing_stats_line("7 1/0"), None);
+        assert_eq!(parse_ffmpeg_timing_stats_line("-1 1/25"), Some(-3_600));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 摄像头音视频stats共用基准保留AAC起始priming偏移() {
+        let clock = Arc::new(CameraTimingClock::new(true));
+        clock.observe(CameraTimingStream::Video, 0);
+        let video_clock = Arc::clone(&clock);
+        let video = std::thread::spawn(move || video_clock.normalize(0));
+        std::thread::sleep(Duration::from_millis(10));
+        clock.observe(CameraTimingStream::Audio, -1_024);
+        assert_eq!(video.join().unwrap().unwrap(), 1_024);
+        assert_eq!(clock.normalize(-1_024).unwrap(), 0);
+    }
+
+    #[test]
+    fn 延迟stats在有界窗口内严格匹配而不回退() {
+        let pts = Arc::new(Mutex::new(VecDeque::new()));
+        let delayed_pts = Arc::clone(&pts);
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            delayed_pts.lock().unwrap().push_back(Some(4_500));
+        });
+        let value = pop_strict_timing_pts(pts.as_ref(), Duration::from_millis(100), None).unwrap();
+        producer.join().unwrap();
+        assert_eq!(value, 4_500);
+    }
+
+    #[test]
+    fn 缺失stats超时返回错误而不伪造PTS() {
+        let pts = Mutex::new(VecDeque::new());
+        let result = pop_strict_timing_pts(&pts, Duration::from_millis(5), None);
+        assert!(result.is_err());
+        assert!(pts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn 定时视频保留三百五十毫秒掉帧间隔且音频继续按样本推进() {
+        let primary = Arc::new(LatestFrameQueue::new(8));
+        let events = Arc::new(LiveEventQueue::new(32));
+        let hub = EncodedFrameHub::new_with_timing(
+            primary,
+            None,
+            1,
+            Some(Arc::clone(&events)),
+            25,
+            LiveVideoCodec::H264,
+        );
+        hub.send_frame_at(frame(1), Some(0));
+
+        let timeline = Arc::new(Mutex::new(LiveAudioTimeline::new(8_000).unwrap()));
+        for _ in 0..5 {
+            push_timed_audio(
+                Some(&events),
+                Some(&timeline),
+                vec![0xD5; G711_PACKET_BYTES],
+                LiveAudioCodec::G711A,
+            );
+        }
+        // 350ms = 31_500 ticks at the 90kHz media clock. The timestamp gap
+        // survives even though the encoder reader did not emit intervening AUs.
+        hub.send_frame_at(frame(2), Some(31_500));
+
+        let mut video = Vec::new();
+        let mut audio = Vec::new();
+        while let Some(event) = events.pop() {
+            match event {
+                crate::source::MediaEvent::Video(au) => video.push(au),
+                crate::source::MediaEvent::Audio(au) => audio.push(au),
+                crate::source::MediaEvent::Discontinuity { .. } => unreachable!(),
+            }
+        }
+        assert_eq!(video.len(), 2);
+        assert_eq!(video[0].pts_90k, 0);
+        assert_eq!(video[0].duration_90k, 3_600);
+        assert_eq!(video[1].pts_90k, 31_500);
+        assert_eq!(video[1].duration_90k, 31_500);
+        assert_eq!(audio.len(), 5);
+        assert_eq!(
+            audio.iter().map(|au| au.pts_90k).collect::<Vec<_>>(),
+            [0, 1_800, 3_600, 5_400, 7_200]
+        );
+        assert!(audio.iter().all(|au| au.sample_rate_hz == 8_000));
+    }
+
+    #[test]
+    fn 定时音频保留采集起始offset并继续按样本数递增() {
+        let events = Arc::new(LiveEventQueue::new(8));
+        let timeline = Arc::new(Mutex::new(LiveAudioTimeline::new(8_000).unwrap()));
+        push_timed_audio_at(
+            Some(&events),
+            Some(&timeline),
+            vec![0x01; G711_PACKET_BYTES],
+            LiveAudioCodec::G711A,
+            Some(4_500),
+        );
+        push_timed_audio(
+            Some(&events),
+            Some(&timeline),
+            vec![0x02; G711_PACKET_BYTES],
+            LiveAudioCodec::G711A,
+        );
+
+        let first = events.pop().unwrap();
+        let second = events.pop().unwrap();
+        let crate::source::MediaEvent::Audio(first) = first else {
+            panic!("首个事件必须是音频");
+        };
+        let crate::source::MediaEvent::Audio(second) = second else {
+            panic!("第二个事件必须是音频");
+        };
+        assert_eq!(first.pts_90k, 4_500);
+        assert_eq!(first.duration_90k, 1_800);
+        assert_eq!(second.pts_90k, 6_300);
+        assert_eq!(second.duration_90k, 1_800);
+        assert_eq!(first.sample_rate_hz, 8_000);
+    }
+
+    #[test]
+    fn SCK_AAC首包保留捕获PTS起点而不是从零开始() {
+        let origin = LiveAudioCaptureOrigin::default();
+        origin.observe(Some(13_500));
+        origin.observe(Some(18_000));
+
+        let events = Arc::new(LiveEventQueue::new(8));
+        let timeline = Arc::new(Mutex::new(LiveAudioTimeline::new(48_000).unwrap()));
+        let first_origin = sck_audio_capture_origin(Some(&origin))
+            .unwrap()
+            .expect("SCK 应先记录捕获音频 PTS");
+        push_timed_audio_at(
+            Some(&events),
+            Some(&timeline),
+            vec![0x00; 128],
+            LiveAudioCodec::Aac,
+            Some(first_origin),
+        );
+        push_timed_audio(
+            Some(&events),
+            Some(&timeline),
+            vec![0x00; 128],
+            LiveAudioCodec::Aac,
+        );
+
+        let first = events.pop().expect("首个 AAC 事件必须存在");
+        let second = events.pop().expect("第二个 AAC 事件必须存在");
+        assert_eq!(first.pts_90k(), 13_500);
+        assert_eq!(second.pts_90k(), 15_420);
+    }
+
+    #[test]
+    fn H265编码输出按输入PTS_fifo对应且队列溢出先报告间断() {
+        let primary = Arc::new(LatestFrameQueue::new(8));
+        let events = Arc::new(LiveEventQueue::new(8));
+        let hub = EncodedFrameHub::new_with_timing(
+            primary,
+            None,
+            2,
+            Some(Arc::clone(&events)),
+            25,
+            LiveVideoCodec::H265,
+        );
+        let pts = Mutex::new(VecDeque::from([Some(1_000), Some(4_600)]));
+        let sender = TimedFrameSender {
+            hub: &hub,
+            pts: &pts,
+            wait_for_pts: false,
+            strict_timing: false,
+            timing_error: None,
+            timing_stop: None,
+            initial_timing_wait: AtomicBool::new(false),
+        };
+        sender.send_frame(frame(1));
+        sender.send_frame(frame(2));
+
+        let first = events.pop().unwrap();
+        let second = events.pop().unwrap();
+        assert!(matches!(first, crate::source::MediaEvent::Video(ref au)
+            if au.codec == crate::ps::VideoCodec::H265 && au.pts_90k == 1_000));
+        assert!(matches!(second, crate::source::MediaEvent::Video(ref au)
+            if au.codec == crate::ps::VideoCodec::H265 && au.pts_90k == 4_600
+                && au.duration_90k == 3_600));
+
+        let overflow = Arc::new(LiveEventQueue::new(1));
+        overflow.push(crate::source::MediaEvent::Video(
+            crate::source::TimedVideoAu::new(
+                vec![1],
+                crate::ps::VideoCodec::H265,
+                true,
+                8_000,
+                3_600,
+            ),
+        ));
+        overflow.push(crate::source::MediaEvent::Video(
+            crate::source::TimedVideoAu::new(
+                vec![2],
+                crate::ps::VideoCodec::H265,
+                false,
+                12_000,
+                3_600,
+            ),
+        ));
+        assert_eq!(overflow.take_dropped_pts(), Some(12_000));
+        assert_eq!(overflow.pop().map(|event| event.pts_90k()), Some(12_000));
     }
 
     fn frame(id: u8) -> Frame {

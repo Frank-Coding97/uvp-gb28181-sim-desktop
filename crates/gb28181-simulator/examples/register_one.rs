@@ -75,6 +75,7 @@ async fn main() {
             firmware: "0.1.0-dev".into(),
         },
         video_source: std::env::var("VIDEO_SOURCE").ok(),
+        media_profile: None,
         video_fps: std::env::var("VIDEO_FPS")
             .ok()
             .and_then(|s| s.parse().ok())

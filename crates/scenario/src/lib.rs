@@ -235,6 +235,7 @@ impl Scenario for LinearScenario {
                     firmware: self.device_info.firmware.clone(),
                 },
                 video_source,
+                media_profile: None,
                 video_fps: self.video_fps,
                 light_bitrate_kbps,
                 gb_version: self.gb_version,

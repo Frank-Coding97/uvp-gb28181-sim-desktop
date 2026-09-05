@@ -12,7 +12,7 @@ use common::{Error, Result};
 
 use crate::ps::PsMuxer;
 use crate::rtp::{RtpSender, CLOCK_HZ};
-use crate::source::VideoSource;
+use crate::source::{rtp_timestamp, MediaEvent, VideoSource};
 
 /// 编码访问单元是否携带解码所需的参数集。
 ///
@@ -128,6 +128,12 @@ impl PlaybackControl {
     }
 }
 
+fn effective_speed_milli(control: &PlaybackControl) -> u32 {
+    // 保持与旧的 `speed().max(0.01)` 语义一致；原子值可能因极小的
+    // 浮点输入被量化为 0，不能让回放除以 0。
+    control.speed_milli.load(Ordering::Relaxed).max(10)
+}
+
 /// 驱动一路推流:`source` 产帧 → PS 封装 → RTP 发送到 `dst`。
 ///
 /// - `ssrc`:RTP SSRC(与 SDP 的 y= 一致)
@@ -182,6 +188,9 @@ pub async fn push_stream_controlled(
     } else {
         PsMuxer::with_video(source.codec())
     };
+    if source.supports_timed_events() {
+        return push_timed_events(source, sender, control, stop, mux).await;
+    }
     let fps = fps.max(1);
     let ts_step = CLOCK_HZ / fps;
     let base_interval_us = 1_000_000f32 / fps as f32;
@@ -305,10 +314,165 @@ pub async fn push_stream_controlled(
     result
 }
 
+/// 推送已经携带真实 PTS 的媒体事件。
+///
+/// 事件源（实时编码器或按 PTS 读取的文件）自行决定产出节奏；这里仅在
+/// 没有事件时短暂让出线程，并且对有限文件按事件 PTS 做回放等待。不会再
+/// 依据 `fps` 对同一批事件进行第二次限速。
+async fn push_timed_events(
+    mut source: Box<dyn VideoSource>,
+    mut sender: RtpSender,
+    control: Arc<PlaybackControl>,
+    stop: impl Future<Output = ()>,
+    mux: PsMuxer,
+) -> Result<()> {
+    let live = source.is_live();
+    let paced_by_source = source.timed_events_are_paced();
+    let mut first_pts: Option<u64> = None;
+    let mut last_sent_pts: Option<u64> = None;
+    let mut wall_anchor = std::time::Instant::now();
+    let mut was_paused = false;
+    let mut pending_event: Option<MediaEvent> = None;
+    let mut applied_speed_milli = effective_speed_milli(&control);
+    let mut units_sent = 0_u64;
+    let mut bytes_sent = 0_u64;
+    tokio::pin!(stop);
+
+    'events: loop {
+        if let Some(error) = source.take_error() {
+            return Err(Error::Media(error));
+        }
+        if let Some(permille) = control.take_seek() {
+            source.seek(permille);
+            first_pts = None;
+            last_sent_pts = None;
+            wall_anchor = std::time::Instant::now();
+            pending_event = None;
+        }
+        if control.is_paused() {
+            was_paused = true;
+            tokio::select! {
+                _ = &mut stop => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+            continue;
+        }
+        if was_paused {
+            // 暂停期间不消费事件；恢复时以当前事件重新建立等待基准，
+            // 避免把用户暂停的墙钟时间错误计入媒体时间轴。
+            first_pts = None;
+            last_sent_pts = None;
+            wall_anchor = std::time::Instant::now();
+            applied_speed_milli = effective_speed_milli(&control);
+            was_paused = false;
+        }
+
+        let event = if let Some(event) = pending_event.take() {
+            event
+        } else if let Some(event) = source.next_media_event() {
+            event
+        } else {
+            // 有限源可能在最后一次读取时才把异步错误写入自身状态，
+            // 必须在把 None 当作正常结束前再检查一次。
+            if let Some(error) = source.take_error() {
+                return Err(Error::Media(error));
+            }
+            if source.is_live() {
+                tokio::select! {
+                    _ = &mut stop => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                }
+                continue;
+            }
+            return Ok(());
+        };
+        let pts = event.pts_90k();
+        if matches!(&event, MediaEvent::Discontinuity { .. }) {
+            first_pts = None;
+            last_sent_pts = None;
+            wall_anchor = std::time::Instant::now();
+            continue;
+        }
+
+        if !live && !paced_by_source && first_pts.is_none() {
+            first_pts = Some(pts);
+            wall_anchor = std::time::Instant::now();
+        }
+        if !live && !paced_by_source {
+            let speed_milli = effective_speed_milli(&control);
+            if speed_milli != applied_speed_milli {
+                // 以最近已发送 AU 作为新墙钟锚点。这样调速只改变后续
+                // 时间轴的斜率，不会因继续使用首个 PTS 而突发或长停。
+                first_pts = last_sent_pts.or(Some(pts));
+                wall_anchor = std::time::Instant::now();
+                applied_speed_milli = speed_milli;
+            }
+            loop {
+                let base = first_pts.unwrap_or(pts);
+                let elapsed_ticks = pts.saturating_sub(base);
+                let target_us = (elapsed_ticks as f64 * 1_000_000.0
+                    / f64::from(CLOCK_HZ)
+                    / (f64::from(applied_speed_milli) / 1000.0))
+                    as u64;
+                let elapsed_us = wall_anchor.elapsed().as_micros() as u64;
+                if target_us <= elapsed_us {
+                    break;
+                }
+                // 轮询控制面以响应运行中调速、暂停和 seek；长时间一次
+                // sleep 会把旧速度/事件带到控制操作之后。
+                let delay = std::time::Duration::from_micros((target_us - elapsed_us).min(10_000));
+                tokio::select! {
+                    _ = &mut stop => return Ok(()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                if control.is_paused() {
+                    pending_event = Some(event);
+                    was_paused = true;
+                    continue 'events;
+                }
+                if let Some(permille) = control.take_seek() {
+                    source.seek(permille);
+                    first_pts = None;
+                    last_sent_pts = None;
+                    wall_anchor = std::time::Instant::now();
+                    pending_event = None;
+                    continue 'events;
+                }
+                let next_speed_milli = effective_speed_milli(&control);
+                if next_speed_milli != applied_speed_milli {
+                    first_pts = last_sent_pts.or(Some(pts));
+                    wall_anchor = std::time::Instant::now();
+                    applied_speed_milli = next_speed_milli;
+                }
+            }
+        }
+
+        if control.is_paused() {
+            pending_event = Some(event);
+            was_paused = true;
+            continue;
+        }
+
+        let ps = mux.mux_event(&event);
+        if ps.is_empty() {
+            continue;
+        }
+        sender.send_frame(&ps, rtp_timestamp(pts)).await?;
+        last_sent_pts = Some(pts);
+        units_sent += 1;
+        bytes_sent += ps.len() as u64;
+        if units_sent == 1 {
+            tracing::info!(ps_bytes = ps.len(), "定时媒体事件首单元已发出");
+        } else if units_sent % 100 == 0 {
+            tracing::debug!(units_sent, bytes_sent, "定时媒体事件推流进行中");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{FileSource, Frame};
+    use crate::source::{FileSource, Frame, MediaEvent, TimedAudioAu, TimedVideoAu};
     use tokio::net::UdpSocket;
 
     fn sample_h264() -> Vec<u8> {
@@ -469,5 +633,229 @@ mod tests {
 
         let _ = tx_stop.send(());
         let _ = handle.await;
+    }
+
+    struct TimedEventSource {
+        events: std::collections::VecDeque<MediaEvent>,
+    }
+
+    impl VideoSource for TimedEventSource {
+        fn next_frame(&mut self) -> Option<Frame> {
+            None
+        }
+
+        fn supports_timed_events(&self) -> bool {
+            true
+        }
+
+        fn next_media_event(&mut self) -> Option<MediaEvent> {
+            self.events.pop_front()
+        }
+
+        fn has_audio(&self) -> bool {
+            true
+        }
+
+        fn audio_codec(&self) -> crate::ps::AudioCodec {
+            crate::ps::AudioCodec::G711A
+        }
+    }
+
+    #[tokio::test]
+    async fn 定时事件推流使用事件pts且音频可独立发送() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let events = std::collections::VecDeque::from([
+            MediaEvent::Video(TimedVideoAu::new(
+                vec![0, 0, 0, 1, 0x65, 1],
+                crate::ps::VideoCodec::H264,
+                true,
+                123_456,
+                3_600,
+            )),
+            MediaEvent::Audio(TimedAudioAu::from_samples(
+                vec![0xD5; 160],
+                crate::ps::AudioCodec::G711A,
+                8_000,
+                160,
+                123_456,
+            )),
+        ]);
+        let source = Box::new(TimedEventSource { events });
+        let result = push_stream(
+            source,
+            rx_addr,
+            0x4455,
+            1,
+            false,
+            tokio::time::sleep(std::time::Duration::from_secs(1)),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let mut timestamps = Vec::new();
+        for _ in 0..2 {
+            let mut buf = [0u8; 2048];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv(&mut buf))
+                .await
+                .expect("定时事件应发出 RTP")
+                .unwrap();
+            assert!(n >= 12);
+            timestamps.push(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]));
+        }
+        assert_eq!(timestamps, vec![123_456, 123_456]);
+    }
+
+    struct TimedErrorAtEof {
+        error: Option<String>,
+    }
+
+    impl VideoSource for TimedErrorAtEof {
+        fn next_frame(&mut self) -> Option<Frame> {
+            None
+        }
+
+        fn supports_timed_events(&self) -> bool {
+            true
+        }
+
+        fn next_media_event(&mut self) -> Option<MediaEvent> {
+            self.error = Some("定时源在结束读取时失败".into());
+            None
+        }
+
+        fn is_live(&self) -> bool {
+            false
+        }
+
+        fn take_error(&mut self) -> Option<String> {
+            self.error.take()
+        }
+    }
+
+    #[tokio::test]
+    async fn 定时源末次读取设置错误必须返回Err() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = Box::new(TimedErrorAtEof { error: None });
+        let result = push_stream(
+            source,
+            rx.local_addr().unwrap(),
+            0x5566,
+            25,
+            false,
+            tokio::time::sleep(std::time::Duration::from_secs(1)),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "next_media_event 末次读取设置的错误不能被吞掉"
+        );
+    }
+
+    struct TimedControlSource {
+        events: Vec<MediaEvent>,
+        cursor: usize,
+    }
+
+    impl VideoSource for TimedControlSource {
+        fn next_frame(&mut self) -> Option<Frame> {
+            None
+        }
+
+        fn supports_timed_events(&self) -> bool {
+            true
+        }
+
+        fn next_media_event(&mut self) -> Option<MediaEvent> {
+            let event = self.events.get(self.cursor).cloned()?;
+            self.cursor += 1;
+            Some(event)
+        }
+
+        fn seek(&mut self, permille: u32) {
+            self.cursor = if permille >= 1_000 {
+                self.events.len().saturating_sub(1)
+            } else {
+                0
+            };
+        }
+
+        fn is_live(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn 定时源速率切换暂停和seek保持时间轴连续() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let control = PlaybackControl::new();
+        let events = [0_u64, 180_000, 360_000, 540_000]
+            .into_iter()
+            .enumerate()
+            .map(|(index, pts)| {
+                MediaEvent::Video(TimedVideoAu::new(
+                    vec![0, 0, 0, 1, if index == 0 { 0x65 } else { 0x61 }, 1],
+                    crate::ps::VideoCodec::H264,
+                    index == 0,
+                    pts,
+                    3_600,
+                ))
+            })
+            .collect();
+        let source = Box::new(TimedControlSource { events, cursor: 0 });
+        let (tx_stop, rx_stop) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn({
+            let control = control.clone();
+            async move {
+                push_stream_controlled(source, rx_addr, 0x7788, 25, false, control, async {
+                    let _ = rx_stop.await;
+                })
+                .await
+            }
+        });
+
+        let mut packet = [0_u8; 2048];
+        let first_at = std::time::Instant::now();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv(&mut packet))
+            .await
+            .expect("定时源首事件未发送")
+            .unwrap();
+        assert!(first >= 12);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        control.set_speed(2.0);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv(&mut packet))
+            .await
+            .expect("速率切换后第二事件未发送")
+            .unwrap();
+        assert!(second >= 12);
+        let second_elapsed = first_at.elapsed();
+        assert!(
+            second_elapsed >= std::time::Duration::from_millis(1_100),
+            "速率切快不应按首 PTS 突发，实际首包后耗时 {second_elapsed:?}"
+        );
+
+        control.pause();
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        control.seek_permille(1_000);
+        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+        assert!(
+            rx.try_recv(&mut packet).is_err(),
+            "暂停期间不应发送待定事件"
+        );
+        control.resume();
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv(&mut packet))
+            .await
+            .expect("seek 后恢复未发送事件")
+            .unwrap();
+        assert!(resumed >= 12);
+        assert_eq!(
+            u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+            540_000,
+            "seek 后应从目标事件的实际 RTP PTS 恢复"
+        );
+
+        let _ = tx_stop.send(());
+        assert!(handle.await.unwrap().is_ok());
     }
 }

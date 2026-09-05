@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::preview::{
     drain_jpeg_frames, CapturedAccessUnit, PreviewJpeg, PreviewPhase, PreviewSink, PreviewStatus,
 };
+use crate::ps::VideoCodec;
 
 const INPUT_CAPACITY: usize = 2;
 const STDERR_TAIL_LINES: usize = 32;
@@ -106,6 +107,17 @@ pub fn spawn_preview_worker(
     generation: u64,
     sink: Arc<dyn PreviewSink>,
 ) -> (PreviewWorkerInput, PreviewWorkerHandle) {
+    spawn_preview_worker_with_codec(ffmpeg, fps, generation, VideoCodec::H264, sink)
+}
+
+/// 启动指定编码的隔离预览 supervisor；不会重新打开或采集视频设备。
+pub fn spawn_preview_worker_with_codec(
+    ffmpeg: String,
+    fps: u32,
+    generation: u64,
+    codec: VideoCodec,
+    sink: Arc<dyn PreviewSink>,
+) -> (PreviewWorkerInput, PreviewWorkerHandle) {
     let (input, rx) = preview_input_channel(generation, INPUT_CAPACITY);
     let discontinuity = Arc::clone(&input.discontinuity);
     let dropped = Arc::clone(&input.dropped);
@@ -121,6 +133,7 @@ pub fn spawn_preview_worker(
             &ffmpeg,
             fps.max(1),
             generation,
+            codec,
             sink,
             rx,
             discontinuity,
@@ -173,6 +186,7 @@ fn run_supervisor(
     ffmpeg: &str,
     fps: u32,
     generation: u64,
+    codec: VideoCodec,
     sink: Arc<dyn PreviewSink>,
     rx: mpsc::Receiver<CapturedAccessUnit>,
     discontinuity: Arc<AtomicBool>,
@@ -214,7 +228,10 @@ fn run_supervisor(
                 );
             } else if status.phase != PreviewPhase::Unavailable {
                 status.phase = PreviewPhase::WaitingKeyframe;
-                status.reason = Some("preview input discontinuity; waiting for SPS/PPS/IDR".into());
+                status.reason = Some(format!(
+                    "preview input discontinuity; waiting for {}",
+                    config_keyframe_label(codec)
+                ));
                 sink.status(status.clone());
             }
         }
@@ -244,9 +261,10 @@ fn run_supervisor(
                         sink.status(status.clone());
                     }
                     AttemptEvent::UnexpectedOutput => {
-                        attempt_failure = Some(
-                            "preview FFmpeg produced JPEG without a matching H.264 input".into(),
-                        );
+                        attempt_failure = Some(format!(
+                            "preview FFmpeg produced JPEG without a matching {} input",
+                            codec_name(codec)
+                        ));
                         break;
                     }
                     AttemptEvent::ReaderFailed(reason) => {
@@ -307,6 +325,16 @@ fn run_supervisor(
         if access_unit.generation != generation {
             continue;
         }
+        if access_unit.codec != codec {
+            status.phase = PreviewPhase::WaitingKeyframe;
+            status.reason = Some(format!(
+                "preview input codec mismatch: expected {}, got {}",
+                codec_name(codec),
+                codec_name(access_unit.codec)
+            ));
+            sink.status(status.clone());
+            continue;
+        }
         status.h264_input_frames = status.h264_input_frames.saturating_add(1);
         status.last_input_at_ms = Some(access_unit.captured_at_ms);
 
@@ -318,7 +346,10 @@ fn run_supervisor(
         }
         if retry_not_before.take().is_some() {
             status.phase = PreviewPhase::WaitingKeyframe;
-            status.reason = Some("waiting for SPS/PPS/IDR after recovery".into());
+            status.reason = Some(format!(
+                "waiting for {} after recovery",
+                config_keyframe_label(codec)
+            ));
             sink.status(status.clone());
         }
         if attempt.is_none() {
@@ -333,6 +364,7 @@ fn run_supervisor(
                 ffmpeg,
                 fps,
                 status.preview_generation,
+                codec,
                 Arc::clone(&active_child),
                 Arc::clone(&stop),
             ) {
@@ -463,10 +495,11 @@ impl PreviewAttempt {
         ffmpeg: &str,
         fps: u32,
         preview_generation: u64,
+        codec: VideoCodec,
         active_child: Arc<Mutex<Option<Child>>>,
         stop: Arc<AtomicBool>,
     ) -> std::result::Result<Self, String> {
-        let args = preview_worker_args(fps, 480);
+        let args = preview_worker_args_with_codec(codec, fps, 480);
         let mut child = Command::new(ffmpeg)
             .args(&args)
             .stdin(Stdio::piped())
@@ -652,6 +685,15 @@ fn child_exit_status(active_child: &Arc<Mutex<Option<Child>>>) -> Option<ExitSta
 }
 
 pub fn preview_worker_args(fps: u32, width: u32) -> Vec<String> {
+    preview_worker_args_with_codec(VideoCodec::H264, fps, width)
+}
+
+/// 生成指定编码的 FFmpeg 预览参数；输入只从 stdin 读取，输出仍为 MJPEG stdout。
+pub fn preview_worker_args_with_codec(codec: VideoCodec, fps: u32, width: u32) -> Vec<String> {
+    let input_format = match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::H265 => "hevc",
+    };
     vec![
         "-hide_banner".into(),
         "-nostdin".into(),
@@ -668,7 +710,7 @@ pub fn preview_worker_args(fps: u32, width: u32) -> Vec<String> {
         "-r".into(),
         fps.max(1).to_string(),
         "-f".into(),
-        "h264".into(),
+        input_format.into(),
         "-i".into(),
         "pipe:0".into(),
         "-map".into(),
@@ -761,6 +803,20 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn codec_name(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::H265 => "h265",
+    }
+}
+
+fn config_keyframe_label(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "SPS/PPS/IDR",
+        VideoCodec::H265 => "VPS/SPS/PPS/IRAP",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +857,15 @@ mod tests {
         assert!(!command.contains("avfoundation"));
         assert!(!command.contains("pipe:3"));
         assert!(!command.contains(" cfr"));
+    }
+
+    #[test]
+    fn worker命令按编码选择hevc输入且输出仍为mjpeg() {
+        let args = preview_worker_args_with_codec(crate::ps::VideoCodec::H265, 30, 480);
+        let command = args.join(" ");
+        assert!(command.contains("-f hevc -i pipe:0"));
+        assert!(command.ends_with("-f mjpeg -flush_packets 1 pipe:1"));
+        assert!(!command.contains("avfoundation"));
     }
 
     #[test]

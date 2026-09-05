@@ -2,6 +2,23 @@
 import { computed, ref, watch } from "vue";
 import { useDevice } from "../device";
 import {
+  MEDIA_AUDIO_CODECS,
+  MEDIA_BITRATE_OPTIONS,
+  MEDIA_FPS_OPTIONS,
+  MEDIA_GOP_OPTIONS,
+  MEDIA_PRESETS,
+  MEDIA_RESOLUTIONS,
+  MEDIA_SAMPLE_RATES,
+  MEDIA_VIDEO_CODECS,
+  applyMediaPreset,
+  matchedPreset,
+  mediaProfileEqual,
+  mediaProfileSummary,
+  validateMediaProfile,
+  type MediaProfile,
+  type MediaQualityPresetId,
+} from "../media-profile";
+import {
   usePlatform,
   type BindMode,
   type DeviceSettings,
@@ -15,7 +32,7 @@ const props = defineProps<{ section: SettingKey }>();
 
 const settings = [
   { key: "device" as const, icon: "◈", title: "设备配置", description: "设备身份、注册周期与出厂信息" },
-  { key: "media" as const, icon: "◉", title: "音视频配置", description: "有效帧率、编码能力与 OSD 状态" },
+  { key: "media" as const, icon: "◉", title: "音视频配置", description: "画质预设、视频编码与音频参数" },
   { key: "network" as const, icon: "⌁", title: "网络配置", description: "本机绑定与 SIP 追踪" },
   { key: "about" as const, icon: "ⓘ", title: "关于", description: "版本、协议与开源信息" },
 ];
@@ -23,29 +40,67 @@ const settings = [
 const activeKey = computed(() => props.section);
 const saving = ref(false);
 const feedback = ref<{ ok: boolean; text: string } | null>(null);
-const { deviceLive, effectiveConfig } = useDevice();
+const { deviceLive, deviceState, effectiveConfig } = useDevice();
 const {
   config,
   active: activePlatform,
   saveDesktopConfig,
+  saveMediaConfig,
   resetDesktopConfig,
 } = usePlatform();
-const locked = computed(() => deviceLive.value || saving.value);
+const locked = computed(() => deviceLive.value
+  || saving.value
+  || deviceState.value === "Registering"
+  || deviceState.value === "Registered"
+  || deviceState.value === "InCall");
 const editableSection = computed(() => activeKey.value !== "about");
 
 const deviceDraft = ref<DeviceSettings | null>(null);
+const mediaDraft = ref<MediaProfile | null>(null);
+const mediaDraftBase = ref<MediaProfile | null>(null);
+const mediaDraftRevision = ref(0);
 const networkDraft = ref<NetworkSettings | null>(null);
 const profileVersion = ref<GbVersion>("V2022");
+const mediaAdvancedOpen = ref(false);
 
-function replaceDrafts() {
-  if (!config.value) return;
-  deviceDraft.value = { ...config.value.device };
-  networkDraft.value = { ...config.value.network };
-  profileVersion.value = activePlatform.value?.gb_version ?? "V2022";
+function sameDeviceDraft(left: DeviceSettings, right: DeviceSettings): boolean {
+  return left.device_id === right.device_id
+    && left.device_name === right.device_name
+    && left.manufacturer === right.manufacturer
+    && left.model === right.model
+    && left.firmware === right.firmware
+    && left.channel_name === right.channel_name
+    && left.register_expires_secs === right.register_expires_secs
+    && left.heartbeat_interval_secs === right.heartbeat_interval_secs
+    && left.heartbeat_fail_threshold === right.heartbeat_fail_threshold;
 }
 
-watch(config, replaceDrafts, { immediate: true });
-watch(activePlatform, replaceDrafts);
+function sameNetworkDraft(left: NetworkSettings, right: NetworkSettings): boolean {
+  return left.bind_mode === right.bind_mode
+    && left.bind_address === right.bind_address
+    && left.sip_trace === right.sip_trace;
+}
+
+function replaceDrafts(force = false) {
+  if (!config.value) return;
+  const preserveDevice = !force && deviceDraft.value && !sameDeviceDraft(deviceDraft.value, config.value.device);
+  const preserveNetwork = !force && networkDraft.value && !sameNetworkDraft(networkDraft.value, config.value.network);
+  const preserveVersion = !force
+    && activePlatform.value
+    && profileVersion.value !== activePlatform.value.gb_version;
+  if (!preserveDevice) deviceDraft.value = { ...config.value.device };
+  if (force || !mediaDraft.value || !mediaDraftBase.value
+    || mediaProfileEqual(mediaDraft.value, mediaDraftBase.value)) {
+    mediaDraft.value = { ...config.value.media };
+    mediaDraftBase.value = { ...config.value.media };
+    mediaDraftRevision.value = config.value.config_revision;
+  }
+  if (!preserveNetwork) networkDraft.value = { ...config.value.network };
+  if (!preserveVersion) profileVersion.value = activePlatform.value?.gb_version ?? "V2022";
+}
+
+watch(config, () => replaceDrafts(), { immediate: true });
+watch(activePlatform, () => replaceDrafts());
 
 const activeSetting = computed(() => settings.find((item) => item.key === activeKey.value)!);
 const platformSummary = computed(() => {
@@ -58,15 +113,48 @@ const runtimeSummary = computed(() => {
     ? `${effective.local_host}:${effective.local_port} · ${effective.network.bind_mode}`
     : "设备未运行";
 });
+const mediaPreset = computed(() => mediaDraft.value ? matchedPreset(mediaDraft.value) : null);
+const mediaPresetLabel = computed(() => MEDIA_PRESETS.find((item) => item.id === mediaPreset.value)?.label ?? "自定义");
+const mediaSummary = computed(() => mediaDraft.value ? mediaProfileSummary(mediaDraft.value) : "配置尚未加载");
+const mediaDirty = computed(() => Boolean(
+  config.value && mediaDraft.value && !mediaProfileEqual(mediaDraft.value, config.value.media),
+));
+
+function selectMediaPreset(id: MediaQualityPresetId) {
+  if (!mediaDraft.value || locked.value) return;
+  mediaDraft.value = applyMediaPreset(mediaDraft.value, id);
+}
+
+function setResolution(event: Event) {
+  if (!mediaDraft.value) return;
+  const width = Number((event.target as HTMLSelectElement).value);
+  const resolution = MEDIA_RESOLUTIONS.find((item) => item.width === width);
+  if (!resolution) return;
+  mediaDraft.value.width = resolution.width;
+  mediaDraft.value.height = resolution.height;
+}
+
+function toggleAudioCodec(codec: MediaProfile["audio_codec"]) {
+  if (!mediaDraft.value || locked.value) return;
+  mediaDraft.value.audio_codec = codec;
+}
+
+function isCommonFps(value: number): boolean {
+  return (MEDIA_FPS_OPTIONS as readonly number[]).includes(value);
+}
+
 function validateDraft(): string | null {
   const device = deviceDraft.value;
   const network = networkDraft.value;
+  if (activeKey.value === "media") {
+    if (!mediaDraft.value) return "配置尚未加载";
+    return validateMediaProfile(mediaDraft.value);
+  }
   if (!device || !network) return "配置尚未加载";
   if (!/^\d{20}$/.test(device.device_id)) return "设备 ID 必须是 20 位数字";
   if (device.register_expires_secs < 3600) return "注册有效期不得短于 3600 秒";
   if (device.heartbeat_interval_secs < 1) return "心跳间隔必须大于 0 秒";
   if (device.heartbeat_fail_threshold < 1) return "连续心跳失败阈值必须大于 0";
-  if (device.video_fps < 1 || device.video_fps > 120) return "视频帧率必须在 1 到 120 之间";
   if (network.bind_mode === "specific" && !network.bind_address.trim()) return "指定绑定模式必须填写本机 IP";
   return null;
 }
@@ -80,6 +168,12 @@ async function saveCurrent() {
   }
   saving.value = true;
   try {
+    if (activeKey.value === "media" && mediaDraft.value) {
+      await saveMediaConfig({ ...mediaDraft.value }, mediaDraftRevision.value);
+      replaceDrafts(true);
+      feedback.value = { ok: true, text: "音视频设置已保存，下次启动设备时生效" };
+      return;
+    }
     const activeId = config.value.active_profile_id;
     await saveDesktopConfig({
       ...config.value,
@@ -89,10 +183,14 @@ async function saveCurrent() {
       device: { ...deviceDraft.value },
       network: { ...networkDraft.value },
     });
-    replaceDrafts();
+    replaceDrafts(true);
     feedback.value = { ok: true, text: "有效设置已由 Rust 保存并回读" };
   } catch (cause) {
     feedback.value = { ok: false, text: String(cause) };
+    if (activeKey.value === "media" && config.value && /版本冲突/.test(String(cause))) {
+      mediaDraftRevision.value = config.value.config_revision;
+      feedback.value.text += "；草稿已保留，请核对后再次保存。";
+    }
   } finally {
     saving.value = false;
   }
@@ -103,7 +201,7 @@ async function resetCurrent() {
   saving.value = true;
   try {
     await resetDesktopConfig();
-    replaceDrafts();
+    replaceDrafts(true);
     feedback.value = { ok: true, text: "全部有效设置已恢复为 Rust 默认值" };
   } catch (cause) {
     feedback.value = { ok: false, text: String(cause) };
@@ -133,7 +231,7 @@ function setBindMode(mode: BindMode) {
     <main class="settings-main glass-card">
         <div v-if="editableSection" class="content-heading">
           <div class="content-context"><span class="content-icon">{{ activeSetting.icon }}</span>模拟器有效配置</div>
-          <div class="content-actions">
+          <div v-if="activeKey !== 'media'" class="content-actions">
             <button class="btn ghost" type="button" :disabled="locked" @click="resetCurrent">恢复全部默认</button>
             <button class="btn primary" type="button" :disabled="locked || !config" @click="saveCurrent">保存有效设置</button>
           </div>
@@ -167,26 +265,100 @@ function setBindMode(mode: BindMode) {
           </div>
         </section>
 
-        <section v-else-if="activeKey === 'media' && deviceDraft" class="settings-section">
-          <div class="section-label">当前有效媒体参数</div>
-          <div class="field-grid two">
-            <label class="field"><span>视频 FPS</span><input v-model.number="deviceDraft.video_fps" type="number" min="1" max="120" :disabled="locked" /></label>
-            <label class="field"><span>分辨率</span><input value="后续阶段" disabled /></label>
-            <label class="field"><span>码率 / GOP</span><input value="后续阶段" disabled /></label>
-            <label class="field"><span>视频 / 音频编解码器</span><input value="后续阶段" disabled /></label>
-            <label class="field"><span>音频采样率</span><input value="后续阶段" disabled /></label>
-          </div>
-          <div class="info-note">只有 FPS 会保存并影响下一次启动；其余控件显示但禁用，避免制造“保存成功”的假象。</div>
-          <div class="section-label">OSD 水印</div>
-          <div class="capability-card">
-            <strong>OSD 尚未接入媒体引擎</strong>
-            <span>时间戳、通道名、自定义水印及字号均属于后续阶段，本页不保存任何占位值。</span>
-            <div class="field-grid two">
-              <label class="field"><span>时间戳</span><input value="后续阶段" disabled /></label>
-              <label class="field"><span>通道名</span><input value="后续阶段" disabled /></label>
-              <label class="field"><span>自定义水印</span><input value="后续阶段" disabled /></label>
-              <label class="field"><span>字号</span><input value="后续阶段" disabled /></label>
+        <section v-else-if="activeKey === 'media' && mediaDraft" class="settings-section media-section">
+          <div class="section-label">参数摘要</div>
+          <div class="media-summary-card">
+            <div>
+              <span class="media-summary-caption">{{ mediaDirty ? "待保存参数" : "当前有效参数" }}</span>
+              <strong>{{ mediaPresetLabel }}</strong>
+              <small>{{ mediaSummary }}</small>
             </div>
+            <span class="media-dirty" :class="{ saved: !mediaDirty }">{{ mediaDirty ? "有未保存修改" : "已保存" }}</span>
+          </div>
+
+          <div class="section-label">画质预设</div>
+          <div class="media-presets" role="list" aria-label="画质预设">
+            <button
+              v-for="preset in MEDIA_PRESETS"
+              :key="preset.id"
+              type="button"
+              class="media-preset"
+              :class="{ selected: mediaPreset === preset.id }"
+              :disabled="locked"
+              :aria-pressed="mediaPreset === preset.id"
+              @click="selectMediaPreset(preset.id)"
+            >
+              <strong>{{ preset.label }}</strong>
+              <span>{{ preset.description }}</span>
+              <small>{{ preset.bitrate_kbps }} kbps · GOP {{ preset.keyframe_interval_seconds }}s</small>
+            </button>
+          </div>
+
+          <div class="section-label">编码</div>
+          <div class="field-grid media-codec-grid">
+            <label class="field">
+              <span>视频编码</span>
+              <select v-model="mediaDraft.video_codec" :disabled="locked">
+                <option v-for="codec in MEDIA_VIDEO_CODECS" :key="codec.value" :value="codec.value">{{ codec.label }}</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>音频编码</span>
+              <select v-model="mediaDraft.audio_codec" :disabled="locked" @change="toggleAudioCodec(mediaDraft.audio_codec)">
+                <option v-for="codec in MEDIA_AUDIO_CODECS" :key="codec.value" :value="codec.value">{{ codec.label }}</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>有效采样率</span>
+              <select v-if="mediaDraft.audio_codec === 'aac'" v-model.number="mediaDraft.audio_sample_rate_hz" :disabled="locked">
+                <option v-for="rate in MEDIA_SAMPLE_RATES" :key="rate" :value="rate">{{ rate / 1000 }} kHz</option>
+              </select>
+              <select v-else value="8000" disabled>
+                <option value="8000">8 kHz（G.711 固定）</option>
+              </select>
+            </label>
+          </div>
+
+          <button
+            type="button"
+            class="media-advanced-toggle"
+            :aria-expanded="mediaAdvancedOpen"
+            @click="mediaAdvancedOpen = !mediaAdvancedOpen"
+          >
+            <span>自定义参数</span>
+            <small>{{ mediaAdvancedOpen ? "收起" : "展开" }} · 分辨率、FPS、码率、关键帧间隔</small>
+            <b>{{ mediaAdvancedOpen ? "⌃" : "⌄" }}</b>
+          </button>
+          <div v-if="mediaAdvancedOpen" class="field-grid two media-advanced-fields">
+            <label class="field">
+              <span>输出分辨率</span>
+              <select :value="mediaDraft.width" :disabled="locked" @change="setResolution">
+                <option v-for="resolution in MEDIA_RESOLUTIONS" :key="resolution.width" :value="resolution.width">{{ resolution.label }}</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>视频帧率</span>
+              <select v-model.number="mediaDraft.video_fps" :disabled="locked">
+                <option v-if="!isCommonFps(mediaDraft.video_fps)" :value="mediaDraft.video_fps">{{ mediaDraft.video_fps }} FPS（自定义）</option>
+                <option v-for="fps in MEDIA_FPS_OPTIONS" :key="fps" :value="fps">{{ fps }} FPS</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>视频码率</span>
+              <select v-model.number="mediaDraft.bitrate_kbps" :disabled="locked">
+                <option v-for="bitrate in MEDIA_BITRATE_OPTIONS" :key="bitrate" :value="bitrate">{{ bitrate }} kbps</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>关键帧间隔</span>
+              <select v-model.number="mediaDraft.keyframe_interval_seconds" :disabled="locked">
+                <option v-for="gop in MEDIA_GOP_OPTIONS" :key="gop" :value="gop">{{ gop }} 秒</option>
+              </select>
+            </label>
+          </div>
+          <div class="info-note">保存后，下次启动设备时生效；运行中请先注销后修改。</div>
+          <div class="media-save-row">
+            <button class="btn primary" type="button" :disabled="locked || !config || !mediaDirty" @click="saveCurrent">保存音视频设置</button>
           </div>
         </section>
 
@@ -249,6 +421,31 @@ function setBindMode(mode: BindMode) {
 .info-note, .capability-card { padding: 12px; border-radius: 9px; background: var(--accent-dim); color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
 .capability-card { display: flex; flex-direction: column; gap: 14px; }
 .capability-card strong { color: var(--text-primary); font-size: 14px; }
+.media-section { gap: 10px; }
+.media-summary-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-default)); border-radius: 11px; background: linear-gradient(135deg, color-mix(in srgb, var(--accent-pale) 72%, #fff), rgba(255,255,255,.62)); }
+.media-summary-card > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.media-summary-caption { color: var(--text-tertiary); font-size: 11px; }
+.media-summary-card strong { color: var(--text-primary); font-size: 17px; }
+.media-summary-card small { overflow: hidden; color: var(--text-secondary); font-family: "SF Mono", Menlo, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.media-dirty { flex: 0 0 auto; padding: 4px 9px; border-radius: 999px; background: color-mix(in srgb, var(--warning) 13%, transparent); color: var(--warning); font-size: 11px; }
+.media-dirty.saved { background: color-mix(in srgb, var(--success) 11%, transparent); color: var(--success); }
+.media-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.media-preset { display: flex; min-width: 0; min-height: 82px; flex-direction: column; align-items: flex-start; gap: 5px; padding: 12px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.44); color: var(--text-secondary); cursor: pointer; text-align: left; }
+.media-preset:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 60%, var(--border-default)); background: var(--accent-pale); }
+.media-preset.selected { border-color: var(--accent); background: var(--accent-dim); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 13%, transparent); }
+.media-preset:disabled { cursor: not-allowed; opacity: .58; }
+.media-preset strong { color: var(--text-primary); font-size: 13px; }
+.media-preset span, .media-preset small { overflow: hidden; max-width: 100%; text-overflow: ellipsis; white-space: nowrap; }
+.media-preset span { color: var(--text-secondary); font-size: 11px; }
+.media-preset small { color: var(--text-tertiary); font-size: 10px; }
+.media-codec-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.media-advanced-toggle { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 11px 12px; border: 1px solid var(--border-default); border-radius: 9px; background: rgba(255,255,255,.42); color: var(--text-primary); cursor: pointer; text-align: left; }
+.media-advanced-toggle:hover { border-color: color-mix(in srgb, var(--accent) 50%, var(--border-default)); }
+.media-advanced-toggle span { font-size: 13px; font-weight: 650; }
+.media-advanced-toggle small { overflow: hidden; color: var(--text-tertiary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.media-advanced-toggle b { color: var(--accent); font-size: 16px; }
+.media-advanced-fields { padding: 12px; border: 1px solid var(--border-subtle); border-radius: 9px; background: rgba(255,255,255,.28); }
+.media-save-row { display: flex; justify-content: flex-end; padding-top: 2px; }
 .network-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .network-option { display: flex; align-items: center; gap: 10px; padding: 14px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.4); color: var(--text-primary); cursor: pointer; }
 .network-option.selected { border-color: var(--accent); background: var(--accent-dim); }
@@ -268,5 +465,6 @@ function setBindMode(mode: BindMode) {
 .loading-section { min-height: 180px; align-items: center; justify-content: center; color: var(--text-tertiary); }
 .loading-section strong { color: var(--text-primary); font-size: 15px; }
 @media (max-width: 980px) { .settings-header { align-items: flex-start; flex-direction: column; } }
-@media (max-width: 680px) { .field-grid.two, .network-options, .about-grid { grid-template-columns: 1fr; } .content-heading { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 900px) { .media-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); } .media-codec-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .field-grid.two, .network-options, .about-grid, .media-codec-grid { grid-template-columns: 1fr; } .media-presets { grid-template-columns: 1fr 1fr; } .content-heading { align-items: flex-start; flex-direction: column; } .media-summary-card { align-items: flex-start; flex-direction: column; gap: 9px; } }
 </style>

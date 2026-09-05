@@ -4,6 +4,8 @@
 //! Program Stream。每帧输出 = Pack Header (+ 关键帧带 System Header + PSM) + PES。
 //! 时间戳基于 90kHz。这是能被主流国标平台(WVP 等)解析的最小可用封装。
 
+use crate::source::{MediaEvent, TimedAudioAu, TimedVideoAu};
+
 /// 视频流 ID(PES stream_id,视频为 0xE0)。
 const STREAM_ID_VIDEO: u8 = 0xE0;
 /// 音频流 ID(PES stream_id,音频为 0xC0)。
@@ -118,6 +120,31 @@ impl AudioCodec {
             Self::Aac => 1_920,                              // 1024 samples / 48 kHz
             Self::G711A | Self::G711U | Self::Opus => 1_800, // 20 ms
         }
+    }
+
+    /// 默认编码采样率。具体事件的有效采样率以 `TimedAudioAu` 为准。
+    pub const fn default_sample_rate_hz(self) -> u32 {
+        match self {
+            Self::G711A | Self::G711U => 8_000,
+            Self::Aac | Self::Opus => 48_000,
+        }
+    }
+
+    /// 默认编码访问单元的采样数。
+    pub const fn default_sample_count(self) -> u32 {
+        match self {
+            Self::Aac => 1_024,
+            Self::G711A | Self::G711U | Self::Opus => 160,
+        }
+    }
+
+    /// 按实际采样率和样本数计算一个访问单元的 90kHz 时长。
+    pub fn duration_90k_for_samples(self, sample_rate_hz: u32, sample_count: u32) -> u64 {
+        let _ = self;
+        if sample_rate_hz == 0 {
+            return 0;
+        }
+        u64::from(sample_count) * u64::from(crate::rtp::CLOCK_HZ) / u64::from(sample_rate_hz)
     }
 
     /// PSM elementary_stream_info descriptor。Opus 通过注册描述符标识私有流。
@@ -284,6 +311,48 @@ impl PsMuxer {
         out
     }
 
+    /// 封装带真实时间戳的视频访问单元。
+    pub fn mux_video_au(&self, au: &TimedVideoAu) -> Vec<u8> {
+        let mut out = Vec::with_capacity(au.data.len() + 64);
+        write_pack_header(&mut out, au.pts_90k);
+        if au.key_frame {
+            write_system_header(&mut out);
+            if self.declare_audio {
+                write_psm_av(&mut out, au.codec, self.audio);
+            } else {
+                write_psm(&mut out, au.codec);
+            }
+        }
+        let mut first = true;
+        for chunk in au.data.chunks(self.pes_max.max(1)) {
+            write_pes(&mut out, chunk, au.pts_90k, first);
+            first = false;
+        }
+        out
+    }
+
+    /// 封装独立到达的音频访问单元。
+    ///
+    /// 音频事件也带 pack/PSM，使其在视频短暂缺失时可以独立发出；下一个
+    /// 视频关键帧会再次携带完整的视频参数集。
+    pub fn mux_audio_au(&self, au: &TimedAudioAu) -> Vec<u8> {
+        let mut out = Vec::with_capacity(au.data.len() + 64);
+        write_pack_header(&mut out, au.pts_90k);
+        write_system_header(&mut out);
+        write_psm_av(&mut out, self.video, au.codec);
+        write_pes_stream(&mut out, STREAM_ID_AUDIO, &au.data, au.pts_90k, true);
+        out
+    }
+
+    /// 按事件类型封装一个访问单元。`Discontinuity` 不产生码流。
+    pub fn mux_event(&self, event: &MediaEvent) -> Vec<u8> {
+        match event {
+            MediaEvent::Video(video) => self.mux_video_au(video),
+            MediaEvent::Audio(audio) => self.mux_audio_au(audio),
+            MediaEvent::Discontinuity { .. } => Vec::new(),
+        }
+    }
+
     /// 封装一帧视频及同一时间窗内的完整编码音频访问单元。
     /// 每个音频元素独立写入一个 PES；关键帧处 PSM 声明音视频两条 ES。
     pub fn mux_frame_av(&self, au: &[u8], pts: u64, key_frame: bool, audio: &[Vec<u8>]) -> Vec<u8> {
@@ -401,5 +470,58 @@ mod tests {
         let b = encode_pts(0, 0b0010);
         assert_eq!(b.len(), 5);
         assert_eq!(b[0] >> 4, 0b0010);
+    }
+
+    fn first_pes_pts(ps: &[u8], stream_id: u8) -> u64 {
+        let marker = [0x00, 0x00, 0x01, stream_id];
+        let start = ps
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("应找到目标 PES")
+            + marker.len();
+        assert_eq!(ps[start + 3] & 0xC0, 0x80);
+        let p = &ps[start + 5..start + 10];
+        (u64::from((p[0] >> 1) & 0x07) << 30)
+            | (u64::from(p[1]) << 22)
+            | (u64::from(p[2] >> 1) << 15)
+            | (u64::from(p[3]) << 7)
+            | u64::from(p[4] >> 1)
+    }
+
+    #[test]
+    fn 定时视频和音频_pes使用各自pts并按协议位宽回绕() {
+        let video_pts = (1_u64 << 33) - 300;
+        let audio_pts = (1_u64 << 33) + 1_234;
+        let video = TimedVideoAu::new(
+            vec![0, 0, 0, 1, 0x65, 1],
+            VideoCodec::H264,
+            true,
+            video_pts,
+            3_600,
+        );
+        let audio =
+            TimedAudioAu::from_samples(vec![0xD5; 160], AudioCodec::G711A, 8_000, 160, audio_pts);
+        let mux = PsMuxer::with_codecs(VideoCodec::H264, AudioCodec::G711A);
+        let video_ps = mux.mux_video_au(&video);
+        let audio_ps = mux.mux_audio_au(&audio);
+        assert_eq!(
+            first_pes_pts(&video_ps, STREAM_ID_VIDEO),
+            video_pts & ((1 << 33) - 1)
+        );
+        assert_eq!(
+            first_pes_pts(&audio_ps, STREAM_ID_AUDIO),
+            audio_pts & ((1 << 33) - 1)
+        );
+    }
+
+    #[test]
+    fn 定时音频_aac8k和16k时长不再固定按48k推算() {
+        let mux = PsMuxer::with_codecs(VideoCodec::H264, AudioCodec::Aac);
+        let aac_8k = TimedAudioAu::from_samples(vec![0x01], AudioCodec::Aac, 8_000, 1_024, 0);
+        let aac_16k =
+            TimedAudioAu::from_samples(vec![0x01], AudioCodec::Aac, 16_000, 1_024, 11_520);
+        assert_eq!(aac_8k.duration_90k, 11_520);
+        assert_eq!(aac_16k.duration_90k, 5_760);
+        assert!(first_pes_pts(&mux.mux_audio_au(&aac_16k), STREAM_ID_AUDIO) >= 11_520);
     }
 }

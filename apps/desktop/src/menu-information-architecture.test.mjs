@@ -44,7 +44,8 @@ assert.match(router, /path: "\/recordings"[\s\S]{0,80}component: Recordings/, "�
 
 assert.doesNotMatch(settings, /settings-nav-item|nav-caption">设置项/, "设置页内部不应再保留二级菜单");
 assert.match(settings, /defineProps<[\s\S]*section:/, "配置页面必须由一级路由决定内容");
-assert.match(settings, /OSD 尚未接入媒体引擎/, "OSD 能力说明必须保留在音视频配置中");
+assert.doesNotMatch(settings, /OSD 尚未接入媒体引擎/, "首版音视频页面不应加入 OSD 占位配置");
+assert.match(settings, /参数摘要/, "音视频配置页应先展示当前参数摘要");
 assert.match(settings, /v-else-if="activeKey === 'about'"/, "配置未加载时不得误显示关于页面");
 assert.match(settings, /配置正在加载/, "配置未加载时必须显示明确的等待状态");
 
