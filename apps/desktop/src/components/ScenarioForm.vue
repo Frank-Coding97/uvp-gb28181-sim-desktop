@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed, ref } from "vue";
 import {
   NButton,
   NForm,
@@ -45,16 +46,24 @@ const emit = defineEmits<{
   (e: "pick-video"): void;
 }>();
 
+const videoCollapsed = ref(true);
+
 const mediaOptions = [
-  { label: "A · 仅信令（最低资源）", value: "A" },
-  { label: "B · 轻量 RTP 伪流", value: "B" },
-  { label: "C · 真实视频循环推流", value: "C" },
+  { label: "A · 仅信令", value: "A" },
+  { label: "B · 轻量伪流", value: "B" },
+  { label: "C · 真实视频", value: "C" },
 ];
 
 const versionOptions = [
   { label: "GB/T 28181-2022", value: "V2022" },
   { label: "GB/T 28181-2016", value: "V2016" },
 ];
+
+const mediaTagText = computed(() => {
+  if (form.value.media_profile === "A") return "A · 仅信令";
+  if (form.value.media_profile === "B") return `B · 伪流 (${form.value.bitrate_kbps}k)`;
+  return `C · 真实视频 (${form.value.active_ratio}%)`;
+});
 </script>
 
 <template>
@@ -64,7 +73,7 @@ const versionOptions = [
         <div class="panel-title">压测场景配置</div>
         <div class="panel-sub" :title="platformLabel">{{ platformLabel }}</div>
       </div>
-      <n-tag size="tiny" round :bordered="false" type="info">并发上限 10,000</n-tag>
+      <n-tag size="tiny" round :bordered="false" type="info">上限 10,000</n-tag>
     </div>
 
     <!-- 运行中状态卡片：紧凑展示锁定参数与运行态 -->
@@ -72,42 +81,42 @@ const versionOptions = [
       <div class="rc-status-row">
         <span class="rc-pulse" :class="{ stopping: stopping || stopPending }" />
         <span class="rc-status-title">
-          {{ stopping || stopPending ? '压测正在平滑停止…' : starting ? '压测正在并发启动…' : '压测场景全力运行中' }}
+          {{ stopping || stopPending ? '压测正在停止…' : starting ? '正在并发拉起…' : '压测全力运行中' }}
         </span>
       </div>
       <div class="rc-grid">
         <div class="rc-item">
-          <span class="rc-label">目标平台</span>
+          <span class="rc-label">平台</span>
           <b class="rc-val mono" :title="platformLabel">{{ platformLabel }}</b>
         </div>
         <div class="rc-item">
-          <span class="rc-label">场景概要</span>
+          <span class="rc-label">概要</span>
           <b class="rc-val mono">{{ scenarioSummary }}</b>
         </div>
         <div class="rc-item">
-          <span class="rc-label">并发规模</span>
-          <b class="rc-val">{{ form.count }} 台 · {{ form.ramp_per_second }} 台/秒</b>
+          <span class="rc-label">并发</span>
+          <b class="rc-val">{{ form.count }} 台 · {{ form.ramp_per_second }} 台/s</b>
         </div>
         <div class="rc-item">
-          <span class="rc-label">国标与媒体</span>
-          <b class="rc-val">{{ form.gb_version }} · 档位 {{ form.media_profile }} ({{ form.active_ratio }}% 推流)</b>
+          <span class="rc-label">国标/媒体</span>
+          <b class="rc-val">{{ form.gb_version }} · 档位 {{ form.media_profile }} ({{ form.active_ratio }}%)</b>
         </div>
         <div class="rc-item">
-          <span class="rc-label">心跳上报</span>
-          <b class="rc-val">{{ form.heartbeat_interval }}s 周期 · {{ form.channels_per_device }} 通道/台</b>
+          <span class="rc-label">心跳/通道</span>
+          <b class="rc-val">{{ form.heartbeat_interval }}s · {{ form.channels_per_device }} 通道</b>
         </div>
         <div class="rc-item">
-          <span class="rc-label">主动施压</span>
+          <span class="rc-label">主动上报</span>
           <b class="rc-val">
-            {{ form.position_enabled ? `GPS(${form.position_interval}s)` : '无GPS' }}
+            {{ form.position_enabled ? `GPS ${form.position_interval}s` : '无GPS' }}
             ·
-            {{ form.alarm_enabled ? `报警(${form.alarm_interval}s)` : '无报警' }}
+            {{ form.alarm_enabled ? `报警 ${form.alarm_interval}s` : '无报警' }}
           </b>
         </div>
       </div>
     </div>
 
-    <!-- 编辑表单：高密度双列紧凑排布 -->
+    <!-- 编辑表单：设备身份、国标参数与折叠视频设置 -->
     <n-form
       v-show="!(running || starting || stopping || stopPending)"
       size="small"
@@ -116,8 +125,9 @@ const versionOptions = [
       :show-feedback="false"
       class="compact-form"
     >
+      <!-- 设备身份与国标核心参数（含主动上报） -->
       <div class="form-grid">
-        <n-form-item label="起始国标 ID" class="span-2 fg-item">
+        <n-form-item label="起始设备 ID" class="span-2 fg-item">
           <n-input
             v-model:value="form.base_device_id"
             size="small"
@@ -126,7 +136,7 @@ const versionOptions = [
           />
         </n-form-item>
 
-        <n-form-item label="并发设备数 (台)" class="fg-item">
+        <n-form-item label="并发数 (台)" class="fg-item">
           <n-input-number
             v-model:value="form.count"
             size="small"
@@ -136,7 +146,7 @@ const versionOptions = [
           />
         </n-form-item>
 
-        <n-form-item label="爬坡速率 (台/秒)" class="fg-item">
+        <n-form-item label="爬坡 (台/s)" class="fg-item">
           <n-input-number
             v-model:value="form.ramp_per_second"
             size="small"
@@ -146,23 +156,7 @@ const versionOptions = [
           />
         </n-form-item>
 
-        <n-form-item label="国标协议版本" class="fg-item">
-          <n-select
-            v-model:value="form.gb_version"
-            size="small"
-            :options="versionOptions"
-          />
-        </n-form-item>
-
-        <n-form-item label="媒体档位" class="fg-item">
-          <n-select
-            v-model:value="form.media_profile"
-            size="small"
-            :options="mediaOptions"
-          />
-        </n-form-item>
-
-        <n-form-item label="心跳间隔 (秒)" class="fg-item">
+        <n-form-item label="心跳 (s)" class="fg-item">
           <n-input-number
             v-model:value="form.heartbeat_interval"
             size="small"
@@ -172,7 +166,7 @@ const versionOptions = [
           />
         </n-form-item>
 
-        <n-form-item label="每台通道数" class="fg-item">
+        <n-form-item label="单台通道" class="fg-item">
           <n-input-number
             v-model:value="form.channels_per_device"
             size="small"
@@ -182,85 +176,120 @@ const versionOptions = [
           />
         </n-form-item>
 
-        <n-form-item label="活跃推流占比" class="fg-item">
-          <n-input-number
-            v-model:value="form.active_ratio"
+        <n-form-item label="国标版本" class="span-2 fg-item">
+          <n-select
+            v-model:value="form.gb_version"
             size="small"
-            :min="0"
-            :max="100"
-            :format="(v: number | null) => `${v ?? 0}%`"
-            style="width: 100%"
+            :options="versionOptions"
           />
         </n-form-item>
 
-        <n-form-item
-          v-if="form.media_profile === 'B'"
-          label="伪流码率 (kbps)"
-          class="fg-item"
-        >
-          <n-input-number
-            v-model:value="form.bitrate_kbps"
-            size="small"
-            :min="64"
-            :max="8192"
-            style="width: 100%"
-          />
-        </n-form-item>
-
-        <n-form-item
-          v-if="form.media_profile === 'C'"
-          label="视频源文件"
-          class="span-2 fg-item"
-        >
-          <n-input-group size="small">
-            <n-input
-              v-model:value="form.video_source"
-              size="small"
-              placeholder="H.264/H.265 或 MP4"
-            />
-            <n-button type="primary" ghost size="small" @click="emit('pick-video')">选择</n-button>
-          </n-input-group>
-        </n-form-item>
-      </div>
-
-      <div class="section-divider">
-        <span>主动施压上报</span>
-        <small>周期向平台上报</small>
-      </div>
-
-      <div class="report-list">
-        <div class="report-row">
-          <div class="rr-title">
-            <b>GPS 移动位置</b>
-            <span>MobilePosition</span>
+        <!-- 上报 GPS 与 报警事件（整合到主卡片中并排两列） -->
+        <div class="report-cell fg-item">
+          <div class="rc-hd">
+            <span class="rc-tit">GPS 上报</span>
+            <n-switch v-model:value="form.position_enabled" size="small" />
           </div>
-          <n-switch v-model:value="form.position_enabled" size="small" />
           <n-input-number
             v-model:value="form.position_interval"
+            size="small"
             :min="1"
             :max="600"
             :disabled="!form.position_enabled"
-            size="small"
-            class="rr-num"
-          />
-          <span class="rr-unit">秒/次</span>
+            placeholder="间隔"
+            style="width: 100%"
+          >
+            <template #suffix>s</template>
+          </n-input-number>
         </div>
 
-        <div class="report-row">
-          <div class="rr-title">
-            <b>国标报警事件</b>
-            <span>MANSCDP Alarm</span>
+        <div class="report-cell fg-item">
+          <div class="rc-hd">
+            <span class="rc-tit">报警上报</span>
+            <n-switch v-model:value="form.alarm_enabled" size="small" />
           </div>
-          <n-switch v-model:value="form.alarm_enabled" size="small" />
           <n-input-number
             v-model:value="form.alarm_interval"
+            size="small"
             :min="1"
             :max="600"
             :disabled="!form.alarm_enabled"
-            size="small"
-            class="rr-num"
-          />
-          <span class="rr-unit">秒/次</span>
+            placeholder="间隔"
+            style="width: 100%"
+          >
+            <template #suffix>s</template>
+          </n-input-number>
+        </div>
+      </div>
+
+      <!-- 视频参数设置（可折叠） -->
+      <div class="video-collapse-box">
+        <button
+          type="button"
+          class="video-collapse-header"
+          :aria-expanded="!videoCollapsed"
+          @click="videoCollapsed = !videoCollapsed"
+        >
+          <div class="vch-left">
+            <span class="vch-arrow" :class="{ rotated: !videoCollapsed }">▶</span>
+            <span class="vch-title">视频参数设置</span>
+            <span class="vch-tag">{{ mediaTagText }}</span>
+          </div>
+          <span class="vch-toggle">{{ videoCollapsed ? '展开' : '收起' }}</span>
+        </button>
+
+        <div v-show="!videoCollapsed" class="video-collapse-body">
+          <div class="form-grid">
+            <n-form-item label="媒体档位" class="fg-item">
+              <n-select
+                v-model:value="form.media_profile"
+                size="small"
+                :options="mediaOptions"
+              />
+            </n-form-item>
+
+            <n-form-item label="推流占比" class="fg-item">
+              <n-input-number
+                v-model:value="form.active_ratio"
+                size="small"
+                :min="0"
+                :max="100"
+                :format="(v: number | null) => `${v ?? 0}%`"
+                style="width: 100%"
+              />
+            </n-form-item>
+
+            <n-form-item
+              v-if="form.media_profile === 'B'"
+              label="伪流码率"
+              class="span-2 fg-item"
+            >
+              <n-input-number
+                v-model:value="form.bitrate_kbps"
+                size="small"
+                :min="64"
+                :max="8192"
+                style="width: 100%"
+              >
+                <template #suffix>kbps</template>
+              </n-input-number>
+            </n-form-item>
+
+            <n-form-item
+              v-if="form.media_profile === 'C'"
+              label="视频源"
+              class="span-2 fg-item"
+            >
+              <n-input-group size="small">
+                <n-input
+                  v-model:value="form.video_source"
+                  size="small"
+                  placeholder="H.264/H.265 或 MP4"
+                />
+                <n-button type="primary" ghost size="small" @click="emit('pick-video')">选择</n-button>
+              </n-input-group>
+            </n-form-item>
+          </div>
         </div>
       </div>
     </n-form>
@@ -288,7 +317,7 @@ const versionOptions = [
           停止压测
         </n-button>
       </div>
-      <div class="action-hint">配置经严格语义校验，运行报告自动脱敏</div>
+      <div class="action-hint">配置语义已校验 · 报告自动脱敏</div>
     </div>
   </section>
 </template>
@@ -325,8 +354,8 @@ const versionOptions = [
 .running-card {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
+  gap: 6px;
+  padding: 8px 10px;
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
@@ -336,7 +365,7 @@ const versionOptions = [
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-bottom: 6px;
+  padding-bottom: 5px;
   border-bottom: 1px solid var(--border-default);
 }
 .rc-pulse {
@@ -359,7 +388,7 @@ const versionOptions = [
 .rc-grid {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
 }
 .rc-item {
   display: flex;
@@ -404,57 +433,89 @@ const versionOptions = [
   min-height: auto !important;
 }
 
-.section-divider {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin: 10px 0 6px;
-  padding-top: 6px;
-  border-top: 1px dashed var(--border-default);
-  font-size: var(--fs-xs);
-  font-weight: 700;
-  color: var(--text-primary);
-}
-.section-divider small {
-  font-weight: 400;
-  color: var(--text-tertiary);
-}
-
-.report-list {
+/* 整合进主卡片的上报项 */
+.report-cell {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 3px;
 }
-.report-row {
+.rc-hd {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 1px;
+}
+.rc-tit {
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+/* 视频参数折叠组件 */
+.video-collapse-box {
+  margin-top: 8px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xs);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+.video-collapse-header {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+}
+.video-collapse-header:hover {
+  background: rgba(120, 140, 170, 0.08);
+}
+.vch-left {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 8px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-xs);
-}
-.rr-title {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
   min-width: 0;
 }
-.rr-title b {
-  font-size: var(--fs-xs);
+.vch-arrow {
+  font-size: 9px;
+  color: var(--text-tertiary);
+  transition: transform 0.2s;
+  display: inline-block;
+}
+.vch-arrow.rotated {
+  transform: rotate(90deg);
+}
+.vch-title {
+  font-size: 11.5px;
+  font-weight: 700;
   color: var(--text-primary);
 }
-.rr-title span {
+.vch-tag {
   font-size: 10px;
-  color: var(--text-tertiary);
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(56, 132, 255, 0.1);
+  color: var(--accent-deep, #1e63dc);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
 }
-.rr-num {
-  width: 70px !important;
-}
-.rr-unit {
-  font-size: 10px;
-  color: var(--text-tertiary);
+.vch-toggle {
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
   flex-shrink: 0;
+}
+.video-collapse-body {
+  padding: 6px 8px 8px;
+  border-top: 1px dashed var(--border-default);
+  background: var(--bg-elevated);
 }
 
 /* 操作区域 */
