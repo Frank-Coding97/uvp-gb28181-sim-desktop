@@ -12,6 +12,10 @@
 # 用法: scripts/bundle-ffmpeg-macos.sh <主app路径> <签名身份> [源ffmpeg] [源ffprobe]
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_ENTITLEMENTS="$SCRIPT_DIR/../apps/desktop/src-tauri/Entitlements.plist"
+/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.camera' "$APP_ENTITLEMENTS" | grep -qx true
+
 APP_INPUT="${1:?需要主 app 路径}"
 IDENTITY="${2:?需要签名身份(security find-identity 里的哈希或名称)}"
 APP="$(cd "$(dirname "$APP_INPUT")" && pwd)/$(basename "$APP_INPUT")"
@@ -100,12 +104,13 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" "$FPBIN" 2>/dev/nu
 # hardened runtime + secure timestamp；本地 ad-hoc 才禁用时间戳。
 sign_code() {
   local target="$1"
+  shift
   if [ "$IDENTITY" = "-" ]; then
     # Ad-hoc signatures have no stable Team ID. Enabling hardened runtime here
     # makes dyld reject the separately signed bundled dylibs as a different team.
-    codesign --force --timestamp=none --sign - "$target"
+    codesign --force --timestamp=none --sign - "$@" "$target"
   else
-    codesign --force --timestamp --options runtime --sign "$IDENTITY" "$target"
+    codesign --force --timestamp --options runtime --sign "$IDENTITY" "$@" "$target"
   fi
 }
 
@@ -126,7 +131,8 @@ for tool in ffmpeg ffprobe; do
 done
 echo "[ffmpeg-bundle] 重签外层主 app…"
 rm -rf "$APP/Contents/_CodeSignature"
-sign_code "$APP"
+# Reuse Tauri's declared permissions; re-signing without this clears camera access.
+sign_code "$APP" --entitlements "$APP_ENTITLEMENTS"
 
 echo "[ffmpeg-bundle] 验证:"
 for tool in ffmpeg ffprobe; do
@@ -143,4 +149,8 @@ for tool in ffmpeg ffprobe; do
   codesign --verify --strict --verbose "$target"
 done
 codesign --verify --deep --strict --verbose "$APP" 2>&1 | tail -2
+SIGNED_ENTITLEMENTS="$(mktemp)"
+trap 'rm -f "$SIGNED_ENTITLEMENTS"' EXIT
+codesign -d --entitlements :- "$APP" >"$SIGNED_ENTITLEMENTS" 2>/dev/null
+/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.camera' "$SIGNED_ENTITLEMENTS" | grep -qx true
 echo "[ffmpeg-bundle] 完成 → $MACOS/ffmpeg, $MACOS/ffprobe"

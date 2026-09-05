@@ -81,6 +81,7 @@ fi
 
 APP="$TMP_DIR/UVP Test.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp /usr/bin/true "$APP/Contents/MacOS/UVP Test"
 cat >"$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -119,5 +120,7 @@ for tool in ffmpeg ffprobe; do
   otool -L "$bundled" | grep -E '^\s+/opt/homebrew/|^\s+/usr/local/' && fail "包内 $tool 仍引用开发机绝对依赖"
 done
 codesign --verify --deep --strict --verbose "$APP" >"$TMP_DIR/app.codesign" 2>&1 || fail "临时 app 深度签名校验失败"
+codesign -d --entitlements :- "$APP" >"$TMP_DIR/app.entitlements.plist" 2>/dev/null
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.camera' "$TMP_DIR/app.entitlements.plist")" = true ]] || fail "主 app 重签丢失摄像头权限"
 
 echo "[T01][PASS] capability probe and macOS bundle probe"

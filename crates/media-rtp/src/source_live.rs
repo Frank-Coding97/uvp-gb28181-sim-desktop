@@ -17,6 +17,10 @@ use crate::preview_worker::{
 };
 use crate::profile::{MediaAudioCodec, MediaProfile, MediaVideoCodec};
 
+#[cfg(target_os = "macos")]
+#[path = "camera_modes.rs"]
+mod camera_modes;
+
 const DEFAULT_SCREEN_WIDTH: u32 = 1280;
 const DEFAULT_SCREEN_HEIGHT: u32 = 720;
 const DEFAULT_SCREEN_BITRATE_KBPS: u32 = 2500;
@@ -1696,10 +1700,28 @@ impl LiveSource {
         if audio_index.is_some() {
             ensure_audio_encoder(&ffmpeg, audio_codec)?;
         }
-        let input_fps = camera_input_fps(fps);
+        let input_mode = camera_modes::probe_camera_mode(
+            &ffmpeg,
+            video_index,
+            profile.width,
+            profile.height,
+            fps,
+        )?;
+        let input_fps = input_mode.fps;
+        tracing::info!(
+            video_index,
+            input_width = input_mode.width,
+            input_height = input_mode.height,
+            input_fps,
+            output_width = profile.width,
+            output_height = profile.height,
+            output_fps = fps,
+            "selected supported camera input mode"
+        );
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let mut command = Command::new(&ffmpeg);
-        let mut camera_args = camera_command_args_for_profile(video_index, audio_index, &profile);
+        let mut camera_args =
+            camera_command_args_for_profile(video_index, audio_index, &profile, input_mode);
         let mut timing_video_stats_reader: Option<std::fs::File> = None;
         let mut timing_audio_stats_reader: Option<std::fs::File> = None;
         let mut timing_stats_writers: Option<(std::fs::File, Option<std::fs::File>)> = None;
@@ -2957,7 +2979,12 @@ fn camera_command_args_for_test(
     fps: u32,
 ) -> Vec<String> {
     let profile = LiveCaptureProfile::legacy_camera(fps, audio_codec);
-    camera_command_args_for_profile(video_index, audio_index, &profile)
+    let input_mode = camera_modes::CameraInputMode {
+        width: profile.width,
+        height: profile.height,
+        fps: f64::from(camera_input_fps(fps)),
+    };
+    camera_command_args_for_profile(video_index, audio_index, &profile, input_mode)
 }
 
 #[cfg(target_os = "macos")]
@@ -2965,8 +2992,9 @@ fn camera_command_args_for_profile(
     video_index: u32,
     audio_index: Option<u32>,
     profile: &LiveCaptureProfile,
+    input_mode: camera_modes::CameraInputMode,
 ) -> Vec<String> {
-    let input_fps = camera_input_fps(profile.video_fps);
+    let input_fps = input_mode.fps;
     let input = audio_index.map_or_else(
         || format!("{video_index}:none"),
         |index| format!("{video_index}:{index}"),
@@ -3008,7 +3036,7 @@ fn camera_command_args_for_profile(
         "-pixel_format".into(),
         "uyvy422".into(),
         "-video_size".into(),
-        "1280x720".into(),
+        format!("{}x{}", input_mode.width, input_mode.height),
         "-framerate".into(),
         input_fps,
         "-i".into(),
@@ -3247,7 +3275,7 @@ fn screen_hevc_command_args(profile: &LiveCaptureProfile) -> Vec<String> {
 struct CameraStartup {
     video_index: u32,
     audio_index: Option<u32>,
-    input_fps: u32,
+    input_fps: f64,
 }
 
 #[cfg(target_os = "macos")]
@@ -4237,7 +4265,22 @@ mod tests {
             audio_codec: LiveAudioCodec::Aac,
             audio_sample_rate_hz: 8_000,
         };
-        let args = camera_command_args_for_profile(0, None, &profile);
+        let args = camera_command_args_for_profile(
+            0,
+            None,
+            &profile,
+            camera_modes::CameraInputMode {
+                width: 1920,
+                height: 1440,
+                fps: 29.970030,
+            },
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-video_size", "1920x1440"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-framerate", "29.97003"]));
         let command = args.join(" ");
 
         assert!(command.contains("-vf scale=640:480:force_original_aspect_ratio=decrease"));
