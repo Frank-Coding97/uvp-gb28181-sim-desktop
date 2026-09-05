@@ -22,3 +22,5 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 openh264 = "=0.6.5"
 screencapturekit = { version = "=8.0.1", features = ["macos_15_0"] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGSession"] }

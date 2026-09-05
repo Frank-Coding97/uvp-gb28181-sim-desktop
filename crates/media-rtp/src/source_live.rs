@@ -1694,6 +1694,19 @@ impl LiveSource {
     ) -> Result<Self> {
         let audio_codec = profile.audio_codec;
         let fps = profile.video_fps;
+        if macos_console_screen_locked() {
+            return Err(Error::Media(camera_startup_timeout_message(
+                "video",
+                CameraStartup {
+                    video_index,
+                    audio_index,
+                    input_fps: f64::from(camera_input_fps(fps)),
+                },
+                "n/a",
+                "n/a",
+                true,
+            )));
+        }
         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
             Error::Media("macOS camera capture requires ffmpeg with AVFoundation support".into())
         })?;
@@ -3279,6 +3292,43 @@ struct CameraStartup {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_console_screen_locked() -> bool {
+    use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString, CFType};
+    use objc2_core_graphics::CGSessionCopyCurrentDictionary;
+
+    let Some(dictionary) = CGSessionCopyCurrentDictionary() else {
+        return false;
+    };
+    // CGSession 返回异构的 CFDictionary；键和值都遵循 CFType 约定。
+    let dictionary =
+        unsafe { CFRetained::cast_unchecked::<CFDictionary<CFType, CFType>>(dictionary) };
+    dictionary
+        .get(&CFString::from_str("CGSSessionScreenIsLocked"))
+        .and_then(|value| value.downcast::<CFBoolean>().ok())
+        .is_some_and(|value| value.value())
+}
+
+#[cfg(target_os = "macos")]
+fn camera_startup_timeout_message(
+    missing: &str,
+    camera: CameraStartup,
+    video_stderr: &str,
+    audio_stderr: &str,
+    console_locked: bool,
+) -> String {
+    if console_locked {
+        return format!(
+            "[camera_screen_locked] Mac 屏幕当前已锁定，AVFoundation 不会交付摄像头视频帧。请解锁 Mac 后重试；video index {} at input {} fps, audio index {:?}",
+            camera.video_index, camera.input_fps, camera.audio_index
+        );
+    }
+    format!(
+        "AVFoundation produced no {missing} data within 15 seconds; video index {} at input {} fps, audio index {:?}; video stderr: {video_stderr}; audio stderr: {audio_stderr}",
+        camera.video_index, camera.input_fps, camera.audio_index
+    )
+}
+
+#[cfg(target_os = "macos")]
 struct StartupChildren {
     children: Vec<Child>,
     worker_threads: Vec<JoinHandle<()>>,
@@ -3400,13 +3450,12 @@ fn wait_for_ffmpeg_startup(
                 (true, false) => "requested audio",
                 (true, true) => unreachable!(),
             };
-            return Err(Error::Media(format!(
-                "AVFoundation produced no {missing} data within 15 seconds; video index {} at input {} fps, audio index {:?}; video stderr: {}; audio stderr: {}",
-                camera.video_index,
-                camera.input_fps,
-                camera.audio_index,
-                locked_tail(video_tail),
-                audio_tail.map_or_else(|| "n/a".into(), locked_tail)
+            return Err(Error::Media(camera_startup_timeout_message(
+                missing,
+                camera,
+                &locked_tail(video_tail),
+                &audio_tail.map_or_else(|| "n/a".into(), locked_tail),
+                macos_console_screen_locked(),
             )));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -4203,6 +4252,26 @@ mod tests {
             .expect("AVFoundation 默认可能选择竖屏模式，必须显式请求 1280x720");
 
         assert!(size_position < input_position, "输入尺寸必须在 -i 之前生效");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 锁屏时摄像头启动失败必须给出可执行提示() {
+        let message = camera_startup_timeout_message(
+            "video",
+            CameraStartup {
+                video_index: 0,
+                audio_index: None,
+                input_fps: 30.0,
+            },
+            "",
+            "n/a",
+            true,
+        );
+
+        assert!(message.contains("[camera_screen_locked]"));
+        assert!(message.contains("解锁 Mac"));
+        assert!(!message.contains("produced no video data within 15 seconds"));
     }
 
     #[test]

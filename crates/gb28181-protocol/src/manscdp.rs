@@ -298,12 +298,9 @@ impl SnapShotConfig {
 /// 在线升级参数(DeviceUpgrade 子元素,GB28181-2022 A.2.3.1.12)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceUpgrade {
-    /// 固件版本。
+    /// 目标固件版本(本模拟器约定该字段表示目标版本)。
     #[serde(rename = "Firmware", default)]
     pub firmware: String,
-    /// 会话标识。
-    #[serde(rename = "SessionID", default)]
-    pub session_id: String,
     /// 固件文件地址。
     #[serde(rename = "FileURL", default)]
     pub file_url: String,
@@ -314,6 +311,9 @@ pub struct DeviceUpgrade {
         skip_serializing_if = "Option::is_none"
     )]
     pub manufacturer: Option<String>,
+    /// 会话标识。
+    #[serde(rename = "SessionID", default)]
+    pub session_id: String,
 }
 
 /// 精确云台控制参数(PTZPreciseCtrl 子元素,GB-2022)。
@@ -937,10 +937,11 @@ impl MobilePositionResponse {
     }
 }
 
-/// 在线升级进度通知(DeviceUpgradeResult,设备 → 平台)。
+/// 在线升级结果通知(DeviceUpgradeResult,设备 → 平台,GB28181-2022 A.2.5.9)。
 ///
-/// 4 步进度 percent [0,30,60,100]。percent<100 → Result=0(进行中),
-/// percent==100 → Result=1(成功);2=失败(定义但模拟不发)。
+/// 2022 版只定义最终结果通知：`UpgradeResult` 为 `OK`/`ERROR`，成功时
+/// `Firmware` 是设备当前版本，失败时必须携带 `UpgradeFailedReason`。本类型
+/// 不包含旧实现中的数字 `Result` 和 `Percent` 字段，避免把工程进度模型误当成国标信令。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "Notify")]
 pub struct DeviceUpgradeResultNotify {
@@ -952,24 +953,66 @@ pub struct DeviceUpgradeResultNotify {
     pub device_id: String,
     #[serde(rename = "SessionID")]
     pub session_id: String,
+    /// 升级结果:OK/ERROR。
+    #[serde(rename = "UpgradeResult")]
+    pub upgrade_result: String,
     #[serde(rename = "Firmware")]
     pub firmware: String,
-    /// 0=进行中 1=成功 2=失败。
-    #[serde(rename = "Result")]
-    pub result: u8,
-    /// 进度百分比(0-100)。
-    #[serde(rename = "Percent")]
-    pub percent: u8,
+    /// 升级失败原因:01/02/03/99。成功时省略。
+    #[serde(
+        rename = "UpgradeFailedReason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub upgrade_failed_reason: Option<String>,
 }
 
 impl DeviceUpgradeResultNotify {
-    /// 用会话/固件/进度构造(Result 由 percent 推导)。
+    /// 构造升级成功结果。
+    pub fn success(
+        device_id: impl Into<String>,
+        sn: u32,
+        session_id: impl Into<String>,
+        firmware: impl Into<String>,
+    ) -> Self {
+        Self {
+            cmd_type: "DeviceUpgradeResult".into(),
+            sn,
+            device_id: device_id.into(),
+            session_id: session_id.into(),
+            firmware: firmware.into(),
+            upgrade_result: "OK".into(),
+            upgrade_failed_reason: None,
+        }
+    }
+
+    /// 构造升级失败结果。失败原因必须是国标定义的 01/02/03/99。
+    pub fn error(
+        device_id: impl Into<String>,
+        sn: u32,
+        session_id: impl Into<String>,
+        firmware: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            cmd_type: "DeviceUpgradeResult".into(),
+            sn,
+            device_id: device_id.into(),
+            session_id: session_id.into(),
+            firmware: firmware.into(),
+            upgrade_result: "ERROR".into(),
+            upgrade_failed_reason: Some(reason.into()),
+        }
+    }
+
+    /// 用显式结果构造最终升级结果。
     pub fn new(
         device_id: impl Into<String>,
         sn: u32,
         session_id: impl Into<String>,
         firmware: impl Into<String>,
-        percent: u8,
+        upgrade_result: impl Into<String>,
+        upgrade_failed_reason: Option<String>,
     ) -> Self {
         DeviceUpgradeResultNotify {
             cmd_type: "DeviceUpgradeResult".into(),
@@ -977,8 +1020,8 @@ impl DeviceUpgradeResultNotify {
             device_id: device_id.into(),
             session_id: session_id.into(),
             firmware: firmware.into(),
-            result: if percent >= 100 { 1 } else { 0 },
-            percent,
+            upgrade_result: upgrade_result.into(),
+            upgrade_failed_reason,
         }
     }
 
@@ -3009,16 +3052,21 @@ mod tests {
     }
 
     #[test]
-    fn 升级进度与抓拍完成通知() {
-        let n0 = DeviceUpgradeResultNotify::new("d", 1, "s1", "v2.0", 0)
+    fn 升级结果与抓拍完成通知() {
+        let ok = DeviceUpgradeResultNotify::success("d", 1, "s1", "v2.0")
             .to_xml()
             .unwrap();
-        assert!(n0.contains("<CmdType>DeviceUpgradeResult</CmdType>"));
-        assert!(n0.contains("<Result>0</Result>") && n0.contains("<Percent>0</Percent>"));
-        let n100 = DeviceUpgradeResultNotify::new("d", 2, "s1", "v2.0", 100)
+        assert!(ok.contains("<CmdType>DeviceUpgradeResult</CmdType>"));
+        assert!(ok.contains("<UpgradeResult>OK</UpgradeResult>"));
+        assert!(ok.contains("<Firmware>v2.0</Firmware>"));
+        assert!(!ok.contains("<Result>") && !ok.contains("<Percent>"));
+        assert!(ok.find("<SessionID>").unwrap() < ok.find("<UpgradeResult>").unwrap());
+        assert!(ok.find("<UpgradeResult>").unwrap() < ok.find("<Firmware>").unwrap());
+        let error = DeviceUpgradeResultNotify::error("d", 2, "s1", "v1.0", "02")
             .to_xml()
             .unwrap();
-        assert!(n100.contains("<Result>1</Result>"));
+        assert!(error.contains("<UpgradeResult>ERROR</UpgradeResult>"));
+        assert!(error.contains("<UpgradeFailedReason>02</UpgradeFailedReason>"));
 
         let snap = SnapShotNotify::new("d", 3, "sess", "20260704T120000_1", "t", "http://x/a.jpg")
             .to_xml()

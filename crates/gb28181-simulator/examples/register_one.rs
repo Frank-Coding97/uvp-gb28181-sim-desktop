@@ -6,7 +6,9 @@
 //! ```bash
 //! SERVER_HOST=127.0.0.1 SERVER_PORT=5060 \
 //! SERVER_DOMAIN=34020000002000000001 \
+//! SERVER_ID=34020000002000000001 \
 //! DEVICE_ID=34020000001320000001 PASSWORD=change-me \
+//! UVP_SIM_UPGRADE_STATE_DIR=/tmp/uvp-sim-upgrade \
 //! cargo run -p gb28181-simulator --example register_one
 //! ```
 
@@ -41,6 +43,7 @@ async fn main() {
         .parse()
         .expect("SERVER_PORT 非法");
     let server_domain = env_or("SERVER_DOMAIN", "34020000002000000001");
+    let server_id = env_or("SERVER_ID", &server_domain);
     let device_id_str = env_or("DEVICE_ID", "34020000001320000001");
     let password = env_or("PASSWORD", "change-me");
 
@@ -61,7 +64,7 @@ async fn main() {
         password,
         server_host: server_host.clone(),
         server_port,
-        server_id: server_domain.clone(),
+        server_id,
         server_domain,
         transport: Transport::Udp,
         register_expires_secs: 3_600,

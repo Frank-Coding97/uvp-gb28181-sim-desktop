@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, OnceLock,
 };
+use std::{collections::HashSet, net::IpAddr};
 
 use common::{DeviceEvent, DeviceId, DeviceObserver, Transport};
 use gb28181_simulator::{
@@ -227,6 +228,9 @@ struct StateEmitter {
 
 fn camera_capture_guidance(message: &str) -> String {
     let normalized = message.to_ascii_lowercase();
+    if normalized.contains("[camera_screen_locked]") {
+        return "[camera_screen_locked] Mac 当前处于锁屏状态，系统不会向模拟器交付摄像头画面。请解锁 Mac 后回到首页重新注册设备。".into();
+    }
     if normalized.contains("not authorized")
         || normalized.contains("permission denied")
         || normalized.contains("camera access denied")
@@ -453,6 +457,50 @@ impl sip_core::TraceObserver for TraceEmitter {
 #[tauri::command]
 fn engine_version() -> String {
     format!("stress-engine v{} 就绪", env!("CARGO_PKG_VERSION"))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LocalIpOption {
+    address: String,
+    interface_name: String,
+    address_family: &'static str,
+    loopback: bool,
+}
+
+fn normalize_local_ip_options(addresses: Vec<(String, IpAddr)>) -> Vec<LocalIpOption> {
+    let mut seen = HashSet::new();
+    let mut options: Vec<_> = addresses
+        .into_iter()
+        .filter(|(_, address)| !address.is_unspecified() && !address.is_multicast())
+        .filter(|(_, address)| seen.insert(*address))
+        .map(|(interface_name, address)| LocalIpOption {
+            address: address.to_string(),
+            interface_name,
+            address_family: if address.is_ipv4() { "IPv4" } else { "IPv6" },
+            loopback: address.is_loopback(),
+        })
+        .collect();
+    options.sort_by(|left, right| {
+        left.loopback
+            .cmp(&right.loopback)
+            .then_with(|| (left.address_family == "IPv6").cmp(&(right.address_family == "IPv6")))
+            .then_with(|| left.interface_name.cmp(&right.interface_name))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    options
+}
+
+#[tauri::command]
+fn list_local_ip_addresses() -> Result<Vec<LocalIpOption>, String> {
+    let addresses = if_addrs::get_if_addrs()
+        .map_err(|error| format!("读取本机网卡地址失败: {error}"))?
+        .into_iter()
+        .map(|interface| {
+            let address = interface.ip();
+            (interface.name, address)
+        })
+        .collect();
+    Ok(normalize_local_ip_options(addresses))
 }
 
 #[tauri::command]
@@ -1259,14 +1307,19 @@ async fn start_device(
     };
 
     // Prepare the immutable output before REGISTER; INVITE only subscribes to it.
-    let prepared_file = if let Some(path) = resolved.video_source.as_ref()
+    let prepared_file = if let Some(path) = resolved
+        .video_source
+        .as_ref()
         .filter(|path| !path.trim().is_empty() && !path.starts_with("live:"))
     {
         let cancel = startup.cancel.clone();
         if state.shutting_down.load(Ordering::Acquire) {
             cancel.store(true, Ordering::Release);
         }
-        let _ = app.emit("media_preparation", serde_json::json!({"phase":"preparing", "message":"正在准备文件音视频"}));
+        let _ = app.emit(
+            "media_preparation",
+            serde_json::json!({"phase":"preparing", "message":"正在准备文件音视频"}),
+        );
         let prepare_app = app.clone();
         let source_path = std::path::PathBuf::from(path);
         let profile = resolved.media.clone();
@@ -1283,26 +1336,48 @@ async fn start_device(
                     FilePreparationPhase::Publishing => "正在保存准备结果",
                     FilePreparationPhase::Complete => "文件音视频准备完成",
                 };
-                let _ = prepare_app.emit("media_preparation", serde_json::json!({"phase":"preparing", "message":message}));
+                let _ = prepare_app.emit(
+                    "media_preparation",
+                    serde_json::json!({"phase":"preparing", "message":message}),
+                );
             };
-            media_rtp::file_profile::prepare_file_profile(&source_path, &profile, &task_cancel, Some(&progress))
-        }).await;
-        let result = result.map_err(|error| format!("文件准备任务异常: {error}")).and_then(|result| result);
+            media_rtp::file_profile::prepare_file_profile(
+                &source_path,
+                &profile,
+                &task_cancel,
+                Some(&progress),
+            )
+        })
+        .await;
+        let result = result
+            .map_err(|error| format!("文件准备任务异常: {error}"))
+            .and_then(|result| result);
         if cancel.load(Ordering::Acquire) {
-            let _ = app.emit("media_preparation", serde_json::json!({"phase":"cancelled", "message":"已取消文件准备"}));
+            let _ = app.emit(
+                "media_preparation",
+                serde_json::json!({"phase":"cancelled", "message":"已取消文件准备"}),
+            );
             return Err("已取消文件准备".into());
         }
         match result {
             Ok(prepared) => {
-                let _ = app.emit("media_preparation", serde_json::json!({"phase":"ready", "message":"文件音视频准备完成"}));
+                let _ = app.emit(
+                    "media_preparation",
+                    serde_json::json!({"phase":"ready", "message":"文件音视频准备完成"}),
+                );
                 Some(prepared)
             }
             Err(error) => {
-                let _ = app.emit("media_preparation", serde_json::json!({"phase":"failed", "message":error}));
+                let _ = app.emit(
+                    "media_preparation",
+                    serde_json::json!({"phase":"failed", "message":error}),
+                );
                 return Err(format!("视频源准备失败: {error}"));
             }
         }
-    } else { None };
+    } else {
+        None
+    };
 
     if state.shutting_down.load(Ordering::Acquire) {
         return Err("应用正在退出".into());
@@ -1330,7 +1405,16 @@ async fn start_device(
 
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
-    let sim = Arc::new(DeviceSimulator::with_observer(cfg, observer));
+    let upgrade_state_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用固件升级状态目录: {error}"))?
+        .join("upgrade-state");
+    let sim = Arc::new(DeviceSimulator::with_observer_and_upgrade_state_dir(
+        cfg,
+        observer,
+        upgrade_state_dir,
+    ));
     if let Some(prepared) = prepared_file {
         sim.install_prepared_file(prepared)?;
     }
@@ -1986,6 +2070,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             engine_version,
+            list_local_ip_addresses,
             get_desktop_config,
             save_desktop_config,
             save_media_config,
@@ -2104,9 +2189,42 @@ mod tests {
     }
 
     #[test]
+    fn 锁屏错误映射为解锁后重试提示() {
+        let message = camera_capture_guidance("[camera_screen_locked] console is locked");
+        assert!(message.contains("解锁 Mac"));
+        assert!(message.contains("[camera_screen_locked]"));
+    }
+
+    #[test]
     fn 普通媒体错误不伪装成权限错误() {
         let original = "preview FFmpeg produced no JPEG within 2000 ms";
         assert_eq!(camera_capture_guidance(original), original);
+    }
+
+    #[test]
+    fn 本机ip去重过滤并优先展示非回环ipv4() {
+        let options = normalize_local_ip_options(vec![
+            ("lo0".into(), "127.0.0.1".parse().unwrap()),
+            ("en0".into(), "192.168.1.8".parse().unwrap()),
+            ("en1".into(), "192.168.1.8".parse().unwrap()),
+            ("en0".into(), "fe80::1".parse().unwrap()),
+            ("bad".into(), "0.0.0.0".parse().unwrap()),
+        ]);
+
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].address, "192.168.1.8");
+        assert_eq!(options[0].interface_name, "en0");
+        assert_eq!(options[1].address, "fe80::1");
+        assert_eq!(options[2].address, "127.0.0.1");
+    }
+
+    #[test]
+    fn 本机网卡扫描返回可解析地址() {
+        let options = list_local_ip_addresses().expect("当前系统应允许读取网卡地址");
+        assert!(!options.is_empty());
+        assert!(options
+            .iter()
+            .all(|option| option.address.parse::<IpAddr>().is_ok()));
     }
 
     #[test]

@@ -44,6 +44,13 @@ export interface NetworkSettings {
   sip_trace: boolean;
 }
 
+export interface LocalIpOption {
+  address: string;
+  interface_name: string;
+  address_family: "IPv4" | "IPv6";
+  loopback: boolean;
+}
+
 export interface CatalogNodeConfig {
   id: string;
   node_type: "AdministrativeRegion" | "System" | "Device" | "BusinessGroup" | "VirtualOrg" | "VideoChannel" | "AlarmChannel";
@@ -311,6 +318,10 @@ export async function resetDesktopConfig(): Promise<DesktopConfigV2> {
     error.value = String(cause);
     throw cause;
   }
+}
+
+export async function listLocalIpAddresses(): Promise<LocalIpOption[]> {
+  return invoke<LocalIpOption[]>("list_local_ip_addresses");
 }
 
 export function usePlatform() {

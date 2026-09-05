@@ -14,6 +14,9 @@ use gb28181_protocol::manscdp::Keepalive;
 use sip_core::{authorization, Challenge, UdpTransport};
 
 use crate::builder::{self, DialogIds};
+use crate::firmware_upgrade::{
+    self, SessionStatus, UpgradeDispatch, UpgradeResult, UpgradeStore, ValidatedUpgrade,
+};
 
 /// 设备初始内置的五个具名预置位(可被平台的预置位设置/删除命令修改)。
 fn default_presets() -> std::collections::BTreeMap<u8, String> {
@@ -289,6 +292,10 @@ pub struct DeviceSimulator {
     catalog_snapshot: std::sync::Mutex<gb28181_protocol::manscdp::CatalogSnapshot>,
     /// 最近一次 Catalog Query 的目标、结果数和分包数。
     catalog_activity: std::sync::Mutex<Option<CatalogQueryActivity>>,
+    /// 当前设备的固件版本和升级会话持久化状态。
+    upgrade_store: Arc<UpgradeStore>,
+    /// 同一设备同时只允许一个新的升级会话执行。
+    active_upgrade: tokio::sync::Mutex<Option<String>>,
 }
 
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
@@ -377,7 +384,8 @@ fn initial_runtime_config(
                 item.video_format = match media.video_codec {
                     media_rtp::profile::MediaVideoCodec::H264 => "H.264",
                     media_rtp::profile::MediaVideoCodec::H265 => "H.265",
-                }.into();
+                }
+                .into();
                 item.resolution = format!("{}*{}", media.width, media.height);
                 item.frame_rate = media.video_fps.to_string();
                 item.video_bit_rate = Some(media.bitrate_kbps.to_string());
@@ -415,40 +423,48 @@ struct Subscription {
 impl DeviceSimulator {
     /// 用配置创建一个待运行的设备仿真实例(无观察者)。
     pub fn new(config: DeviceConfig) -> Self {
-        let runtime_config = initial_runtime_config(&config);
-        Self {
+        let state_dir = std::env::var_os("UVP_SIM_UPGRADE_STATE_DIR").map(std::path::PathBuf::from);
+        Self::new_with_observer_and_state_dir(config, Arc::new(common::NoopObserver), state_dir)
+    }
+
+    /// 创建带设备专属固件状态目录的仿真实例。目录下按设备 ID 写一个 JSON 文件。
+    pub fn with_upgrade_state_dir(
+        config: DeviceConfig,
+        state_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self::new_with_observer_and_state_dir(
             config,
-            preview_sink: std::sync::Mutex::new(None),
-            shared_media: tokio::sync::Mutex::new(None),
-            prepared_file: std::sync::Mutex::new(None),
-            recording_service: std::sync::Mutex::new(None),
-            ids: DialogIds::new(),
-            cseq: AtomicU32::new(1),
-            session: tokio::sync::Mutex::new(None),
-            observer: Arc::new(common::NoopObserver),
-            local_addr: std::sync::OnceLock::new(),
-            position: std::sync::Mutex::new((116.397_428, 39.909_230)),
-            subscriptions: tokio::sync::Mutex::new(HashMap::new()),
-            alarm_dialog: tokio::sync::Mutex::new(None),
-            catalog_dialog: tokio::sync::Mutex::new(None),
-            presets: std::sync::Mutex::new(default_presets()),
-            control_state: std::sync::Mutex::new(ControlState::default()),
-            runtime_config: std::sync::Mutex::new(runtime_config),
-            runtime_change: std::sync::Mutex::new(RuntimeChange {
-                kind: "device_started".into(),
-                updated_at_ms: epoch_millis(),
-            }),
-            catalog_tree: std::sync::Mutex::new(Vec::new()),
-            catalog_snapshot: std::sync::Mutex::new(gb28181_protocol::manscdp::CatalogSnapshot {
-                channels: std::collections::BTreeMap::new(),
-            }),
-            catalog_activity: std::sync::Mutex::new(None),
-        }
+            Arc::new(common::NoopObserver),
+            Some(state_dir.into()),
+        )
     }
 
     /// 带事件观察者创建(压测时由编排器注入共享 Metrics)。
     pub fn with_observer(config: DeviceConfig, observer: Arc<dyn common::DeviceObserver>) -> Self {
+        let state_dir = std::env::var_os("UVP_SIM_UPGRADE_STATE_DIR").map(std::path::PathBuf::from);
+        Self::new_with_observer_and_state_dir(config, observer, state_dir)
+    }
+
+    /// 带观察者和设备专属固件状态目录创建仿真实例。
+    pub fn with_observer_and_upgrade_state_dir(
+        config: DeviceConfig,
+        observer: Arc<dyn common::DeviceObserver>,
+        state_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self::new_with_observer_and_state_dir(config, observer, Some(state_dir.into()))
+    }
+
+    fn new_with_observer_and_state_dir(
+        config: DeviceConfig,
+        observer: Arc<dyn common::DeviceObserver>,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         let runtime_config = initial_runtime_config(&config);
+        let upgrade_store = Arc::new(UpgradeStore::open(
+            state_dir,
+            config.device_id.as_str(),
+            &config.device_info.firmware,
+        ));
         Self {
             config,
             preview_sink: std::sync::Mutex::new(None),
@@ -476,6 +492,8 @@ impl DeviceSimulator {
                 channels: std::collections::BTreeMap::new(),
             }),
             catalog_activity: std::sync::Mutex::new(None),
+            upgrade_store,
+            active_upgrade: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -495,6 +513,11 @@ impl DeviceSimulator {
     /// 只读访问配置。
     pub fn config(&self) -> &DeviceConfig {
         &self.config
+    }
+
+    /// 当前设备固件版本。升级成功后该值会立即反映持久化的模拟版本。
+    pub fn current_firmware(&self) -> String {
+        self.upgrade_store.current_firmware()
     }
 
     /// 注入桌面端录像目录。重复注入时保留新 Store 的持久化真相。
@@ -673,7 +696,9 @@ impl DeviceSimulator {
     fn apply_device_config(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<bool> {
         // Encoding changes must be applied to the capture pipeline, never just the query DTO.
         if ctrl.cfg_video_param_attribute.is_some() {
-            return Err(Error::Gb28181("媒体参数需停止设备后在音视频配置中修改".into()));
+            return Err(Error::Gb28181(
+                "媒体参数需停止设备后在音视频配置中修改".into(),
+            ));
         }
         let mut current = self
             .runtime_config
@@ -744,11 +769,17 @@ impl DeviceSimulator {
     }
 
     /// Install a verified immutable file output prepared before REGISTER.
-    pub fn install_prepared_file(&self, prepared: media_rtp::file_profile::PreparedFileProfile) -> std::result::Result<(), String> {
+    pub fn install_prepared_file(
+        &self,
+        prepared: media_rtp::file_profile::PreparedFileProfile,
+    ) -> std::result::Result<(), String> {
         if self.config.media_profile.as_ref() != Some(prepared.profile()) {
             return Err("文件准备结果与设备媒体配置不一致".into());
         }
-        *self.prepared_file.lock().map_err(|_| "文件准备状态锁异常")? = Some(prepared);
+        *self
+            .prepared_file
+            .lock()
+            .map_err(|_| "文件准备状态锁异常")? = Some(prepared);
         Ok(())
     }
 
@@ -781,24 +812,34 @@ impl DeviceSimulator {
         };
         let fps = self.config.video_fps;
         let profile = self.config.media_profile.clone();
-        let prepared = self.prepared_file.lock().map_err(|_| Error::Media("文件准备状态锁异常".into()))?.clone();
+        let prepared = self
+            .prepared_file
+            .lock()
+            .map_err(|_| Error::Media("文件准备状态锁异常".into()))?
+            .clone();
         let preview = self.preview_sink.lock().unwrap().clone();
         let source = tokio::task::spawn_blocking(move || {
             if path.starts_with("live:") {
                 let capture = match profile {
-                    Some(profile) => media_rtp::LiveSource::capture_with_profile(&path, profile, preview),
+                    Some(profile) => {
+                        media_rtp::LiveSource::capture_with_profile(&path, profile, preview)
+                    }
                     None => media_rtp::LiveSource::capture(&path, fps, preview),
                 };
                 capture
                     .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
                     .map_err(|error| Error::Media(format!("实时采集失败: {error}")))
             } else if profile.is_some() {
-                let source = prepared.ok_or_else(|| Error::Media("文件尚未按媒体配置准备，请重新启动设备".into()))?
-                    .open_source(true).map_err(Error::Media)?;
+                let source = prepared
+                    .ok_or_else(|| Error::Media("文件尚未按媒体配置准备，请重新启动设备".into()))?
+                    .open_source(true)
+                    .map_err(Error::Media)?;
                 let source: Box<dyn media_rtp::VideoSource> = Box::new(source);
                 match preview {
-                    Some(sink) => media_rtp::preview_source::PreviewingSource::new(source, fps, sink)
-                        .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>),
+                    Some(sink) => {
+                        media_rtp::preview_source::PreviewingSource::new(source, fps, sink)
+                            .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
+                    }
                     None => Ok(source),
                 }
             } else {
@@ -1653,7 +1694,11 @@ impl DeviceSimulator {
                             body_str.contains("<Control>") || body_str.contains("<Control ");
                         if is_control {
                             if let Ok(ctrl) = gb28181_protocol::manscdp::Control::parse(body_str) {
-                                let xml = self.handle_control(&ctrl).await?;
+                                let (xml, upgrade_dispatch) = if ctrl.device_upgrade.is_some() {
+                                    self.handle_control_with_dispatch(&ctrl).await?
+                                } else {
+                                    (self.handle_control(&ctrl).await?, None)
+                                };
                                 self.send_reply_message(transport, incoming.from, &xml)
                                     .await?;
                                 // 平台命令时间线:上报语义摘要(控制类,含方向/变倍/预置位等细节)。
@@ -1661,12 +1706,12 @@ impl DeviceSimulator {
                                     .on_event(common::DeviceEvent::PlatformCommand {
                                         kind: "control".into(),
                                         summary: format!(
-                                            "平台控制:{} → 已应答 OK",
+                                            "平台控制:{} → 已应答",
                                             Self::control_detail(&ctrl)
                                         ),
                                     });
                                 // 抓拍/升级等需设备主动发 NOTIFY 的命令:回 200/结果后异步执行。
-                                self.spawn_control_side_effects(transport, &ctrl);
+                                self.spawn_control_side_effects(transport, &ctrl, upgrade_dispatch);
                             }
                         } else if body_str.contains("Broadcast") {
                             // 语音广播:回 Broadcast Response(OK/ERROR),接受则反向发 INVITE。
@@ -2415,7 +2460,7 @@ impl DeviceSimulator {
                     device_name: self.config.device_info.device_name.clone(),
                     manufacturer: self.config.device_info.manufacturer.clone(),
                     model: self.config.device_info.model.clone(),
-                    firmware: self.config.device_info.firmware.clone(),
+                    firmware: self.current_firmware(),
                     channel: self.config.channels.len() as u32,
                 };
                 resp.to_xml()
@@ -2547,10 +2592,18 @@ impl DeviceSimulator {
         }
     }
 
+    /// 处理设备控制命令并返回业务应答 XML。升级命令还会返回一次性副作用调度结果。
+    async fn handle_control(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<String> {
+        Ok(self.handle_control_with_dispatch(ctrl).await?.0)
+    }
+
     /// 处理设备控制命令(PTZ/关键帧/录像/布防/复位/重启),返回应答 XML。
     /// 语义:模拟器接受并回 Result=OK;强制关键帧会触发当前推流立即发关键帧
     ///(当前 FileSource/LightSource 本就周期性带关键帧,记录日志即可)。
-    async fn handle_control(&self, ctrl: &gb28181_protocol::manscdp::Control) -> Result<String> {
+    async fn handle_control_with_dispatch(
+        &self,
+        ctrl: &gb28181_protocol::manscdp::Control,
+    ) -> Result<(String, Option<UpgradeDispatch>)> {
         if ctrl.cfg_video_param_attribute.is_some() {
             let response = gb28181_protocol::manscdp::ControlResponse {
                 cmd_type: "DeviceConfig".into(),
@@ -2558,7 +2611,10 @@ impl DeviceSimulator {
                 device_id: ctrl.device_id.clone(),
                 result: "ERROR".into(),
             };
-            return Ok(response.to_xml()?);
+            return Ok((response.to_xml()?, None));
+        }
+        if ctrl.device_upgrade.is_some() {
+            return self.handle_upgrade_control(ctrl).await;
         }
         tracing::info!(kind = %ctrl.kind(), sn = ctrl.sn, "收到设备控制");
         if let Some(ptz) = &ctrl.ptz_cmd {
@@ -2743,7 +2799,79 @@ impl DeviceSimulator {
         } else {
             gb28181_protocol::manscdp::ControlResponse::ok(&ctrl.device_id, ctrl.sn)
         };
-        resp.to_xml()
+        Ok((resp.to_xml()?, None))
+    }
+
+    /// 校验并登记一次升级会话。入站 MESSAGE 的 SIP 200 已经由调用方先行发送，
+    /// 这里生成的 DeviceControl Response 只表示设备是否接受本次升级任务；最终结果
+    /// 必须等下载、校验、模拟应用和重新注册完成后另发 DeviceUpgradeResult Notify。
+    async fn handle_upgrade_control(
+        &self,
+        ctrl: &gb28181_protocol::manscdp::Control,
+    ) -> Result<(String, Option<UpgradeDispatch>)> {
+        let rejected = |reason: &str| {
+            tracing::warn!(sn = ctrl.sn, %reason, "设备固件升级请求拒绝");
+            gb28181_protocol::manscdp::ControlResponse {
+                cmd_type: "DeviceControl".into(),
+                sn: ctrl.sn,
+                device_id: self.config.device_id.as_str().into(),
+                result: "ERROR".into(),
+            }
+            .to_xml()
+            .map(|xml| (xml, None))
+        };
+
+        let upgrade = match firmware_upgrade::validate_request(
+            &self.config.gb_version,
+            self.config.device_id.as_str(),
+            &self.config.device_info.manufacturer,
+            ctrl,
+        ) {
+            Ok(upgrade) => upgrade,
+            Err(reason) => return rejected(&reason),
+        };
+        tracing::info!(
+            sn = ctrl.sn,
+            session_id = %upgrade.session_id,
+            firmware = %upgrade.firmware,
+            "收到 DeviceUpgrade 请求"
+        );
+
+        let dispatch = if let Some(existing) = self.upgrade_store.lookup(&upgrade.session_id) {
+            if existing.fingerprint != upgrade.fingerprint {
+                return rejected("同一 SessionID 的请求参数不一致");
+            }
+            match existing.status {
+                SessionStatus::Success | SessionStatus::Error => UpgradeDispatch::Replay {
+                    session_id: upgrade.session_id.clone(),
+                    session: existing,
+                },
+                SessionStatus::InProgress => {
+                    let active = self.active_upgrade.lock().await;
+                    if active.as_deref() == Some(upgrade.session_id.as_str()) {
+                        UpgradeDispatch::AlreadyRunning
+                    } else {
+                        return rejected("升级会话处于未完成状态，等待设备恢复处理");
+                    }
+                }
+            }
+        } else {
+            let mut active = self.active_upgrade.lock().await;
+            if active.is_some() {
+                return rejected("设备正在执行其他固件升级");
+            }
+            if let Err(error) = self.upgrade_store.begin(&upgrade) {
+                tracing::error!(%error, "固件升级 InProgress 状态持久化失败");
+                return rejected("升级状态无法持久化");
+            }
+            *active = Some(upgrade.session_id.clone());
+            UpgradeDispatch::Start(upgrade)
+        };
+
+        let response =
+            gb28181_protocol::manscdp::ControlResponse::ok(self.config.device_id.as_str(), ctrl.sn)
+                .to_xml()?;
+        Ok((response, Some(dispatch)))
     }
 
     /// 应用巡航轨迹控制操作到设备控制态(供 CruiseTrack* 查询读回)。
@@ -2839,21 +2967,23 @@ impl DeviceSimulator {
         Ok(())
     }
 
-    /// 触发需设备主动 NOTIFY/上报的控制副作用(在线升级 4 步进度、抓拍上传)。
+    /// 触发需设备主动 NOTIFY/上报的控制副作用(固件升级结果、抓拍上传)。
     /// 已在入站循环里回过 200/结果,这里异步执行不阻塞应答。
     fn spawn_control_side_effects(
         self: &Arc<Self>,
         transport: &Arc<UdpTransport>,
         ctrl: &gb28181_protocol::manscdp::Control,
+        upgrade_dispatch: Option<UpgradeDispatch>,
     ) {
-        // 在线升级:4 步进度 NOTIFY。
-        if let Some(up) = &ctrl.device_upgrade {
-            let dev = Arc::clone(self);
-            let tp = Arc::clone(transport);
-            let up = up.clone();
-            tokio::spawn(async move {
-                dev.run_upgrade_progress(&tp, &up).await;
-            });
+        // 在线升级:下载/校验/应用/重新注册后只发一次最终结果 Notify。
+        if let Some(dispatch) = upgrade_dispatch {
+            if !matches!(dispatch, UpgradeDispatch::AlreadyRunning) {
+                let dev = Arc::clone(self);
+                let tp = Arc::clone(transport);
+                tokio::spawn(async move {
+                    dev.run_upgrade_dispatch(&tp, dispatch).await;
+                });
+            }
         }
         // 抓拍配置(GB-2022):HTTP 上传 + 完成 NOTIFY。
         if let Some(cfg) = &ctrl.snap_shot_config {
@@ -2879,41 +3009,193 @@ impl DeviceSimulator {
         }
     }
 
-    /// 在线升级 4 步进度:percent [0,30,60,100],步间 1.5s,发 DeviceUpgradeResult NOTIFY。
-    async fn run_upgrade_progress(
+    /// 执行已登记的升级会话，成功路径重新注册并持久化版本后发送最终 Notify。
+    async fn run_upgrade_dispatch(
+        self: &Arc<Self>,
+        transport: &Arc<UdpTransport>,
+        dispatch: UpgradeDispatch,
+    ) {
+        let clear_active = matches!(&dispatch, UpgradeDispatch::Start(_));
+        let (session_id, result) = match dispatch {
+            UpgradeDispatch::Start(upgrade) => {
+                let mut result = self.execute_upgrade(&upgrade).await;
+                if result.success {
+                    // 将状态文件中的成功提交作为模拟刷写的原子点；只有重新 REGISTER
+                    // 成功后才提交并对平台宣告 OK。这样 REGISTER 失败或其窗口内进程崩溃
+                    // 都不会留下一个已确认的成功结果。
+                    let (host, port) = (self.local_host(), self.local_port());
+                    if let Err(error) = self.register(transport, &host, port).await {
+                        tracing::warn!(%error, "固件升级后重新注册失败，升级结果改为 ERROR");
+                        result = UpgradeResult {
+                            firmware: self.current_firmware(),
+                            success: false,
+                            failure_reason: Some("03".into()),
+                        };
+                        let _ = self.upgrade_store.complete(&upgrade.session_id, &result);
+                    } else {
+                        if let Err(error) =
+                            self.upgrade_store.complete(&upgrade.session_id, &result)
+                        {
+                            tracing::error!(%error, "固件版本持久化失败，升级结果改为 ERROR");
+                            result = UpgradeResult {
+                                firmware: self.current_firmware(),
+                                success: false,
+                                failure_reason: Some("03".into()),
+                            };
+                            let _ = self.upgrade_store.complete(&upgrade.session_id, &result);
+                        }
+                    }
+                } else if let Err(error) = self.upgrade_store.complete(&upgrade.session_id, &result)
+                {
+                    tracing::error!(%error, "固件升级失败状态持久化失败");
+                }
+                (upgrade.session_id, result)
+            }
+            UpgradeDispatch::Replay {
+                session_id,
+                session,
+            } => (session_id, session.result()),
+            UpgradeDispatch::AlreadyRunning => return,
+        };
+
+        self.send_upgrade_result(transport, &result, &session_id)
+            .await;
+
+        if clear_active {
+            let mut active = self.active_upgrade.lock().await;
+            if active.as_deref() == Some(session_id.as_str()) {
+                *active = None;
+            }
+        }
+    }
+
+    async fn execute_upgrade(&self, upgrade: &ValidatedUpgrade) -> UpgradeResult {
+        let body = match firmware_upgrade::download(&upgrade.file_url).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %upgrade.session_id,
+                    reason = error.reason_code(),
+                    error = %error.message(),
+                    "固件下载失败"
+                );
+                return UpgradeResult {
+                    firmware: self.current_firmware(),
+                    success: false,
+                    failure_reason: Some(error.reason_code().into()),
+                };
+            }
+        };
+        match firmware_upgrade::verify_package(
+            &body,
+            &self.config.device_info.manufacturer,
+            &self.config.device_info.model,
+            &upgrade.firmware,
+        ) {
+            Ok(firmware) => {
+                tracing::info!(
+                    session_id = %upgrade.session_id,
+                    firmware = %firmware,
+                    "固件包校验通过，模拟设备版本已准备更新"
+                );
+                UpgradeResult {
+                    firmware,
+                    success: true,
+                    failure_reason: None,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(session_id = %upgrade.session_id, %error, "固件包校验失败");
+                UpgradeResult {
+                    firmware: self.current_firmware(),
+                    success: false,
+                    failure_reason: Some("02".into()),
+                }
+            }
+        }
+    }
+
+    async fn send_upgrade_result(
         &self,
         transport: &Arc<UdpTransport>,
-        up: &gb28181_protocol::manscdp::DeviceUpgrade,
+        result: &UpgradeResult,
+        session_id: &str,
     ) {
-        let (h, p) = (self.local_host(), self.local_port());
-        for percent in [0u8, 30, 60, 100] {
-            let sn = self.next_cseq() & 0xFFFF;
-            let notify = gb28181_protocol::manscdp::DeviceUpgradeResultNotify::new(
+        let sn = self.next_cseq();
+        let notify = if result.success {
+            gb28181_protocol::manscdp::DeviceUpgradeResultNotify::success(
                 self.config.device_id.as_str(),
                 sn,
-                &up.session_id,
-                &up.firmware,
-                percent,
-            );
-            if let Ok(xml) = notify.to_xml() {
-                let _ = self.send_message_xml(transport, &h, p, &xml).await;
-            }
-            tracing::info!(percent, "在线升级进度");
-            let step = match percent {
-                0 => 1,
-                30 => 2,
-                60 => 3,
-                _ => 4,
+                session_id,
+                &result.firmware,
+            )
+        } else {
+            gb28181_protocol::manscdp::DeviceUpgradeResultNotify::error(
+                self.config.device_id.as_str(),
+                sn,
+                session_id,
+                &result.firmware,
+                result.failure_reason.as_deref().unwrap_or("99"),
+            )
+        };
+        let Ok(xml) = notify.to_xml() else {
+            tracing::error!(session_id, "固件升级结果通知序列化失败");
+            return;
+        };
+        // 平台可能先用 503 表示结果落库尚未完成；每次调用都会创建独立的
+        // SIP 事务，最多补发两次。重试只覆盖事务超时和 5xx，4xx/其它错误
+        // 直接结束，且整个过程不会重新下载或执行升级。
+        for attempt in 0..3u8 {
+            let outcome = self
+                .send_message_xml(transport, &self.local_host(), self.local_port(), &xml)
+                .await;
+            let retryable = match outcome {
+                Ok(status) if (200..300).contains(&status) => {
+                    tracing::info!(
+                        session_id,
+                        status,
+                        attempt = attempt + 1,
+                        "固件升级结果通知已确认"
+                    );
+                    false
+                }
+                Ok(status) if (500..600).contains(&status) => {
+                    tracing::warn!(
+                        session_id,
+                        status,
+                        attempt = attempt + 1,
+                        "固件升级结果通知收到 5xx"
+                    );
+                    true
+                }
+                Ok(status) => {
+                    tracing::warn!(
+                        session_id,
+                        status,
+                        attempt = attempt + 1,
+                        "固件升级结果通知未获 2xx"
+                    );
+                    false
+                }
+                Err(error) => {
+                    let retryable = matches!(
+                        &error,
+                        Error::Sip(message) if message.contains("事务超时") || message.contains("超时")
+                    );
+                    tracing::warn!(
+                        session_id,
+                        %error,
+                        attempt = attempt + 1,
+                        retryable,
+                        "固件升级结果通知发送失败"
+                    );
+                    retryable
+                }
             };
-            self.observer.on_event(common::DeviceEvent::Progress {
-                kind: "upgrade".into(),
-                current: step,
-                total: 4,
-                percent: percent as u32,
-            });
-            if percent < 100 {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            if !retryable || attempt == 2 {
+                break;
             }
+            tokio::time::sleep(std::time::Duration::from_secs((attempt + 1) as u64)).await;
         }
     }
 
@@ -2957,8 +3239,8 @@ impl DeviceSimulator {
                 tracing::warn!("尚无可解码当前关键帧，本张抓拍跳过");
                 None
             };
-            match jpeg {
-                Some(jpeg) => match http_put_jpeg(&url, &jpeg).await {
+            if let Some(jpeg) = jpeg {
+                match http_put_jpeg(&url, &jpeg).await {
                     Ok(()) => {
                         let sn = self.next_cseq();
                         let notify = gb28181_protocol::manscdp::SnapShotNotify::new(
@@ -2975,8 +3257,7 @@ impl DeviceSimulator {
                         tracing::info!(snap_id, "抓拍上传成功");
                     }
                     Err(e) => tracing::warn!(error = %e, url, "抓拍上传失败"),
-                },
-                None => {}
+                }
             }
             self.observer.on_event(common::DeviceEvent::Progress {
                 kind: "snapshot".into(),
@@ -3442,8 +3723,9 @@ mod tests {
         let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
         let before = sim.runtime_config.lock().unwrap().clone();
         let mut ctrl = gb28181_protocol::manscdp::Control::parse(
-            "<Control><CmdType>DeviceConfig</CmdType><SN>19</SN><DeviceID>d</DeviceID></Control>"
-        ).unwrap();
+            "<Control><CmdType>DeviceConfig</CmdType><SN>19</SN><DeviceID>d</DeviceID></Control>",
+        )
+        .unwrap();
         ctrl.cfg_video_param_attribute = before.video_param_attribute.clone();
         let xml = sim.handle_control(&ctrl).await.unwrap();
         assert!(xml.contains("<Result>ERROR</Result>"));
@@ -3455,7 +3737,10 @@ mod tests {
         let mut config = test_cfg("127.0.0.1", 5060);
         config.video_fps = 20;
         config.media_profile = Some(media_rtp::profile::MediaProfile {
-            width: 640, height: 480, video_fps: 20, bitrate_kbps: 600,
+            width: 640,
+            height: 480,
+            video_fps: 20,
+            bitrate_kbps: 600,
             video_codec: media_rtp::profile::MediaVideoCodec::H265,
             ..Default::default()
         });

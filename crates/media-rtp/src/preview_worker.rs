@@ -11,7 +11,8 @@ use crate::preview::{
 };
 use crate::ps::VideoCodec;
 
-const INPUT_CAPACITY: usize = 2;
+const MIN_INPUT_CAPACITY: usize = 2;
+const MAX_INPUT_CAPACITY: usize = 8;
 const STDERR_TAIL_LINES: usize = 32;
 const OUTPUT_WATCHDOG: Duration = Duration::from_secs(2);
 const WRITE_DEADLINE: Duration = Duration::from_millis(500);
@@ -118,7 +119,7 @@ pub fn spawn_preview_worker_with_codec(
     codec: VideoCodec,
     sink: Arc<dyn PreviewSink>,
 ) -> (PreviewWorkerInput, PreviewWorkerHandle) {
-    let (input, rx) = preview_input_channel(generation, INPUT_CAPACITY);
+    let (input, rx) = preview_input_channel(generation, preview_input_capacity(fps));
     let discontinuity = Arc::clone(&input.discontinuity);
     let dropped = Arc::clone(&input.dropped);
     let stop = Arc::new(AtomicBool::new(false));
@@ -153,6 +154,12 @@ pub fn spawn_preview_worker_with_codec(
             control,
         },
     )
+}
+
+fn preview_input_capacity(fps: u32) -> usize {
+    fps.max(1)
+        .div_ceil(4)
+        .clamp(MIN_INPUT_CAPACITY as u32, MAX_INPUT_CAPACITY as u32) as usize
 }
 
 fn preview_input_channel(
@@ -902,6 +909,14 @@ mod tests {
         assert!(discontinuity.load(Ordering::Acquire));
         assert_eq!(dropped.load(Ordering::Acquire), 1);
         assert_eq!(input.try_send(access_unit(8, 3)), PreviewSendResult::Stale);
+    }
+
+    #[test]
+    fn preview入口按帧率保留约四分之一秒抖动预算() {
+        assert_eq!(preview_input_capacity(1), 2);
+        assert_eq!(preview_input_capacity(15), 4);
+        assert_eq!(preview_input_capacity(30), 8);
+        assert_eq!(preview_input_capacity(120), 8);
     }
 
     #[test]

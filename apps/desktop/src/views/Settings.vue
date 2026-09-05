@@ -20,9 +20,11 @@ import {
 } from "../media-profile";
 import {
   usePlatform,
+  listLocalIpAddresses,
   type BindMode,
   type DeviceSettings,
   type GbVersion,
+  type LocalIpOption,
   type NetworkSettings,
 } from "../platform";
 
@@ -62,6 +64,9 @@ const mediaDraftRevision = ref(0);
 const networkDraft = ref<NetworkSettings | null>(null);
 const profileVersion = ref<GbVersion>("V2022");
 const mediaAdvancedOpen = ref(false);
+const localIpOptions = ref<LocalIpOption[]>([]);
+const localIpLoading = ref(false);
+const localIpError = ref("");
 
 function sameDeviceDraft(left: DeviceSettings, right: DeviceSettings): boolean {
   return left.device_id === right.device_id
@@ -101,6 +106,28 @@ function replaceDrafts(force = false) {
 
 watch(config, () => replaceDrafts(), { immediate: true });
 watch(activePlatform, () => replaceDrafts());
+
+async function refreshLocalIpOptions() {
+  if (localIpLoading.value) return;
+  localIpLoading.value = true;
+  localIpError.value = "";
+  try {
+    localIpOptions.value = await listLocalIpAddresses();
+    if (networkDraft.value?.bind_mode === "specific"
+      && !networkDraft.value.bind_address
+      && localIpOptions.value.length > 0) {
+      networkDraft.value.bind_address = localIpOptions.value[0].address;
+    }
+  } catch (cause) {
+    localIpError.value = String(cause);
+  } finally {
+    localIpLoading.value = false;
+  }
+}
+
+watch(activeKey, (key) => {
+  if (key === "network") void refreshLocalIpOptions();
+}, { immediate: true });
 
 const activeSetting = computed(() => settings.find((item) => item.key === activeKey.value)!);
 const platformSummary = computed(() => {
@@ -211,7 +238,11 @@ async function resetCurrent() {
 }
 
 function setBindMode(mode: BindMode) {
-  if (networkDraft.value) networkDraft.value.bind_mode = mode;
+  if (!networkDraft.value) return;
+  networkDraft.value.bind_mode = mode;
+  if (mode === "specific" && !networkDraft.value.bind_address && localIpOptions.value.length > 0) {
+    networkDraft.value.bind_address = localIpOptions.value[0].address;
+  }
 }
 </script>
 
@@ -368,7 +399,24 @@ function setBindMode(mode: BindMode) {
             <button class="network-option" :class="{ selected: networkDraft.bind_mode === 'auto' }" :disabled="locked" @click="setBindMode('auto')"><span>⌁</span><b>自动绑定</b></button>
             <button class="network-option" :class="{ selected: networkDraft.bind_mode === 'specific' }" :disabled="locked" @click="setBindMode('specific')"><span>◎</span><b>指定本机 IP</b></button>
           </div>
-          <label v-if="networkDraft.bind_mode === 'specific'" class="field network-address"><span>本机绑定地址</span><input v-model="networkDraft.bind_address" placeholder="例如 192.168.1.20" :disabled="locked" /></label>
+          <div v-if="networkDraft.bind_mode === 'specific'" class="network-address-row">
+            <label class="field network-address">
+              <span>本机绑定地址</span>
+              <select v-model="networkDraft.bind_address" :disabled="locked || localIpLoading || localIpOptions.length === 0">
+                <option v-if="networkDraft.bind_address && !localIpOptions.some((item) => item.address === networkDraft!.bind_address)" :value="networkDraft.bind_address">
+                  {{ networkDraft.bind_address }}（已保存，当前未扫描到）
+                </option>
+                <option v-if="localIpOptions.length === 0" value="">{{ localIpLoading ? "正在扫描本机 IP…" : "未扫描到可绑定 IP" }}</option>
+                <option v-for="item in localIpOptions" :key="`${item.interface_name}-${item.address}`" :value="item.address">
+                  {{ item.address }} · {{ item.interface_name }} · {{ item.address_family }}{{ item.loopback ? " · 回环" : "" }}
+                </option>
+              </select>
+            </label>
+            <button class="btn ghost refresh-ip" type="button" :disabled="locked || localIpLoading" @click="refreshLocalIpOptions">
+              {{ localIpLoading ? "扫描中…" : "重新扫描" }}
+            </button>
+          </div>
+          <div v-if="localIpError" class="feedback error">扫描本机 IP 失败：{{ localIpError }}</div>
           <label class="switch-line"><span><b>SIP 信令追踪</b><small>关闭后下一次启动不再安装 tracer</small></span><input v-model="networkDraft.sip_trace" type="checkbox" :disabled="locked" /></label>
           <div class="runtime-card"><span>Rust 运行回读</span><strong>{{ runtimeSummary }}</strong></div>
           <div class="info-note">指定地址不可绑定时启动会明确失败，不会静默回退自动模式。</div>
@@ -415,8 +463,8 @@ function setBindMode(mode: BindMode) {
 .field-grid { display: grid; gap: 10px; }
 .field-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .field { display: flex; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 12px; }
-.field input { width: 100%; min-height: 34px; padding: 7px 10px; border: 1px solid var(--border-default); border-radius: 8px; outline: none; background: rgba(255,255,255,.58); color: var(--text-primary); }
-.field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+.field input, .field select { width: 100%; min-height: 34px; padding: 7px 10px; border: 1px solid var(--border-default); border-radius: 8px; outline: none; background: rgba(255,255,255,.58); color: var(--text-primary); }
+.field input:focus, .field select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
 .future-field { min-height: 57px; border: 1px dashed var(--border-default); border-radius: 8px; background: rgba(255,255,255,.3); color: var(--text-tertiary); }
 .info-note, .capability-card { padding: 12px; border-radius: 9px; background: var(--accent-dim); color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
 .capability-card { display: flex; flex-direction: column; gap: 14px; }
@@ -450,6 +498,9 @@ function setBindMode(mode: BindMode) {
 .network-option { display: flex; align-items: center; gap: 10px; padding: 14px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.4); color: var(--text-primary); cursor: pointer; }
 .network-option.selected { border-color: var(--accent); background: var(--accent-dim); }
 .network-address { max-width: 420px; }
+.network-address-row { display: flex; align-items: flex-end; gap: 8px; }
+.network-address-row .network-address { flex: 1; }
+.refresh-ip { min-height: 34px; white-space: nowrap; }
 .switch-line { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px; border: 1px solid var(--border-default); border-radius: 9px; }
 .switch-line span { display: flex; flex-direction: column; gap: 4px; }
 .switch-line small { color: var(--text-tertiary); }

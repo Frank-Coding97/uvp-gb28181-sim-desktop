@@ -5,6 +5,7 @@
 
 pub mod builder;
 pub mod device;
+pub(crate) mod firmware_upgrade;
 pub mod recording;
 
 pub use device::{
