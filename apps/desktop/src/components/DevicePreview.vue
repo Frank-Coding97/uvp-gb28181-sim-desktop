@@ -1,10 +1,11 @@
 <script setup lang="ts">
-// 本地媒体预览卡片:文件/摄像头/屏幕三种源的画面回显 + 适应/铺满切换。
-// 只呈现本地回显,推给平台的仍是后端 PS/RTP 流(状态行有明确说明)。
+// 本地媒体预览卡片:文件/摄像头/屏幕三种源的画面回显 + 适应/铺满切换 + 实时推流 HUD。
+import { ref } from "vue";
 import { useMessage } from "naive-ui";
 import { useDevice } from "../device";
 import { useLiveSources } from "../composables/useLiveSources";
 import { useMediaPreview } from "../composables/useMediaPreview";
+import { useMediaTelemetry, formatBytes } from "../composables/useMediaTelemetry";
 
 const message = useMessage();
 const { startDisabled } = useDevice();
@@ -19,6 +20,12 @@ const {
   toggleVideoFitMode,
   refreshVideoPreview,
 } = useMediaPreview();
+
+const { telemetry, streaming, hasFeedback, qualityWarning } = useMediaTelemetry();
+const showHud = ref(true);
+function toggleHud() {
+  showHud.value = !showHud.value;
+}
 
 async function onPickVideoSource() {
   const picked = await pickVideoSource();
@@ -51,6 +58,15 @@ function bindPreviewEl(el: unknown) {
           @click="toggleVideoFitMode"
         >
           {{ videoFitMode === 'cover' ? '模式：铺满' : '模式：适应' }}
+        </button>
+        <button
+          type="button"
+          class="file-btn compact toggle-hud-btn"
+          :class="{ on: showHud }"
+          :title="showHud ? '隐藏推流 HUD 指标' : '显示推流 HUD 指标'"
+          @click="toggleHud"
+        >
+          HUD
         </button>
         <span class="preview-badge" :class="previewState.tone">
           {{ previewState.tone === 'live' ? 'PREVIEW' : previewState.tone === 'warn' ? 'CHECK' : 'IDLE' }}
@@ -85,6 +101,43 @@ function bindPreviewEl(el: unknown) {
         controls
         :class="`video-${videoFitMode}`"
       />
+      <!-- 推流 HUD 实时指标浮层 -->
+      <div v-if="showHud" class="stream-hud" :class="{ streaming }">
+        <div class="hud-top">
+          <div class="hud-tag">
+            <span class="hud-pulse" :class="{ live: streaming }" />
+            <span>{{ streaming ? (telemetry?.is_history ? 'PLAYBACK' : 'LIVE RTP') : 'STANDBY' }}</span>
+          </div>
+          <div v-if="streaming" class="hud-source mono">
+            {{ telemetry?.media_source || 'GB28181 1080P' }}
+          </div>
+        </div>
+        <div class="hud-brackets" aria-hidden="true">
+          <span class="corner tl" />
+          <span class="corner tr" />
+          <span class="corner bl" />
+          <span class="corner br" />
+        </div>
+        <div v-if="streaming && telemetry" class="hud-bottom">
+          <div class="hud-stat-chip">
+            <span class="stat-label">发包:</span>
+            <span class="stat-value mono">{{ telemetry.sent_packets.toLocaleString() }} pkts</span>
+          </div>
+          <div class="hud-stat-chip">
+            <span class="stat-label">流量:</span>
+            <span class="stat-value mono">{{ formatBytes(telemetry.sent_bytes) }}</span>
+          </div>
+          <div v-if="hasFeedback" class="hud-stat-chip" :class="{ bad: qualityWarning }">
+            <span class="stat-label">丢包:</span>
+            <span class="stat-value mono">{{ telemetry.feedback.loss_percent.toFixed(2) }}%</span>
+          </div>
+          <div v-if="hasFeedback" class="hud-stat-chip">
+            <span class="stat-label">抖动:</span>
+            <span class="stat-value mono">{{ telemetry.feedback.jitter_ms.toFixed(1) }}ms</span>
+          </div>
+        </div>
+      </div>
+
       <div v-if="!previewUrl && previewState.tone !== 'live'" class="preview-empty">
         <div class="scan-mark">GB</div>
         <strong>{{ previewState.text }}</strong>
@@ -138,6 +191,64 @@ function bindPreviewEl(el: unknown) {
 .video-frame video { width: 100%; height: 100%; background: #050914; z-index: 1; }
 .video-frame video.video-cover { object-fit: cover; }
 .video-frame video.video-contain { object-fit: contain; }
+
+/* 推流 HUD 实时指标浮层 */
+.stream-hud {
+  position: absolute; inset: 0; pointer-events: none; z-index: 3;
+  display: flex; flex-direction: column; justify-content: space-between;
+  padding: 10px;
+}
+.hud-top {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.hud-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: rgba(10, 20, 35, 0.72); backdrop-filter: blur(4px);
+  border: 1px solid rgba(56, 132, 255, 0.35); border-radius: 4px;
+  padding: 2px 7px; color: #a5d2ff; font: 700 9px/1 "SF Mono", Menlo, monospace;
+  letter-spacing: 0.8px;
+}
+.hud-pulse {
+  width: 6px; height: 6px; border-radius: 50%; background: #64748b;
+}
+.hud-pulse.live {
+  background: var(--success); box-shadow: 0 0 6px var(--success);
+  animation: hudPulse 1.5s ease-in-out infinite;
+}
+@keyframes hudPulse { 50% { opacity: 0.4; } }
+.hud-source {
+  background: rgba(10, 20, 35, 0.72); backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 4px;
+  padding: 2px 7px; color: rgba(235, 245, 255, 0.88); font-size: 10px;
+}
+.hud-brackets {
+  position: absolute; inset: 12px; pointer-events: none;
+}
+.hud-brackets .corner {
+  position: absolute; width: 12px; height: 12px; border: 1.5px solid rgba(56, 132, 255, 0.45);
+}
+.hud-brackets .corner.tl { top: 0; left: 0; border-right: none; border-bottom: none; }
+.hud-brackets .corner.tr { top: 0; right: 0; border-left: none; border-bottom: none; }
+.hud-brackets .corner.bl { bottom: 0; left: 0; border-right: none; border-top: none; }
+.hud-brackets .corner.br { bottom: 0; right: 0; border-left: none; border-top: none; }
+.hud-bottom {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.hud-stat-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: rgba(10, 20, 35, 0.8); backdrop-filter: blur(4px);
+  border: 1px solid rgba(56, 132, 255, 0.28); border-radius: 4px;
+  padding: 2px 6px; font-size: 10px; color: #d0e4ff;
+}
+.hud-stat-chip.bad {
+  border-color: rgba(248, 113, 113, 0.5); color: #fca5a5;
+}
+.hud-stat-chip .stat-label { color: rgba(180, 210, 250, 0.65); font-size: 9px; }
+.toggle-hud-btn { background: var(--bg-surface); border-color: var(--border-default); color: var(--text-secondary); }
+.toggle-hud-btn.on {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  border-color: var(--accent); color: var(--accent);
+}
 
 .preview-empty {
   position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; align-content: center;

@@ -1507,11 +1507,32 @@ impl DeviceSimulator {
         description: &str,
         alarm_type: gb28181_protocol::manscdp::VideoAlarmType,
     ) -> Result<u16> {
+        self.report_alarm_full(
+            transport,
+            local_host,
+            local_port,
+            description,
+            alarm_type,
+            None,
+        )
+        .await
+    }
+
+    /// 主动上报一条指定类型与优先级的视频报警。
+    pub async fn report_alarm_full(
+        &self,
+        transport: &Arc<dyn SipTransport>,
+        local_host: &str,
+        local_port: u16,
+        description: &str,
+        alarm_type: gb28181_protocol::manscdp::VideoAlarmType,
+        priority: Option<u8>,
+    ) -> Result<u16> {
         let sn = self.next_cseq();
         // 报警时间用校时后的 ISO8601(与平台时间对齐,见 common::clock)。
         let time = common::clock::synced_iso8601();
         let position = Some(*self.position.lock());
-        let alarm = gb28181_protocol::manscdp::AlarmNotify::video_typed(
+        let mut alarm = gb28181_protocol::manscdp::AlarmNotify::video_typed(
             self.config.device_id.as_str(),
             sn,
             time,
@@ -1519,6 +1540,9 @@ impl DeviceSimulator {
             alarm_type,
             position,
         );
+        if let Some(p) = priority {
+            alarm.priority = p;
+        }
         let xml = alarm.to_xml()?;
 
         // 若存在报警订阅对话:在对话内以 SIP NOTIFY 上报(GB28181 订阅语义);

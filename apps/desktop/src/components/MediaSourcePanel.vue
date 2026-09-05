@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // 媒体源配置区:媒体模式选择 + 上报动作 + 三种源(文件/摄像头/屏幕)的参数面板 + 采集自检结果。
 // 状态集中在 useLiveSources,这里只负责渲染与提示。
-import { useMessage } from "naive-ui";
-import { NButton } from "naive-ui";
+import { ref } from "vue";
+import { useMessage, NButton, NModal, NSelect, NInput } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { useDevice } from "../device";
 import { useLiveSources } from "../composables/useLiveSources";
@@ -65,9 +65,55 @@ async function onProbeLiveSource() {
   }
 }
 
-async function fireAlarm() {
+const ALARM_TYPES = [
+  { label: "1 - 人工视频报警", value: 1, defaultDesc: "人工视频触发报警" },
+  { label: "2 - 运动目标检测 (常用)", value: 2, defaultDesc: "画面检测到运动目标" },
+  { label: "3 - 遗留物检测", value: 3, defaultDesc: "检测到可疑遗留物" },
+  { label: "4 - 物体移除检测", value: 4, defaultDesc: "重要资产/物体被移除" },
+  { label: "5 - 绊线检测", value: 5, defaultDesc: "目标穿越防范警戒绊线" },
+  { label: "6 - 区域入侵检测", value: 6, defaultDesc: "目标非法入侵禁区" },
+  { label: "7 - 逆行检测", value: 7, defaultDesc: "检测到车辆/人员逆向通行" },
+  { label: "8 - 目标徘徊检测", value: 8, defaultDesc: "敏感区域检测到人员异常徘徊" },
+  { label: "9 - 流量统计", value: 9, defaultDesc: "通道瞬时流量达到预警阈值" },
+  { label: "10 - 密度检测", value: 10, defaultDesc: "监控区域人群聚集过密" },
+  { label: "11 - 视频异常检测", value: 11, defaultDesc: "视频画面异常或信号丢失" },
+  { label: "12 - 快速移动", value: 12, defaultDesc: "检测到人员异常快速奔跑" },
+  { label: "13 - 图像遮挡/篡改", value: 13, defaultDesc: "镜头被遮挡或视角被篡改" },
+];
+
+const ALARM_PRIORITIES = [
+  { label: "一级警情 (最紧急)", value: 1 },
+  { label: "二级警情 (严重)", value: 2 },
+  { label: "三级警情 (一般)", value: 3 },
+  { label: "四级警情 (提示)", value: 4 },
+];
+
+const alarmModalOpen = ref(false);
+const selectedAlarmType = ref(2);
+const selectedPriority = ref(1);
+const alarmDesc = ref("画面检测到运动目标");
+
+function openAlarmModal() {
+  alarmModalOpen.value = true;
+}
+
+function onAlarmTypeChange(val: number) {
+  selectedAlarmType.value = val;
+  const found = ALARM_TYPES.find((t) => t.value === val);
+  if (found) {
+    alarmDesc.value = found.defaultDesc;
+  }
+}
+
+async function doSendAlarm() {
   try {
-    message.success(await invoke<string>("fire_alarm", { description: "移动侦测报警" }));
+    const res = await invoke<string>("fire_alarm", {
+      description: alarmDesc.value,
+      alarm_type: selectedAlarmType.value,
+      priority: selectedPriority.value,
+    });
+    message.success(res);
+    alarmModalOpen.value = false;
   } catch (e) {
     message.error(formatError(e, "上报报警失败"), { duration: 0, closable: true });
   }
@@ -119,10 +165,54 @@ async function firePosition() {
       >
         {{ probeState?.kind === 'loading' ? '测试中…' : '测试采集' }}
       </button>
-      <n-button size="small" tertiary :disabled="!canReport" @click="fireAlarm">上报报警</n-button>
+      <n-button size="small" tertiary :disabled="!canReport" @click="openAlarmModal">上报报警...</n-button>
       <n-button size="small" tertiary :disabled="!canReport" @click="firePosition">上报 GPS</n-button>
     </div>
   </div>
+
+  <!-- 国标报警 (MANSCDP) 弹窗 -->
+  <n-modal
+    v-model:show="alarmModalOpen"
+    preset="card"
+    title="上报国标报警 (MANSCDP Alarm)"
+    :mask-closable="false"
+    style="width: 380px"
+  >
+    <div class="alarm-form">
+      <div class="af-item">
+        <span class="af-label">报警类型 (GB28181 A.2.5.3 规范)</span>
+        <n-select
+          :value="selectedAlarmType"
+          size="small"
+          aria-label="报警类型"
+          :options="ALARM_TYPES"
+          @update:value="onAlarmTypeChange"
+        />
+      </div>
+      <div class="af-item">
+        <span class="af-label">警情级别 (Priority)</span>
+        <n-select
+          v-model:value="selectedPriority"
+          size="small"
+          aria-label="警情级别"
+          :options="ALARM_PRIORITIES"
+        />
+      </div>
+      <div class="af-item">
+        <span class="af-label">报警描述 (Description)</span>
+        <n-input
+          v-model:value="alarmDesc"
+          size="small"
+          aria-label="报警描述"
+          placeholder="输入报警描述..."
+        />
+      </div>
+      <div class="af-actions">
+        <n-button size="small" type="primary" @click="doSendAlarm">立即发送</n-button>
+        <n-button size="small" @click="alarmModalOpen = false">取消</n-button>
+      </div>
+    </div>
+  </n-modal>
 
   <!-- 1. 视频文件模式:仅显示文件选择行,音视频参数隐藏 -->
   <div v-if="mediaMode === 'file'" class="source-config file-config-box">
@@ -331,4 +421,9 @@ async function firePosition() {
 @media (max-width: 760px) {
   .media-param-columns { grid-template-columns: 1fr; }
 }
+
+.alarm-form { display: flex; flex-direction: column; gap: 10px; }
+.af-item { display: flex; flex-direction: column; gap: 4px; }
+.af-item .af-label { font-size: var(--fs-xs); color: var(--text-secondary); font-weight: 600; }
+.af-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 </style>

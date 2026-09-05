@@ -260,6 +260,55 @@ function stopPtzTracking() {
   }
 }
 
+function gotoPreset(id: number) {
+  if (ptzStopTimer) {
+    clearTimeout(ptzStopTimer);
+    ptzStopTimer = null;
+  }
+  ptz.value = { ...IDLE_ACTION };
+  activePreset.value = id;
+  activePresetName.value = presetNames.value[id] || `预置位${id}`;
+  const preset =
+    PRESET_POS[id] ?? {
+      pan: (id * 53) % 360,
+      tilt: ((id * 37) % 180) - 90,
+      zoom: 1 + (id % 3),
+    };
+  target.value = { ...preset, pan: nearestEquivalentPan(preset.pan) };
+  lastPtzAction.value = `测试调用 ${activePresetName.value}（${id}）`;
+  lastPtzAt.value = ptzTimestamp();
+  seeking.value = true;
+}
+
+function triggerManualPtz(action: string) {
+  if (action === "stop") {
+    seeking.value = false;
+    target.value = null;
+    ptz.value = { ...IDLE_ACTION };
+    lastPtzAction.value = "STOP";
+    lastPtzAt.value = ptzTimestamp();
+    return;
+  }
+  seeking.value = false;
+  target.value = null;
+  const newAction: PtzAction = { ...IDLE_ACTION };
+  if (action === "up") { newAction.up = true; newAction.tilt_speed = 120; }
+  else if (action === "down") { newAction.down = true; newAction.tilt_speed = 120; }
+  else if (action === "left") { newAction.left = true; newAction.pan_speed = 120; }
+  else if (action === "right") { newAction.right = true; newAction.pan_speed = 120; }
+  else if (action === "zoom-in") { newAction.zoom_in = true; newAction.zoom_speed = 8; }
+  else if (action === "zoom-out") { newAction.zoom_out = true; newAction.zoom_speed = 8; }
+  ptz.value = newAction;
+  lastPtzAction.value = describePtzAction(newAction);
+  lastPtzAt.value = ptzTimestamp();
+  if (ptzStopTimer) clearTimeout(ptzStopTimer);
+  ptzStopTimer = window.setTimeout(() => {
+    ptz.value = { ...IDLE_ACTION };
+    lastPtzAction.value = "STOP（自停）";
+    lastPtzAt.value = ptzTimestamp();
+  }, 1200);
+}
+
 export function usePtzPose() {
   return {
     ptz,
@@ -282,6 +331,8 @@ export function usePtzPose() {
     compassDialStyle,
     tiltMarkerStyle,
     poseText,
+    gotoPreset,
+    triggerManualPtz,
     startPtzTracking,
     stopPtzTracking,
   };

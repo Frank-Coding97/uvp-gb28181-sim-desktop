@@ -10,6 +10,7 @@ const {
   traceDirectionFilter,
   traceMethodFilter,
   traceMethodOptions,
+  traceSearchText,
   filteredTraces,
   traceTone,
   isExpanded,
@@ -19,9 +20,21 @@ const {
   clearTraces,
 } = useSipTrace();
 
+const commonMethods = ["all", "REGISTER", "INVITE", "MESSAGE", "BYE", "ACK", "NOTIFY"] as const;
+
 async function onToggleTrace() {
   const result = await applyTraceEnabled();
   if (!result.ok) message.error(result.error ?? "切换追踪失败");
+}
+
+async function copyRaw(raw?: string) {
+  if (!raw) return;
+  try {
+    await navigator.clipboard.writeText(raw);
+    message.success("SIP 原始报文已复制到剪切板");
+  } catch {
+    message.error("复制失败，请手动选取复制");
+  }
 }
 </script>
 
@@ -41,8 +54,28 @@ async function onToggleTrace() {
         <select v-model="traceMethodFilter" class="trace-filter" aria-label="方法过滤">
           <option v-for="m in traceMethodOptions" :key="m" :value="m">{{ m === 'all' ? '全部方法' : m }}</option>
         </select>
+        <input
+          v-model="traceSearchText"
+          type="text"
+          class="trace-search"
+          placeholder="搜索信令/XML..."
+          aria-label="搜索信令报文或XML"
+        />
         <button class="trace-clear" type="button" @click="clearTraces">清空</button>
       </div>
+    </div>
+    <!-- 快捷信令方法筛选胶囊条 -->
+    <div class="trace-quick-chips">
+      <button
+        v-for="method in commonMethods"
+        :key="method"
+        type="button"
+        class="method-chip"
+        :class="{ active: traceMethodFilter === method }"
+        @click="traceMethodFilter = method"
+      >
+        {{ method === 'all' ? '全部' : method }}
+      </button>
     </div>
     <div class="trace-log">
       <div v-if="!traces.length" class="trace-empty">
@@ -64,7 +97,13 @@ async function onToggleTrace() {
           <span class="trace-sum">{{ t.summary }}</span>
           <span v-if="t.cseq" class="trace-cseq">{{ t.cseq }}</span>
         </button>
-        <pre v-if="isExpanded(t)" :id="`trace-raw-${i}`" class="trace-raw">{{ t.raw }}</pre>
+        <div v-if="isExpanded(t)" class="trace-detail-box">
+          <div class="trace-detail-bar">
+            <span class="detail-label">SIP 原始报文与 MANSCDP XML</span>
+            <button type="button" class="copy-raw-btn" @click.stop="copyRaw(t.raw)">复制报文</button>
+          </div>
+          <pre :id="`trace-raw-${i}`" class="trace-raw">{{ t.raw }}</pre>
+        </div>
       </template>
     </div>
   </div>
@@ -101,9 +140,38 @@ async function onToggleTrace() {
 .trace-row:hover { background: var(--accent-dim); }
 .trace-row.open { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .trace-caret { flex: 0 0 auto; color: var(--text-tertiary); font-size: var(--fs-xs); width: 7px; }
+.trace-search {
+  border: 1px solid var(--border-default); background: var(--bg-surface);
+  border-radius: 4px; padding: 1px 6px; font-size: var(--fs-xs); color: var(--text-primary);
+  height: 22px; width: 140px; outline: none; transition: border-color 0.15s;
+}
+.trace-search:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+.trace-quick-chips {
+  display: flex; align-items: center; gap: 4px; margin-bottom: 6px; overflow-x: auto;
+}
+.method-chip {
+  padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;
+  background: var(--bg-surface); border: 1px solid var(--border-default);
+  color: var(--text-secondary); cursor: pointer; transition: all 0.12s;
+}
+.method-chip:hover { border-color: var(--accent); color: var(--accent); }
+.method-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.trace-detail-box {
+  margin: 0 0 6px 14px; border: 1px solid var(--border-default); border-radius: 4px; overflow: hidden;
+}
+.trace-detail-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg-surface); padding: 3px 8px; border-bottom: 1px solid var(--border-default);
+}
+.detail-label { font-size: 10px; color: var(--text-tertiary); }
+.copy-raw-btn {
+  background: var(--accent-dim); border: 1px solid var(--border-accent);
+  color: var(--accent); border-radius: 3px; font-size: 10px; padding: 1px 6px; cursor: pointer;
+}
+.copy-raw-btn:hover { background: var(--accent); color: #fff; }
 .trace-raw {
-  margin: 0 0 4px 14px; padding: 6px 8px; background: var(--code-bg); color: var(--code-fg);
-  border-radius: 4px; font-size: var(--fs-xs); line-height: 1.4; white-space: pre-wrap;
+  margin: 0; padding: 6px 8px; background: var(--code-bg); color: var(--code-fg);
+  border-radius: 0; font-size: var(--fs-xs); line-height: 1.4; white-space: pre-wrap;
   word-break: break-all; max-height: 200px; overflow-y: auto;
 }
 .trace-ts { color: var(--text-secondary); flex: 0 0 auto; }

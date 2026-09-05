@@ -24,6 +24,67 @@ export interface PlatformProfile {
   signaling_encoding?: SignalingEncoding;
 }
 
+export interface PlatformPreset {
+  label: string;
+  description: string;
+  profile: Omit<PlatformProfile, "id">;
+}
+
+export const PLATFORM_PRESETS: PlatformPreset[] = [
+  {
+    label: "WVP-Pro 视频平台",
+    description: "开源 GB28181 流媒体平台 (默认 SIP 端口 5060, UDP)",
+    profile: {
+      name: "WVP-Pro",
+      server_host: "192.168.10.222",
+      server_port: 5060,
+      server_domain: "34020000002000000001",
+      inbound_identity_mode: "compatible",
+      transport: "UDP",
+      signaling_encoding: "GB18030",
+    },
+  },
+  {
+    label: "LiveGBS 国标流媒体服务",
+    description: "商业级 GB28181 流媒体服务 (默认 SIP 端口 5060, UDP)",
+    profile: {
+      name: "LiveGBS",
+      server_host: "192.168.10.222",
+      server_port: 5060,
+      server_domain: "34020000002000000001",
+      inbound_identity_mode: "compatible",
+      transport: "UDP",
+      signaling_encoding: "GB18030",
+    },
+  },
+  {
+    label: "EasyGBS 国标视频平台",
+    description: "支持海量级联的国标视频云服务 (默认 SIP 端口 15060 / 5060)",
+    profile: {
+      name: "EasyGBS",
+      server_host: "192.168.10.222",
+      server_port: 15060,
+      server_domain: "34020000002000000001",
+      inbound_identity_mode: "compatible",
+      transport: "UDP",
+      signaling_encoding: "GB18030",
+    },
+  },
+  {
+    label: "通用国标平台 (Localhost)",
+    description: "本地开发与单机测试默认预设",
+    profile: {
+      name: "本地开发平台",
+      server_host: "127.0.0.1",
+      server_port: 5060,
+      server_domain: "34020000002000000001",
+      inbound_identity_mode: "compatible",
+      transport: "UDP",
+      signaling_encoding: "GB18030",
+    },
+  },
+];
+
 interface PlatformDataV1 {
   profiles: PlatformProfile[];
   activeProfileId: string;
@@ -342,7 +403,7 @@ export function usePlatform() {
   }
 
   return {
-    profiles, activeId, active, secretStatus, activeHasSecret,
+    profiles, activeId, active, secretStatus, activeHasSecret, presets: PLATFORM_PRESETS,
     setActive, addProfile, updateProfile, removeProfile,
     savePassword, refreshSecretStatus, migrateLegacyPasswords,
   };

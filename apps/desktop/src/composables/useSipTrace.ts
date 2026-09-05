@@ -23,6 +23,7 @@ const traces = ref<TraceEntry[]>([]);
 const traceOn = ref(true);
 const traceDirectionFilter = ref<"all" | "in" | "out">("all");
 const traceMethodFilter = ref("all");
+const traceSearchText = ref("");
 // 展开态按条目身份记录,而不是按下标:下标会在新报文插到头部后错位,
 // 过滤条件变化时更是对不上(旧实现靠"展开下标 +1"补偿,过滤后依然会串行)。
 const expandedEntry = ref<TraceEntry | null>(null);
@@ -33,11 +34,19 @@ const traceMethodOptions = computed(() => {
 });
 
 const filteredTraces = computed(() =>
-  traces.value.filter(
-    (t) =>
-      (traceDirectionFilter.value === "all" || t.direction === traceDirectionFilter.value) &&
-      (traceMethodFilter.value === "all" || (t.method || "响应") === traceMethodFilter.value)
-  )
+  traces.value.filter((t) => {
+    if (traceDirectionFilter.value !== "all" && t.direction !== traceDirectionFilter.value) return false;
+    if (traceMethodFilter.value !== "all" && (t.method || "响应") !== traceMethodFilter.value) return false;
+    if (traceSearchText.value.trim()) {
+      const q = traceSearchText.value.trim().toLowerCase();
+      const matchSummary = t.summary.toLowerCase().includes(q);
+      const matchRaw = t.raw ? t.raw.toLowerCase().includes(q) : false;
+      const matchCSeq = t.cseq ? t.cseq.toLowerCase().includes(q) : false;
+      const matchCallId = t.call_id ? t.call_id.toLowerCase().includes(q) : false;
+      if (!matchSummary && !matchRaw && !matchCSeq && !matchCallId) return false;
+    }
+    return true;
+  })
 );
 
 function traceTone(t: TraceEntry): "" | "warn" | "error" {
@@ -104,6 +113,7 @@ export function useSipTrace() {
     traceDirectionFilter,
     traceMethodFilter,
     traceMethodOptions,
+    traceSearchText,
     filteredTraces,
     traceTone,
     isExpanded,

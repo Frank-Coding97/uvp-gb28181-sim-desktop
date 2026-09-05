@@ -18,6 +18,7 @@ const {
   lastPtzAt, ptzActive, moving, ptzButtons,
   zoomText, dirText, speedText, statusText,
   normalizedPan, compassDialStyle, tiltMarkerStyle, poseText,
+  gotoPreset, triggerManualPtz,
   startPtzTracking, stopPtzTracking,
 } = usePtzPose();
 
@@ -30,12 +31,12 @@ onUnmounted(stopPtzTracking);
     <div class="ptz-head">
       <div class="panel-title">云台控制</div>
       <div class="ptz-sub">
-        {{ deviceLive ? '平台下发 PTZ 时机芯与光学变倍实时联动' : '设备未启动,以下为静态示意' }}
+        {{ deviceLive ? '平台下发 PTZ 或点击按钮联动 3D 球机与光学变倍' : '设备未启动,以下为静态示意(支持本地交互预览)' }}
       </div>
     </div>
     <!-- 未启动蒙层:说清"这不是实时数据"以及下一步做什么。 -->
     <div v-if="!deviceLive" class="ptz-idle-note">
-      设备未启动,云台读数不是实时值。请在上方「注册」按钮启动设备,平台下发 PTZ 后此处会实时联动。
+      设备未启动。可直接点击下方方向或预置位进行 3D 姿态预览，或在顶栏「注册」后与上级平台实时信令联动。
     </div>
     <div class="ptz-body">
       <div class="ptz-stage" :class="{ active: ptzActive, seeking }">
@@ -57,11 +58,11 @@ onUnmounted(stopPtzTracking);
           </div>
           <b class="heading-readout">{{ normalizedPan.toFixed(0).padStart(3, "0") }}°</b>
         </div>
-        <div class="direction-hud" aria-hidden="true">
-          <span class="hud-up" :class="{ on: ptz.up }">↑</span>
-          <span class="hud-down" :class="{ on: ptz.down }">↓</span>
-          <span class="hud-left" :class="{ on: ptz.left }">←</span>
-          <span class="hud-right" :class="{ on: ptz.right }">→</span>
+        <div class="direction-hud" aria-label="云台方向微调">
+          <button type="button" class="hud-btn hud-up" :class="{ on: ptz.up }" title="模拟上移" @click="triggerManualPtz('up')">↑</button>
+          <button type="button" class="hud-btn hud-down" :class="{ on: ptz.down }" title="模拟下移" @click="triggerManualPtz('down')">↓</button>
+          <button type="button" class="hud-btn hud-left" :class="{ on: ptz.left }" title="模拟左转" @click="triggerManualPtz('left')">←</button>
+          <button type="button" class="hud-btn hud-right" :class="{ on: ptz.right }" title="模拟右转" @click="triggerManualPtz('right')">→</button>
         </div>
         <div class="tilt-gauge" aria-hidden="true">
           <span class="tilt-plus">+90°</span><span class="tilt-zero">0°</span><span class="tilt-minus">−90°</span>
@@ -82,23 +83,29 @@ onUnmounted(stopPtzTracking);
         <div class="ptz-stat action-state">
           <span>平台命令 · {{ lastPtzAt }}</span>
           <span class="action-chips">
-            <b
+            <button
               v-for="button in ptzButtons"
               :key="button.key"
+              type="button"
               class="action-chip"
               :class="{ on: button.active, stop: button.key === 'stop' }"
-            >{{ button.label }}</b>
+              :title="`点击测试 ${button.label}`"
+              @click="triggerManualPtz(button.key)"
+            >{{ button.label }}</button>
           </span>
         </div>
         <div class="ptz-stat presets">
-          <span>预置位</span>
+          <span>预置位 (点击联动 3D 球机视角)</span>
           <span class="preset-chips">
-            <b
+            <button
               v-for="id in PRESET_IDS"
               :key="id"
+              type="button"
               class="pchip"
               :class="{ on: activePreset === id && seeking }"
-            ><small>{{ id }}</small>{{ presetNames[id] }}</b>
+              :title="`点击巡航至预置位 ${id} (${presetNames[id]})`"
+              @click="gotoPreset(id)"
+            ><small>{{ id }}</small>{{ presetNames[id] }}</button>
           </span>
         </div>
       </div>
@@ -169,12 +176,13 @@ onUnmounted(stopPtzTracking);
   color: var(--accent); font: 800 9.5px/1 "SF Mono", Menlo, monospace; background: var(--bg-elevated);
   padding: 2px 5px; border-radius: 5px; box-shadow: 0 2px 5px rgba(43,68,100,.12);
 }
-.direction-hud span {
+.direction-hud .hud-btn {
   position: absolute; z-index: 10; display: grid; place-items: center; width: 18px; height: 18px;
   border-radius: 4px; color: var(--text-tertiary); background: var(--bg-surface); border: 1px solid var(--border-default);
-  font-size: var(--fs-sm); transition: .15s ease;
+  font-size: var(--fs-sm); transition: .15s ease; cursor: pointer; padding: 0; outline: none;
 }
-.direction-hud span.on { color: #fff; background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: scale(1.1); }
+.direction-hud .hud-btn:hover { border-color: var(--accent); color: var(--text-primary); background: var(--bg-hover); }
+.direction-hud .hud-btn.on { color: #fff; background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transform: scale(1.1); }
 .hud-up { top: 6px; left: calc(50% - 9px); }
 .hud-down { bottom: 6px; left: calc(50% - 9px); }
 .hud-left { left: 6px; top: calc(50% - 9px); }
@@ -230,7 +238,9 @@ onUnmounted(stopPtzTracking);
   display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 17px; padding: 0 4px;
   border-radius: 4px; color: var(--text-tertiary); background: var(--bg-surface);
   border: 1px solid var(--border-default); font-size: var(--fs-xs); transition: all .15s ease;
+  cursor: pointer; outline: none;
 }
+.action-chip:hover { border-color: var(--accent); color: var(--text-primary); }
 .action-chip.on { color: #fff; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px var(--accent-glow); transform: translateY(-1px); }
 .action-chip.stop.on { background: var(--text-secondary); border-color: var(--text-secondary); box-shadow: 0 0 6px rgba(100,116,139,.2); }
 
@@ -242,7 +252,9 @@ onUnmounted(stopPtzTracking);
   min-width: 58px; height: 20px; padding: 0 5px; border-radius: 4px;
   font-size: var(--fs-xs); font-weight: 600; color: var(--text-secondary);
   background: var(--bg-surface); border: 1px solid var(--border-default); transition: all 0.15s;
+  cursor: pointer; outline: none;
 }
+.pchip:hover { border-color: var(--accent); color: var(--accent); background: var(--bg-hover); }
 .pchip small {
   display: inline-grid; place-items: center; width: 13px; height: 13px; border-radius: 3px;
   color: var(--accent); background: var(--accent-dim); font: 700 8px/1 "SF Mono", Menlo, monospace;

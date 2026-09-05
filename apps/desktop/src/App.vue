@@ -19,10 +19,11 @@ import PulseOutline from "@vicons/ionicons5/es/PulseOutline.js";
 import GitNetworkOutline from "@vicons/ionicons5/es/GitNetworkOutline.js";
 import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { usePlatform } from "./platform";
+import { usePlatform, PLATFORM_PRESETS } from "./platform";
 import type { InboundIdentityMode, PlatformTransport, SignalingEncoding } from "./platform";
 import { useDevice } from "./device";
 import { useTheme } from "./theme";
+import { useI18n } from "./i18n";
 import {
   consumeStorageIssues,
   subscribeStorageIssues,
@@ -43,18 +44,26 @@ function readToken(name: string, fallback: string): string {
 // 主题:浅色 / 暗色 / 跟随系统。切 <html data-theme> + Naive UI 主题。
 const { isDark, naiveTheme, label: themeLabel, toggle: toggleTheme } = useTheme();
 
+// 国际化支持
+const { locale, setLocale, t } = useI18n();
+const naiveLocale = computed(() => (locale.value === "zh-CN" ? zhCN : null));
+const naiveDateLocale = computed(() => (locale.value === "zh-CN" ? dateZhCN : null));
+function toggleLocale() {
+  setLocale(locale.value === "zh-CN" ? "en-US" : "zh-CN");
+}
+
 // 侧边栏菜单图标工厂。参数是 @vicons 的组件,用 `Component` 而不是 `any`。
 function icon(comp: VueComponent) {
   return () => h(NIcon, null, { default: () => h(comp) });
 }
 
-const menuOptions: MenuOption[] = [
-  { label: "仪表盘",    key: "/dashboard", icon: icon(SpeedometerOutline) },
-  { label: "单设备联调", key: "/device",    icon: icon(HardwareChipOutline) },
-  { label: "多通道目录", key: "/channels",  icon: icon(GitNetworkOutline) },
-  { label: "压力测试",   key: "/scenario",  icon: icon(PulseOutline) },
-  { label: "系统信息",   key: "/system",    icon: icon(TerminalOutline) },
-];
+const menuOptions = computed<MenuOption[]>(() => [
+  { label: t("nav.dashboard"), key: "/dashboard", icon: icon(SpeedometerOutline) },
+  { label: t("nav.device"),    key: "/device",    icon: icon(HardwareChipOutline) },
+  { label: t("nav.channels"),  key: "/channels",  icon: icon(GitNetworkOutline) },
+  { label: t("nav.scenario"),  key: "/scenario",  icon: icon(PulseOutline) },
+  { label: t("nav.system"),    key: "/system",    icon: icon(TerminalOutline) },
+]);
 
 // 平台档案(全局):顶栏切换,单设备/压测共用同一份平台连接参数。
 // 密码不在档案里(存 OS 钥匙串),这里只维护「是否已配置」与保存动作。
@@ -89,6 +98,25 @@ const editForm = ref({
 const secretHint = computed(() =>
   activeHasSecret.value ? "已保存到系统钥匙串,留空则不改动" : "尚未配置,注册前必须填写"
 );
+
+const selectedPresetIndex = ref<number | null>(null);
+const presetOptions = PLATFORM_PRESETS.map((p, index) => ({
+  label: `${p.label} - ${p.description}`,
+  value: index,
+}));
+function onSelectPreset(index: number) {
+  selectedPresetIndex.value = index;
+  const preset = PLATFORM_PRESETS[index];
+  if (!preset) return;
+  editForm.value.name = preset.profile.name;
+  editForm.value.server_host = preset.profile.server_host;
+  editForm.value.server_port = preset.profile.server_port;
+  editForm.value.server_domain = preset.profile.server_domain;
+  editForm.value.transport = preset.profile.transport;
+  editForm.value.signaling_encoding = preset.profile.signaling_encoding ?? "GB18030";
+  editForm.value.inbound_identity_mode = preset.profile.inbound_identity_mode ?? "compatible";
+}
+
 function openEdit() {
   if (active.value && editTargetId !== activeId.value) {
     Object.assign(editForm.value, active.value, { password: "" });
@@ -97,6 +125,7 @@ function openEdit() {
 }
 function openEditModal() {
   openEdit();
+  selectedPresetIndex.value = null;
   refreshSecretStatus();
   editOpen.value = true;
 }
@@ -307,8 +336,8 @@ const themeOverrides = {
 
 <template>
   <n-config-provider
-    :locale="zhCN"
-    :date-locale="dateZhCN"
+    :locale="naiveLocale"
+    :date-locale="naiveDateLocale"
     :theme="naiveTheme"
     :theme-overrides="themeOverrides"
   >
@@ -364,9 +393,19 @@ const themeOverrides = {
                     title="平台档案"
                     :mask-closable="false"
                     :close-on-esc="false"
-                    style="width: 330px"
+                    style="width: 350px"
                   >
                     <div class="plat-edit">
+                      <div class="pe-preset">
+                        <span class="pe-hint">快速套用平台模板：</span>
+                        <n-select
+                          size="small"
+                          :value="selectedPresetIndex"
+                          placeholder="选择主流平台模板快速填充..."
+                          :options="presetOptions"
+                          @update:value="onSelectPreset"
+                        />
+                      </div>
                       <n-input v-model:value="editForm.name" size="small" placeholder="档案名称" />
                       <n-input v-model:value="editForm.server_host" size="small" placeholder="平台 IP" />
                       <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
@@ -429,6 +468,15 @@ const themeOverrides = {
                       :loading="startingUp"
                       @click="onLogout"
                     >注销</n-button>
+                    <button
+                      class="locale-toggle"
+                      type="button"
+                      :title="`语言 / Language: ${locale === 'zh-CN' ? '中文' : 'English'} (点击切换)`"
+                      :aria-label="`切换语言，当前为${locale === 'zh-CN' ? '中文' : 'English'}`"
+                      @click="toggleLocale"
+                    >
+                      <span aria-hidden="true">{{ locale === 'zh-CN' ? '🇨🇳' : '🇺🇸' }}</span>
+                    </button>
                     <button
                       class="theme-toggle"
                       type="button"
@@ -524,6 +572,7 @@ const themeOverrides = {
 .plat-icon { color: var(--accent); font-size: var(--fs-lg); }
 .plat-label { font-size: var(--fs-sm); color: var(--text-secondary); }
 .plat-edit { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.pe-preset { display: flex; flex-direction: column; gap: 3px; padding-bottom: 5px; border-bottom: 1px dashed var(--border-default); margin-bottom: 2px; }
 .pe-actions { display: flex; gap: 6px; margin-top: 4px; }
 .pe-secret { display: flex; flex-direction: column; gap: 3px; }
 .pe-hint { margin: 0; font-size: var(--fs-sm); color: var(--text-tertiary); line-height: 1.35; }
@@ -553,15 +602,15 @@ const themeOverrides = {
 .conn-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent); }
 .conn-status-text { color: var(--text-primary); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; }
 .reg-btns { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; margin-left: 2px; }
-/* 外观切换:轻量图标按钮,与注册/注销同一行 */
-.theme-toggle {
+/* 语言与外观切换:轻量图标按钮,与注册/注销同一行 */
+.locale-toggle, .theme-toggle {
   display: inline-flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; padding: 0; cursor: pointer;
   border: 1px solid var(--border-default); border-radius: var(--radius-xs);
   background: var(--bg-surface); color: var(--text-secondary); font-size: var(--fs-md);
   transition: border-color var(--transition), background var(--transition);
 }
-.theme-toggle:hover { border-color: var(--accent); background: var(--bg-hover); }
+.locale-toggle:hover, .theme-toggle:hover { border-color: var(--accent); background: var(--bg-hover); }
 /* 顶栏轻量提示条:居中浮在顶栏下方,不占布局。 */
 .top-toast {
   position: absolute; top: 50px; left: 50%; transform: translateX(-50%);

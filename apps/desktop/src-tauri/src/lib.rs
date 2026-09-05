@@ -1597,22 +1597,52 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> IpcRe
     }
 }
 
-/// 主动上报一条报警。
+/// 主动上报一条报警（支持指定国标 13 种视频报警类型与优先级）。
 #[tauri::command]
-async fn fire_alarm(description: String, state: tauri::State<'_, AppState>) -> IpcResult<String> {
+async fn fire_alarm(
+    description: Option<String>,
+    alarm_type: Option<u32>,
+    priority: Option<u8>,
+    state: tauri::State<'_, AppState>,
+) -> IpcResult<String> {
     let guard = state.device.lock().await;
     match &*guard {
         Some(h) => {
-            let desc = if description.is_empty() {
-                "移动侦测报警".to_string()
-            } else {
-                description
+            let desc = description
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "移动侦测报警".to_string());
+            let vtype = match alarm_type.unwrap_or(2) {
+                1 => gb28181_protocol::manscdp::VideoAlarmType::Manual,
+                2 => gb28181_protocol::manscdp::VideoAlarmType::MotionDetection,
+                3 => gb28181_protocol::manscdp::VideoAlarmType::ObjectLeft,
+                4 => gb28181_protocol::manscdp::VideoAlarmType::ObjectRemoved,
+                5 => gb28181_protocol::manscdp::VideoAlarmType::TripwireCrossing,
+                6 => gb28181_protocol::manscdp::VideoAlarmType::Intrusion,
+                7 => gb28181_protocol::manscdp::VideoAlarmType::WrongWay,
+                8 => gb28181_protocol::manscdp::VideoAlarmType::Loitering,
+                9 => gb28181_protocol::manscdp::VideoAlarmType::FlowStatistics,
+                10 => gb28181_protocol::manscdp::VideoAlarmType::DensityDetection,
+                11 => gb28181_protocol::manscdp::VideoAlarmType::VideoAbnormal,
+                12 => gb28181_protocol::manscdp::VideoAlarmType::FastMoving,
+                13 => gb28181_protocol::manscdp::VideoAlarmType::Tampering,
+                _ => gb28181_protocol::manscdp::VideoAlarmType::MotionDetection,
             };
             let code = h
                 .sim
-                .report_alarm(&h.transport, &h.local_host, h.local_port, &desc)
+                .report_alarm_full(
+                    &h.transport,
+                    &h.local_host,
+                    h.local_port,
+                    &desc,
+                    vtype,
+                    priority,
+                )
                 .await?;
-            Ok(format!("报警上报完成(平台响应 {code})"))
+            if code == 0 {
+                Ok("报警已触发，但因不满足平台订阅筛选条件已被本端过滤".to_string())
+            } else {
+                Ok(format!("报警上报完成(平台响应 {code})"))
+            }
         }
         None => Err(IpcError::device_not_running("设备未启动")),
     }
