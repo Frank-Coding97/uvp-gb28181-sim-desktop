@@ -388,7 +388,13 @@ impl Metrics {
         let first = self.register_first_attempt.load(Ordering::Relaxed);
         let succeeded = self.register_succeeded.load(Ordering::Relaxed);
         let local_pressure = transport
-            .map(|t| t.dropped_queue_full + t.send_errors + t.parse_errors)
+            .map(|t| {
+                t.dropped_queue_full
+                    + t.send_errors
+                    + t.parse_errors
+                    + t.rate_limited
+                    + t.anti_amplification_blocked
+            })
             .unwrap_or(0)
             + self.fail_local.load(Ordering::Relaxed);
         MetricsSnapshot {
@@ -652,6 +658,18 @@ mod tests {
         assert_eq!(s.fail_local, 1);
         assert!(!s.results_trustworthy, "出现本地瓶颈后不应再把失败归给平台");
         assert_eq!(s.local_pressure, 1);
+
+        let transport = sip_core::TransportStatsSnapshot {
+            rate_limited: 2,
+            anti_amplification_blocked: 3,
+            ..Default::default()
+        };
+        let guarded = Metrics::default().snapshot_with_transport(Some(transport));
+        assert_eq!(guarded.local_pressure, 5);
+        assert!(
+            !guarded.results_trustworthy,
+            "安全门控丢包也说明设定流量超过本机可接受范围"
+        );
     }
 
     #[test]

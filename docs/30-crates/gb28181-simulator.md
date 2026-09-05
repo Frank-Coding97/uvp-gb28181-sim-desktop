@@ -44,13 +44,19 @@ impl DeviceSimulator {
 
 ## 数据类型
 
-`DeviceConfig`(M0 已定义骨架):device_id、username、password、server_host/port/domain、transport、heartbeat_interval_secs;M2 增视频源配置(媒体档/文件/码率)。
+`DeviceConfig`:device_id、username、password、server_host/port/domain、transport、heartbeat_interval_secs、
+`inbound_identity_mode`(`compatible`/`strict`，旧配置默认 compatible);M2 增视频源配置(媒体档/文件/码率)。
 
 `DeviceState`:与 `10-functional/device-simulation.md#2` 状态机、UI DTO 一致。
 
 ## 行为
 
 严格实现 `10-functional/device-simulation.md`:注册+Digest、心跳+重注册(指数退避)、OPTIONS、Catalog/DeviceInfo 应答、INVITE→推流→BYE。
+
+入站平台身份有两档：`compatible` 仅依赖传输层可信平台 IP，保持主流平台/级联/SBC 互操作；
+`strict` 在任何业务副作用前额外要求唯一且可解析的 From，其 SIP URI user 必须精确匹配
+`server_domain`。缺失/畸形回 400，ID 不匹配回 403，错误 ACK 静默丢弃；拒绝响应进入服务端
+事务缓存。严格模式不是双向 Digest，能力边界由桌面 IPC 显式报告。
 
 ## 错误
 向上返回 `common::Result`;单设备异常隔离,不得拖垮同批其它设备(NFR-5)。

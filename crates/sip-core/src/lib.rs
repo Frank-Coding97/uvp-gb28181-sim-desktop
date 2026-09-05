@@ -21,5 +21,5 @@ pub use subject::Subject;
 pub use transaction::{client_transact, Admit, ServerTransactions, Timing, TxToken};
 pub use transport::{
     Incoming, RouteGuard, SipTrace, SipTransport, TcpTransport, TraceDir, TraceObserver,
-    TransportStats, TransportStatsSnapshot, UdpTransport,
+    TransportStats, TransportStatsSnapshot, UdpRateLimitConfig, UdpTransport,
 };

@@ -3,12 +3,17 @@
 //! 按 docs/20-architecture/api-contract.md 注册 IPC 命令。
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
+mod artifacts;
 mod diagnostics;
+mod ipc_error;
 mod media_access;
 mod secrets;
+mod series;
+
+use ipc_error::{sanitize_public_message, IpcError, IpcResult};
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -48,7 +53,12 @@ struct StressHandle {
     run_id: u64,
     stop_tx: broadcast::Sender<()>,
     stopping: bool,
+    stopping_flag: Arc<AtomicBool>,
+    worker_abort: tokio::task::AbortHandle,
+    completion: tokio::sync::watch::Receiver<bool>,
     device_count: usize,
+    /// 当前 run 的 `.inprogress` 时序；retention 必须始终保留。
+    series_path: Option<std::path::PathBuf>,
 }
 
 /// 单设备运行句柄。
@@ -79,6 +89,36 @@ static CLEANUP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// 客户端事务会重传到 Timer B(约 32 秒)。用户关窗口不该等那么久 ——
 /// 5 秒足够覆盖平台正常响应的情形,超时就放弃并如实记一条日志。
 const GRACEFUL_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 等待 Tokio 任务优雅退出；超时后必须 abort + await。
+///
+/// 仅把 `JoinHandle` 移进 `timeout` 再丢弃会 detach 任务，不会取消。设备运行任务持有
+/// 推流 future，detach 会阻断 `LiveSource::drop`，从而让 FFmpeg 变成孤儿进程。
+async fn await_or_abort_task(what: &str, task: &mut tokio::task::JoinHandle<()>) -> bool {
+    match tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, &mut *task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) if error.is_cancelled() => true,
+        Ok(Err(error)) => {
+            tracing::warn!(what, %error, "后台任务异常结束");
+            true
+        }
+        Err(_) => {
+            tracing::warn!(
+                what,
+                secs = GRACEFUL_STOP_TIMEOUT.as_secs(),
+                "后台任务未在期限内退出,正在强制取消"
+            );
+            task.abort();
+            match tokio::time::timeout(std::time::Duration::from_secs(1), &mut *task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => tracing::warn!(what, %error, "强制取消后的任务异常"),
+                Err(_) => tracing::error!(what, "强制取消后任务仍未收敛"),
+            }
+            false
+        }
+    }
+}
 
 impl AppState {
     /// `app_data_dir` 为 None 时媒体授权退化为仅本次运行有效(拿不到数据目录的极端情形)。
@@ -196,9 +236,10 @@ impl DeviceObserver for StateEmitter {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                let error = IpcError::from(message);
                 let _ = self.app.emit(
                     "device_error",
-                    serde_json::json!({ "scope": scope, "message": message, "ts_ms": ts_ms }),
+                    serde_json::json!({ "scope": scope, "error": error, "ts_ms": ts_ms }),
                 );
                 return;
             }
@@ -315,12 +356,33 @@ fn engine_version() -> String {
     format!("stress-engine v{} 就绪", env!("CARGO_PKG_VERSION"))
 }
 
+/// 入站信令安全能力。静态显式暴露边界，避免 UI 把“严格模式”误解为双向 Digest。
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct InboundSecurityCapabilities {
+    source_ip_filter: bool,
+    from_platform_id: bool,
+    digest_server_validation: bool,
+    digest_client_registration: bool,
+    literal_platform_ip_only: bool,
+}
+
+#[tauri::command]
+fn get_inbound_security_capabilities() -> InboundSecurityCapabilities {
+    InboundSecurityCapabilities {
+        source_ip_filter: true,
+        from_platform_id: true,
+        digest_server_validation: false,
+        digest_client_registration: true,
+        literal_platform_ip_only: true,
+    }
+}
+
 /// 校验场景 TOML 并返回摘要，不启动压测。
 #[tauri::command]
-async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
-    let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
+async fn validate_scenario(toml: String) -> IpcResult<ScenarioSummary> {
+    let sc = scenario::LinearScenario::from_toml_str(&toml)?;
     // 生成一台设备可触发所有语义校验,避免“语法正确、启动才失败”。
-    Orchestrator::new(&sc, 1).map_err(|e| e.to_string())?;
+    Orchestrator::new(&sc, 1)?;
     Ok(ScenarioSummary {
         name: sc.device_info.device_name.clone(),
         device_count: 0, // 由前端传 count 参数
@@ -329,9 +391,10 @@ async fn validate_scenario(toml: String) -> Result<ScenarioSummary, String> {
     })
 }
 
-/// 压测产物目录:优先 app 数据目录,回退系统临时目录。
+/// 压测产物目录：优先 app 数据目录，回退系统临时目录。
 ///
-/// 之前报告写在 `std::env::temp_dir()`,可能被 OS 清理 —— 压测报告不该是易失的。
+/// 该目录由应用按 [`artifacts::RetentionPolicy`] 自动清理；IPC 返回路径只是当前
+/// 托管产物的位置，不承诺永久保存。
 fn reports_dir(app: &AppHandle) -> std::path::PathBuf {
     let base = app
         .path()
@@ -340,41 +403,25 @@ fn reports_dir(app: &AppHandle) -> std::path::PathBuf {
     base.join("uvp-reports")
 }
 
-/// 追加一行时序指标(JSONL)。失败只告警:时序缺一行不该影响压测本身。
-fn append_series_line(path: &std::path::Path, snapshot: &stress_engine::MetricsSnapshot) {
-    use std::io::Write;
-    let line = match serde_json::to_string(&serde_json::json!({
-        "ts_ms": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        "metrics": snapshot,
-    })) {
-        Ok(v) => v,
-        Err(error) => {
-            tracing::warn!(%error, "时序指标序列化失败");
-            return;
-        }
-    };
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| writeln!(f, "{line}"));
-    if let Err(error) = result {
-        tracing::warn!(%error, path = %path.display(), "时序指标写入失败");
-    }
+fn cleanup_artifacts(
+    dir: &std::path::Path,
+    preserve: std::collections::HashSet<std::path::PathBuf>,
+) -> artifacts::CleanupHealth {
+    artifacts::cleanup(dir, artifacts::RetentionPolicy::default(), &preserve)
 }
 
-/// 读取时序 JSONL 为数组(导出报告用)。
-fn read_series(path: &std::path::Path) -> Vec<serde_json::Value> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect(),
-        Err(_) => Vec::new(),
+/// 同时 preserve 活跃 `.inprogress` 及其可能在并发收尾中出现的 final 名称。
+fn preserve_series_path(
+    preserve: &mut std::collections::HashSet<std::path::PathBuf>,
+    path: &std::path::Path,
+) {
+    preserve.insert(path.to_path_buf());
+    if let Some(name) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".inprogress"))
+    {
+        preserve.insert(path.with_file_name(name));
     }
 }
 
@@ -384,8 +431,9 @@ fn read_series(path: &std::path::Path) -> Vec<serde_json::Value> {
 /// `serialize_with = serialize_redacted`,**序列化时恒为占位符**。
 /// 之前这里要先把字段改成 `"***"` 再序列化 —— 那依赖每条导出路径的作者都记得,
 /// 现在漏了也不会泄露。
-fn serialize_redacted_scenario(scenario: &scenario::LinearScenario) -> Result<String, String> {
-    toml::to_string(scenario).map_err(|e| format!("脱敏场景序列化失败: {e}"))
+fn serialize_redacted_scenario(scenario: &scenario::LinearScenario) -> IpcResult<String> {
+    toml::to_string(scenario)
+        .map_err(|error| IpcError::config(format!("脱敏场景序列化失败: {error}")))
 }
 
 /// 启动压测。`toml` 为场景内容,`count` 为设备数。
@@ -400,57 +448,108 @@ async fn start_stress(
     alarm_interval: u64,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> IpcResult<String> {
     if position_interval > 86_400 || alarm_interval > 86_400 {
         return Err("主动上报间隔不能超过 86400 秒".into());
     }
 
-    let mut sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
-    // 密码只在 Rust 侧存在:场景 TOML 里的字段被钥匙串取值覆盖。
+    let mut sc = scenario::LinearScenario::from_toml_str(&toml)?;
     sc.password = common::Secret::new(secrets::get(&profile_id)?);
     let redacted_scenario = serialize_redacted_scenario(&sc)?;
-    let orch = Orchestrator::new(&sc, count).map_err(|e| e.to_string())?;
+    let orch = Orchestrator::new(&sc, count)?;
 
-    let mut stress_guard = state.stress.lock().await;
-    if stress_guard.is_some() {
-        return Err("已有压测正在运行或停止中，请等待任务完全退出".into());
-    }
+    let orch = Arc::new(orch);
+    let metrics = Arc::clone(&orch.metrics);
+
+    // 只在所有关联状态锁都能同步取得时提交本轮；任何等待都发生在未持锁时。
+    // 在锁定槽位前绝不创建 SeriesWriter，确保启动被拒绝时不残留空 .inprogress。
+    let mut stress_guard = loop {
+        let guard = state.stress.lock().await;
+        if guard.is_some() {
+            return Err(IpcError::new(
+                "stress.already_running",
+                "已有压测正在运行或停止中，请等待任务完全退出",
+            )
+            .with_retryable(true)
+            .with_action("请等待当前压测完全退出后重试"));
+        }
+        let (Ok(mut metrics_guard), Ok(mut last_metrics), Ok(mut last_series), Ok(mut scenario)) = (
+            state.metrics.try_lock(),
+            state.last_metrics.try_lock(),
+            state.last_series.try_lock(),
+            state.last_scenario.try_lock(),
+        ) else {
+            drop(guard);
+            tokio::task::yield_now().await;
+            continue;
+        };
+        *metrics_guard = Some(Arc::clone(&metrics));
+        *last_metrics = None;
+        *last_series = None;
+        *scenario = Some((redacted_scenario, count));
+        drop((metrics_guard, last_metrics, last_series, scenario));
+        break guard;
+    };
 
     let run_id = state.next_stress_id.fetch_add(1, Ordering::Relaxed);
+    let reports_dir = reports_dir(&app);
+    // 此时生命周期锁确认无活跃 run；清理失败只降级并告警，绝不阻止压测。
+    let cleanup_dir = reports_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        cleanup_artifacts(&cleanup_dir, std::collections::HashSet::new())
+    })
+    .await
+    {
+        Ok(health) if !health.healthy => {
+            tracing::warn!(?health, "压测启动前产物清理未完全健康");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "压测启动前产物清理任务异常"),
+    }
+    let series_writer = match series::SeriesWriter::new(&reports_dir, run_id) {
+        Ok(writer) => Some(Arc::new(writer)),
+        Err(error) => {
+            tracing::warn!(%error, "创建时序文件失败，本轮压测将降级为无时序");
+            None
+        }
+    };
+    let series_path = series_writer
+        .as_ref()
+        .map(|writer| writer.inprogress_path().to_path_buf());
+
     let (tx, _) = broadcast::channel::<()>(1);
-    // 必须在向前端暴露运行态前创建接收器，确保“启动后立即停止”不会丢信号。
     let run_stop = tx.subscribe();
     let tick_stop = tx.subscribe();
+    let stopping_flag = Arc::new(AtomicBool::new(false));
+    let (completion_tx, completion_rx) = tokio::sync::watch::channel(false);
+
+    // 真正的 worker JoinHandle 只归 supervisor 所有；状态槽只保存 AbortHandle 与
+    // 可克隆 completion，避免 worker 自己 join 或 graceful stop detach 任务。
+    let orch_for_worker = Arc::clone(&orch);
+    let tx_for_worker = tx.clone();
+    let stopping_for_worker = Arc::clone(&stopping_flag);
+    let worker_task = tokio::spawn(async move {
+        let result = orch_for_worker
+            .run_with_stop_receiver(tx_for_worker, run_stop, position_interval, alarm_interval)
+            .await;
+        // 这是运行结果的线性化点：不经过任何 await，立即固定停止状态，
+        // 防止自然完成后才到达的 stop 把 completed 误标成 stopped。
+        let was_stopping = stopping_for_worker.load(Ordering::Acquire);
+        (result, was_stopping)
+    });
+    let worker_abort = worker_task.abort_handle();
+
     *stress_guard = Some(StressHandle {
         run_id,
         stop_tx: tx.clone(),
         stopping: false,
+        stopping_flag,
+        worker_abort,
+        completion: completion_rx,
         device_count: count,
+        series_path,
     });
 
-    let metrics = Arc::clone(&orch.metrics);
-    *state.metrics.lock().await = Some(Arc::clone(&metrics));
-    *state.last_metrics.lock().await = None;
-    *state.last_scenario.lock().await = Some((redacted_scenario, count));
-
-    // 时序指标落盘:每秒一行 JSONL,导出报告时一并打包。
-    let series_path = {
-        let dir = reports_dir(&app);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        match std::fs::create_dir_all(&dir) {
-            Ok(()) => Some(dir.join(format!("series-run{run_id}-{ts}.jsonl"))),
-            Err(error) => {
-                tracing::warn!(%error, "创建报告目录失败,本轮不落时序");
-                None
-            }
-        }
-    };
-    *state.last_series.lock().await = series_path.clone();
-
-    // 先发布运行事件再启动后台任务，避免初始化瞬时失败时“最终事件”被旧启动事件覆盖。
     let _ = app.emit(
         "stress_state",
         serde_json::json!({
@@ -462,12 +561,10 @@ async fn start_stress(
     );
     drop(stress_guard);
 
-    // 每秒推送带运行 ID 的指标快照，前端据此隔离迟到事件。
     let app_for_tick = app.clone();
-    let orch = Arc::new(orch);
     let orch_for_tick = Arc::clone(&orch);
-    let series_for_tick = series_path.clone();
-    tokio::spawn(async move {
+    let writer_for_tick = series_writer.clone();
+    let tick_task = tokio::spawn(async move {
         let mut tick_stop = tick_stop;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -475,15 +572,14 @@ async fn start_stress(
             tokio::select! {
                 _ = tick_stop.recv() => break,
                 _ = interval.tick() => {
-                    // 快照带上传输层统计,前端据此判断"结论是否可信"。
                     let snapshot = orch_for_tick.snapshot();
-                    if let Some(path) = series_for_tick.clone() {
-                        let snap = snapshot.clone();
-                        // 文件 IO 放 blocking 池,不占 runtime 工作线程。
-                        let _ = tokio::task::spawn_blocking(move || {
-                            append_series_line(&path, &snap);
-                        })
-                        .await;
+                    if let Some(writer) = writer_for_tick.clone() {
+                        let sample = snapshot.clone();
+                        match tokio::task::spawn_blocking(move || writer.append(&sample)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::warn!(%error, "时序指标写入失败"),
+                            Err(error) => tracing::warn!(%error, "时序指标写任务异常"),
+                        }
                     }
                     let _ = app_for_tick.emit(
                         "metrics_tick",
@@ -497,69 +593,164 @@ async fn start_stress(
         }
     });
 
-    // 压测任务结束后保存最终快照并回收槽位；停止请求不会提前释放运行权。
     let app_for_run = app.clone();
     let orch_for_run = Arc::clone(&orch);
     let tx_for_run = tx.clone();
-    let series_for_run = series_path.clone();
     tokio::spawn(async move {
-        let result = orch_for_run
-            .run_with_stop_receiver(
-                tx_for_run.clone(),
-                run_stop,
-                position_interval,
-                alarm_interval,
-            )
-            .await;
-        // 初始化失败时也要关闭指标推送任务。
+        // supervisor 必须 await 真正 worker；panic/abort 也转换为本轮失败并继续状态清理。
+        let (result, was_stopping): (IpcResult<()>, bool) = match worker_task.await {
+            Ok((result, was_stopping)) => (result.map_err(IpcError::from), was_stopping),
+            Err(error) => {
+                let was_stopping = app_for_run
+                    .state::<AppState>()
+                    .stress
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|handle| {
+                        handle.run_id == run_id && handle.stopping_flag.load(Ordering::Acquire)
+                    });
+                if error.is_cancelled() && was_stopping {
+                    tracing::warn!(run_id, "压测 worker 在主动停止超时后被取消");
+                    (Ok(()), true)
+                } else {
+                    (
+                        Err(IpcError::internal(format!("压测 worker 异常结束: {error}"))),
+                        was_stopping,
+                    )
+                }
+            }
+        };
         let _ = tx_for_run.send(());
+        if let Err(error) = tick_task.await {
+            tracing::warn!(%error, run_id, "指标 tick 任务异常结束");
+        }
 
-        let state = app_for_run.state::<AppState>();
+        let outcome = if result.is_err() {
+            series::RunOutcome::Failed
+        } else if was_stopping {
+            series::RunOutcome::Stopped
+        } else {
+            series::RunOutcome::Completed
+        };
         let final_metrics = orch_for_run.snapshot();
-        // 收尾再写一行,保证时序覆盖到最后一刻。
-        if let Some(path) = series_for_run.clone() {
-            let snap = final_metrics.clone();
-            let _ = tokio::task::spawn_blocking(move || append_series_line(&path, &snap)).await;
-        }
-        let mut current = state.stress.lock().await;
-        let owns_state = current
-            .as_ref()
-            .is_some_and(|handle| handle.run_id == run_id);
-        if !owns_state {
-            return;
-        }
-        let was_stopping = current.as_ref().is_some_and(|handle| handle.stopping);
 
-        // 在仍持有本轮生命周期所有权时提交全部共享状态，最后才释放运行槽位。
-        // last_metrics 先写、metrics 后清，确保报告能力不会出现瞬时空窗。
-        *state.last_metrics.lock().await = Some(final_metrics.clone());
-        state.metrics.lock().await.take();
-        current.take();
-        drop(current);
+        let (finalized_series, incomplete_series) = if let Some(writer) = series_writer.as_ref() {
+            let final_sample = final_metrics.clone();
+            let inprogress_path = writer.inprogress_path().to_path_buf();
+            let writer_for_finalize = Arc::clone(writer);
+            match tokio::task::spawn_blocking(move || {
+                if let Err(error) = writer_for_finalize.append(&final_sample) {
+                    tracing::warn!(%error, "最终时序样本写入失败");
+                }
+                writer_for_finalize.finalize(outcome)
+            })
+            .await
+            {
+                Ok(Ok(finalized)) => (Some(finalized), None),
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, run_id, "时序收尾失败，保留 inprogress 文件");
+                    (None, Some(inprogress_path))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, run_id, "时序收尾任务异常，保留 inprogress 文件");
+                    (None, Some(inprogress_path))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let mut preserve = std::collections::HashSet::new();
+        if let Some(finalized) = &finalized_series {
+            preserve.insert(finalized.path.clone());
+            tracing::info!(
+                path = %finalized.path.display(),
+                sample_count = finalized.sample_count,
+                degraded = finalized.degraded,
+                outcome = finalized.outcome.as_str(),
+                "压测时序已完整发布"
+            );
+        }
+        if let Some(path) = &incomplete_series {
+            preserve.insert(path.clone());
+        }
+        let cleanup_dir = reports_dir.clone();
+        let cleanup_health =
+            tokio::task::spawn_blocking(move || cleanup_artifacts(&cleanup_dir, preserve)).await;
+        match cleanup_health {
+            Ok(health) if !health.healthy => {
+                tracing::warn!(?health, "压测收尾后产物清理未完全健康");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "压测收尾后产物清理任务异常"),
+        }
 
         let payload = match result {
             Ok(()) => serde_json::json!({
                 "run_id": run_id,
                 "running": false,
                 "stopping": false,
-                "reason": if was_stopping { "stopped" } else { "completed" },
+                "reason": outcome.as_str(),
                 "device_count": count,
                 "metrics": final_metrics,
             }),
             Err(error) => {
-                tracing::error!(%error, run_id, "压测任务异常结束");
+                tracing::error!(?error, run_id, "压测任务异常结束");
                 serde_json::json!({
                     "run_id": run_id,
                     "running": false,
                     "stopping": false,
                     "reason": "failed",
-                    "error": error.to_string(),
+                    "error": error,
                     "device_count": count,
                     "metrics": final_metrics,
                 })
             }
         };
-        let _ = app_for_run.emit("stress_state", payload);
+
+        let retained_series_path = finalized_series
+            .as_ref()
+            .map(|finalized| finalized.path.clone())
+            .or_else(|| incomplete_series.clone());
+        let state = app_for_run.state::<AppState>();
+        loop {
+            let mut current = state.stress.lock().await;
+            if !current
+                .as_ref()
+                .is_some_and(|handle| handle.run_id == run_id)
+            {
+                drop(current);
+                drop(series_writer);
+                let _ = completion_tx.send(true);
+                return;
+            }
+            let (Ok(mut last_metrics), Ok(mut last_series), Ok(mut metrics)) = (
+                state.last_metrics.try_lock(),
+                state.last_series.try_lock(),
+                state.metrics.try_lock(),
+            ) else {
+                drop(current);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            *last_metrics = Some(final_metrics.clone());
+            if let Some(path) = retained_series_path.clone() {
+                *last_series = Some(path);
+            }
+            metrics.take();
+            // 最终事件与槽位释放在同一个无 await 临界区内线性化。
+            let _ = app_for_run.emit("stress_state", payload.clone());
+            current.take();
+            drop((last_metrics, last_series, metrics, current));
+            break;
+        }
+        // SeriesWriter 的 RAII 令牌一直存活到 cleanup 与 last_series 状态交接之后。
+        drop(series_writer);
+        // completion=true 作为 supervisor 任务最后一个无 await 动作发送，
+        // 确保当 receiver 观察到完成信号时，所有 supervisor 资源与文件 guard 已完全释放，
+        // 避免退出时的 runtime teardown 与 supervisor 尾部资源销毁发生竞态。
+        let _ = completion_tx.send(true);
     });
 
     Ok(format!("已启动 {count} 台设备压测"))
@@ -567,12 +758,13 @@ async fn start_stress(
 
 /// 停止当前压测。只发送信号并进入 stopping 状态，运行槽位由后台任务退出时释放。
 #[tauri::command]
-async fn stop_stress(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+async fn stop_stress(state: tauri::State<'_, AppState>, app: AppHandle) -> IpcResult<String> {
     let mut stress_guard = state.stress.lock().await;
     match stress_guard.as_mut() {
         Some(handle) if handle.stopping => Ok("压测正在停止，请稍候".into()),
         Some(handle) => {
             handle.stopping = true;
+            handle.stopping_flag.store(true, Ordering::Release);
             let _ = handle.stop_tx.send(());
             // 在持有生命周期锁时发布，保证后台最终事件一定排在 stopping 事件之后。
             let _ = app.emit(
@@ -587,45 +779,57 @@ async fn stop_stress(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
             );
             Ok("压测停止信号已发送，正在等待设备任务退出".into())
         }
-        None => Err("没有正在运行的压测".into()),
+        None => Err(IpcError::new("stress.not_running", "没有正在运行的压测")),
     }
 }
 
 /// 查询当前指标快照（供按需轮询；实时更新通过 metrics_tick 事件）。
 #[tauri::command]
-async fn get_metrics(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn get_metrics(state: tauri::State<'_, AppState>) -> IpcResult<String> {
     match &*state.metrics.lock().await {
-        Some(m) => serde_json::to_string(&m.snapshot()).map_err(|e| e.to_string()),
-        None => Err("无正在运行的压测".into()),
+        Some(m) => Ok(serde_json::to_string(&m.snapshot())
+            .map_err(|error| IpcError::internal(format!("指标序列化失败: {error}")))?),
+        None => Err(IpcError::new("stress.not_running", "无正在运行的压测")),
     }
 }
 
 /// 查询压测状态，供 UI 页面切换或 IPC 返回后与引擎真实状态对账。
 #[tauri::command]
-async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    // 生命周期变更也持有此锁；在锁内读取关联字段可得到同一运行代际的快照。
-    let stress_guard = state.stress.lock().await;
-    let (running, stopping, run_id, device_count) = match stress_guard.as_ref() {
-        Some(handle) => (
-            true,
-            handle.stopping,
-            Some(handle.run_id),
-            handle.device_count,
-        ),
-        None => {
-            let count = state
-                .last_scenario
-                .lock()
-                .await
-                .as_ref()
-                .map(|(_, count)| *count)
-                .unwrap_or(0);
-            (false, false, None, count)
-        }
+async fn get_stress_status(state: tauri::State<'_, AppState>) -> IpcResult<serde_json::Value> {
+    // 生命周期与关联字段在无 await 临界区取同代际快照。
+    let (running, stopping, run_id, device_count, has_report) = loop {
+        let stress_guard = state.stress.lock().await;
+        let (Ok(last_scenario), Ok(metrics), Ok(last_metrics)) = (
+            state.last_scenario.try_lock(),
+            state.metrics.try_lock(),
+            state.last_metrics.try_lock(),
+        ) else {
+            drop(stress_guard);
+            tokio::task::yield_now().await;
+            continue;
+        };
+        let (running, stopping, run_id, device_count) = match stress_guard.as_ref() {
+            Some(handle) => (
+                true,
+                handle.stopping,
+                Some(handle.run_id),
+                handle.device_count,
+            ),
+            None => (
+                false,
+                false,
+                None,
+                last_scenario.as_ref().map(|(_, count)| *count).unwrap_or(0),
+            ),
+        };
+        break (
+            running,
+            stopping,
+            run_id,
+            device_count,
+            metrics.is_some() || last_metrics.is_some(),
+        );
     };
-    let has_report =
-        state.metrics.lock().await.is_some() || state.last_metrics.lock().await.is_some();
-    drop(stress_guard);
     Ok(serde_json::json!({
         "running": running,
         "stopping": stopping,
@@ -637,66 +841,143 @@ async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_js
 
 /// 查询单设备运行状态(UI 切页后对账用)。running=设备实例是否存在。
 #[tauri::command]
-async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn get_device_status(state: tauri::State<'_, AppState>) -> IpcResult<serde_json::Value> {
     let running = state.device.lock().await.is_some();
     Ok(serde_json::json!({ "running": running }))
 }
 
-/// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
-/// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
+struct ReportV1Input {
+    policy: artifacts::RetentionPolicy,
+    retention_health: artifacts::CleanupHealth,
+    environment: diagnostics::Environment,
+    scenario: Option<(String, usize)>,
+    metrics: stress_engine::MetricsSnapshot,
+    series: series::SeriesRead,
+    series_file: Option<String>,
+    generated_at_epoch_secs: u64,
+}
+
+/// 构造稳定的 schema v1 payload。JSONL envelope 只用于 reader 校验，series 固定为裸 metrics。
+fn build_report_v1(input: ReportV1Input) -> serde_json::Value {
+    let ReportV1Input {
+        policy,
+        retention_health,
+        environment,
+        scenario,
+        metrics,
+        series,
+        series_file,
+        generated_at_epoch_secs,
+    } = input;
+    serde_json::json!({
+        "schema_version": 1,
+        "producer": "uvp-gb28181-sim-desktop",
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "managed_artifact": true,
+        "generated_at_epoch_secs": generated_at_epoch_secs,
+        "retention": policy,
+        "retention_policy": policy,
+        "artifact_health": retention_health,
+        "environment": environment,
+        "scenario_toml_redacted": scenario.as_ref().map(|(toml, _)| toml),
+        "device_count": scenario.as_ref().map(|(_, count)| count),
+        "metrics": metrics,
+        "series_sample_count": series.sample_count,
+        "sample_count": series.sample_count,
+        "series_complete": series.complete,
+        "series_outcome": series.outcome,
+        "outcome": series.outcome,
+        "series_degraded": series.degraded,
+        "series_torn_tail": series.torn_tail,
+        "series_corrupt_lines": series.corrupt_lines,
+        "series": series.samples,
+        "series_file": series_file,
+    })
+}
+
+/// 导出压测报告（FR-28），返回应用托管产物路径。
 #[tauri::command]
-async fn export_report(
-    state: tauri::State<'_, AppState>,
-    app: AppHandle,
-) -> Result<String, String> {
-    // 与启动/完成提交共用生命周期锁，避免混合读取不同 run 的场景和指标。
-    let _stress_guard = state.stress.lock().await;
-    // 优先取运行中指标,否则取最近一次压测保留的快照。
-    let snap = match &*state.metrics.lock().await {
-        Some(m) => m.snapshot(),
-        None => match &*state.last_metrics.lock().await {
-            Some(s) => s.clone(),
-            None => return Err("无压测数据可导出(尚未运行过压测)".into()),
-        },
+async fn export_report(state: tauri::State<'_, AppState>, app: AppHandle) -> IpcResult<String> {
+    // 同一 run 的关联状态用 try_lock 在无 await 临界区复制，竞争时释放后重试。
+    let (snap, scenario, series_path) = loop {
+        let stress_guard = state.stress.lock().await;
+        let (Ok(metrics), Ok(last_metrics), Ok(scenario), Ok(last_series)) = (
+            state.metrics.try_lock(),
+            state.last_metrics.try_lock(),
+            state.last_scenario.try_lock(),
+            state.last_series.try_lock(),
+        ) else {
+            drop(stress_guard);
+            tokio::task::yield_now().await;
+            continue;
+        };
+        let snap = match &*metrics {
+            Some(metrics) => metrics.snapshot(),
+            None => match &*last_metrics {
+                Some(snapshot) => snapshot.clone(),
+                None => return Err("无压测数据可导出(尚未运行过压测)".into()),
+            },
+        };
+        let series_path = stress_guard
+            .as_ref()
+            .and_then(|handle| handle.series_path.clone())
+            .or_else(|| last_series.clone());
+        break (snap, scenario.clone(), series_path);
     };
-    let scenario = state.last_scenario.lock().await.clone();
-    let series_path = state.last_series.lock().await.clone();
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let dir = reports_dir(&app);
-
-    // 文件 IO 全部放 blocking 池:之前在持有生命周期锁时做同步 IO,
-    // 既阻塞 runtime 工作线程,也把压测启停一起卡住。
-    let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
-        let series = series_path.as_deref().map(read_series).unwrap_or_default();
-        let report = serde_json::json!({
-            "generated_at_epoch_secs": ts,
-            // 运行环境快照。
-            //
-            // 报告以前只有"这次压测的结果",没有"这个结果是在什么机器上得到的" ——
-            // 于是结论既无法复现也无法采信。其中 fd 限额尤其关键:
-            // 压测按 64 台设备一个 socket 分片,fd 不够的表现是
-            // "注册到某个数量就大面积失败",极易被误判成平台承载不住。
-            "environment": diagnostics::Environment::collect(),
-            "scenario_toml_redacted": scenario.as_ref().map(|(t, _)| t),
-            "device_count": scenario.as_ref().map(|(_, c)| c),
-            "metrics": snap,
-            // 时序指标(每秒一个采样点),不再只有最终快照。
-            "series_sample_count": series.len(),
-            "series": series,
-            "series_file": series_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+    let path = tokio::task::spawn_blocking(move || -> IpcResult<std::path::PathBuf> {
+        let policy = artifacts::RetentionPolicy::default();
+        let mut preserve = std::collections::HashSet::new();
+        if let Some(path) = &series_path {
+            preserve_series_path(&mut preserve, path);
+        }
+        let retention_health = cleanup_artifacts(&dir, preserve.clone());
+        let series = series_path
+            .as_deref()
+            .map(series::read_series)
+            .unwrap_or_default();
+        let generated_at_epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let series_file = series.source_file.clone().or_else(|| {
+            series_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
         });
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建报告目录失败: {e}"))?;
-        let path = dir.join(format!("report-{ts}.json"));
-        let content = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-        std::fs::write(&path, content).map_err(|e| format!("写报告失败: {e}"))?;
+        let report = build_report_v1(ReportV1Input {
+            policy,
+            retention_health,
+            environment: diagnostics::Environment::collect(),
+            scenario,
+            metrics: snap,
+            series,
+            series_file,
+            generated_at_epoch_secs,
+        });
+        let content = serde_json::to_vec_pretty(&report).map_err(|error| {
+            IpcError::new("report.export_failed", format!("报告序列化失败: {error}"))
+        })?;
+        let (nanos, counter) = artifacts::unique_timestamp_counter();
+        let path = dir.join(format!("report-{nanos}-{counter}.json"));
+        let published = artifacts::atomic_write_new(&path, &content).map_err(|error| {
+            IpcError::new("report.export_failed", format!("原子写报告失败: {error}"))
+        })?;
+        if let Some(warning) = published.durability_warning() {
+            tracing::warn!(warning, path = %published.path().display(), "报告持久性降级");
+        }
+        preserve.insert(path.clone());
+        let health = cleanup_artifacts(&dir, preserve);
+        if !health.healthy {
+            tracing::warn!(?health, "报告导出后产物清理未完全健康");
+        }
+        // published guard 保留到新报告进入 preserve 并完成 cleanup 交接。
+        drop(published);
         Ok(path)
     })
     .await
-    .map_err(|e| format!("导出任务异常: {e}"))??;
+    .map_err(|error| IpcError::new("report.export_failed", format!("导出任务异常: {error}")))??;
 
     Ok(path.to_string_lossy().to_string())
 }
@@ -728,6 +1009,14 @@ struct LiveSourceCatalogDto {
     microphones: Vec<LiveAvDeviceDto>,
     screen_error: Option<String>,
     avfoundation_error: Option<String>,
+}
+
+fn sanitize_catalog_error(message: String) -> String {
+    if message.to_ascii_lowercase().contains("ffmpeg") {
+        "FFmpeg 设备枚举失败（详细输出已隐藏，请查看系统日志）".to_string()
+    } else {
+        sanitize_public_message(&message)
+    }
 }
 
 impl From<media_rtp::LiveSourceCatalog> for LiveSourceCatalogDto {
@@ -763,8 +1052,8 @@ impl From<media_rtp::LiveSourceCatalog> for LiveSourceCatalogDto {
                     name: device.name,
                 })
                 .collect(),
-            screen_error: catalog.screen_error,
-            avfoundation_error: catalog.avfoundation_error,
+            screen_error: catalog.screen_error.map(sanitize_catalog_error),
+            avfoundation_error: catalog.avfoundation_error.map(sanitize_catalog_error),
         }
     }
 }
@@ -780,24 +1069,23 @@ struct LiveProbeDto {
 
 /// 枚举可用于规范实时源 URI 的摄像头、麦克风和显示器。
 #[tauri::command]
-async fn list_live_sources() -> Result<LiveSourceCatalogDto, String> {
-    tokio::task::spawn_blocking(media_rtp::list_live_sources)
+async fn list_live_sources() -> IpcResult<LiveSourceCatalogDto> {
+    let catalog = tokio::task::spawn_blocking(media_rtp::list_live_sources)
         .await
-        .map_err(|error| format!("实时源枚举任务异常: {error}"))?
-        .map(LiveSourceCatalogDto::from)
-        .map_err(|error| error.to_string())
+        .map_err(|error| IpcError::internal(format!("实时源枚举任务异常: {error}")))??;
+    Ok(LiveSourceCatalogDto::from(catalog))
 }
 
 /// 启动一次短时采集探测。请求音频时，用户应确保麦克风或系统正在产生声音。
 #[tauri::command]
-async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
-    let spec = media_rtp::LiveSourceSpec::parse(uri.trim()).map_err(|error| error.to_string())?;
+async fn probe_live_source(uri: String) -> IpcResult<LiveProbeDto> {
+    let spec = media_rtp::LiveSourceSpec::parse(uri.trim())?;
     let canonical_uri = uri.trim().to_string();
     let audio_requested = match spec {
         media_rtp::LiveSourceSpec::Camera { audio_index, .. } => audio_index.is_some(),
         media_rtp::LiveSourceSpec::Screen { audio, .. } => audio.is_enabled(),
     };
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || -> Result<LiveProbeDto, String> {
         use media_rtp::VideoSource;
 
         let mut source = media_rtp::LiveSource::capture(&canonical_uri, 25)
@@ -837,7 +1125,8 @@ async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
         })
     })
     .await
-    .map_err(|error| format!("实时采集探测任务异常: {error}"))?
+    .map_err(|error| IpcError::internal(format!("实时采集探测任务异常: {error}")))?;
+    Ok(result?)
 }
 
 /// 前端传入的单设备配置。
@@ -851,6 +1140,8 @@ struct DeviceCfg {
     server_host: String,
     server_port: u16,
     server_domain: String,
+    #[serde(default)]
+    inbound_identity_mode: common::InboundIdentityMode,
     device_id: String,
     #[serde(default)]
     transport: String, // "UDP" / "TCP"
@@ -905,19 +1196,22 @@ async fn start_device(
     mut config: DeviceCfg,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<String, String> {
+) -> IpcResult<String> {
     let mut guard = state.device.lock().await;
     if guard.is_some() {
-        return Err("已有设备在运行,请先停止".into());
+        return Err(
+            IpcError::new("device.already_running", "已有设备在运行,请先停止")
+                .with_retryable(false)
+                .with_action("请先停止当前设备实例"),
+        );
     }
 
-    if config.server_port == 0
-        || format!("{}:{}", config.server_host, config.server_port)
-            .parse::<std::net::SocketAddr>()
-            .is_err()
-    {
-        return Err("平台地址必须是有效的 IP:端口（当前不支持域名）".into());
+    if config.server_port == 0 {
+        return Err("平台端口必须在 1–65535 之间".into());
     }
+    let platform_addr = format!("{}:{}", config.server_host, config.server_port)
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "平台地址必须是有效的 IP:端口（当前不支持域名）".to_string())?;
     // 密码从钥匙串取:未配置时给出明确的引导而不是「密码不能为空」。
     let password = secrets::get(&config.profile_id)?;
     if let Some(source) = config.video_source.take() {
@@ -926,12 +1220,12 @@ async fn start_device(
             config.video_source = None;
         } else {
             if source.starts_with("live:") {
-                let spec = media_rtp::LiveSourceSpec::parse(&source)
-                    .map_err(|error| format!("实时媒体源配置无效: {error}"))?;
+                let spec = media_rtp::LiveSourceSpec::parse(&source)?;
                 let catalog = tokio::task::spawn_blocking(media_rtp::list_live_sources)
                     .await
-                    .map_err(|error| format!("实时设备枚举任务异常: {error}"))?
-                    .map_err(|error| format!("实时设备枚举失败: {error}"))?;
+                    .map_err(|error| {
+                        IpcError::internal(format!("实时设备枚举任务异常: {error}"))
+                    })??;
                 let requested_audio_codec = match &spec {
                     media_rtp::LiveSourceSpec::Camera {
                         audio_index: Some(_),
@@ -961,9 +1255,12 @@ async fn start_device(
                             .iter()
                             .any(|camera| camera.index == video_index) =>
                     {
-                        return Err(catalog.avfoundation_error.unwrap_or_else(|| {
-                            format!("未找到 AVFoundation 摄像头索引 {video_index}")
-                        }));
+                        return Err(catalog
+                            .avfoundation_error
+                            .unwrap_or_else(|| {
+                                format!("未找到 AVFoundation 摄像头索引 {video_index}")
+                            })
+                            .into());
                     }
                     media_rtp::LiveSourceSpec::Camera {
                         audio_index: Some(index),
@@ -975,7 +1272,8 @@ async fn start_device(
                     {
                         return Err(catalog
                             .avfoundation_error
-                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}"))
+                            .into());
                     }
                     media_rtp::LiveSourceSpec::Screen {
                         audio: media_rtp::LiveAudioSource::Microphone(index),
@@ -987,7 +1285,8 @@ async fn start_device(
                     {
                         return Err(catalog
                             .avfoundation_error
-                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                            .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}"))
+                            .into());
                     }
                     media_rtp::LiveSourceSpec::Screen { display_id, .. }
                         if display_id != 0
@@ -996,9 +1295,12 @@ async fn start_device(
                                 .iter()
                                 .any(|screen| screen.display_id == display_id) =>
                     {
-                        return Err(catalog.screen_error.unwrap_or_else(|| {
-                            format!("未找到 ScreenCaptureKit 显示器 {display_id}")
-                        }));
+                        return Err(catalog
+                            .screen_error
+                            .unwrap_or_else(|| {
+                                format!("未找到 ScreenCaptureKit 显示器 {display_id}")
+                            })
+                            .into());
                     }
                     _ => {}
                 }
@@ -1013,10 +1315,10 @@ async fn start_device(
         return Err("输出帧率必须在 1–120 之间".into());
     }
 
-    let device_id = DeviceId::new(config.device_id.clone()).map_err(|e| e.to_string())?;
+    let device_id = DeviceId::new(config.device_id.clone())?;
     // 通道 ID:设备 ID 前 17 位 + 132(视频通道类型码)。
     let channel_id_str = format!("{}132", &config.device_id[..17]);
-    let channel_id = DeviceId::new(channel_id_str).map_err(|e| e.to_string())?;
+    let channel_id = DeviceId::new(channel_id_str)?;
     let gb_version = if config.gb_version == "2016" {
         GbVersion::V2016
     } else {
@@ -1041,6 +1343,7 @@ async fn start_device(
         server_host: config.server_host.clone(),
         server_port: config.server_port,
         server_domain: config.server_domain.clone(),
+        inbound_identity_mode: config.inbound_identity_mode,
         transport,
         heartbeat_interval_secs: config.heartbeat_interval.unwrap_or(60).max(1),
         register_expires_secs: config.expires.unwrap_or(3600).max(1),
@@ -1084,29 +1387,20 @@ async fn start_device(
             let prepared =
                 tokio::task::spawn_blocking(move || gb28181_simulator::prepare_video_source(&vs))
                     .await
-                    .map_err(|e| e.to_string())?;
-            if let Err(e) = prepared {
-                return Err(format!("视频源准备失败:{e}"));
-            }
+                    .map_err(|error| IpcError::internal(format!("视频源准备任务异常: {error}")))?;
+            prepared?;
         }
     }
 
-    // 共享传输 + 本端地址发现。
+    // 共享传输 + 本端地址发现。可信来源在接收/accept 循环启动前原子安装，
+    // 避免 TCP bind 后再设白名单时，竞态窗口中的恶意连接被长期保留。
+    let trusted_ips = vec![platform_addr.ip()];
     let udp: Arc<dyn SipTransport> = match transport {
-        Transport::Udp => UdpTransport::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| e.to_string())?,
-        Transport::Tcp => TcpTransport::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| e.to_string())?,
+        Transport::Udp => UdpTransport::bind_with_trusted_ips("0.0.0.0:0", trusted_ips).await?,
+        Transport::Tcp => TcpTransport::bind_with_trusted_ips("0.0.0.0:0", trusted_ips).await?,
     };
-    // 只接受来自该平台的入站报文:不设限时任何主机都能注入 PTZ/DeviceConfig/INVITE,
-    // 而 INVITE 的 c=/m= 决定推流目标 —— 那是可被利用的媒体流量放大。
-    if !udp.trust_only_host(&config.server_host) {
-        tracing::warn!(host = %config.server_host, "平台地址不是字面 IP,来源白名单未启用");
-    }
-    let local_port = udp.local_addr().map_err(|e| e.to_string())?.port();
-    let local_host = discover_local_ip(&format!("{}:{}", config.server_host, config.server_port));
+    let local_port = udp.local_addr()?.port();
+    let local_host = discover_local_ip(&platform_addr.to_string());
 
     // 单设备联调默认开启 SIP 信令追踪(FR-43),把收发报文推给前端。
     udp.set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
@@ -1152,45 +1446,113 @@ async fn stop_device_graceful(state: &AppState) -> bool {
     let Some(handle) = handle else {
         return false;
     };
-    let _ = handle.stop_tx.send(());
-    match tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, handle.run_task).await {
-        Ok(_) => tracing::info!("设备下线序列已完成"),
-        Err(_) => tracing::warn!(
-            secs = GRACEFUL_STOP_TIMEOUT.as_secs(),
-            "设备下线未在超时内完成(平台可能无响应),继续退出"
-        ),
+    let DeviceHandle {
+        transport,
+        stop_tx,
+        mut run_task,
+        ..
+    } = handle;
+    let _ = stop_tx.send(());
+    if await_or_abort_task("设备下线", &mut run_task).await {
+        tracing::info!("设备下线序列已完成");
     }
-    // 关掉传输,释放监听 socket 与全部连接。
-    handle.transport.shutdown();
+    // 即使任务被 abort，future drop 会先释放媒体源；随后关传输释放 socket。
+    transport.shutdown();
     true
 }
 
-/// 停压测并等到全部设备任务退出(带超时)。返回是否停了一次压测。
-async fn stop_stress_graceful(state: &AppState) -> bool {
-    let mut guard = state.stress.lock().await;
-    let Some(handle) = guard.as_mut() else {
-        return false;
-    };
-    handle.stopping = true;
-    let _ = handle.stop_tx.send(());
-    drop(guard);
-
-    // 后台任务退出时会把 `stress` 槽位清掉,以此判断收敛。
-    let deadline = std::time::Instant::now() + GRACEFUL_STOP_TIMEOUT;
+/// 等待 supervisor 完成 series/状态交接。返回 false 表示 sender 未发布完成就异常关闭。
+async fn wait_stress_completion(completion: &mut tokio::sync::watch::Receiver<bool>) -> bool {
     loop {
-        if state.stress.lock().await.is_none() {
-            tracing::info!("压测任务已全部退出");
+        if *completion.borrow() {
             return true;
         }
-        if std::time::Instant::now() >= deadline {
+        if completion.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
+/// supervisor 异常消失时按 run_id 兜底清理槽位和实时 metrics；等待不持有任何锁。
+async fn clear_abandoned_stress(state: &AppState, run_id: u64) {
+    loop {
+        let mut stress = state.stress.lock().await;
+        if !stress
+            .as_ref()
+            .is_some_and(|handle| handle.run_id == run_id)
+        {
+            return;
+        }
+        let Ok(mut metrics) = state.metrics.try_lock() else {
+            drop(stress);
+            tokio::task::yield_now().await;
+            continue;
+        };
+        metrics.take();
+        stress.take();
+        return;
+    }
+}
+
+/// 停压测并等到 supervisor 收尾完成(带超时)。返回是否停了一次压测。
+async fn stop_stress_graceful(state: &AppState) -> bool {
+    let (run_id, stop_tx, worker_abort, mut completion) = {
+        let mut guard = state.stress.lock().await;
+        let Some(handle) = guard.as_mut() else {
+            return false;
+        };
+        handle.stopping = true;
+        handle.stopping_flag.store(true, Ordering::Release);
+        (
+            handle.run_id,
+            handle.stop_tx.clone(),
+            handle.worker_abort.clone(),
+            handle.completion.clone(),
+        )
+    };
+    let _ = stop_tx.send(());
+
+    match tokio::time::timeout(
+        GRACEFUL_STOP_TIMEOUT,
+        wait_stress_completion(&mut completion),
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::info!("压测任务及 supervisor 收尾已全部退出");
+        }
+        Ok(false) => {
+            tracing::error!(run_id, "压测 supervisor 未发布 completion 就异常结束");
+            worker_abort.abort();
+            clear_abandoned_stress(state, run_id).await;
+        }
+        Err(_) => {
             tracing::warn!(
                 secs = GRACEFUL_STOP_TIMEOUT.as_secs(),
-                "压测未在超时内收敛,继续退出"
+                "压测未在超时内收敛，正在强制取消 worker"
             );
-            return true;
+            worker_abort.abort();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_stress_completion(&mut completion),
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::error!(run_id, "强制取消后 supervisor 异常关闭 completion");
+                    clear_abandoned_stress(state, run_id).await;
+                }
+                Err(_) => {
+                    tracing::error!(
+                        run_id,
+                        "强制取消 worker 后 supervisor 仍未在 1 秒内完成收尾"
+                    );
+                }
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    true
 }
 
 /// 应用退出前的清理:先设备、再压测。
@@ -1211,30 +1573,33 @@ async fn shutdown_all(state: &AppState) {
 
 /// 停止当前设备。
 #[tauri::command]
-async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> IpcResult<String> {
     let mut guard = state.device.lock().await;
     match guard.take() {
         Some(h) => {
-            let _ = h.stop_tx.send(());
+            let DeviceHandle {
+                transport,
+                stop_tx,
+                mut run_task,
+                ..
+            } = h;
+            let _ = stop_tx.send(());
             let _ = app.emit("device_state", "Disconnected");
-            // 界面要立刻响应,所以不在这里等下线序列;但传输必须在任务真的退出后
-            // 才关闭,否则注销 REGISTER 会因为"传输已关停"直接失败。
+            // 界面要立刻响应,所以在后台等下线；超时必须 abort+await，不能 detach
+            // 仍持有 LiveSource/FFmpeg 的任务。
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, h.run_task).await;
-                h.transport.shutdown();
+                await_or_abort_task("设备停止", &mut run_task).await;
+                transport.shutdown();
             });
             Ok("设备已停止".into())
         }
-        None => Err("没有正在运行的设备".into()),
+        None => Err(IpcError::device_not_running("没有正在运行的设备")),
     }
 }
 
 /// 主动上报一条报警。
 #[tauri::command]
-async fn fire_alarm(
-    description: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+async fn fire_alarm(description: String, state: tauri::State<'_, AppState>) -> IpcResult<String> {
     let guard = state.device.lock().await;
     match &*guard {
         Some(h) => {
@@ -1246,11 +1611,10 @@ async fn fire_alarm(
             let code = h
                 .sim
                 .report_alarm(&h.transport, &h.local_host, h.local_port, &desc)
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             Ok(format!("报警上报完成(平台响应 {code})"))
         }
-        None => Err("设备未启动".into()),
+        None => Err(IpcError::device_not_running("设备未启动")),
     }
 }
 
@@ -1261,7 +1625,7 @@ async fn fire_alarm(
 #[tauri::command]
 async fn get_broadcast_status(
     state: tauri::State<'_, AppState>,
-) -> Result<Option<gb28181_simulator::BroadcastSnapshot>, String> {
+) -> IpcResult<Option<gb28181_simulator::BroadcastSnapshot>> {
     let guard = state.device.lock().await;
     match &*guard {
         Some(h) => Ok(h.sim.broadcast_snapshot().await),
@@ -1277,7 +1641,7 @@ async fn get_broadcast_status(
 #[tauri::command]
 async fn get_media_telemetry(
     state: tauri::State<'_, AppState>,
-) -> Result<Option<gb28181_simulator::MediaTelemetrySnapshot>, String> {
+) -> IpcResult<Option<gb28181_simulator::MediaTelemetrySnapshot>> {
     let guard = state.device.lock().await;
     match &*guard {
         Some(h) => Ok(h.sim.media_telemetry().await),
@@ -1287,7 +1651,7 @@ async fn get_media_telemetry(
 
 /// 设备侧主动挂断语音广播(按附录 K a) 发会话内 BYE)。
 #[tauri::command]
-async fn hangup_broadcast(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn hangup_broadcast(state: tauri::State<'_, AppState>) -> IpcResult<String> {
     let guard = state.device.lock().await;
     match &*guard {
         Some(h) => {
@@ -1297,7 +1661,7 @@ async fn hangup_broadcast(state: tauri::State<'_, AppState>) -> Result<String, S
                 Ok("当前没有进行中的语音广播".into())
             }
         }
-        None => Err("设备未启动".into()),
+        None => Err(IpcError::device_not_running("设备未启动")),
     }
 }
 
@@ -1307,7 +1671,7 @@ async fn fire_position(
     longitude: f64,
     latitude: f64,
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+) -> IpcResult<String> {
     let guard = state.device.lock().await;
     match &*guard {
         Some(h) => {
@@ -1320,11 +1684,10 @@ async fn fire_position(
                     longitude,
                     latitude,
                 )
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             Ok(format!("位置上报完成(平台响应 {code})"))
         }
-        None => Err("设备未启动".into()),
+        None => Err(IpcError::device_not_running("设备未启动")),
     }
 }
 
@@ -1334,7 +1697,7 @@ async fn set_sip_trace(
     enabled: bool,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
-) -> Result<String, String> {
+) -> IpcResult<String> {
     let guard = state.device.lock().await;
     match &*guard {
         Some(h) => {
@@ -1347,7 +1710,7 @@ async fn set_sip_trace(
                 Ok("信令追踪已关闭".into())
             }
         }
-        None => Err("设备未启动".into()),
+        None => Err(IpcError::device_not_running("设备未启动")),
     }
 }
 
@@ -1526,16 +1889,18 @@ impl From<&gb28181_protocol::id_codec::CatalogNode> for ChannelNodeDto {
 async fn load_catalog_template(
     template: String,
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<ChannelNodeDto>, String> {
+) -> IpcResult<Vec<ChannelNodeDto>> {
     const TEMPLATES: [&str; 4] = ["single", "nvr-8ch", "civil-3x2", "large-16ch"];
     if !TEMPLATES.contains(&template.as_str()) {
-        return Err(format!(
+        return Err(IpcError::config(format!(
             "未知的目录模板 {template},可选:{}",
             TEMPLATES.join(" / ")
-        ));
+        )));
     }
     let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动,请先在单设备页启动设备")?;
+    let h = guard
+        .as_ref()
+        .ok_or_else(|| IpcError::device_not_running("设备未启动,请先在单设备页启动设备"))?;
     h.sim.load_catalog_template(&template);
     // 增量 NOTIFY 推送是副作用,后台发送不阻塞 UI 返回(平台不及时回 200 时事务会退避重传数秒)。
     spawn_catalog_notify(h);
@@ -1544,11 +1909,11 @@ async fn load_catalog_template(
 
 /// 获取当前目录树节点(FR-34)。
 #[tauri::command]
-async fn get_catalog_tree(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<ChannelNodeDto>, String> {
+async fn get_catalog_tree(state: tauri::State<'_, AppState>) -> IpcResult<Vec<ChannelNodeDto>> {
     let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
+    let h = guard
+        .as_ref()
+        .ok_or_else(|| IpcError::device_not_running("设备未启动"))?;
     Ok(h.sim.catalog_tree().iter().map(Into::into).collect())
 }
 
@@ -1557,10 +1922,12 @@ async fn get_catalog_tree(
 async fn upsert_channel(
     node: ChannelNodeDto,
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+) -> IpcResult<String> {
     let node = validate_channel_node(node)?;
     let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
+    let h = guard
+        .as_ref()
+        .ok_or_else(|| IpcError::device_not_running("设备未启动"))?;
     let added = h.sim.upsert_channel(node);
     spawn_catalog_notify(h);
     Ok(if added {
@@ -1572,9 +1939,11 @@ async fn upsert_channel(
 
 /// 删除一个目录通道节点,触发增量 NOTIFY(FR-34)。
 #[tauri::command]
-async fn remove_channel(id: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn remove_channel(id: String, state: tauri::State<'_, AppState>) -> IpcResult<String> {
     let guard = state.device.lock().await;
-    let h = guard.as_ref().ok_or("设备未启动")?;
+    let h = guard
+        .as_ref()
+        .ok_or_else(|| IpcError::device_not_running("设备未启动"))?;
     if h.sim.remove_channel(&id) {
         spawn_catalog_notify(h);
         Ok("已删除通道".into())
@@ -1609,11 +1978,11 @@ struct ScenarioSummary {
 
 /// 设置全局日志级别(error/warn/info/debug/trace,或 EnvFilter 语法)。返回生效后的级别。
 #[tauri::command]
-fn set_log_level(level: String) -> Result<String, String> {
+fn set_log_level(level: String) -> IpcResult<String> {
     if common::logging::set_level(&level) {
         Ok(common::logging::current_level())
     } else {
-        Err(format!("无效的日志级别: {level}"))
+        Err(IpcError::config(format!("无效的日志级别: {level}")))
     }
 }
 
@@ -1634,13 +2003,41 @@ fn get_recent_logs(max: Option<usize>) -> Vec<common::logging::LogLine> {
 /// 与「导出压测报告」分开:报告回答"这次压测结果如何",诊断包回答
 /// "这台机器上到底发生了什么"。后者才是把问题发给技术支持时需要的东西。
 #[tauri::command]
-async fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
+async fn export_diagnostics(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> IpcResult<String> {
     let dir = reports_dir(&app);
-    // 打包会读若干 MB 日志并做 deflate,放到阻塞线程池,别卡住 IPC。
-    tauri::async_runtime::spawn_blocking(move || diagnostics::export(&dir))
+    let preserve = loop {
+        let stress_guard = state.stress.lock().await;
+        let Ok(last_series) = state.last_series.try_lock() else {
+            drop(stress_guard);
+            tokio::task::yield_now().await;
+            continue;
+        };
+        let mut preserve = std::collections::HashSet::new();
+        if let Some(path) = stress_guard
+            .as_ref()
+            .and_then(|handle| handle.series_path.clone())
+        {
+            preserve_series_path(&mut preserve, &path);
+        }
+        if let Some(path) = last_series.clone() {
+            preserve_series_path(&mut preserve, &path);
+        }
+        break preserve;
+    };
+    // 打包会读若干 MB 日志并做 deflate，放到阻塞线程池，别卡住 IPC。
+    let path = tauri::async_runtime::spawn_blocking(move || diagnostics::export(&dir, &preserve))
         .await
-        .map_err(|e| format!("诊断包导出任务异常: {e}"))?
-        .map(|p| p.display().to_string())
+        .map_err(|error| {
+            IpcError::new(
+                "diagnostics.export_failed",
+                format!("诊断包导出任务异常: {error}"),
+            )
+        })?
+        .map_err(|message| IpcError::new("diagnostics.export_failed", message))?;
+    Ok(path.display().to_string())
 }
 
 /// 弹出系统文件对话框让用户选一个视频源文件,并**同时**授权它的 asset 预览。
@@ -1652,7 +2049,7 @@ async fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
 async fn pick_video_source(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<Option<String>, String> {
+) -> IpcResult<Option<String>> {
     use tauri_plugin_dialog::DialogExt;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1664,18 +2061,28 @@ async fn pick_video_source(
             // 对话框回调在别的线程,用 oneshot 把结果搬回当前 async 上下文。
             let _ = tx.send(picked);
         });
-    let picked = rx.await.map_err(|_| "文件选择对话框异常关闭".to_string())?;
+    let picked = rx
+        .await
+        .map_err(|_| IpcError::new("media.dialog_failed", "文件选择对话框异常关闭"))?;
     let Some(file) = picked else {
         return Ok(None); // 用户取消,不是错误
     };
-    let path = file
-        .into_path()
-        .map_err(|e| format!("无法识别所选文件路径: {e}"))?;
+    let path = file.into_path().map_err(|error| {
+        IpcError::new(
+            "media.path_invalid",
+            format!("无法识别所选文件路径: {error}"),
+        )
+    })?;
 
-    let canonical = state.media_grants.grant(&path)?;
+    let canonical = state
+        .media_grants
+        .grant(&path)
+        .map_err(|message| IpcError::new("media.access", message))?;
     app.asset_protocol_scope()
         .allow_file(&canonical)
-        .map_err(|e| format!("放行媒体预览失败: {e}"))?;
+        .map_err(|error| {
+            IpcError::new("media.preview_denied", format!("放行媒体预览失败: {error}"))
+        })?;
     Ok(Some(canonical.to_string_lossy().into_owned()))
 }
 
@@ -1689,15 +2096,25 @@ fn allow_media_preview(
     path: String,
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> IpcResult<()> {
     let p = std::path::PathBuf::from(&path);
     if !state.media_grants.is_granted(&p) {
-        return Err("该文件尚未经你选择授权,请点「选择文件」重新选取".into());
+        return Err(IpcError::new(
+            "media.preview_denied",
+            "该文件尚未经你选择授权,请点「选择文件」重新选取",
+        )
+        .with_retryable(false)
+        .with_action("请点「选择文件」重新选择该媒体文件"));
     }
-    let canonical = p.canonicalize().map_err(|e| format!("文件不可访问: {e}"))?;
+    let canonical = p
+        .canonicalize()
+        .map_err(|error| IpcError::new("media.access", format!("文件不可访问: {error}")))?;
     app.asset_protocol_scope()
         .allow_file(&canonical)
-        .map_err(|e| format!("放行媒体预览失败: {e}"))
+        .map_err(|error| {
+            IpcError::new("media.preview_denied", format!("放行媒体预览失败: {error}"))
+        })?;
+    Ok(())
 }
 
 // ── 应用入口 ──────────────────────────────────────────────
@@ -1732,7 +2149,16 @@ pub fn run() {
             // 状态在 setup 里注册而不是 builder 上:媒体预览授权要落到应用数据目录,
             // 而那个目录只有拿到 AppHandle 之后才能解析出来。setup 早于窗口加载,
             // 任何命令跑起来时状态都已就位。
-            app.manage(AppState::new(data_dir));
+            app.manage(AppState::new(data_dir.clone()));
+            let artifact_dir = data_dir
+                .unwrap_or_else(std::env::temp_dir)
+                .join("uvp-reports");
+            tauri::async_runtime::spawn_blocking(move || {
+                let health = cleanup_artifacts(&artifact_dir, std::collections::HashSet::new());
+                if !health.healthy {
+                    tracing::warn!(?health, "应用启动时产物清理未完全健康");
+                }
+            });
             tracing::info!(
                 media_grants = app.state::<AppState>().media_grants.len(),
                 work_dir = %media_rtp::work_dir().display(),
@@ -1784,6 +2210,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             engine_version,
+            get_inbound_security_capabilities,
             validate_scenario,
             start_stress,
             stop_stress,
@@ -1846,6 +2273,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn 实时源部分错误不会透传_ffmpeg_输出() {
+        let safe = sanitize_catalog_error(
+            "FFmpeg 未返回可解析设备: /Users/alice/private.mov secret".into(),
+        );
+        assert!(safe.contains("详细输出已隐藏"));
+        assert!(!safe.contains("private.mov"));
+        assert!(!safe.contains("secret"));
+    }
+
+    #[test]
+    fn 入站安全能力不谎报双向_digest() {
+        let capabilities = get_inbound_security_capabilities();
+        assert!(capabilities.source_ip_filter);
+        assert!(capabilities.from_platform_id);
+        assert!(capabilities.digest_client_registration);
+        assert!(!capabilities.digest_server_validation);
+        assert!(capabilities.literal_platform_ip_only);
+    }
+
+    #[test]
     fn sip追踪里的鉴权头被脱敏() {
         // SIP 追踪面板会把整条报文原文推给前端,用户还能复制导出。
         // Digest 的 response= 是可离线爆破的口令哈希,而同一条报文里
@@ -1905,6 +2352,114 @@ mod tests {
             out.contains("<Notify>Authorization: 不该被改</Notify>"),
             "空行之后是正文,不该被当成头部处理:\n{out}"
         );
+    }
+
+    #[tokio::test]
+    async fn stress_completion区分完成值和sender异常关闭() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("发布完成");
+        assert!(wait_stress_completion(&mut rx).await);
+
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        assert!(
+            !wait_stress_completion(&mut rx).await,
+            "sender 未写 true 就关闭不得误判完成"
+        );
+    }
+
+    #[tokio::test]
+    async fn stress_completion不早于guard销毁被观察到() {
+        let dir = std::env::temp_dir().join(format!("uvp-completion-seq-{}", artifacts::unique_suffix()));
+        artifacts::create_secure_dir(&dir).expect("建目录");
+        let (completion_tx, mut rx) = tokio::sync::watch::channel(false);
+        let writer = series::SeriesWriter::new(&dir, 999).expect("创建 writer");
+        let inprogress_path = writer.inprogress_path().to_path_buf();
+        assert!(artifacts::is_registered_active(&inprogress_path));
+
+        // 模拟 supervisor 尾部：先释放 writer guard，再发送 completion=true
+        drop(writer);
+        assert!(!artifacts::is_registered_active(&inprogress_path), "guard 销毁后注销活跃注册");
+        completion_tx.send(true).expect("发送 completion");
+
+        assert!(wait_stress_completion(&mut rx).await);
+        // 观察到 completion 时活跃注册必须已经消除，不得产生竞争
+        assert!(!artifacts::is_registered_active(&inprogress_path));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn 重复启动被拒绝时不残留空inprogress() {
+        let app_state = AppState::new(None);
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        let (_, rx) = tokio::sync::watch::channel(false);
+        let dir = std::env::temp_dir().join(format!("uvp-no-orphan-{}", artifacts::unique_suffix()));
+        artifacts::create_secure_dir(&dir).expect("建目录");
+
+        // 模拟前序压测正在运行
+        {
+            let mut guard = app_state.stress.lock().await;
+            *guard = Some(StressHandle {
+                run_id: 1,
+                stop_tx: tx,
+                stopping: false,
+                stopping_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                worker_abort: tokio::spawn(async {}).abort_handle(),
+                completion: rx,
+                device_count: 1,
+                series_path: None,
+            });
+        }
+
+        // 槽位被占用时直接返回拒绝，在此分支前不得触碰 SeriesWriter::new
+        let guard = app_state.stress.lock().await;
+        assert!(guard.is_some(), "已有任务运行");
+        drop(guard);
+
+        let inprogress_count = std::fs::read_dir(&dir)
+            .expect("读取目录")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".inprogress"))
+            .count();
+        assert_eq!(inprogress_count, 0, "拒绝启动路径下绝不创建任何 .inprogress 文件");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn schema_v1报告边界保持裸metrics数组() {
+        let dir =
+            std::env::temp_dir().join(format!("uvp-report-v1-{}", artifacts::unique_suffix()));
+        artifacts::create_secure_dir(&dir).expect("建目录");
+        let path = dir.join("series-run1-1-1.jsonl");
+        std::fs::write(
+            &path,
+            b"{\"kind\":\"sample\",\"seq\":1,\"ts_ms\":123,\"metrics\":{\"devices_online\":7}}\n{\"kind\":\"run_end\",\"seq\":2,\"sample_count\":1,\"outcome\":\"completed\",\"complete\":true,\"degraded\":false}\n",
+        )
+        .expect("写时序");
+        let series = series::read_series(&path);
+        assert!(series.complete, "reader 应先用 envelope 校验完整性");
+        let report = build_report_v1(ReportV1Input {
+            policy: artifacts::RetentionPolicy::default(),
+            retention_health: artifacts::CleanupHealth::default(),
+            environment: diagnostics::Environment::collect(),
+            scenario: None,
+            metrics: Metrics::default().snapshot(),
+            series,
+            series_file: Some(path.to_string_lossy().into_owned()),
+            generated_at_epoch_secs: 1,
+        });
+
+        assert_eq!(report["schema_version"], 1);
+        let samples = report["series"].as_array().expect("series 数组");
+        assert_eq!(samples, &[serde_json::json!({"devices_online": 7})]);
+        for field in ["kind", "seq", "ts_ms", "metrics"] {
+            assert!(
+                samples[0].get(field).is_none(),
+                "不得泄漏 envelope 字段 {field}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

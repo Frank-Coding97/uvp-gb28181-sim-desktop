@@ -23,7 +23,9 @@
   失败样本上限、爬坡减速计数。
 - **前端**:`ipcError` 的错误映射(原文永不丢失、未知错误不编造建议);
   `device.ts` 的启停守卫(IPC 已发出但未返回这段窗口不可重复触发);
-  `platform.ts` 的"localStorage 里永不出现 password"不变量。
+  `versionedStorage` 的 legacy 迁移、future schema 防覆盖、损坏备份去重/上限、quota/security 分类与
+  “备份失败不覆盖 primary”；`platform.ts` 的“任何 localStorage（含损坏备份）里永不出现可识别
+  password”不变量；设备表单和主题的字段白名单与边界修复。
 
 ## Mock 与确定性
 

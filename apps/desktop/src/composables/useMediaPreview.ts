@@ -3,6 +3,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { isLikelyPlayableFile } from "../lib/liveSource";
+import { formatError } from "../lib/ipcError";
 import { useDevice } from "../device";
 import { useLiveSources } from "./useLiveSources";
 
@@ -78,7 +79,7 @@ async function refreshVideoPreview(auto = false) {
     try {
       await invoke("allow_media_preview", { path });
     } catch (e) {
-      previewState.value = { tone: "warn", text: `预览未授权:${String(e)}` };
+      previewState.value = { tone: "warn", text: formatError(e, "预览未授权") };
       return;
     }
     previewUrl.value = convertFileSrc(path);
@@ -106,7 +107,7 @@ async function refreshVideoPreview(auto = false) {
     await video.play().catch(() => undefined);
     previewState.value = { tone: "live", text: auto ? "实时预览已刷新" : "实时预览中" };
   } catch (e) {
-    previewState.value = { tone: "warn", text: `预览未开启：${String(e)}` };
+    previewState.value = { tone: "warn", text: formatError(e, "预览未开启") };
   }
 }
 

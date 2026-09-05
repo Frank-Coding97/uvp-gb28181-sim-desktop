@@ -2,14 +2,33 @@
 
 **状态:M2 完成** · RTP/PS 封装与推流引擎。
 
-> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **TCP(RFC 4571)推流**(ACTIVE 主动连 / PASSIVE 被动等连)✅ · **音频收发**(裸 G.711 上行 + `AudioReceiver` 下行收流与电平)🟢 · **RTCP 双向**(周期发 SR、接收平台 RR;设备作为接收方按 RFC 3550 回报 RR)🟢 · 单测 79 全绿。
+> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带安全原子缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **TCP(RFC 4571)推流**(ACTIVE 主动连 / PASSIVE 被动等连)✅ · **音频收发**(裸 G.711 上行 + `AudioReceiver` 下行收流与电平)🟢 · **RTCP 双向**(周期发 SR、接收平台 RR;设备作为接收方按 RFC 3550 回报 RR)🟢 · 单测 83 全绿。
 
 ## 容器格式支持(FileSource)
 
 引擎推流只吃 **H.264/H.265 Annex B 裸流**(按起始码切帧)。为支持常见容器(MP4/FLV/MKV/MOV):
 `FileSource::from_path` 检测文件非 Annex B 时,调用系统 **ffmpeg** 转封装为 Annex B 裸流
-(`-c:v copy -bsf:v h264_mp4toannexb`,失败回退重编码),结果按"源路径+修改时间"缓存到临时目录复用。
-ffmpeg 为**可选**外部依赖:仅容器格式需要;裸流(.h264/.h265)不依赖它。ffmpeg 缺失时对容器文件报明确错误。
+(`-c:v copy -bsf:v h264_mp4toannexb`,失败回退重编码),结果按 canonical path + size +
+高精度 mtime 缓存。ffmpeg 为**可选**外部依赖:仅容器格式需要;裸流(.h264/.h265)
+不依赖它。ffmpeg 缺失时对容器文件报明确错误。
+
+### 临时文件与外部进程安全边界
+
+- 固定 `$TEMP/uvp-gb28181` 只用于兼容 Tauri asset scope；任何写入前都用
+  `symlink_metadata` 验证它不是符号链接且确为目录，Unix 强制并复核 `0700`。
+  初始化失败会中止媒体操作，不能再吞错后继续写未知目标。
+- FFmpeg **永不直接写最终缓存名**。Rust 在私有目录中用 128-bit 随机名 +
+  `create_new` 占位 staging(Unix `0600`)；成功后验证普通非空文件，视频还必须有
+  Annex-B 起始码，最后同目录原子发布。错误/超时由 RAII 删除 staging。
+  缓存命中同样拒绝 symlink、非普通文件、空文件或无效 Annex-B，避免 TOCTOU/半文件。
+- 所有短命 FFmpeg 命令走统一有界执行器：`stdin=null`，stdout/stderr 持续排空且各只
+  保留 256 KiB，探测 3 秒、转码 120 秒；每个成功 spawn 的进程在所有返回路径都会
+  `kill + wait` 收尸。实时采集是长驻进程，不设总时长，但有首帧 deadline。
+- 实时 FFmpeg 在 spawn 后立即进入 `StartupChildren` armed guard，后续 pipe、handler、
+  编码器初始化任一步失败都会 kill+wait。摄像头 FFREPORT 使用每会话高熵 0600 文件，
+  启动失败或 `LiveSource::drop` 在子进程收尾后删除。
+- 上层停止等待超时后必须 `JoinHandle::abort()` 再 await；仅丢弃 handle 会 detach 任务，
+  使持有 `LiveSource` 的 future 不被 drop，最终留下 FFmpeg 孤儿进程。
 
 ## 职责
 

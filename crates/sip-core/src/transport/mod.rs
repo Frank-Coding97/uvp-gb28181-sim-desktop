@@ -33,12 +33,12 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
-use common::Result;
+use common::{Error, Result};
 
 use crate::message::SipMessage;
 
 pub use tcp::TcpTransport;
-pub use udp::UdpTransport;
+pub use udp::{UdpRateLimitConfig, UdpTransport};
 
 /// 每设备入站队列容量。SIP 是请求-应答模型,正常情况下队列深度个位数;
 /// 128 足够吸收突发,又能在平台洪泛时快速形成可观测的背压而不是吃光内存。
@@ -92,6 +92,15 @@ pub struct TransportStats {
     pub parse_errors: AtomicU64,
     /// 来源 IP 不在白名单被拒的报文数。
     pub rejected_source: AtomicU64,
+    /// UDP 来源超过令牌桶预算而被静默丢弃的数据报数。
+    ///
+    /// 与白名单叠加:白名单先筛掉不可信来源,可信来源仍受限流保护,避免平台故障
+    /// 或可信主机失陷后耗尽解析 CPU。拒绝时绝不回 429/503,避免把限流器变成反射器。
+    pub rate_limited: AtomicU64,
+    /// 被限流数据报的总字节数,用于区分小包洪泛与大包 CPU/带宽攻击。
+    pub rate_limited_bytes: AtomicU64,
+    /// UDP 直接响应因无入站请求字节信用或超过安全 MTU 而被阻断的次数。
+    pub anti_amplification_blocked: AtomicU64,
     /// 目标设备队列已满被丢弃的报文数——**本地背压**,不是平台失败。
     pub dropped_queue_full: AtomicU64,
     /// 找不到路由被丢弃的报文数。
@@ -124,6 +133,9 @@ pub struct TransportStatsSnapshot {
     pub received: u64,
     pub parse_errors: u64,
     pub rejected_source: u64,
+    pub rate_limited: u64,
+    pub rate_limited_bytes: u64,
+    pub anti_amplification_blocked: u64,
     pub dropped_queue_full: u64,
     pub unrouted: u64,
     pub sent: u64,
@@ -141,6 +153,9 @@ impl TransportStatsSnapshot {
             received,
             parse_errors,
             rejected_source,
+            rate_limited,
+            rate_limited_bytes,
+            anti_amplification_blocked,
             dropped_queue_full,
             unrouted,
             sent,
@@ -155,6 +170,9 @@ impl TransportStatsSnapshot {
         self.received += received;
         self.parse_errors += parse_errors;
         self.rejected_source += rejected_source;
+        self.rate_limited += rate_limited;
+        self.rate_limited_bytes += rate_limited_bytes;
+        self.anti_amplification_blocked += anti_amplification_blocked;
         self.dropped_queue_full += dropped_queue_full;
         self.unrouted += unrouted;
         self.sent += sent;
@@ -172,6 +190,9 @@ impl TransportStats {
             received: self.received.load(Ordering::Relaxed),
             parse_errors: self.parse_errors.load(Ordering::Relaxed),
             rejected_source: self.rejected_source.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            rate_limited_bytes: self.rate_limited_bytes.load(Ordering::Relaxed),
+            anti_amplification_blocked: self.anti_amplification_blocked.load(Ordering::Relaxed),
             dropped_queue_full: self.dropped_queue_full.load(Ordering::Relaxed),
             unrouted: self.unrouted.load(Ordering::Relaxed),
             sent: self.sent.load(Ordering::Relaxed),
@@ -392,12 +413,30 @@ impl Router {
         }
     }
 
+    /// 构造时原子安装非空来源白名单。
+    ///
+    /// 与 bind 后再调用 setter 不同，这保证 UDP 接收循环/TCP accept 循环第一次被调度时
+    /// 策略已经存在；空集合报配置错误，绝不退化成“不设限”。
+    pub(crate) fn new_with_trusted_ips(ips: impl IntoIterator<Item = IpAddr>) -> Result<Self> {
+        let set: HashSet<IpAddr> = ips.into_iter().map(normalize_transport_ip).collect();
+        if set.is_empty() {
+            return Err(Error::Config("可信 SIP 来源 IP 集合不能为空".into()));
+        }
+        Ok(Router {
+            routes: DashMap::new(),
+            aor_routes: DashMap::new(),
+            tracer: std::sync::RwLock::new(None),
+            trusted_ips: std::sync::RwLock::new(Some(Arc::new(set))),
+            stats: Arc::new(TransportStats::default()),
+        })
+    }
+
     pub(crate) fn stats(&self) -> Arc<TransportStats> {
         Arc::clone(&self.stats)
     }
 
     pub(crate) fn set_trusted_ips(&self, ips: impl IntoIterator<Item = IpAddr>) {
-        let set: HashSet<IpAddr> = ips.into_iter().collect();
+        let set: HashSet<IpAddr> = ips.into_iter().map(normalize_transport_ip).collect();
         if let Ok(mut guard) = self.trusted_ips.write() {
             *guard = if set.is_empty() {
                 None
@@ -420,7 +459,7 @@ impl Router {
     pub(crate) fn source_allowed(&self, from: SocketAddr) -> bool {
         match self.trusted_ips.read() {
             Ok(guard) => match guard.as_ref() {
-                Some(set) => set.contains(&from.ip()),
+                Some(set) => set.contains(&normalize_transport_ip(from.ip())),
                 None => true,
             },
             // 锁中毒时宁可放行也不要静默瘫痪信令;中毒本身会在别处报错。
@@ -433,6 +472,37 @@ impl Router {
         let count = self.stats.rejected_source.fetch_add(1, Ordering::Relaxed) + 1;
         if count <= 5 || count % 1000 == 0 {
             tracing::warn!(%from, count, "丢弃来自非可信来源的 SIP 报文");
+        }
+    }
+
+    /// UDP 来源被令牌桶拒绝时的计数 + 限流日志。
+    ///
+    /// 日志按来源攻击的**全局累计数**抽样,避免洪泛反过来灌爆日志。调用方必须静默丢包,
+    /// 不回任何 SIP 错误响应,否则伪造源地址可借设备向受害者反射流量。
+    pub(crate) fn note_rate_limited(&self, from: SocketAddr, bytes: usize) {
+        let count = self.stats.rate_limited.fetch_add(1, Ordering::Relaxed) + 1;
+        self.stats
+            .rate_limited_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        if count <= 5 || count % 1000 == 0 {
+            tracing::warn!(%from, bytes, count, "SIP UDP 来源超过速率预算,静默丢弃");
+        }
+    }
+
+    /// UDP 响应触发反放大保护时的计数 + 抽样日志。
+    pub(crate) fn note_anti_amplification_blocked(
+        &self,
+        dst: SocketAddr,
+        bytes: usize,
+        reason: &'static str,
+    ) {
+        let count = self
+            .stats
+            .anti_amplification_blocked
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if count <= 5 || count % 1000 == 0 {
+            tracing::warn!(%dst, bytes, reason, count, "阻断可能造成 UDP 反射放大的 SIP 响应");
         }
     }
 
@@ -603,6 +673,17 @@ impl Router {
                 "无匹配 Call-ID 路由,丢弃响应(事务可能已结束)"
             ),
         }
+    }
+}
+
+/// 将 IPv4-mapped IPv6 归一为 IPv4，避免同一平台因 socket 地址表示不同绕过/误触白名单。
+fn normalize_transport_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
     }
 }
 

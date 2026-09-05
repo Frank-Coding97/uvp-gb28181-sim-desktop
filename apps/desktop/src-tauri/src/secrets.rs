@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::ipc_error::{IpcError, IpcResult};
+
 /// 钥匙串中的服务名(与包标识一致,便于用户在钥匙串工具里辨认)。
 const SERVICE: &str = "uvp-gb28181-desktop";
 
@@ -139,13 +141,24 @@ pub struct SecretSaveResult {
     message: String,
 }
 
+fn credential_error(message: String) -> IpcError {
+    if message.contains("尚未配置密码") {
+        IpcError::new("credential.missing", message)
+            .with_retryable(false)
+            .with_action("请在平台设置中填写并保存 SIP 密码")
+    } else if message.contains("密码不能为空") {
+        IpcError::new("credential.invalid", message).with_retryable(false)
+    } else if message.contains("档案标识") {
+        IpcError::config(message)
+    } else {
+        IpcError::new("credential.store", message).with_retryable(true)
+    }
+}
+
 /// 保存平台档案密码到 OS 钥匙串。
 #[tauri::command]
-pub fn save_platform_secret(
-    profile_id: String,
-    password: String,
-) -> Result<SecretSaveResult, String> {
-    let backend = set(&profile_id, &password)?;
+pub fn save_platform_secret(profile_id: String, password: String) -> IpcResult<SecretSaveResult> {
+    let backend = set(&profile_id, &password).map_err(credential_error)?;
     Ok(SecretSaveResult {
         backend,
         message: backend.describe().to_string(),
@@ -154,8 +167,8 @@ pub fn save_platform_secret(
 
 /// 删除平台档案密码。
 #[tauri::command]
-pub fn delete_platform_secret(profile_id: String) -> Result<(), String> {
-    remove(&profile_id)
+pub fn delete_platform_secret(profile_id: String) -> IpcResult<()> {
+    remove(&profile_id).map_err(credential_error)
 }
 
 /// 批量查询哪些档案已配置密码(一次 IPC 渲染整个列表的状态)。
@@ -182,6 +195,22 @@ mod tests {
         assert!(validate_profile_id("bad id").is_err());
         assert!(validate_profile_id("bad/../id").is_err());
         assert!(validate_profile_id(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn 凭据命令错误使用稳定代码() {
+        assert_eq!(
+            credential_error("该平台档案尚未配置密码".into()).code,
+            "credential.missing"
+        );
+        assert_eq!(
+            credential_error("SIP 认证密码不能为空".into()).code,
+            "credential.invalid"
+        );
+        assert_eq!(
+            credential_error("平台档案标识只能包含字母".into()).code,
+            "config.invalid"
+        );
     }
 
     #[test]

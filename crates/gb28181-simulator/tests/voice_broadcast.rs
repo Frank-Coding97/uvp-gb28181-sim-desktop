@@ -37,6 +37,7 @@ fn cfg(server_host: &str, server_port: u16, video_source: Option<String>) -> Dev
         server_host: server_host.into(),
         server_port,
         server_domain: PLATFORM_ID.into(),
+        inbound_identity_mode: common::InboundIdentityMode::Compatible,
         transport: Transport::Udp,
         heartbeat_interval_secs: 3600,
         register_expires_secs: 3600,

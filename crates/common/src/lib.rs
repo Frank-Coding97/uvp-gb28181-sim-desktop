@@ -15,4 +15,4 @@ pub use error::{Error, Result};
 pub use logfile::{LogFileConfig, LogFileWriter};
 pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver, RejectBucket};
 pub use secret::Secret;
-pub use types::{DeviceId, GbVersion, SignalingEncoding, Transport};
+pub use types::{DeviceId, GbVersion, InboundIdentityMode, SignalingEncoding, Transport};

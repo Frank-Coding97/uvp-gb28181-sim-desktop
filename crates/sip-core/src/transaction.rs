@@ -5,8 +5,9 @@
 //! - **客户端事务** [`client_transact`]:发请求 → 等响应,UDP 下按 T1 指数退避重传。
 //!   按 RFC 3261 §17.1 的关键行为:收到 1xx 临时响应后 INVITE 停止重传、非 INVITE
 //!   把重传间隔钉在 T2;总超时按 Timer B/F = 64×T1;响应匹配看 branch + CSeq 方法。
-//! - **服务端事务** [`ServerTransactions`]:对入站请求按 (branch, CSeq, method) 去重,
-//!   缓存最终响应用于重传应答。缺了这一层会出现一个很具体的互操作 bug:平台的
+//! - **服务端事务** [`ServerTransactions`]:对入站请求按 (来源, branch, CSeq, method) 去重,
+//!   缓存最终响应用于重传应答。来源必须参与键:否则知道事务标识的另一主机可命中缓存,
+//!   让设备把响应反射给它。缺了去重层还会出现一个具体的互操作 bug:平台的
 //!   200 OK 丢包后重传 INVITE,设备因"已有会话"直接回 486 Busy Here,点播失败。
 
 use std::collections::HashMap;
@@ -219,18 +220,20 @@ async fn wait_matching(
 
 // ── 服务端事务 ────────────────────────────────────────────
 
-/// 服务端事务标识:Via branch + CSeq 序号 + 方法。
+/// 服务端事务标识:返回路径 + Via branch + CSeq 序号 + 方法。
 ///
-/// branch 缺失(极老实现)时退化用 Call-ID 顶替,保证仍有去重能力。
+/// 来源地址必须参与键:仅凭可伪造的 SIP 头去重会让不同主机命中同一缓存响应,
+/// 构成跨来源误去重和 UDP 反射面。branch 缺失(极老实现)时退化用 Call-ID 顶替。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TxKey {
+    peer: SocketAddr,
     branch: String,
     cseq: u32,
     method: &'static str,
 }
 
 impl TxKey {
-    fn of(request: &Request) -> Self {
+    fn of(request: &Request, peer: SocketAddr) -> Self {
         let branch = request
             .headers
             .via_branch()
@@ -238,6 +241,7 @@ impl TxKey {
             .unwrap_or("")
             .to_string();
         TxKey {
+            peer,
             branch,
             cseq: request.headers.cseq_number().unwrap_or(0),
             method: request.method.as_str(),
@@ -265,7 +269,7 @@ pub enum Admit {
 /// [`Admit::Proceed`] 的凭据,用于回填最终响应。
 pub struct TxToken(TxKey);
 
-/// 服务端事务表。按 (branch, CSeq, method) 去重入站请求并缓存最终响应。
+/// 服务端事务表。按 (来源, branch, CSeq, method) 去重入站请求并缓存最终响应。
 pub struct ServerTransactions {
     map: Mutex<HashMap<TxKey, ServerTxState>>,
     /// 事务完成后保留响应的时长(Timer J = 64×T1)。
@@ -293,11 +297,11 @@ impl ServerTransactions {
     ///
     /// ACK 不构成独立事务(它确认的是 INVITE 的 2xx),因此始终 `Proceed`,
     /// 由上层自行幂等处理。
-    pub fn admit(&self, request: &Request) -> Admit {
+    pub fn admit(&self, request: &Request, peer: SocketAddr) -> Admit {
         if request.method == Method::Ack {
-            return Admit::Proceed(TxToken(TxKey::of(request)));
+            return Admit::Proceed(TxToken(TxKey::of(request, peer)));
         }
-        let key = TxKey::of(request);
+        let key = TxKey::of(request, peer);
         let mut map = self.map.lock();
         self.purge_expired(&mut map);
 
@@ -380,6 +384,10 @@ mod tests {
     use super::*;
     use crate::message::{Headers, Method};
     use crate::transport::UdpTransport;
+
+    fn peer(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
 
     fn make_request(call_id: &str, cseq: u32) -> Request {
         let mut headers = Headers::new();
@@ -545,12 +553,12 @@ mod tests {
         let req = make_request("srv-1", 1);
 
         // 首次:新事务。
-        let token = match txns.admit(&req) {
+        let token = match txns.admit(&req, peer(5060)) {
             Admit::Proceed(t) => t,
             _ => panic!("首次应为新事务"),
         };
         // 处理中的重传应被吸收,而不是再跑一遍业务逻辑。
-        assert!(matches!(txns.admit(&req), Admit::Absorb));
+        assert!(matches!(txns.admit(&req, peer(5060)), Admit::Absorb));
 
         let resp = match response_for(&req, 200) {
             SipMessage::Response(r) => r,
@@ -559,21 +567,40 @@ mod tests {
         txns.complete(&token, &resp);
 
         // 完成后的重传应拿到缓存响应。
-        match txns.admit(&req) {
+        match txns.admit(&req, peer(5060)) {
             Admit::Retransmit(cached) => assert_eq!(cached.status, 200),
             _ => panic!("重传应命中缓存响应"),
         }
 
         // 不同 branch 的同名请求是新事务。
         let other = make_request("srv-1", 2);
-        assert!(matches!(txns.admit(&other), Admit::Proceed(_)));
+        assert!(matches!(txns.admit(&other, peer(5060)), Admit::Proceed(_)));
+    }
+
+    #[test]
+    fn 相同事务标识不能跨来源命中缓存() {
+        let txns = ServerTransactions::new(Duration::from_secs(5), 64);
+        let req = make_request("srv-peer-bound", 1);
+        let token = match txns.admit(&req, peer(5060)) {
+            Admit::Proceed(token) => token,
+            _ => panic!("首个来源应创建事务"),
+        };
+        let resp = match response_for(&req, 200) {
+            SipMessage::Response(resp) => resp,
+            _ => unreachable!(),
+        };
+        txns.complete(&token, &resp);
+
+        assert!(matches!(txns.admit(&req, peer(6060)), Admit::Proceed(_)));
+        assert_eq!(txns.len(), 2, "不同返回路径必须是两个独立事务");
+        assert!(matches!(txns.admit(&req, peer(5060)), Admit::Retransmit(_)));
     }
 
     #[test]
     fn 服务端事务在_linger_后过期() {
         let txns = ServerTransactions::new(Duration::from_millis(30), 64);
         let req = make_request("srv-2", 1);
-        let token = match txns.admit(&req) {
+        let token = match txns.admit(&req, peer(5060)) {
             Admit::Proceed(t) => t,
             _ => panic!(),
         };
@@ -584,7 +611,7 @@ mod tests {
         txns.complete(&token, &resp);
         std::thread::sleep(Duration::from_millis(60));
         // 过期后视为新事务(平台隔很久重用同一 branch 属异常,按新请求处理更安全)。
-        assert!(matches!(txns.admit(&req), Admit::Proceed(_)));
+        assert!(matches!(txns.admit(&req, peer(5060)), Admit::Proceed(_)));
     }
 
     #[test]
@@ -592,8 +619,8 @@ mod tests {
         let txns = ServerTransactions::new(Duration::from_secs(5), 64);
         let mut ack = make_request("srv-3", 1);
         ack.method = Method::Ack;
-        assert!(matches!(txns.admit(&ack), Admit::Proceed(_)));
-        assert!(matches!(txns.admit(&ack), Admit::Proceed(_)));
+        assert!(matches!(txns.admit(&ack, peer(5060)), Admit::Proceed(_)));
+        assert!(matches!(txns.admit(&ack, peer(5060)), Admit::Proceed(_)));
         assert!(txns.is_empty(), "ACK 不应在事务表里留条目");
     }
 
@@ -601,11 +628,11 @@ mod tests {
     fn abandon_让后续重传重新处理() {
         let txns = ServerTransactions::new(Duration::from_secs(5), 64);
         let req = make_request("srv-4", 1);
-        let token = match txns.admit(&req) {
+        let token = match txns.admit(&req, peer(5060)) {
             Admit::Proceed(t) => t,
             _ => panic!(),
         };
         txns.abandon(&token);
-        assert!(matches!(txns.admit(&req), Admit::Proceed(_)));
+        assert!(matches!(txns.admit(&req, peer(5060)), Admit::Proceed(_)));
     }
 }

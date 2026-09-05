@@ -85,10 +85,25 @@ impl Drop for TcpTransport {
 impl TcpTransport {
     /// 绑定本地监听地址(如 "0.0.0.0:0" 由系统分配端口),启动 accept 循环。
     pub async fn bind(local: &str) -> Result<Arc<Self>> {
+        Self::bind_inner(local, None).await
+    }
+
+    /// 绑定并在 accept 循环启动前原子安装非空可信来源集合。
+    ///
+    /// 这避免 `bind()` 后再调用 setter 时，竞态窗口中的恶意连接被长期保留。
+    pub async fn bind_with_trusted_ips(local: &str, trusted_ips: Vec<IpAddr>) -> Result<Arc<Self>> {
+        Self::bind_inner(local, Some(trusted_ips)).await
+    }
+
+    async fn bind_inner(local: &str, trusted_ips: Option<Vec<IpAddr>>) -> Result<Arc<Self>> {
+        let router = match trusted_ips {
+            Some(ips) => Router::new_with_trusted_ips(ips)?,
+            None => Router::new(),
+        };
         let listener = TcpListener::bind(local).await.map_err(Error::Io)?;
         let local_addr = listener.local_addr().map_err(Error::Io)?;
         let core = Arc::new(TcpCore {
-            router: Arc::new(Router::new()),
+            router: Arc::new(router),
             connections: Mutex::new(HashMap::new()),
             inbound_count: AtomicUsize::new(0),
             shutdown: Shutdown::new(),
@@ -546,10 +561,15 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_拒绝非可信来源的连接() {
-        let device = TcpTransport::bind("127.0.0.1:0").await.unwrap();
+        // 白名单随 Router 一起构造，并在 accept loop 启动前已经生效。
+        let device = TcpTransport::bind_with_trusted_ips(
+            "127.0.0.1:0",
+            vec!["203.0.113.7".parse::<IpAddr>().unwrap()],
+        )
+        .await
+        .unwrap();
         let device_addr = device.local_addr().unwrap();
         let mut inbound = device.register_inbound("34020000001320000001");
-        device.set_trusted_ips(vec!["203.0.113.7".parse::<IpAddr>().unwrap()]);
 
         let platform = TcpTransport::bind("127.0.0.1:0").await.unwrap();
         // 连接会被 accept 后立即丢弃,报文送不进队列。
@@ -561,6 +581,15 @@ mod tests {
             "非可信来源不应进入设备队列"
         );
         assert!(device.stats().snapshot().rejected_source >= 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_原子可信来源构造器拒绝空集合() {
+        assert!(
+            TcpTransport::bind_with_trusted_ips("127.0.0.1:0", Vec::new())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -6,12 +6,29 @@
 
 ## 1. 当前存储现实
 
-**当前无数据库**。持久化只有一处:`export_report` 命令把一次压测的场景参数(原始 TOML)+ 设备数 + 结束时的 `MetricsSnapshot` 汇总成**单个 JSON 文件**,写到**系统临时目录**下的 `uvp-reports/report-<epoch 秒>.json`。
+**当前无数据库**。压测时序、JSON 报告与诊断 ZIP 都写入应用数据目录下的
+`uvp-reports/`；只有无法解析应用数据目录时才回退系统临时目录。它们是
+**应用托管产物**，IPC 当前返回该路径供用户定位，但不表示永久归档。
 
-压测指标为**内存原子计数**(`stress-engine::Metrics`,含延迟直方图),不建库;
-每秒通过 `metrics_tick` 事件投影给 UI(见 `20-architecture/api-contract.md#4`),
-**同时追加一行 JSONL 时序**到 `<app 数据目录>/uvp-reports/series-run<id>-<ts>.jsonl`,
-导出报告时一并打包。SQLite 仍未引入(下节为草案)。
+默认保留策略为：最长 30 天、最多 100 个文件、总计最多 1 GiB；本模块遗留的
+`.uvp-*.tmp` staging 超过 24 小时会优先清理。清理只识别本应用的严格文件名，
+跳过 symlink、目录和未知文件；所有活跃 staging、发布后尚未完成状态/preserve 交接的
+final 及本次刚导出的产物都由 RAII 注册令牌保护。清理逐项告警并降级，不阻止压测
+启动或完成；`CleanupHealth.failed_removals`、`retained_temp_files/bytes` 和
+`metadata_failures` 分别暴露删除失败、仍保留的 temp 及元数据读取失败，managed 文件
+即使修改时间读取失败，也继续计入可测的保留文件数和字节数。
+
+压测指标为**内存原子计数**（`stress-engine::Metrics`，含延迟直方图），每秒通过
+`metrics_tick` 事件投影给 UI，同时由单一 writer 追加到
+`series-run<run_id>-<nanos>-<counter>.jsonl.inprogress`。运行结束写入带
+`sample_count/outcome/complete` 的 `run_end` marker，同步后原子发布为 `.jsonl`。
+JSONL 内部的 sample 使用 `{kind,seq,ts_ms,metrics}` envelope 做顺序和完整性校验，
+其中 `metrics` 必须是 object；但 `schema_version=1` 报告的 `series` 字段固定输出
+**裸 metrics object 数组**，不得把内部 envelope 暴露进报告。`export_report` 将脱敏
+场景、最终快照、完整性 metadata 和该兼容数组写入唯一命名的
+`report-<nanos>-<counter>.json`。文件 rename 成功即视为已发布；若随后父目录同步失败，
+真实 final 路径仍用于 registry/状态交接，同时记录 durability warning。SQLite 仍未引入
+（下节为草案）。
 
 ## 1.1 规划中(未实现):SQLite 持久化
 
@@ -94,7 +111,9 @@ CREATE TABLE failure_stat (
 | `DeviceSimulator` | gb28181-simulator | 单设备运行时状态机 |
 | `Metrics` | stress-engine | 原子计数聚合,每秒投影成 `MetricsSnapshot` 推 UI |
 
-指标聚合:热路径用原子计数,定时器每秒 snapshot → 通过 `metrics_tick` 事件推送(NFR-4)。**当前不落库**(无 `metric_sample` 时间序列);仅 `export_report` 在导出时把最终快照写入一个 JSON 文件。
+指标聚合：热路径用原子计数，定时器每秒 snapshot → 通过 `metrics_tick` 事件推送（NFR-4）。
+当前仍**不落数据库**（无 SQLite `metric_sample` 表），但同一快照会安全追加到应用托管
+JSONL；报告导出时解析该 JSONL，并显式报告 `series_complete`、样本数、运行结果和损坏行数。
 
 ---
 

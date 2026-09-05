@@ -8,6 +8,7 @@ import {
   NInputNumber, NTag, useDialog, useMessage, type DataTableColumns,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
+import { formatError, normalizeIpcError } from "../lib/ipcError";
 
 const message = useMessage();
 const dialog = useDialog();
@@ -103,7 +104,7 @@ async function loadTemplate() {
     loadState.value = "ready";
     message.success(`已载入模板,共 ${nodes.value.length} 个节点`);
   } catch (e) {
-    message.error(`载入模板失败:${String(e)}`, { duration: 0, closable: true });
+    message.error(formatError(e, "载入模板失败"), { duration: 0, closable: true });
   } finally {
     busy.value = false;
   }
@@ -129,13 +130,17 @@ async function refresh() {
   } catch (e) {
     // 后端在"设备未启动"时返回错误。这两种情况的下一步动作完全不同:
     // 未启动要去单设备页启动,真错误要看日志或重试。
-    const msg = String(e);
+    const normalized = normalizeIpcError(e);
     nodes.value = [];
-    if (msg.includes("未启动") || msg.includes("没有正在运行")) {
+    if (
+      normalized.code === "device.not_running" ||
+      normalized.message.includes("未启动") ||
+      normalized.message.includes("没有正在运行")
+    ) {
       loadState.value = "offline";
     } else {
       loadState.value = "error";
-      loadError.value = msg;
+      loadError.value = formatError(normalized, "读取目录失败");
     }
   }
 }
@@ -191,7 +196,7 @@ async function saveNode() {
     await refresh();
   } catch (e) {
     // 失败提示不自动消失:校验错误信息往往要照着改表单,一闪而过没法用。
-    message.error(`保存通道失败:${String(e)}`, { duration: 0, closable: true });
+    message.error(formatError(e, "保存通道失败"), { duration: 0, closable: true });
   } finally {
     busy.value = false;
   }
@@ -211,7 +216,7 @@ function removeNode(row: ChannelNode) {
         message.success("已删除通道");
         await refresh();
       } catch (e) {
-        message.error(`删除通道失败:${String(e)}`, { duration: 0, closable: true });
+        message.error(formatError(e, "删除通道失败"), { duration: 0, closable: true });
       } finally {
         busy.value = false;
       }
@@ -317,7 +322,7 @@ onActivated(refresh);
         启动后会一并同步给平台。
       </div>
       <div v-else-if="loadState === 'error'" class="state-note error" role="alert">
-        读取目录失败:{{ loadError }}
+        {{ loadError }}
         <button type="button" class="retry-btn" @click="refresh">重试</button>
       </div>
       <div v-else-if="nodes.length === 0" class="state-note">

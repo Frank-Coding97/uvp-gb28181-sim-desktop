@@ -10,6 +10,7 @@ import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
 import { invoke } from "@tauri-apps/api/core";
 import { useDevice } from "../device";
 import { usePlatform } from "../platform";
+import { formatError } from "../lib/ipcError";
 
 const router = useRouter();
 const engineInfo = ref("正在检查引擎");
@@ -26,7 +27,7 @@ onMounted(async () => {
     engineInfo.value = await invoke<string>("engine_version");
     online.value = true;
   } catch (error) {
-    engineInfo.value = `引擎不可用：${String(error)}`;
+    engineInfo.value = formatError(error, "引擎不可用");
   }
 });
 

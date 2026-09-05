@@ -39,6 +39,9 @@ pub struct LinearScenario {
     pub server_port: u16,
     /// 平台域。
     pub server_domain: String,
+    /// 入站 SIP 请求的平台身份校验模式。
+    #[serde(default)]
+    pub inbound_identity_mode: common::InboundIdentityMode,
     /// 传输方式。
     #[serde(default = "default_transport")]
     pub transport: Transport,
@@ -222,6 +225,7 @@ impl Scenario for LinearScenario {
                 server_host: self.server_host.clone(),
                 server_port: self.server_port,
                 server_domain: self.server_domain.clone(),
+                inbound_identity_mode: self.inbound_identity_mode,
                 transport: self.transport,
                 heartbeat_interval_secs: self.heartbeat_interval_secs,
                 channels,
@@ -267,6 +271,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn 旧_toml_缺少入站身份模式时默认兼容() {
+        let toml = r#"
+base_device_id = "34020000001320000001"
+server_host = "127.0.0.1"
+server_port = 5060
+server_domain = "34020000002000000001"
+
+[device_info]
+device_name = "Legacy"
+manufacturer = "UVP"
+model = "Sim"
+firmware = "0.1"
+"#;
+
+        let scenario = LinearScenario::from_toml_str(toml).unwrap();
+        assert_eq!(
+            scenario.inbound_identity_mode,
+            common::InboundIdentityMode::Compatible
+        );
+        assert_eq!(
+            scenario.generate(1).unwrap()[0].inbound_identity_mode,
+            common::InboundIdentityMode::Compatible
+        );
+    }
+
+    #[test]
     fn 线性场景生成_id_递增() {
         let sc = LinearScenario {
             base_device_id: "34020000001320000001".into(),
@@ -274,6 +304,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_domain: "34020000002000000001".into(),
+            inbound_identity_mode: common::InboundIdentityMode::Compatible,
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             register_expires_secs: 3600,
@@ -314,6 +345,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_domain: "34020000002000000001".into(),
+            inbound_identity_mode: common::InboundIdentityMode::Compatible,
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             register_expires_secs: 3600,
@@ -351,6 +383,7 @@ mod tests {
             server_host: "1.2.3.4".into(),
             server_port: 5060,
             server_domain: "34020000002000000001".into(),
+            inbound_identity_mode: common::InboundIdentityMode::Compatible,
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             register_expires_secs: 3600,

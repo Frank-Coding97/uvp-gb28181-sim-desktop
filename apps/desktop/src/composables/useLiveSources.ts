@@ -18,6 +18,7 @@ import {
   type ScreenCodec,
 } from "../lib/liveSource";
 import { persistForm, useDevice } from "../device";
+import { formatError } from "../lib/ipcError";
 
 export interface LiveAvDevice {
   index: number;
@@ -232,7 +233,7 @@ async function pickVideoSource(): Promise<PickResult> {
     probeState.value = null;
     return { ok: true, path: picked };
   } catch (e) {
-    return { ok: false, error: String(e) };
+    return { ok: false, error: formatError(e, "选择文件失败") };
   }
 }
 
@@ -242,7 +243,15 @@ async function refreshLiveSources(): Promise<{ ok: boolean; error?: string }> {
   probeState.value = null;
   try {
     const catalog = await invoke<LiveSourceCatalog>("list_live_sources");
-    liveCatalog.value = catalog;
+    liveCatalog.value = {
+      ...catalog,
+      screen_error: catalog.screen_error
+        ? formatError(catalog.screen_error, "屏幕枚举失败")
+        : null,
+      avfoundation_error: catalog.avfoundation_error
+        ? formatError(catalog.avfoundation_error, "采集设备枚举失败")
+        : null,
+    };
     if (selectedCameraIndex.value === null) {
       selectedCameraIndex.value = catalog.cameras[0]?.index ?? null;
     }
@@ -252,7 +261,7 @@ async function refreshLiveSources(): Promise<{ ok: boolean; error?: string }> {
     if (mediaMode.value === "camera" || mediaMode.value === "screen") syncLiveSourceUri();
     return { ok: true };
   } catch (e) {
-    const error = `设备枚举失败：${String(e)}`;
+    const error = formatError(e, "设备枚举失败");
     probeState.value = { kind: "error", message: error };
     return { ok: false, error };
   } finally {
@@ -272,7 +281,7 @@ async function probeLiveSource(): Promise<ProbeOutcome | null> {
     probeState.value = { kind: ready ? "success" : "warning", message: result.message };
     return { ready, message: result.message };
   } catch (e) {
-    const message = `采集测试失败：${String(e)}`;
+    const message = formatError(e, "采集测试失败");
     probeState.value = { kind: "error", message };
     return { ready: false, message };
   }

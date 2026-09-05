@@ -96,6 +96,15 @@ impl Headers {
         param_value(self.get("Via")?, "branch")
     }
 
+    /// From 头 URI 的 user 部分。
+    ///
+    /// 支持带/不带 display-name 的 name-addr 形式；严格按尖括号边界选 URI，避免在
+    /// display-name 中搜索字符串造成身份混淆。语法不完整、无 userinfo 或重复分隔符时
+    /// 返回 None，由上层按 400 Bad Request 处理。
+    pub fn from_uri_user(&self) -> Option<&str> {
+        name_addr_uri_user(self.get("From")?)
+    }
+
     /// From 头的 `tag` 参数。
     pub fn from_tag(&self) -> Option<&str> {
         param_value(self.get("From")?, "tag")
@@ -115,6 +124,57 @@ impl Headers {
     pub fn contact_expires(&self) -> Option<u64> {
         param_value(self.get("Contact")?, "expires")?.parse().ok()
     }
+}
+
+/// 解析 SIP name-addr/addr-spec 并返回 URI user，拒绝含糊或截断输入。
+fn name_addr_uri_user(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let uri = if let Some(open) = value.find('<') {
+        let prefix = &value[..open];
+        if prefix.contains('>') || prefix.contains('<') {
+            return None;
+        }
+        let rest = &value[open + 1..];
+        let close = rest.find('>')?;
+        let uri = rest[..close].trim();
+        let suffix = rest[close + 1..].trim();
+        if uri.is_empty()
+            || uri.contains(['<', '>'])
+            || (!suffix.is_empty() && !suffix.starts_with(';'))
+        {
+            return None;
+        }
+        uri
+    } else {
+        if value.contains(['<', '>']) {
+            return None;
+        }
+        value.split(';').next()?.trim()
+    };
+
+    let scheme_end = uri.find(':')?;
+    let scheme = &uri[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("sip") && !scheme.eq_ignore_ascii_case("sips") {
+        return None;
+    }
+    let authority = &uri[scheme_end + 1..];
+    let (userinfo, host) = authority.split_once('@')?;
+    if host.trim().is_empty() || host.contains('@') {
+        return None;
+    }
+    let user = userinfo.split(':').next()?.trim();
+    if user.is_empty()
+        || user
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control() || matches!(ch, '<' | '>' | '"' | ','))
+    {
+        return None;
+    }
+    Some(user)
 }
 
 /// 从形如 `<sip:a@b>;tag=xyz;q=0.5` 的头值里取参数值。
@@ -179,6 +239,32 @@ mod tests {
 
         h.set("To", "<sip:34020000002000000001@3402.gov>");
         assert_eq!(h.to_tag(), None, "无 tag 参数应返回 None");
+    }
+
+    #[test]
+    fn from_uri_user_严格按_name_addr_解析() {
+        let mut h = Headers::new();
+        h.set(
+            "From",
+            "\"伪装 sip:evil@attacker\" <SIP:34020000002000000001@3402.gov>;tag=p",
+        );
+        assert_eq!(h.from_uri_user(), Some("34020000002000000001"));
+
+        h.set("From", "sip:platform@example.test;tag=p");
+        assert_eq!(h.from_uri_user(), Some("platform"));
+
+        for malformed in [
+            "Platform <sip:platform@example.test",
+            "Platform sip:platform@example.test>",
+            "<http://platform@example.test>",
+            "<sip:@example.test>",
+            "<sip:platform@>",
+            "<sip:platform@example.test> trailing",
+            "<sip:platform@example.test@evil>",
+        ] {
+            h.set("From", malformed);
+            assert_eq!(h.from_uri_user(), None, "应拒绝: {malformed}");
+        }
     }
 
     #[test]

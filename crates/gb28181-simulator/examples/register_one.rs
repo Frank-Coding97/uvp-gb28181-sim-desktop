@@ -63,6 +63,7 @@ async fn main() {
         server_host: server_host.clone(),
         server_port,
         server_domain,
+        inbound_identity_mode: common::InboundIdentityMode::Compatible,
         transport: Transport::Udp,
         heartbeat_interval_secs: 60,
         channels,

@@ -41,7 +41,14 @@
     "publisher": "UVP",
     "copyright": "Copyright © 2026 UVP. MIT License.",
     "macOS": {
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": null,
+      "entitlements": null
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
     },
     "icon": [
       "icons/32x32.png",

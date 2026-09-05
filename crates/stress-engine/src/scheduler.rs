@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use common::Result;
+use common::{Error, Result};
 use gb28181_simulator::DeviceSimulator;
 use scenario::Scenario;
 use sip_core::SipTransport;
@@ -28,6 +28,59 @@ struct TransportShard {
     transport: Arc<dyn SipTransport>,
     local_host: String,
     local_port: u16,
+}
+
+/// 等待全部设备/上报子任务。JoinError 在非主动停止时向上聚合，且先停止再 drain。
+async fn await_workers(
+    mut handles: tokio::task::JoinSet<()>,
+    stop: &tokio::sync::broadcast::Sender<()>,
+    mut completion_stop: tokio::sync::broadcast::Receiver<()>,
+    mut externally_stopping: bool,
+) -> Result<()> {
+    let mut worker_errors = Vec::new();
+    while !handles.is_empty() {
+        tokio::select! {
+            stop_result = completion_stop.recv(), if !externally_stopping => {
+                if !matches!(
+                    stop_result,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed)
+                ) {
+                    externally_stopping = true;
+                }
+            }
+            result = handles.join_next() => {
+                let Some(result) = result else { break };
+                if let Err(error) = result {
+                    // 取消只有在主动停止已线性化时才是预期；panic 永远是运行异常，
+                    // 不能被稍后到达的 stop 掩盖。
+                    if !externally_stopping {
+                        externally_stopping = !matches!(
+                            completion_stop.try_recv(),
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                                | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+                        );
+                    }
+                    if error.is_cancelled() && externally_stopping {
+                        tracing::warn!(%error, "主动停止期间压测设备任务被取消");
+                    } else {
+                        tracing::error!(%error, "压测设备任务异常退出，正在停止其余任务");
+                        worker_errors.push(error.to_string());
+                        let _ = stop.send(());
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!("所有设备已停止");
+    if worker_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::other(format!(
+            "{} 个压测设备子任务异常: {}",
+            worker_errors.len(),
+            worker_errors.join("; ")
+        ))))
+    }
 }
 
 /// 压测编排器:持有场景、批量设备、共享指标。
@@ -101,6 +154,8 @@ impl Orchestrator {
         t.dropped_queue_full
             + t.send_errors
             + t.parse_errors
+            + t.rate_limited
+            + t.anti_amplification_blocked
             + self
                 .metrics
                 .fail_local
@@ -150,12 +205,21 @@ impl Orchestrator {
         position_secs: u64,
         alarm_secs: u64,
     ) -> Result<()> {
+        // 该 receiver 从入口即存在，用于准确区分“外部主动停止”和 worker 异常后内部停机。
+        let completion_stop = stop.subscribe();
+        let mut externally_stopping = false;
+        // 当前设备发送路径只接受字面平台 IP；在创建任何 transport/task 前失败，
+        // 绝不因解析失败而退化成关闭来源过滤。
+        let platform_ip = self
+            .server_host
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| Error::Config("平台地址必须是字面 IP（当前不支持域名）".into()))?;
+        let platform_addr = std::net::SocketAddr::new(platform_ip, self.server_port);
+
         // 不能把 bind 得到的 0.0.0.0 写进 Via/Contact。通过连接目标平台探测
         // 操作系统实际选择的出口地址(UDP connect 不会发送数据)。
         let probe = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        probe
-            .connect((self.server_host.as_str(), self.server_port))
-            .await?;
+        probe.connect(platform_addr).await?;
         let local_host = probe.local_addr()?.ip().to_string();
 
         // 按 DEVICES_PER_SOCKET 分片建共享传输,避免单 socket + 单接收循环成为
@@ -164,19 +228,17 @@ impl Orchestrator {
         let mut shards: Vec<TransportShard> = Vec::with_capacity(shard_count);
         let mut shard_stats = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            // 传输种类由场景决定;Via 里的标识由传输对象自己给出,不会与实际不一致。
+            // 可信来源与 Router 同时构造，在 UDP recv/TCP accept loop 启动前生效。
             let transport: Arc<dyn SipTransport> = match self.transport_kind {
-                common::Transport::Udp => sip_core::UdpTransport::bind("0.0.0.0:0").await?,
-                common::Transport::Tcp => sip_core::TcpTransport::bind("0.0.0.0:0").await?,
+                common::Transport::Udp => {
+                    sip_core::UdpTransport::bind_with_trusted_ips("0.0.0.0:0", vec![platform_ip])
+                        .await?
+                }
+                common::Transport::Tcp => {
+                    sip_core::TcpTransport::bind_with_trusted_ips("0.0.0.0:0", vec![platform_ip])
+                        .await?
+                }
             };
-            // 只接受来自上级平台的报文:不设限时任何主机都能注入 PTZ/INVITE,
-            // 而 INVITE 的 c=/m= 决定推流目标,构成媒体流量放大。
-            if !transport.trust_only_host(&self.server_host) {
-                tracing::warn!(
-                    host = %self.server_host,
-                    "平台地址不是字面 IP,无法启用来源白名单"
-                );
-            }
             let local_port = transport.local_addr()?.port();
             shard_stats.push(transport.stats());
             shards.push(TransportShard {
@@ -220,7 +282,7 @@ impl Orchestrator {
         let mut pressure_at_window = self.local_pressure();
 
         // 批量启动设备 run 任务。
-        let mut handles = Vec::new();
+        let mut handles = tokio::task::JoinSet::new();
         for (i, dev) in self.devices.iter().enumerate() {
             // 爬坡等待必须可被停止打断,否则停止后仍会继续创建新设备,且晚订阅者
             // 收不到之前已经发送过的 broadcast 信号。
@@ -228,6 +290,7 @@ impl Orchestrator {
                 next_slot += gap * gap_multiplier;
                 tokio::select! {
                     _ = ramp_stop.recv() => {
+                        externally_stopping = true;
                         tracing::info!(started = i, "爬坡阶段收到停止信号");
                         break;
                     }
@@ -283,6 +346,7 @@ impl Orchestrator {
             match ramp_stop.try_recv() {
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 _ => {
+                    externally_stopping = true;
                     tracing::info!(started = i, "启动设备前收到停止信号");
                     break;
                 }
@@ -293,13 +357,13 @@ impl Orchestrator {
             let tp = Arc::clone(&shard.transport);
             let host = shard.local_host.clone();
             let port = shard.local_port;
-            handles.push(tokio::spawn(async move {
+            handles.spawn(async move {
                 dev_clone
                     .run(tp, host, port, async move {
                         let _ = stop_rx.recv().await;
                     })
                     .await;
-            }));
+            });
 
             // 主动上报施压:为该设备挂一个周期任务(定位/报警),随 stop 退出。
             if let Some(mut stop_rep) = stop_rep {
@@ -308,7 +372,7 @@ impl Orchestrator {
                 let host_rep = shard.local_host.clone();
                 let port_rep = shard.local_port;
                 let metrics = Arc::clone(&self.metrics);
-                handles.push(tokio::spawn(async move {
+                handles.spawn(async move {
                     Self::report_loop(
                         dev_rep,
                         tp_rep,
@@ -320,20 +384,15 @@ impl Orchestrator {
                         &mut stop_rep,
                     )
                     .await;
-                }));
+                });
             }
         }
 
         tracing::info!(task_count = handles.len(), "设备任务已启动");
 
-        // 等待所有任务完成(stop 触发后自然退出),同时记录异常退出。
-        for handle in handles {
-            if let Err(error) = handle.await {
-                tracing::warn!(%error, "压测设备任务异常退出");
-            }
-        }
-        tracing::info!("所有设备已停止");
-        Ok(())
+        // 按完成顺序 drain，任何非主动停止下的 panic/cancel 都触发全局 stop，
+        // 但仍等待所有其余任务退出，避免 detach。
+        await_workers(handles, &stop, completion_stop, externally_stopping).await
     }
 
     /// 单设备的周期主动上报循环(定位/报警),用于压测施压。随 stop 广播退出。
@@ -403,6 +462,7 @@ mod tests {
             server_host: "127.0.0.1".into(),
             server_port: 15060,
             server_domain: "34020000002000000001".into(),
+            inbound_identity_mode: common::InboundIdentityMode::Compatible,
             transport: Transport::Udp,
             heartbeat_interval_secs: 3600, // 长心跳避免测试中发送
             register_expires_secs: 3600,
@@ -429,5 +489,54 @@ mod tests {
         let sc = test_scenario();
         let orch = Orchestrator::new(&sc, 5).unwrap();
         assert_eq!(orch.device_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn 非主动停止的worker_panic向上返回错误并drain其余任务() {
+        let (stop, _) = tokio::sync::broadcast::channel(1);
+        let completion_stop = stop.subscribe();
+        let mut child_stop = stop.subscribe();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async { panic!("boom") });
+        workers.spawn(async move {
+            let _ = child_stop.recv().await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            await_workers(workers, &stop, completion_stop, false),
+        )
+        .await
+        .expect("异常后应停止并 drain 全部 worker");
+        assert!(result.is_err(), "非主动停止的 panic 不得降级为成功");
+    }
+
+    #[tokio::test]
+    async fn 主动停止期间的worker取消不误报运行失败() {
+        let (stop, _) = tokio::sync::broadcast::channel(1);
+        let completion_stop = stop.subscribe();
+        let mut workers = tokio::task::JoinSet::new();
+        let abort = workers.spawn(std::future::pending::<()>());
+
+        let _ = stop.send(());
+        abort.abort();
+        let result = await_workers(workers, &stop, completion_stop, false).await;
+        assert!(result.is_ok(), "先发生的主动停止应准确识别后续取消");
+    }
+
+    #[tokio::test]
+    async fn panic先于stop时后到停止不得掩盖异常() {
+        let (stop, _) = tokio::sync::broadcast::channel(1);
+        let completion_stop = stop.subscribe();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async { panic!("panic-first") });
+        tokio::task::yield_now().await;
+        let _ = stop.send(());
+
+        let result = await_workers(workers, &stop, completion_stop, false).await;
+        assert!(
+            result.is_err(),
+            "后到的 stop 不得把已发生 panic 改判为主动停止"
+        );
     }
 }

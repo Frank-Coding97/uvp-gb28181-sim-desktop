@@ -20,6 +20,7 @@ export interface PlatformLike {
   server_host: string;
   server_port: number;
   server_domain: string;
+  inbound_identity_mode: "compatible" | "strict";
   transport: string;
 }
 
@@ -40,6 +41,7 @@ export function buildScenarioToml(form: ScenarioFormLike, platform: PlatformLike
     `server_host = ${tomlString(platform.server_host.trim())}`,
     `server_port = ${platform.server_port}`,
     `server_domain = ${tomlString(platform.server_domain.trim())}`,
+    `inbound_identity_mode = ${tomlString(platform.inbound_identity_mode)}`,
     `transport = ${tomlString(platform.transport.toUpperCase())}`,
     `heartbeat_interval_secs = ${form.heartbeat_interval}`,
     `channels_per_device = ${form.channels_per_device}`,

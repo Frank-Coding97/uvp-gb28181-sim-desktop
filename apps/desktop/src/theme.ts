@@ -1,47 +1,67 @@
-// 主题切换:浅色 / 暗色 / 跟随系统。
-//
-// 实现方式是切 `<html data-theme>`,CSS 侧只覆盖设计令牌(见 theme.css),
-// 因此所有组件里的 `var(--xxx)` 自动跟随,不需要逐个组件改样式。
-// Naive UI 侧同步切 `darkTheme`,否则内建组件(Select/Modal/Menu)会与页面配色打架。
+// 主题切换:浅色 / 暗色 / 跟随系统。偏好使用 V1 envelope 持久化。
 import { computed, ref, watch } from "vue";
 import { darkTheme } from "naive-ui";
+import {
+  createVersionedStorage,
+  type DecodeResult,
+  type StorageSaveResult,
+} from "./lib/versionedStorage";
 
 export type ThemePreference = "light" | "dark" | "system";
 
-const STORE_KEY = "uvp_theme";
-
-function loadPreference(): ThemePreference {
-  try {
-    const saved = localStorage.getItem(STORE_KEY);
-    if (saved === "light" || saved === "dark" || saved === "system") return saved;
-  } catch {
-    // 忽略存储不可用
-  }
-  return "system";
+interface ThemeDataV1 {
+  preference: ThemePreference;
 }
 
-/** 系统是否偏好暗色。无 matchMedia(测试环境)时按浅色。 */
+const STORE_KEY = "uvp_theme";
+
+function isPreference(value: unknown): value is ThemePreference {
+  return value === "light" || value === "dark" || value === "system";
+}
+
+function decodeTheme(value: unknown): DecodeResult<ThemeDataV1> {
+  if (!value || typeof value !== "object" || !isPreference((value as { preference?: unknown }).preference)) {
+    throw new Error("invalid theme preference");
+  }
+  const data = { preference: (value as { preference: ThemePreference }).preference };
+  return {
+    data,
+    repaired: JSON.stringify(value) !== JSON.stringify(data),
+    summary: "主题配置中的未知字段已移除",
+  };
+}
+
+const themeStorage = createVersionedStorage<ThemeDataV1>({
+  key: STORE_KEY,
+  schemaVersion: 1,
+  defaultValue: () => ({ preference: "system" }),
+  decode: decodeTheme,
+  parseLegacyRaw: (raw) => isPreference(raw) ? raw : undefined,
+  migrate(value, fromVersion) {
+    if (fromVersion !== null || !isPreference(value)) throw new Error("unsupported theme version");
+    return { data: { preference: value }, summary: "旧版主题偏好已迁移" };
+  },
+});
+
+const initial = themeStorage.load();
+const preference = ref<ThemePreference>(initial.data.preference);
+
 function systemPrefersDark(): boolean {
   return typeof window !== "undefined" && typeof window.matchMedia === "function"
     ? window.matchMedia("(prefers-color-scheme: dark)").matches
     : false;
 }
 
-const preference = ref<ThemePreference>(loadPreference());
 const systemDark = ref(systemPrefersDark());
 
-// 跟随系统时,系统主题变化要实时生效。
 if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
   const query = window.matchMedia("(prefers-color-scheme: dark)");
-  const onChange = (e: MediaQueryListEvent) => {
-    systemDark.value = e.matches;
+  const onChange = (event: MediaQueryListEvent) => {
+    systemDark.value = event.matches;
   };
-  if (typeof query.addEventListener === "function") {
-    query.addEventListener("change", onChange);
-  }
+  if (typeof query.addEventListener === "function") query.addEventListener("change", onChange);
 }
 
-/** 实际生效的是否暗色。 */
 export const isDark = computed(() =>
   preference.value === "system" ? systemDark.value : preference.value === "dark",
 );
@@ -49,25 +69,21 @@ export const isDark = computed(() =>
 function apply() {
   if (typeof document === "undefined") return;
   document.documentElement.dataset.theme = isDark.value ? "dark" : "light";
-  // 让原生控件(滚动条、表单)也跟随。
   document.documentElement.style.colorScheme = isDark.value ? "dark" : "light";
 }
 
 watch(isDark, apply, { immediate: true });
 
 export function useTheme() {
-  function setPreference(next: ThemePreference) {
-    preference.value = next;
-    try {
-      localStorage.setItem(STORE_KEY, next);
-    } catch {
-      // 忽略存储不可用
-    }
+  /** 先提交存储，成功后再改变内存与界面主题。 */
+  function setPreference(next: ThemePreference): StorageSaveResult {
+    const result = themeStorage.save({ preference: next });
+    if (result.ok) preference.value = next;
+    return result;
   }
 
-  /** 在浅色 / 暗色之间切换(当前是"跟随系统"时,切到与系统相反的那个)。 */
-  function toggle() {
-    setPreference(isDark.value ? "light" : "dark");
+  function toggle(): StorageSaveResult {
+    return setPreference(isDark.value ? "light" : "dark");
   }
 
   const naiveTheme = computed(() => (isDark.value ? darkTheme : null));

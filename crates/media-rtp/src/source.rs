@@ -6,22 +6,179 @@
 //! - `FileSource`:H.264 文件循环 —— C 档 / 单设备联调
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::hash::{Hash, Hasher};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use bytes::Bytes;
 use common::{Error, Result};
+use rand::rngs::OsRng;
+use rand::RngCore;
 
-/// 把用户提供的文件路径整成"一定被 ffmpeg 当作路径"的形式。
+const COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
+const FFMPEG_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const OFFLINE_CONVERSION_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A completed bounded child process. Output is continuously drained, but only the
+/// most recent [`COMMAND_OUTPUT_LIMIT`] bytes of each stream are retained.
+#[derive(Debug)]
+pub(crate) struct BoundedCommandOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) timed_out: bool,
+}
+
+/// Run a command without a shell and with a hard deadline.
 ///
-/// 以 `-` 开头的路径会被 ffmpeg 当成选项(参数注入);加 `./` 前缀即消除歧义。
-/// 这里不用 shell,所以不存在命令注入,只需要防这一类**参数**注入。
-fn safe_input_path(path: &str) -> String {
-    if path.starts_with('-') {
-        format!("./{path}")
-    } else {
-        path.to_string()
+/// Once spawned, the child is always killed (a no-op if it already exited) and
+/// waited on before this function returns. Reader threads continuously drain both
+/// pipes so verbose children cannot deadlock on a full pipe.
+pub(crate) fn run_command_bounded(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<BoundedCommandOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ChildGuard::new(command.spawn()?);
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout pipe was not created"))?;
+    let stderr = child
+        .child_mut()
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("child stderr pipe was not created"))?;
+    let stdout_reader = std::thread::Builder::new()
+        .name("bounded-command-stdout".into())
+        .spawn(move || drain_bounded(stdout))?;
+    let stderr_reader = match std::thread::Builder::new()
+        .name("bounded-command-stderr".into())
+        .spawn(move || drain_bounded(stderr))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill_and_wait();
+            let _ = join_command_reader(stdout_reader, "stdout");
+            return Err(error);
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let mut wait_error = None;
+    loop {
+        match child.child_mut().try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                break;
+            }
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(COMMAND_POLL_INTERVAL.min(remaining));
+            }
+            Err(error) => {
+                wait_error = Some(error);
+                break;
+            }
+        }
     }
+
+    // Deliberately unconditional: every successfully spawned process reaches both
+    // kill and wait, including normal exits and try_wait failures.
+    let status = child.kill_and_wait();
+    let stdout = join_command_reader(stdout_reader, "stdout")?;
+    let stderr = join_command_reader(stderr_reader, "stderr")?;
+    if let Some(error) = wait_error {
+        return Err(error);
+    }
+
+    Ok(BoundedCommandOutput {
+        status: status?,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+struct ChildGuard {
+    child: Child,
+    reaped: bool,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn kill_and_wait(&mut self) -> io::Result<ExitStatus> {
+        let _ = self.child.kill();
+        let status = self.child.wait();
+        if status.is_ok() {
+            self.reaped = true;
+        }
+        status
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn drain_bounded<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        if read >= COMMAND_OUTPUT_LIMIT {
+            retained.clear();
+            retained.extend_from_slice(&chunk[read - COMMAND_OUTPUT_LIMIT..read]);
+            continue;
+        }
+        let overflow = retained
+            .len()
+            .saturating_add(read)
+            .saturating_sub(COMMAND_OUTPUT_LIMIT);
+        if overflow > 0 {
+            retained.drain(..overflow);
+        }
+        retained.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn join_command_reader(
+    reader: std::thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream: &str,
+) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other(format!("{stream} reader thread panicked")))?
 }
 
 /// 判断字节流是否以 Annex B 起始码开头(`00 00 01` 或 `00 00 00 01`)。
@@ -35,64 +192,307 @@ fn starts_with_annexb(b: &[u8]) -> bool {
 /// **应在设备启动时预调用一次**(预热缓存):容器转封装可能耗时数秒,若放到 INVITE
 /// 处理里同步执行,会阻塞 200 OK 与首包推流,导致平台收流超时。预热后 INVITE 时
 /// [`FileSource::from_path`] 命中缓存瞬时返回。
-pub fn prepare_video_source(path: &str) -> Result<std::path::PathBuf> {
+pub fn prepare_video_source(path: &str) -> Result<PathBuf> {
     let head = {
-        use std::io::Read;
-        let mut f = std::fs::File::open(path).map_err(Error::Io)?;
+        let mut f = File::open(path).map_err(Error::Io)?;
         let mut buf = [0u8; 8];
         let n = f.read(&mut buf).map_err(Error::Io)?;
         buf[..n].to_vec()
     };
     if starts_with_annexb(&head) {
-        Ok(std::path::PathBuf::from(path))
+        Ok(PathBuf::from(path))
     } else {
         ensure_annexb(path)
     }
 }
 
-/// 定位 ffmpeg 可执行文件。
-///
-/// **关键**:从 .app 双击启动的 GUI 进程 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`,
-/// 不含 Homebrew 的 `/opt/homebrew/bin`,故仅靠 PATH 找 `ffmpeg` 在打包后会失败
-/// (终端 `cargo run` 有完整 PATH 所以能找到——这是"终端能用、打包不能用"的根因)。
-/// 先试 PATH,再逐个探测常见绝对路径。返回可用的命令名/路径。
-/// 本 crate 所有临时产物的**唯一**落地目录:`<系统临时目录>/uvp-gb28181/`。
-///
-/// 为什么必须收在一个自有子目录里,而不是直接摊在系统临时目录下:
-/// 1. 桌面端 `tauri.conf.json` 的 `assetProtocol.scope` 声明的是
-///    `$TEMP/uvp-gb28181/**` —— 产物散在 `$TEMP/` 根下会让那条 scope 名不符实,
-///    结果只能靠运行时逐个放行,把好不容易收窄的权限又打开;
-/// 2. 目录权限可以一次性收紧(Unix 下 0700),而系统临时目录是同机所有用户共享的;
-/// 3. 卸载/清理时一条 `rm -rf` 就能收干净,不用按文件名前缀去猜。
-pub fn work_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("uvp-gb28181");
-    // 目录已存在时 create_dir_all 返回 Ok,不需要先判存在。
-    let _ = std::fs::create_dir_all(&dir);
-    harden_dir_permissions(&dir);
-    dir
+/// 本 crate 临时产物的固定诊断路径。该函数不创建或修改文件系统；所有写入方必须先
+/// 调用可失败的 [`secure_work_dir`] 完成类型与权限验证。
+pub fn work_dir() -> PathBuf {
+    std::env::temp_dir().join("uvp-gb28181")
 }
 
-/// 把工作目录权限收到"仅当前用户可读写执行"。
-///
-/// 系统临时目录是同机所有用户共享的:默认权限下别的用户能读到转封装出来的码流,
-/// 甚至预置同名符号链接把我们的写操作导向别处。Windows 上临时目录本就在用户
-/// profile 内(已按用户隔离),所以这里只处理类 Unix。
+pub(crate) fn secure_work_dir() -> Result<PathBuf> {
+    let dir = work_dir();
+    initialize_work_dir_at(&dir).map_err(Error::Io)?;
+    Ok(dir)
+}
+
+fn initialize_work_dir_at(dir: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => validate_work_dir_type(dir, &metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_private_dir(dir)?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    // Re-check after creation to handle an AlreadyExists race before changing mode.
+    let metadata = std::fs::symlink_metadata(dir)?;
+    validate_work_dir_type(dir, &metadata)?;
+    harden_and_verify_dir_permissions(dir)?;
+    let metadata = std::fs::symlink_metadata(dir)?;
+    validate_work_dir_type(dir, &metadata)
+}
+
+fn validate_work_dir_type(dir: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("media work path is not a real directory: {}", dir.display()),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-fn harden_dir_permissions(dir: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(unix))]
-fn harden_dir_permissions(_dir: &std::path::Path) {}
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn harden_and_verify_dir_permissions(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let mode = std::fs::symlink_metadata(dir)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("media work directory mode is {mode:o}, expected 700"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_and_verify_dir_permissions(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[derive(Debug, Hash)]
+struct SourceIdentity {
+    canonical_path: PathBuf,
+    size: u64,
+    modified_before_epoch: bool,
+    modified_secs: u64,
+    modified_nanos: u32,
+}
+
+fn source_identity(src: &str) -> Result<SourceIdentity> {
+    let canonical_path = std::fs::canonicalize(src).map_err(Error::Io)?;
+    let metadata = std::fs::metadata(&canonical_path).map_err(Error::Io)?;
+    let modified = metadata.modified().map_err(Error::Io)?;
+    let (modified_before_epoch, timestamp) = match modified.duration_since(UNIX_EPOCH) {
+        Ok(timestamp) => (false, timestamp),
+        Err(_) => (
+            true,
+            UNIX_EPOCH
+                .duration_since(modified)
+                .map_err(|error| Error::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?,
+        ),
+    };
+    Ok(SourceIdentity {
+        canonical_path,
+        size: metadata.len(),
+        modified_before_epoch,
+        modified_secs: timestamp.as_secs(),
+        modified_nanos: timestamp.subsec_nanos(),
+    })
+}
+
+fn source_cache_key(identity: &SourceIdentity, flavor: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    flavor.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Clone, Copy)]
+enum CacheKind {
+    AnnexB,
+    G711,
+}
+
+impl CacheKind {
+    fn accepts_head(self, head: &[u8]) -> bool {
+        match self {
+            Self::AnnexB => starts_with_annexb(head),
+            Self::G711 => true,
+        }
+    }
+}
+
+struct StagedFile {
+    path: PathBuf,
+}
+
+impl StagedFile {
+    fn create(dir: &Path, prefix: &str, extension: &str) -> io::Result<Self> {
+        for _ in 0..32 {
+            let mut random = [0u8; 16];
+            OsRng
+                .try_fill_bytes(&mut random)
+                .map_err(io::Error::other)?;
+            let token = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let path = dir.join(format!(
+                ".{prefix}-{}-{token}.{extension}",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    drop(file);
+                    let staging = Self { path };
+                    #[cfg(unix)]
+                    verify_staging_permissions(&staging.path)?;
+                    return Ok(staging);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique media staging file",
+        ))
+    }
+    fn persist(self) -> PathBuf {
+        let path = self.path.clone();
+        std::mem::forget(self);
+        path
+    }
+}
+
+/// 在已验证的私有工作目录中原子占位一个高熵、0600(Unix)文件。
+/// 调用方拥有该路径并负责在子进程收尾后删除；主要供 FFREPORT 这类必须由外部进程
+/// 按路径打开的临时输出使用。
+pub(crate) fn create_private_work_file(prefix: &str, extension: &str) -> Result<PathBuf> {
+    let dir = secure_work_dir()?;
+    StagedFile::create(&dir, prefix, extension)
+        .map(StagedFile::persist)
+        .map_err(Error::Io)
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn verify_staging_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if !metadata.file_type().is_file() || mode != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("media staging file mode is {mode:o}, expected 600"),
+        ));
+    }
+    Ok(())
+}
+
+fn cache_file_is_valid(path: &Path, kind: CacheKind) -> io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    let mut head = [0u8; 4];
+    let read = file.read(&mut head)?;
+    Ok(kind.accepts_head(&head[..read]))
+}
+
+fn cache_hit(path: &Path, kind: CacheKind) -> io::Result<bool> {
+    if cache_file_is_valid(path, kind)? {
+        return Ok(true);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cache destination is a directory: {}", path.display()),
+        )),
+        Ok(_) => {
+            std::fs::remove_file(path)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn publish_cache(staging: &StagedFile, destination: &Path, kind: CacheKind) -> io::Result<()> {
+    if !cache_file_is_valid(&staging.path, kind)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid media staging file: {}", staging.path.display()),
+        ));
+    }
+    if cache_hit(destination, kind)? {
+        return Ok(());
+    }
+    match std::fs::rename(&staging.path, destination) {
+        Ok(()) => Ok(()),
+        // Unix rename replaces an existing destination; Windows commonly reports
+        // AlreadyExists or PermissionDenied. If another writer published a valid
+        // file first, adopt it and let RAII remove our staging file.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+            ) && cache_file_is_valid(destination, kind)? =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn command_tail(output: &BoundedCommandOutput) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .to_string()
+}
 
 pub fn ffmpeg_bin() -> Option<String> {
-    use std::process::Command;
     let probe = |bin: &str| {
-        Command::new(bin)
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
+        let mut command = Command::new(bin);
+        command.args(["-nostdin", "-version"]);
+        run_command_bounded(&mut command, FFMPEG_PROBE_TIMEOUT)
+            .map(|output| !output.timed_out && output.status.success() && !output.stdout.is_empty())
             .unwrap_or(false)
     };
     // 0) app 包内 ffmpeg(macOS)。**关键**:Homebrew ffmpeg 在包外、不属任何 .app,
@@ -124,7 +524,7 @@ pub fn ffmpeg_bin() -> Option<String> {
         "/opt/local/bin/ffmpeg",    // MacPorts
         "/usr/bin/ffmpeg",          // Linux 系统包
     ] {
-        if std::path::Path::new(p).exists() && probe(p) {
+        if Path::new(p).exists() && probe(p) {
             return Some(p.to_string());
         }
     }
@@ -132,32 +532,14 @@ pub fn ffmpeg_bin() -> Option<String> {
 }
 
 /// 把容器视频文件(MP4/FLV/MKV/MOV 等)转封装为 H.264 Annex B 裸流,返回裸流文件路径。
-///
-/// 用系统 `ffmpeg`:优先 `-c:v copy -bsf:v h264_mp4toannexb`(无损转封装,快);
-/// 失败则回退重编码(`libx264 -preset ultrafast`,兼容任意输入)。结果按"源路径 + 修改时间"
-/// 缓存到临时目录,同一文件只转一次(压测多设备共用同一文件时只转一次)。
-///
-/// ffmpeg 为可选外部依赖:仅容器格式需要;缺失时返回明确错误。
-fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
-    use std::process::Command;
-
-    // 缓存键:源路径 + 修改时间(mtime),避免源文件更新后用旧缓存。
-    let meta = std::fs::metadata(src).map_err(Error::Io)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&(src, mtime), &mut hasher);
-    let key = std::hash::Hasher::finish(&hasher);
-    let out = work_dir().join(format!("annexb-{key:016x}.h264"));
-    if out.exists() {
+fn ensure_annexb(src: &str) -> Result<PathBuf> {
+    let identity = source_identity(src)?;
+    let key = source_cache_key(&identity, "annexb-h264-v1");
+    let out = secure_work_dir()?.join(format!("annexb-{key:016x}.h264"));
+    if cache_hit(&out, CacheKind::AnnexB).map_err(Error::Io)? {
         return Ok(out);
     }
 
-    // 检查 ffmpeg 是否可用(PATH + 常见绝对路径,兼容 GUI 启动无 Homebrew PATH)。
     let ffmpeg = ffmpeg_bin().ok_or_else(|| {
         Error::Media(format!(
             "视频源是容器格式({src}),需要 ffmpeg 转封装,但未找到 ffmpeg;\
@@ -165,36 +547,34 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
         ))
     })?;
 
-    // ① 无损转封装(copy + h264_mp4toannexb)。
-    //
-    // `-i` 的值来自用户选择的文件路径:以 `-` 开头的路径会被 ffmpeg 当成选项解析。
-    // 用 `./` 前缀把相对路径固定成路径语义(见 safe_input_path)。
-    let input = safe_input_path(src);
-    let copy_ok = Command::new(&ffmpeg)
-        .args([
-            "-y",
-            "-i",
-            &input,
-            "-c:v",
-            "copy",
-            "-bsf:v",
-            "h264_mp4toannexb",
-        ])
-        .arg(&out)
-        .output()
-        .map(|o| o.status.success() && out.exists())
-        .unwrap_or(false);
-    if copy_ok {
-        return Ok(out);
+    // First try a lossless remux. FFmpeg writes only the high-entropy staging
+    // path; the cache name becomes visible only after validation and rename.
+    let staging = StagedFile::create(out.parent().expect("cache has parent"), "annexb", "h264")
+        .map_err(Error::Io)?;
+    let mut copy = Command::new(&ffmpeg);
+    copy.args(["-nostdin", "-y", "-i"])
+        .arg(&identity.canonical_path)
+        .args(["-c:v", "copy", "-bsf:v", "h264_mp4toannexb"])
+        .arg(&staging.path);
+    if let Ok(output) = run_command_bounded(&mut copy, OFFLINE_CONVERSION_TIMEOUT) {
+        if !output.timed_out
+            && output.status.success()
+            && cache_file_is_valid(&staging.path, CacheKind::AnnexB).unwrap_or(false)
+            && publish_cache(&staging, &out, CacheKind::AnnexB).is_ok()
+        {
+            return Ok(out);
+        }
     }
+    drop(staging);
 
-    // ② 回退:重编码为 H.264 Annex B(兼容任意编码/容器)。
-    let _ = std::fs::remove_file(&out);
-    let enc = Command::new(&ffmpeg)
+    // Fall back to H.264 encoding for codecs/containers that cannot be remuxed.
+    let staging = StagedFile::create(out.parent().expect("cache has parent"), "annexb", "h264")
+        .map_err(Error::Io)?;
+    let mut encode = Command::new(&ffmpeg);
+    encode
+        .args(["-nostdin", "-y", "-i"])
+        .arg(&identity.canonical_path)
         .args([
-            "-y",
-            "-i",
-            &input,
             "-an",
             "-c:v",
             "libx264",
@@ -203,63 +583,58 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
             "-f",
             "h264",
         ])
-        .arg(&out)
-        .output()
-        .map_err(|e| Error::Media(format!("ffmpeg 执行失败: {e}")))?;
-    if enc.status.success() && out.exists() {
-        Ok(out)
-    } else {
-        Err(Error::Media(format!(
-            "ffmpeg 转封装/重编码失败({src}):{}",
-            String::from_utf8_lossy(&enc.stderr)
-                .lines()
-                .last()
-                .unwrap_or("")
-        )))
+        .arg(&staging.path);
+    let output = run_command_bounded(&mut encode, OFFLINE_CONVERSION_TIMEOUT)
+        .map_err(|error| Error::Media(format!("ffmpeg 执行失败: {error}")))?;
+    if output.timed_out {
+        return Err(Error::Media(format!(
+            "ffmpeg 转封装/重编码超时({src}, 120s):{}",
+            command_tail(&output)
+        )));
     }
+    if !output.status.success() {
+        return Err(Error::Media(format!(
+            "ffmpeg 转封装/重编码失败({src}):{}",
+            command_tail(&output)
+        )));
+    }
+    publish_cache(&staging, &out, CacheKind::AnnexB).map_err(Error::Io)?;
+    Ok(out)
 }
 
 /// 从视频文件抽音频轨为 G.711A(PCMA)8kHz 单声道裸流,返回字节;无音频轨返回空 Vec。
-///
-/// 用系统 ffmpeg(`-vn -c:a pcm_alaw -ar 8000 -ac 1 -f alaw`),结果按源路径+mtime 缓存。
-/// ffmpeg 缺失或无音频轨时返回空(调用方据此退化为纯视频)。
 fn extract_g711a(src: &str) -> Result<Vec<u8>> {
-    use std::process::Command;
-
-    let meta = std::fs::metadata(src).map_err(Error::Io)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&(src, mtime, "g711a"), &mut hasher);
-    let key = std::hash::Hasher::finish(&hasher);
-    let out = work_dir().join(format!("g711a-{key:016x}.alaw"));
-    if out.exists() {
+    let identity = source_identity(src)?;
+    let key = source_cache_key(&identity, "g711a-8k-mono-v1");
+    let out = secure_work_dir()?.join(format!("g711a-{key:016x}.alaw"));
+    if cache_hit(&out, CacheKind::G711).map_err(Error::Io)? {
         return std::fs::read(&out).map_err(Error::Io);
     }
 
     let Some(ffmpeg) = ffmpeg_bin() else {
-        return Ok(Vec::new()); // 无 ffmpeg:静默退化为纯视频。
+        return Ok(Vec::new());
     };
-
-    let input = safe_input_path(src);
-    let res = Command::new(&ffmpeg)
+    let staging = StagedFile::create(out.parent().expect("cache has parent"), "g711a", "alaw")
+        .map_err(Error::Io)?;
+    let mut command = Command::new(&ffmpeg);
+    command
+        .args(["-nostdin", "-y", "-i"])
+        .arg(&identity.canonical_path)
         .args([
-            "-y", "-i", &input, "-vn", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1", "-f", "alaw",
+            "-vn", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1", "-f", "alaw",
         ])
-        .arg(&out)
-        .output()
-        .map_err(|e| Error::Media(format!("ffmpeg 抽音频失败: {e}")))?;
-    // 无音频轨时 ffmpeg 会失败或产空文件 —— 都按"无音频"处理,不报错。
-    if res.status.success() && out.exists() {
-        std::fs::read(&out).map_err(Error::Io)
-    } else {
-        let _ = std::fs::remove_file(&out);
-        Ok(Vec::new())
+        .arg(&staging.path);
+    let output = run_command_bounded(&mut command, OFFLINE_CONVERSION_TIMEOUT)
+        .map_err(|error| Error::Media(format!("ffmpeg 抽音频失败: {error}")))?;
+    // No audio stream (or an empty output) preserves the existing pure-video fallback.
+    if output.timed_out || !output.status.success() {
+        return Ok(Vec::new());
     }
+    if !cache_file_is_valid(&staging.path, CacheKind::G711).map_err(Error::Io)? {
+        return Ok(Vec::new());
+    }
+    publish_cache(&staging, &out, CacheKind::G711).map_err(Error::Io)?;
+    std::fs::read(&out).map_err(Error::Io)
 }
 
 /// 一帧编码数据(H.264 Annex B 访问单元,含起始码)。
@@ -394,9 +769,9 @@ pub struct MediaAsset {
     audio: Arc<[Bytes]>,
 }
 
-/// 已解析素材的进程内缓存(键为规范化后的源路径 + 是否抽音频)。
-fn asset_cache() -> &'static Mutex<HashMap<String, Arc<MediaAsset>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<MediaAsset>>>> = OnceLock::new();
+/// 已解析素材的进程内缓存(键包含规范路径、大小、高精度 mtime 与音频模式)。
+fn asset_cache() -> &'static Mutex<HashMap<u64, Arc<MediaAsset>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<MediaAsset>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -432,7 +807,15 @@ impl FileSource {
     /// 统一的文件加载入口:**同一 (路径, 是否抽音频) 的素材在进程内只解析一次**,
     /// 之后所有设备通过 `Arc` 共享同一份帧数据。
     fn from_path_with_audio(path: &str, fps: u32, with_audio: bool) -> Result<Self> {
-        let key = format!("{}|audio={}", path, with_audio);
+        let identity = source_identity(path)?;
+        let key = source_cache_key(
+            &identity,
+            if with_audio {
+                "media-asset-av-v1"
+            } else {
+                "media-asset-video-v1"
+            },
+        );
         if let Some(asset) = asset_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
             return Ok(Self::from_asset(asset, fps));
         }
@@ -1168,17 +1551,117 @@ fn drain_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
 mod tests {
     use super::*;
 
+    fn unique_test_path(label: &str) -> PathBuf {
+        let mut random = [0u8; 16];
+        OsRng.fill_bytes(&mut random);
+        let token = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        std::env::temp_dir().join(format!("uvp-media-rtp-{label}-{token}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 安全工作目录拒绝符号链接() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = unique_test_path("workdir-symlink");
+        let actual = sandbox.join("actual");
+        let link = sandbox.join("work");
+        std::fs::create_dir(&sandbox).unwrap();
+        std::fs::create_dir(&actual).unwrap();
+        symlink(&actual, &link).unwrap();
+
+        let error = initialize_work_dir_at(&link).expect_err("symlink must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&sandbox).unwrap();
+    }
+
+    #[test]
+    fn staging权限清理与发布() {
+        let dir = unique_test_path("staging");
+        initialize_work_dir_at(&dir).unwrap();
+
+        let cleanup_path = {
+            let staging = StagedFile::create(&dir, "cleanup", "h264").unwrap();
+            let path = staging.path.clone();
+            assert!(path.exists());
+            path
+        };
+        assert!(
+            !cleanup_path.exists(),
+            "RAII must remove unpublished staging"
+        );
+
+        let staging = StagedFile::create(&dir, "publish", "h264").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::symlink_metadata(&staging.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::write(&staging.path, [0, 0, 0, 1, 0x65]).unwrap();
+        let staging_path = staging.path.clone();
+        let published = dir.join("published.h264");
+        publish_cache(&staging, &published, CacheKind::AnnexB).unwrap();
+        drop(staging);
+
+        assert!(!staging_path.exists());
+        assert!(cache_file_is_valid(&published, CacheKind::AnnexB).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 缓存命中拒绝符号链接() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_path("cache-symlink");
+        initialize_work_dir_at(&dir).unwrap();
+        let victim = dir.join("victim.h264");
+        let cached = dir.join("annexb-cache.h264");
+        std::fs::write(&victim, [0, 0, 0, 1, 0x65]).unwrap();
+        symlink(&victim, &cached).unwrap();
+
+        assert!(!cache_hit(&cached, CacheKind::AnnexB).unwrap());
+        assert!(!cached.exists(), "rejected cache symlink should be removed");
+        assert!(victim.exists(), "symlink target must not be removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 有界命令超时后快速返回并收尸() {
+        let start = Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("5");
+        let output = run_command_bounded(&mut command, Duration::from_millis(100)).unwrap();
+
+        assert!(output.timed_out);
+        assert!(!output.status.success());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout runner returned too slowly: {:?}",
+            start.elapsed()
+        );
+    }
+
     #[test]
     fn ffmpeg查找_返回可执行或none不panic() {
         // 不强求装了 ffmpeg;只验证查找逻辑健壮(PATH + 绝对路径探测)不 panic,
         // 且返回值要么 None 要么是真能跑 -version 的路径。
         if let Some(bin) = ffmpeg_bin() {
-            let ok = std::process::Command::new(&bin)
-                .arg("-version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            assert!(ok, "ffmpeg_bin 返回的 {bin} 应可执行");
+            let mut command = Command::new(&bin);
+            command.args(["-nostdin", "-version"]);
+            let output = run_command_bounded(&mut command, FFMPEG_PROBE_TIMEOUT).unwrap();
+            assert!(!output.timed_out && output.status.success());
         }
     }
 

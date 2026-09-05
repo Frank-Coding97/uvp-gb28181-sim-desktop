@@ -42,15 +42,30 @@ pub mod subject;      // 附录 L Subject 头域(媒体流标识,附录 K 的同
 - 实时流序列号首位取 0、历史流首位取 1。
 
 ### transport
-- `UdpTransport`:共享 socket,后台接收循环解析后分发。
+- `UdpTransport`:共享 socket,后台接收循环按「可信来源 → 每 IP 令牌桶 → 解析 → 分发」处理。
+- `TcpTransport`:SIP 流式重组,首报文/空闲超时与 64 条入站连接上限;TCP 已完成,不再是规划项。
 - **响应**按 `Call-ID` 路由到发起事务的设备队列(`register(call_id)`)。
 - **入站请求**(平台主动发来的 OPTIONS / MESSAGE 查询)按目标设备 AOR 路由:取 Request-URI 的
   user 部分(即 device_id),投递到该设备的入站队列(`register_inbound(device_id)`)。
+- **UDP 来源限流**:`UdpRateLimitConfig` 默认每来源 IP 200 个 MTU 等价令牌/s、突发 400;
+  数据报按 `ceil(bytes/1300)` 计费,所以 65 KiB 大包不能伪装成一个普通包。桶最多 4096 个来源,
+  空闲 60s 回收;同 IP 换源端口或 IPv4-mapped IPv6 不能绕过。
+- **白名单与限流叠加**:生产入口使用 `bind_with_trusted_ips`，非空白名单与 Router 同时构造，
+  在 UDP 接收循环/TCP accept 循环启动前已生效，消除 bind 后 setter 的竞态窗口；空集合明确报错，
+  不会退化成放行。先做平台 IP 白名单,未命中者不占桶;命中白名单的来源仍受限流。
+  低层测试 API 仍可显式关闭白名单，但桌面单设备与压测生产路径不会使用该降级。
+- **反放大**:限流拒绝一律静默丢弃,不回 429/503。每条通过的 UDP Request 仅为同一
+  `SocketAddr` 产生最多 3×入站字节的短期响应信用;UDP Response 必须消耗信用且不超过
+  1300 B 安全 MTU。服务端事务键也包含来源地址,不同主机不能靠复制 branch/CSeq 命中缓存响应。
+- `TransportStats` 的 `rate_limited` / `rate_limited_bytes` / `anti_amplification_blocked`
+  会汇入压测 `local_pressure`;安全策略丢包时报告必须标为不可信,不能把它归咎于平台。
 - **压测关键**:所有虚拟设备复用少量 socket,避免每设备一 socket 耗尽端口(见 `10-functional/stress-testing.md#42`)。
-- TCP(RFC 4571)在 M2 补充。
 
 ### auth
-- 解析 401/407 挑战,计算 `response = MD5(HA1:nonce:HA2)`,构造 `Authorization`。GB28181 用 MD5。
+- 解析 401/407 挑战,计算 `response = MD5(HA1:nonce:HA2)`,构造 `Authorization`。该能力用于设备
+  作为 UAC 完成 REGISTER Digest。
+- 当前**不提供平台→设备的 Digest 服务端校验**：尚无平台反向凭据模型、服务端 nonce TTL、
+  `nc/cnonce` 重放检测与常量时间 verifier；不能仅凭请求带有 Authorization 就宣称已认证。
 
 ## 错误
 统一用 `common::Error::Sip(...)`;超时单独可辨识(供 `timeout` 归因)。

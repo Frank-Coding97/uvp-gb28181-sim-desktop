@@ -30,6 +30,7 @@ fn cfg(server_port: u16) -> DeviceConfig {
         server_host: "127.0.0.1".into(),
         server_port,
         server_domain: PLATFORM_ID.into(),
+        inbound_identity_mode: common::InboundIdentityMode::Compatible,
         transport: Transport::Udp,
         heartbeat_interval_secs: 60,
         register_expires_secs: 3600,

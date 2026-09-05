@@ -9,6 +9,7 @@ import {
   watch,
 } from "vue";
 import * as THREE from "three";
+import { formatError } from "../lib/ipcError";
 
 const props = defineProps<{
   pan: number;
@@ -92,7 +93,7 @@ function buildScene(): void {
   try {
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
   } catch (error) {
-    webglError.value = `WebGL 初始化失败：${String(error)}`;
+    webglError.value = formatError(error, "WebGL 初始化失败");
     return;
   }
 

@@ -23,7 +23,7 @@ const {
 async function onPickVideoSource() {
   const picked = await pickVideoSource();
   if (!picked.ok) {
-    message.error("选择文件失败:" + picked.error);
+    message.error(picked.error);
     return;
   }
   if (picked.path) refreshVideoPreview(true);

@@ -27,6 +27,26 @@ impl fmt::Display for Transport {
     }
 }
 
+/// 入站 SIP 请求的平台身份校验模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundIdentityMode {
+    /// 兼容模式：保持现有入站处理行为。
+    #[default]
+    Compatible,
+    /// 严格模式：要求可信来源 IP 且 From 用户匹配平台域 ID。
+    Strict,
+}
+
+impl fmt::Display for InboundIdentityMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InboundIdentityMode::Compatible => f.write_str("compatible"),
+            InboundIdentityMode::Strict => f.write_str("strict"),
+        }
+    }
+}
+
 /// GB/T 28181 协议版本。影响 MANSCDP XML 的字段集(2022 是 2016 的扩展超集)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GbVersion {
@@ -160,6 +180,25 @@ mod tests {
         assert_eq!(GbVersion::from_x_gb_ver("4.0"), None);
         assert_eq!(GbVersion::from_x_gb_ver(""), None);
         assert_eq!(GbVersion::from_x_gb_ver("GB/T 28181-2022"), None);
+    }
+
+    #[test]
+    fn 入站身份模式默认兼容且使用蛇形序列化() {
+        assert_eq!(
+            InboundIdentityMode::default(),
+            InboundIdentityMode::Compatible
+        );
+        assert_eq!(InboundIdentityMode::Compatible.to_string(), "compatible");
+        assert_eq!(InboundIdentityMode::Strict.to_string(), "strict");
+        assert_eq!(
+            serde_json::to_string(&InboundIdentityMode::Compatible).unwrap(),
+            r#""compatible""#
+        );
+        assert_eq!(
+            serde_json::from_str::<InboundIdentityMode>(r#""strict""#).unwrap(),
+            InboundIdentityMode::Strict
+        );
+        assert!(serde_json::from_str::<InboundIdentityMode>(r#""unknown""#).is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { formatError } from "../lib/ipcError";
 
 export interface TraceEntry {
   ts_ms: number;
@@ -65,7 +66,7 @@ async function applyTraceEnabled(): Promise<{ ok: boolean; error?: string }> {
     await invoke<string>("set_sip_trace", { enabled: traceOn.value });
     return { ok: true };
   } catch (e) {
-    return { ok: false, error: String(e) };
+    return { ok: false, error: formatError(e, "切换追踪失败") };
   }
 }
 

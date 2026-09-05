@@ -4,6 +4,7 @@ import { ref, onMounted, onUnmounted, onActivated, computed, nextTick, useId } f
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useMessage } from "naive-ui";
+import { formatError } from "../lib/ipcError";
 
 const message = useMessage();
 const idLevelLabel = useId();
@@ -12,6 +13,15 @@ const idLevelFilter = useId();
 interface LogLine { ts_ms: number; level: string; target: string; message: string; }
 /** 后端每 100ms 聚合一次推来的日志批。`dropped` 是因队列满被丢弃的条数。 */
 interface LogBatch { lines: LogLine[]; dropped: number; }
+interface InboundSecurityCapabilities {
+  source_ip_filter: boolean;
+  from_platform_id: boolean;
+  digest_server_validation: boolean;
+  digest_client_registration: boolean;
+  literal_platform_ip_only: boolean;
+}
+
+const securityCapabilities = ref<InboundSecurityCapabilities | null>(null);
 
 const LEVELS = ["error", "warn", "info", "debug", "trace"];
 const level = ref("info");
@@ -65,7 +75,7 @@ async function exportDiagnostics() {
     lastBundle.value = await invoke<string>("export_diagnostics");
     message.success(`诊断包已导出:${lastBundle.value}`, { duration: 8000, closable: true });
   } catch (e) {
-    message.error(`诊断包导出失败:${String(e)}`, { duration: 0, closable: true });
+    message.error(formatError(e, "诊断包导出失败"), { duration: 0, closable: true });
   } finally {
     exporting.value = false;
   }
@@ -76,7 +86,7 @@ async function applyLevel(lv: string) {
     const got = await invoke<string>("set_log_level", { level: lv });
     level.value = got;
   } catch (e) {
-    console.error("设置日志级别失败", e);
+    message.error(formatError(e, "设置日志级别失败"));
   }
 }
 
@@ -99,6 +109,11 @@ async function refreshHistory() {
 }
 
 onMounted(async () => {
+  try {
+    securityCapabilities.value = await invoke<InboundSecurityCapabilities>("get_inbound_security_capabilities");
+  } catch (e) {
+    console.error("读取入站安全能力失败", e);
+  }
   try { level.value = await invoke<string>("get_log_level"); } catch { /* 忽略 */ }
   await refreshHistory();
   // 后端按 100ms 批量推送(而不是每条日志一个事件),压测时前端不再被 IPC 压垮。
@@ -120,6 +135,20 @@ onUnmounted(() => unlisten?.());
     <div class="page-header">
       <div class="page-title">系统信息</div>
       <div class="page-sub">软件运行日志:配置级别、实时查看、按级别/关键字筛选</div>
+    </div>
+
+    <div class="glass-card security-card">
+      <div class="panel-title">入站信令安全能力</div>
+      <div v-if="securityCapabilities" class="security-grid">
+        <div><span>可信来源 IP</span><strong>{{ securityCapabilities.source_ip_filter ? '已支持' : '不支持' }}</strong></div>
+        <div><span>From 平台 ID</span><strong>{{ securityCapabilities.from_platform_id ? '严格模式可用' : '不支持' }}</strong></div>
+        <div><span>设备注册 Digest</span><strong>{{ securityCapabilities.digest_client_registration ? '已支持' : '不支持' }}</strong></div>
+        <div><span>平台反向 Digest</span><strong class="unsupported">{{ securityCapabilities.digest_server_validation ? '已支持' : '不支持' }}</strong></div>
+      </div>
+      <p class="log-hint">
+        严格模式是“启动前冻结的可信平台 IP + From 用户匹配平台域 ID”，不是双向 Digest。
+        当前仅接受字面平台 IP；域名解析失败时不会降级为无来源过滤。
+      </p>
     </div>
 
     <div class="glass-card panel">
@@ -198,6 +227,12 @@ onUnmounted(() => unlisten?.());
 
 <style scoped>
 .page { max-width: 1320px; }
+.security-card { padding: 12px 14px; margin-bottom: 10px; border-radius: var(--radius-md); }
+.security-grid { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 8px; }
+.security-grid > div { display: flex; justify-content: space-between; gap: 10px; padding: 8px; border: 1px solid var(--border-default); border-radius: var(--radius-xs); }
+.security-grid span { color: var(--text-secondary); font-size: var(--fs-sm); }
+.security-grid strong { color: var(--success); font-size: var(--fs-sm); }
+.security-grid .unsupported { color: var(--warning); }
 .panel { padding: 12px 14px; border-radius: var(--radius-md); }
 /* 页头与表单原语已提到 theme.css;这里只留本页的差异化覆盖。 */
 .panel-title { margin-bottom: 8px; }

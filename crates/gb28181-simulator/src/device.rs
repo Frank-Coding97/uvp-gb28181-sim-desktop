@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::{DeviceId, Error, Result, Transport};
 use gb28181_protocol::manscdp::Keepalive;
@@ -278,6 +279,8 @@ pub struct DeviceConfig {
     pub server_port: u16,
     /// 上级平台域(SIP domain / 服务器 ID 中心编码)。
     pub server_domain: String,
+    /// 入站 SIP 请求的平台身份校验模式。
+    pub inbound_identity_mode: common::InboundIdentityMode,
     /// 信令传输方式。
     pub transport: Transport,
     /// 心跳间隔(秒)。
@@ -400,6 +403,8 @@ pub struct DeviceSimulator {
     /// 少了这层会出现一个很具体的现场故障:平台 200 OK 丢包后重传 INVITE,
     /// 设备因"已有会话"回 486 Busy Here,点播直接失败。
     server_txns: sip_core::ServerTransactions,
+    /// 严格身份模式拒绝计数，用于抽样日志，避免可信网段内的洪泛灌爆日志。
+    rejected_identity: AtomicU32,
     /// 当前语音广播会话(§9.12.1)。设备是主叫,同一时刻只维持一路。
     broadcast: tokio::sync::Mutex<Option<BroadcastSession>>,
     /// 广播/对讲媒体流序列号计数器(附录 L 的"媒体流序列号")。
@@ -527,7 +532,15 @@ const TASK_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3)
 /// 超时不是错误:媒体发送可能卡在一个不响应的对端上。但它值得记一条日志 ——
 /// 频繁超时说明某条停止路径没有真正响应停止信号。
 async fn await_task(what: &str, task: tokio::task::JoinHandle<()>) -> bool {
-    match tokio::time::timeout(TASK_JOIN_TIMEOUT, task).await {
+    await_task_with_timeout(what, task, TASK_JOIN_TIMEOUT).await
+}
+
+async fn await_task_with_timeout(
+    what: &str,
+    mut task: tokio::task::JoinHandle<()>,
+    timeout: Duration,
+) -> bool {
+    match tokio::time::timeout(timeout, &mut task).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) if error.is_cancelled() => true,
         Ok(Err(error)) => {
@@ -537,9 +550,18 @@ async fn await_task(what: &str, task: tokio::task::JoinHandle<()>) -> bool {
         Err(_) => {
             tracing::warn!(
                 what,
-                secs = TASK_JOIN_TIMEOUT.as_secs(),
-                "子任务未在超时内退出,已放弃等待"
+                secs = timeout.as_secs_f64(),
+                "子任务未在超时内退出,正在强制取消"
             );
+            // 丢弃 JoinHandle 只会 detach,不会取消任务。必须 abort 后再次 await，
+            // 让推流 future 被 drop，进而必达 LiveSource::drop -> kill+wait FFmpeg。
+            task.abort();
+            match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(what, %error, "强制取消后的子任务异常"),
+                Err(_) => tracing::error!(what, "强制取消后子任务仍未收敛"),
+            }
             false
         }
     }
@@ -746,6 +768,13 @@ pub struct BroadcastSnapshot {
     pub recv: media_rtp::RecvStatsSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InboundIdentityRejection {
+    status: u16,
+    reason: &'static str,
+    detail: &'static str,
+}
+
 impl DeviceSimulator {
     /// 用配置创建一个待运行的设备仿真实例(无观察者)。
     pub fn new(config: DeviceConfig) -> Self {
@@ -771,6 +800,7 @@ impl DeviceSimulator {
             granted_expires: AtomicU32::new(0),
             online: std::sync::atomic::AtomicBool::new(false),
             server_txns: sip_core::ServerTransactions::default(),
+            rejected_identity: AtomicU32::new(0),
             broadcast: tokio::sync::Mutex::new(None),
             media_seq: AtomicU32::new(1),
             runtime: parking_lot::Mutex::new(runtime),
@@ -803,6 +833,7 @@ impl DeviceSimulator {
             granted_expires: AtomicU32::new(0),
             online: std::sync::atomic::AtomicBool::new(false),
             server_txns: sip_core::ServerTransactions::default(),
+            rejected_identity: AtomicU32::new(0),
             broadcast: tokio::sync::Mutex::new(None),
             media_seq: AtomicU32::new(1),
             runtime: parking_lot::Mutex::new(runtime),
@@ -2009,6 +2040,42 @@ impl DeviceSimulator {
         *self.catalog_dialog.lock().await = None;
     }
 
+    /// 在任何业务分派前统一校验平台身份。
+    ///
+    /// Compatible 保持既有互操作；Strict 要求恰好一个可解析的 From，且 URI user
+    /// 精确匹配平台域 ID。这里不把 Authorization 的存在当成认证成功：当前只实现
+    /// 设备作为 UAC 的 REGISTER Digest，没有平台反向凭据与 nonce/replay verifier。
+    fn validate_inbound_identity(
+        &self,
+        req: &sip_core::Request,
+    ) -> std::result::Result<(), InboundIdentityRejection> {
+        if self.config.inbound_identity_mode == common::InboundIdentityMode::Compatible {
+            return Ok(());
+        }
+        if req.headers.get_all("From").len() != 1 {
+            return Err(InboundIdentityRejection {
+                status: 400,
+                reason: "Bad Request",
+                detail: "From 头缺失或重复",
+            });
+        }
+        let Some(platform_id) = req.headers.from_uri_user() else {
+            return Err(InboundIdentityRejection {
+                status: 400,
+                reason: "Bad Request",
+                detail: "From URI 无法解析",
+            });
+        };
+        if platform_id != self.config.server_domain {
+            return Err(InboundIdentityRejection {
+                status: 403,
+                reason: "Forbidden",
+                detail: "From URI user 与平台域 ID 不匹配",
+            });
+        }
+        Ok(())
+    }
+
     /// 处理一条入站请求(带服务端事务去重)。
     ///
     /// 去重是必须的:UDP 下平台的请求会重传,而重复执行业务逻辑会产生真实故障
@@ -2023,7 +2090,7 @@ impl DeviceSimulator {
             return Ok(false);
         };
 
-        let token = match self.server_txns.admit(req) {
+        let token = match self.server_txns.admit(req, incoming.from) {
             sip_core::Admit::Retransmit(cached) => {
                 tracing::info!(
                     method = %req.method,
@@ -2041,6 +2108,29 @@ impl DeviceSimulator {
             }
             sip_core::Admit::Proceed(token) => token,
         };
+
+        if let Err(rejection) = self.validate_inbound_identity(req) {
+            let count = self.rejected_identity.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 5 || count % 1000 == 0 {
+                tracing::warn!(
+                    method = %req.method,
+                    from = %incoming.from,
+                    status = rejection.status,
+                    reason = rejection.detail,
+                    count,
+                    "严格入站身份校验拒绝 SIP 请求"
+                );
+            }
+            // ACK 不允许产生响应（RFC 3261）；身份错误时只静默丢弃，且绝不进入业务分派。
+            if req.method == sip_core::Method::Ack {
+                self.server_txns.abandon(&token);
+                return Ok(true);
+            }
+            let response = builder::response_status(req, rejection.status, rejection.reason);
+            self.respond(transport, incoming.from, &token, response)
+                .await?;
+            return Ok(true);
+        }
 
         let result = self
             .dispatch_inbound(transport, req, incoming.from, &token)
@@ -4669,6 +4759,36 @@ mod tests {
     use super::*;
     use sip_core::{Headers, Method, Request, Response, SipMessage, UdpTransport};
 
+    /// 经真实 UDP 接收循环注入请求,而不是手工伪造 `Incoming`。
+    ///
+    /// 这样单测同时覆盖来源限流与反放大字节信用；若直接构造 `Incoming`,随后发送的
+    /// Response 理应被传输层视为"没有对应入站请求"并阻断。
+    async fn deliver_udp_request(
+        device: &Arc<dyn SipTransport>,
+        platform: &Arc<UdpTransport>,
+        request: Request,
+    ) -> sip_core::Incoming {
+        let aor = request
+            .uri
+            .strip_prefix("sip:")
+            .and_then(|rest| rest.split(['@', ';', '>']).next())
+            .filter(|value| !value.is_empty())
+            .expect("测试请求 URI 应含 AOR")
+            .to_string();
+        let mut inbound = device.register_inbound(&aor);
+        platform
+            .send_to(
+                &SipMessage::Request(request),
+                device.local_addr().expect("设备 UDP 地址"),
+            )
+            .await
+            .expect("注入平台请求");
+        tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
+            .await
+            .expect("设备未收到测试请求")
+            .expect("设备入站路由提前关闭")
+    }
+
     fn change(id: &str, event: &str, status: &str) -> gb28181_protocol::manscdp::CatalogNotifyItem {
         gb28181_protocol::manscdp::CatalogNotifyItem {
             device_id: id.into(),
@@ -4676,6 +4796,31 @@ mod tests {
             event: event.into(),
             status: status.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn 子任务超时后被真正取消而非_detach() {
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let task = tokio::spawn(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            !await_task_with_timeout("取消测试", task, Duration::from_millis(20)).await,
+            "超时路径应报告非正常完成"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "abort 后 future 必须被 drop,资源所有权链才能收敛"
+        );
     }
 
     #[test]
@@ -4762,6 +4907,7 @@ mod tests {
             server_host: host.into(),
             server_port: port,
             server_domain: "34020000002000000001".into(),
+            inbound_identity_mode: common::InboundIdentityMode::Compatible,
             transport: Transport::Udp,
             heartbeat_interval_secs: 60,
             channels: vec![],
@@ -4779,6 +4925,165 @@ mod tests {
             gb_version: common::GbVersion::V2022,
             signaling_encoding: common::SignalingEncoding::Gb18030,
         }
+    }
+
+    fn inbound_request(method: Method, call_id: &str, from: Option<&str>) -> Request {
+        let mut headers = Headers::new();
+        headers.set(
+            "Via",
+            format!("SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-{call_id}"),
+        );
+        if let Some(from) = from {
+            headers.set("From", from);
+        }
+        headers.set("To", "<sip:34020000001320000001@3402>");
+        headers.set("Call-ID", call_id);
+        headers.set("CSeq", format!("1 {}", method.as_str()));
+        Request {
+            method,
+            uri: "sip:34020000001320000001@127.0.0.1".into(),
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    async fn answer_and_status(
+        sim: &Arc<DeviceSimulator>,
+        device: &Arc<dyn SipTransport>,
+        platform: &Arc<UdpTransport>,
+        request: Request,
+    ) -> Option<u16> {
+        let call_id = request.headers.call_id().unwrap().to_string();
+        let mut responses = platform.register(&call_id);
+        let incoming = deliver_udp_request(device, platform, request).await;
+        sim.answer_inbound(device, &incoming).await.unwrap();
+        match tokio::time::timeout(Duration::from_millis(500), responses.recv()).await {
+            Ok(Some(sip_core::Incoming {
+                message: SipMessage::Response(response),
+                ..
+            })) => Some(response.status),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn 入站身份模式严格校验_from_且_ack_静默拒绝() {
+        let device_impl = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device: Arc<dyn SipTransport> = device_impl;
+        let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = test_cfg("127.0.0.1", platform.local_addr().unwrap().port());
+        cfg.inbound_identity_mode = common::InboundIdentityMode::Strict;
+        let sim = Arc::new(DeviceSimulator::new(cfg));
+
+        assert_eq!(
+            answer_and_status(
+                &sim,
+                &device,
+                &platform,
+                inbound_request(
+                    Method::Options,
+                    "strict-ok",
+                    Some("<sip:34020000002000000001@3402>;tag=p")
+                ),
+            )
+            .await,
+            Some(200)
+        );
+        assert_eq!(
+            answer_and_status(
+                &sim,
+                &device,
+                &platform,
+                inbound_request(Method::Options, "strict-missing", None),
+            )
+            .await,
+            Some(400)
+        );
+        assert_eq!(
+            answer_and_status(
+                &sim,
+                &device,
+                &platform,
+                inbound_request(
+                    Method::Options,
+                    "strict-malformed",
+                    Some("Platform <sip:bad@3402")
+                ),
+            )
+            .await,
+            Some(400)
+        );
+        assert_eq!(
+            answer_and_status(
+                &sim,
+                &device,
+                &platform,
+                inbound_request(
+                    Method::Options,
+                    "strict-wrong",
+                    Some("<sip:attacker@3402>;tag=p")
+                ),
+            )
+            .await,
+            Some(403)
+        );
+        assert_eq!(
+            answer_and_status(
+                &sim,
+                &device,
+                &platform,
+                inbound_request(Method::Ack, "strict-ack", Some("<sip:attacker@3402>;tag=p")),
+            )
+            .await,
+            None,
+            "身份错误的 ACK 必须静默丢弃"
+        );
+    }
+
+    #[tokio::test]
+    async fn 严格身份拒绝发生在控制命令副作用之前() {
+        let device_impl = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device: Arc<dyn SipTransport> = device_impl;
+        let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = test_cfg("127.0.0.1", platform.local_addr().unwrap().port());
+        cfg.inbound_identity_mode = common::InboundIdentityMode::Strict;
+        let sim = Arc::new(DeviceSimulator::new(cfg));
+        let mut request = inbound_request(
+            Method::Message,
+            "strict-no-side-effect",
+            Some("<sip:attacker@3402>;tag=p"),
+        );
+        request.body = b"<Control><CmdType>DeviceControl</CmdType><SN>2</SN><DeviceID>34020000001320000001</DeviceID><RecordCmd>Record</RecordCmd></Control>".to_vec();
+
+        assert_eq!(
+            answer_and_status(&sim, &device, &platform, request).await,
+            Some(403)
+        );
+        assert!(
+            !sim.control_state.lock().recording,
+            "错误身份 MESSAGE 不得修改设备控制状态"
+        );
+    }
+
+    #[tokio::test]
+    async fn 入站身份兼容模式保持旧平台互操作() {
+        let device_impl = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device: Arc<dyn SipTransport> = device_impl;
+        let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let sim = Arc::new(DeviceSimulator::new(test_cfg(
+            "127.0.0.1",
+            platform.local_addr().unwrap().port(),
+        )));
+        assert_eq!(
+            answer_and_status(
+                &sim,
+                &device,
+                &platform,
+                inbound_request(Method::Options, "compatible-missing", None),
+            )
+            .await,
+            Some(200)
+        );
     }
 
     /// mock 平台:收到首个 REGISTER 回 401(带挑战),第二个回 200。
@@ -4899,10 +5204,7 @@ mod tests {
         let mut presp = platform_tp.register("opt-call-1");
 
         // 设备侧应答一条入站请求。
-        let incoming = sip_core::Incoming {
-            message: SipMessage::Request(options),
-            from: platform_addr,
-        };
+        let incoming = deliver_udp_request(&device_tp, &platform_tp, options).await;
         let answered = sim.answer_inbound(&device_tp, &incoming).await.unwrap();
         assert!(answered);
 
@@ -4954,10 +5256,7 @@ mod tests {
         };
         let mut presp = platform_tp.register("cat-call-1");
 
-        let incoming = sip_core::Incoming {
-            message: SipMessage::Request(query_msg),
-            from: platform_addr,
-        };
+        let incoming = deliver_udp_request(&device_tp, &platform_tp, query_msg).await;
         // 应答 MESSAGE 的 Request-URI 指向平台域,平台按 AOR 收独立应答。
         let mut preply = platform_tp.register_inbound("34020000002000000001");
 
@@ -5458,10 +5757,7 @@ mod tests {
             headers: h,
             body: body.into_bytes(),
         };
-        let incoming = sip_core::Incoming {
-            message: SipMessage::Request(msg),
-            from: platform_addr,
-        };
+        let incoming = deliver_udp_request(&device_tp, &platform_tp, msg).await;
         // 广播 Response 走独立 MESSAGE,平台按 AOR 收。
         let mut preply = platform_tp.register_inbound("34020000002000000001");
         sim.answer_inbound(&device_tp, &incoming).await.unwrap();
@@ -5556,10 +5852,7 @@ mod tests {
         // 位置 NOTIFY(MESSAGE)Request-URI 指向平台域,平台按 AOR 收。
         let mut pnotify = platform_tp.register_inbound("34020000002000000001");
 
-        let incoming = sip_core::Incoming {
-            message: SipMessage::Request(sub_req),
-            from: platform_addr,
-        };
+        let incoming = deliver_udp_request(&device_tp, &platform_tp, sub_req).await;
         let answered = sim.answer_inbound(&device_tp, &incoming).await.unwrap();
         assert!(answered);
 
@@ -5632,10 +5925,7 @@ mod tests {
         };
         let mut psub = platform_tp.register("alarm-sub-1");
 
-        let incoming = sip_core::Incoming {
-            message: SipMessage::Request(sub_req),
-            from: platform_addr,
-        };
+        let incoming = deliver_udp_request(&device_tp, &platform_tp, sub_req).await;
         assert!(sim.answer_inbound(&device_tp, &incoming).await.unwrap());
 
         // 平台收到订阅 200(To 带本端 tag)。
@@ -5719,20 +6009,22 @@ mod tests {
                 "To",
                 "<sip:34020000001320000001@34020000002000000001>;tag=d",
             );
-            sip_core::Incoming {
-                message: SipMessage::Request(Request {
-                    method: Method::Info,
-                    uri: "sip:34020000001320000001@127.0.0.1".into(),
-                    headers: h,
-                    body: body.as_bytes().to_vec(),
-                }),
-                from: platform_addr,
+            Request {
+                method: Method::Info,
+                uri: "sip:34020000001320000001@127.0.0.1".into(),
+                headers: h,
+                body: body.as_bytes().to_vec(),
             }
         };
         let mut prx = platform_tp.register("info-call-1");
 
         // PLAY + Scale=2.0 → 倍速 2.0,未暂停。
-        let inc = make_info(2, "PLAY MANSRTSP/1.0\r\nCSeq: 2\r\nScale: 2.0\r\n\r\n");
+        let inc = deliver_udp_request(
+            &device_tp,
+            &platform_tp,
+            make_info(2, "PLAY MANSRTSP/1.0\r\nCSeq: 2\r\nScale: 2.0\r\n\r\n"),
+        )
+        .await;
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         assert_eq!(control.speed(), 2.0);
         assert!(!control.is_paused());
@@ -5744,19 +6036,35 @@ mod tests {
         matches!(ok.message, SipMessage::Response(r) if r.status == 200);
 
         // PAUSE → 暂停。
-        let inc = make_info(3, "PAUSE MANSRTSP/1.0\r\nCSeq: 3\r\nPauseTime: now\r\n\r\n");
+        let inc = deliver_udp_request(
+            &device_tp,
+            &platform_tp,
+            make_info(3, "PAUSE MANSRTSP/1.0\r\nCSeq: 3\r\nPauseTime: now\r\n\r\n"),
+        )
+        .await;
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         assert!(control.is_paused());
 
         // PLAY(无 Scale)→ 恢复,倍速回 1.0。
-        let inc = make_info(4, "PLAY MANSRTSP/1.0\r\nCSeq: 4\r\n\r\n");
+        let inc = deliver_udp_request(
+            &device_tp,
+            &platform_tp,
+            make_info(4, "PLAY MANSRTSP/1.0\r\nCSeq: 4\r\n\r\n"),
+        )
+        .await;
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         assert!(!control.is_paused());
         assert_eq!(control.speed(), 1.0);
 
         // 同一 (branch, CSeq) 的重传:必须只重发缓存响应,**不能**再跑一遍业务逻辑。
         control.pause();
-        assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
+        let retransmit = deliver_udp_request(
+            &device_tp,
+            &platform_tp,
+            make_info(4, "PLAY MANSRTSP/1.0\r\nCSeq: 4\r\n\r\n"),
+        )
+        .await;
+        assert!(sim.answer_inbound(&device_tp, &retransmit).await.unwrap());
         assert!(
             control.is_paused(),
             "重传的 INFO 不应被当成新命令重新执行 PLAY"
@@ -5804,22 +6112,17 @@ y=0100000001\r\n";
             );
             h.set("To", "<sip:34020000001320000132@34020000002000000001>");
             h.set("Content-Type", "application/sdp");
-            sip_core::Incoming {
-                message: SipMessage::Request(Request {
-                    method: Method::Invite,
-                    uri: "sip:34020000001320000132@127.0.0.1".into(),
-                    headers: h,
-                    body: sdp.as_bytes().to_vec(),
-                }),
-                from: platform_addr,
+            Request {
+                method: Method::Invite,
+                uri: "sip:34020000001320000132@127.0.0.1".into(),
+                headers: h,
+                body: sdp.as_bytes().to_vec(),
             }
         };
 
         let mut prx = platform_tp.register("invite-retrans");
-        assert!(sim
-            .answer_inbound(&device_tp, &make_invite())
-            .await
-            .unwrap());
+        let first_invite = deliver_udp_request(&device_tp, &platform_tp, make_invite()).await;
+        assert!(sim.answer_inbound(&device_tp, &first_invite).await.unwrap());
 
         // 收 100 Trying 与 200 OK。
         let mut statuses = Vec::new();
@@ -5838,10 +6141,8 @@ y=0100000001\r\n";
         );
 
         // 重传同一条 INVITE:应重发缓存的 200,而不是 486。
-        assert!(sim
-            .answer_inbound(&device_tp, &make_invite())
-            .await
-            .unwrap());
+        let retransmit = deliver_udp_request(&device_tp, &platform_tp, make_invite()).await;
+        assert!(sim.answer_inbound(&device_tp, &retransmit).await.unwrap());
         let inc = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
             .await
             .expect("超时")
@@ -5872,15 +6173,13 @@ y=0100000001\r\n";
         h.set("Call-ID", "publish-call");
         h.set("CSeq", "1 PUBLISH");
         h.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-pub");
-        let inc = sip_core::Incoming {
-            message: SipMessage::Request(Request {
-                method: Method::Publish,
-                uri: "sip:34020000001320000001@127.0.0.1".into(),
-                headers: h,
-                body: Vec::new(),
-            }),
-            from: platform_addr,
+        let request = Request {
+            method: Method::Publish,
+            uri: "sip:34020000001320000001@127.0.0.1".into(),
+            headers: h,
+            body: Vec::new(),
         };
+        let inc = deliver_udp_request(&device_tp, &platform_tp, request).await;
         let mut prx = platform_tp.register("publish-call");
         assert!(sim.answer_inbound(&device_tp, &inc).await.unwrap());
         let got = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())

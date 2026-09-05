@@ -10,7 +10,7 @@
 //! # 包里有什么
 //!
 //! ```text
-//! uvp-diagnostics-<时间戳>.zip
+//! uvp-diagnostics-<纳秒>-<计数>.zip
 //! ├── README.txt          说明 + 隐私声明
 //! ├── environment.json    工具版本 / OS / CPU 核数 / fd 限额 / 日志目录 / ffmpeg 可用性
 //! └── logs/uvp-*.log      滚动日志文件(全部保留副本)
@@ -56,6 +56,8 @@ pub struct Environment {
     pub work_dir: String,
     /// ffmpeg 是否可用(实时采集与容器转封装依赖它)。
     pub ffmpeg_available: bool,
+    /// 应用托管报告/诊断产物的默认自动清理策略。
+    pub artifact_retention: crate::artifacts::RetentionPolicy,
     /// 导出时刻(Unix 秒)。
     pub exported_at_epoch_secs: u64,
 }
@@ -82,6 +84,7 @@ impl Environment {
             log_lines_dropped: common::logging::file_dropped(),
             work_dir: media_rtp::work_dir().display().to_string(),
             ffmpeg_available: media_rtp::ffmpeg_bin().is_some(),
+            artifact_retention: crate::artifacts::RetentionPolicy::default(),
             exported_at_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -174,27 +177,39 @@ fn readme(env: &Environment) -> String {
 ///
 /// `out_dir` 为输出目录(与压测报告同一个位置)。日志文件读取失败时**跳过该文件继续**
 /// —— 少一个日志文件的诊断包也远比"导出失败什么都没有"有用。
-pub fn export(out_dir: &Path) -> Result<PathBuf, String> {
+pub fn export(
+    out_dir: &Path,
+    preserve: &std::collections::HashSet<PathBuf>,
+) -> Result<PathBuf, String> {
+    crate::artifacts::create_secure_dir(out_dir)
+        .map_err(|error| format!("创建导出目录失败: {error}"))?;
+    let pre_health = crate::artifacts::cleanup(
+        out_dir,
+        crate::artifacts::RetentionPolicy::default(),
+        preserve,
+    );
+    if !pre_health.healthy {
+        tracing::warn!(?pre_health, "诊断导出前产物清理未完全健康");
+    }
+
     let env = Environment::collect();
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("创建导出目录失败: {e}"))?;
-    let path = out_dir.join(format!(
-        "uvp-diagnostics-{}.zip",
-        env.exported_at_epoch_secs
-    ));
-    let file = std::fs::File::create(&path).map_err(|e| format!("创建诊断包失败: {e}"))?;
-    let mut zip = zip::ZipWriter::new(file);
+    let (nanos, counter) = crate::artifacts::unique_timestamp_counter();
+    let path = out_dir.join(format!("uvp-diagnostics-{nanos}-{counter}.zip"));
+    let mut staged = crate::artifacts::AtomicFile::new(&path)
+        .map_err(|error| format!("创建诊断包 staging 失败: {error}"))?;
+    let mut zip = zip::ZipWriter::new(staged.file_mut());
     let options: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    let add = |zip: &mut zip::ZipWriter<std::fs::File>, name: &str, bytes: &[u8]| {
+    let add = |zip: &mut zip::ZipWriter<&mut std::fs::File>, name: &str, bytes: &[u8]| {
         zip.start_file(name, options)
             .and_then(|_| zip.write_all(bytes).map_err(Into::into))
-            .map_err(|e| format!("写入 {name} 失败: {e}"))
+            .map_err(|error| format!("写入 {name} 失败: {error}"))
     };
 
     add(&mut zip, "README.txt", readme(&env).as_bytes())?;
     let env_json =
-        serde_json::to_vec_pretty(&env).map_err(|e| format!("环境快照序列化失败: {e}"))?;
+        serde_json::to_vec_pretty(&env).map_err(|error| format!("环境快照序列化失败: {error}"))?;
     add(&mut zip, "environment.json", &env_json)?;
 
     let mut logs_added = 0usize;
@@ -202,7 +217,7 @@ pub fn export(out_dir: &Path) -> Result<PathBuf, String> {
         let mut files = common::logfile::list_log_files(&dir);
         files.sort();
         for log in files {
-            let Some(name) = log.file_name().and_then(|n| n.to_str()) else {
+            let Some(name) = log.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
             match std::fs::read(&log) {
@@ -210,7 +225,6 @@ pub fn export(out_dir: &Path) -> Result<PathBuf, String> {
                     add(&mut zip, &format!("logs/{name}"), &bytes)?;
                     logs_added += 1;
                 }
-                // 正在被写入的文件在 Windows 上可能读不到:跳过而不是让整个导出失败。
                 Err(error) => {
                     tracing::debug!(%error, file = %log.display(), "诊断包跳过一个日志文件");
                 }
@@ -218,18 +232,42 @@ pub fn export(out_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    zip.finish().map_err(|e| format!("诊断包收尾失败: {e}"))?;
-    tracing::info!(
-        path = %path.display(),
-        logs_added,
-        "已导出诊断包"
+    zip.finish()
+        .map_err(|error| format!("诊断包收尾失败: {error}"))?;
+    let published = staged
+        .publish()
+        .map_err(|error| format!("原子发布诊断包失败: {error}"))?;
+    if let Some(warning) = published.durability_warning() {
+        tracing::warn!(warning, path = %published.path().display(), "诊断包持久性降级");
+    }
+    let path = published.path().to_path_buf();
+
+    let mut preserved = preserve.clone();
+    preserved.insert(path.clone());
+    let health = crate::artifacts::cleanup(
+        out_dir,
+        crate::artifacts::RetentionPolicy::default(),
+        &preserved,
     );
+    if !health.healthy {
+        tracing::warn!(?health, "诊断导出后产物清理未完全健康");
+    }
+    // published guard 一直保留到 preserve 清理交接完成，避免并发 cleanup 删除 final。
+    drop(published);
+    tracing::info!(path = %path.display(), logs_added, "已导出诊断包");
     Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "uvp-diag-{label}-{}",
+            crate::artifacts::unique_suffix()
+        ))
+    }
 
     #[test]
     fn 环境快照包含排障必需项() {
@@ -265,9 +303,9 @@ mod tests {
 
     #[test]
     fn 导出产出可打开的zip且含必需条目() {
-        let dir = std::env::temp_dir().join("uvp-diag-test");
+        let dir = test_dir("export");
         let _ = std::fs::remove_dir_all(&dir);
-        let path = export(&dir).expect("导出应成功");
+        let path = export(&dir, &std::collections::HashSet::new()).expect("导出应成功");
         assert!(path.exists() && path.extension().is_some_and(|e| e == "zip"));
 
         // 真正打开读一遍:只断言"文件存在"会漏掉写坏的 zip。
@@ -286,19 +324,36 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("应是合法 JSON");
         assert!(parsed.get("version").is_some());
         assert!(parsed.get("fd_limit").is_some());
+        assert!(parsed.get("artifact_retention").is_some());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 连续导出使用唯一名称且不残留staging() {
+        let dir = test_dir("unique");
+        let preserve = std::collections::HashSet::new();
+        let first = export(&dir, &preserve).expect("第一次导出");
+        let second = export(&dir, &preserve).expect("第二次导出");
+        assert_ne!(first, second, "同秒连续导出不得覆盖");
+        assert!(first.exists() && second.exists());
+        let temp_remains = std::fs::read_dir(&dir)
+            .expect("读目录")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".uvp-"));
+        assert!(!temp_remains, "成功发布后不应残留 staging");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn 目录不可写时报错而不panic() {
         // 传一个普通文件当输出目录。
-        let dir = std::env::temp_dir().join("uvp-diag-badpath");
+        let dir = test_dir("badpath");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建目录");
         let file = dir.join("occupied");
         std::fs::write(&file, b"x").expect("写文件");
-        assert!(export(&file).is_err());
+        assert!(export(&file, &std::collections::HashSet::new()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

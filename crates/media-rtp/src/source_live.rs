@@ -686,13 +686,13 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
 }
 
 fn detect_audio_encoders(ffmpeg: &str) -> (bool, bool) {
-    let Ok(output) = Command::new(ffmpeg)
-        .args(["-hide_banner", "-encoders"])
-        .output()
+    let mut command = Command::new(ffmpeg);
+    command.args(["-hide_banner", "-nostdin", "-encoders"]);
+    let Ok(output) = crate::source::run_command_bounded(&mut command, Duration::from_secs(8))
     else {
         return (false, false);
     };
-    if !output.status.success() {
+    if output.timed_out || !output.status.success() {
         return (false, false);
     }
     let listing = String::from_utf8_lossy(&output.stdout);
@@ -726,10 +726,23 @@ fn ensure_audio_encoder(ffmpeg: &str, codec: LiveAudioCodec) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn enumerate_avfoundation(ffmpeg: &str) -> Result<(Vec<LiveAvDevice>, Vec<LiveAvDevice>)> {
-    let output = Command::new(ffmpeg)
-        .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
-        .output()
+    let mut command = Command::new(ffmpeg);
+    command.args([
+        "-nostdin",
+        "-f",
+        "avfoundation",
+        "-list_devices",
+        "true",
+        "-i",
+        "",
+    ]);
+    let output = crate::source::run_command_bounded(&mut command, Duration::from_secs(10))
         .map_err(|e| Error::Media(format!("failed to enumerate AVFoundation devices: {e}")))?;
+    if output.timed_out {
+        return Err(Error::Media(
+            "AVFoundation device enumeration timed out after 10 seconds".into(),
+        ));
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut cameras = Vec::new();
     let mut microphones = Vec::new();
@@ -793,6 +806,8 @@ pub struct LiveSource {
     fps: u32,
     codec: LiveVideoCodec,
     children: Vec<Child>,
+    /// FFmpeg 会话级诊断文件。子进程 wait 后删除,避免临时目录无限积累。
+    report_files: Vec<std::path::PathBuf>,
     stop_flag: Arc<AtomicBool>,
     producer_alive: Arc<AtomicBool>,
     terminal_error: Arc<Mutex<Option<String>>>,
@@ -937,12 +952,9 @@ impl LiveSource {
         // 但"日志完全看不到"是不可接受的:失败时只能报一句"stopped unexpectedly"。
         // 用 ffmpeg 自带的 FFREPORT 把日志写到文件,既不占 stderr 也保住了诊断。
         let report_path = if audio_index.is_some() {
-            let path = crate::source::work_dir().join(format!(
-                "ffmpeg-camera-{video_index}-{}.log",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_file(&path);
-            // FFREPORT 的 file= 里 ':' 与 '\\' 需转义。
+            let path = crate::source::create_private_work_file("ffmpeg-camera", "log")?;
+            // FFREPORT 的 file= 里 ':' 与 '\\' 需转义。文件已由 Rust 以 create_new
+            // 原子占位并在 Unix 设为 0600,FFmpeg 只截断本次会话的高熵路径。
             let escaped = path
                 .to_string_lossy()
                 .replace('\\', "\\\\")
@@ -952,15 +964,26 @@ impl LiveSource {
         } else {
             None
         };
+        let report_cleanup = TemporaryFileCleanup::new(report_path.clone());
         if audio_index.is_some() {
             command.args(["-map", "0:a:0"]);
             audio_codec.append_ffmpeg_output(&mut command, "pipe:2");
         }
-        let video = command
+        let video = match command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::Media(format!("failed to start {video_label}: {e}")))?;
+        {
+            Ok(video) => video,
+            Err(error) => {
+                if let Some(path) = report_path.as_deref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(Error::Media(format!(
+                    "failed to start {video_label}: {error}"
+                )));
+            }
+        };
 
         let mut startup = StartupChildren::new(video);
         let video_tail = if audio_index.is_some() {
@@ -1094,12 +1117,16 @@ impl LiveSource {
                 .as_deref()
                 .map(read_report_tail)
                 .unwrap_or_default();
+            if let Some(path) = report_path.as_deref() {
+                let _ = std::fs::remove_file(path);
+            }
             if tail.is_empty() {
                 return Err(error);
             }
             return Err(Error::Media(format!("{error}; ffmpeg log: {tail}")));
         }
         let children = startup.disarm();
+        let report_files = report_cleanup.persist().into_iter().collect();
 
         Ok(Self {
             rx,
@@ -1112,6 +1139,7 @@ impl LiveSource {
             fps,
             codec: profile.codec,
             children,
+            report_files,
             stop_flag,
             producer_alive,
             terminal_error,
@@ -1269,7 +1297,7 @@ impl LiveSource {
                 let fps_text = fps.to_string();
                 let bitrate = format!("{}k", profile.bitrate_kbps);
                 let gop_text = profile.gop.to_string();
-                let mut child = Command::new(&ffmpeg)
+                let child = Command::new(&ffmpeg)
                     .args([
                         "-hide_banner",
                         "-nostdin",
@@ -1303,15 +1331,22 @@ impl LiveSource {
                     .stderr(Stdio::piped())
                     .spawn()
                     .map_err(|e| Error::Media(format!("failed to start H.265 encoder: {e}")))?;
-                let mut stdin = child
+                // spawn 成功后第一时间交给 armed guard；此后任一 pipe/tail 初始化失败,
+                // StartupChildren::drop 都会 kill+wait，不能让 std::process::Child drop 后孤儿化。
+                screen_startup.children.push(child);
+                let child_index = screen_startup.children.len() - 1;
+                let mut stdin = screen_startup.children[child_index]
                     .stdin
                     .take()
                     .ok_or_else(|| Error::Media("failed to open H.265 encoder stdin".into()))?;
-                let mut stdout = child
+                let mut stdout = screen_startup.children[child_index]
                     .stdout
                     .take()
                     .ok_or_else(|| Error::Media("failed to open H.265 encoder stdout".into()))?;
-                let stderr_tail = capture_stderr_tail(&mut child, "H.265 screen encoder")?;
+                let stderr_tail = capture_stderr_tail(
+                    &mut screen_startup.children[child_index],
+                    "H.265 screen encoder",
+                )?;
                 let writer_tail = Arc::clone(&stderr_tail);
                 let reader_tail = Arc::clone(&stderr_tail);
                 let writer_stop = Arc::clone(&stop_flag);
@@ -1359,7 +1394,6 @@ impl LiveSource {
                     }
                     encoder_alive.store(false, Ordering::Release);
                 });
-                screen_startup.children.push(child);
             }
         }
 
@@ -1477,7 +1511,7 @@ impl LiveSource {
                             "-vn",
                         ]);
                         audio_codec.append_ffmpeg_output(&mut command, "pipe:1");
-                        let mut encoder = command
+                        let encoder = command
                             .stdin(Stdio::piped())
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
@@ -1485,14 +1519,20 @@ impl LiveSource {
                             .map_err(|error| {
                                 Error::Media(format!("failed to start {label}: {error}"))
                             })?;
-                        let stdin = encoder
+                        screen_startup.children.push(encoder);
+                        let child_index = screen_startup.children.len() - 1;
+                        let stdin = screen_startup.children[child_index]
                             .stdin
                             .take()
                             .ok_or_else(|| Error::Media(format!("failed to open {label} stdin")))?;
-                        let mut stdout = encoder.stdout.take().ok_or_else(|| {
-                            Error::Media(format!("failed to open {label} stdout"))
-                        })?;
-                        let tail = capture_stderr_tail(&mut encoder, &label)?;
+                        let mut stdout = screen_startup.children[child_index]
+                            .stdout
+                            .take()
+                            .ok_or_else(|| {
+                                Error::Media(format!("failed to open {label} stdout"))
+                            })?;
+                        let tail =
+                            capture_stderr_tail(&mut screen_startup.children[child_index], &label)?;
                         let input = Arc::new(Mutex::new(stdin));
                         let callback_input = Arc::clone(&input);
                         if stream
@@ -1514,7 +1554,6 @@ impl LiveSource {
                             )
                             .is_none()
                         {
-                            let _ = encoder.kill();
                             return Err(Error::Media(
                                 "ScreenCaptureKit rejected the system-audio output handler".into(),
                             ));
@@ -1553,7 +1592,6 @@ impl LiveSource {
                                 }
                             }
                         });
-                        screen_startup.children.push(encoder);
                         microphone_ready = Some(ready);
                         microphone_tail = Some(tail);
                     }
@@ -1701,6 +1739,7 @@ impl LiveSource {
             fps,
             codec: profile.codec,
             children,
+            report_files: Vec::new(),
             stop_flag,
             producer_alive,
             terminal_error,
@@ -1726,6 +1765,29 @@ struct CameraStartup {
     video_index: u32,
     audio_index: Option<u32>,
     input_fps: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct TemporaryFileCleanup(Option<std::path::PathBuf>);
+
+#[cfg(target_os = "macos")]
+impl TemporaryFileCleanup {
+    fn new(path: Option<std::path::PathBuf>) -> Self {
+        Self(path)
+    }
+
+    fn persist(mut self) -> Option<std::path::PathBuf> {
+        self.0.take()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TemporaryFileCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2165,6 +2227,13 @@ impl Drop for LiveSource {
         for child in &mut self.children {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        for report in self.report_files.drain(..) {
+            if let Err(error) = std::fs::remove_file(&report) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(%error, path = %report.display(), "清理 FFmpeg 临时报告失败");
+                }
+            }
         }
     }
 }

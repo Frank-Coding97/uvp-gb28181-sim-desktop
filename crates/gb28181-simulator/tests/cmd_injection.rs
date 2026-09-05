@@ -6,7 +6,7 @@ use std::time::Duration;
 use common::{DeviceId, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use sip_core::SipTransport;
-use sip_core::{Headers, Incoming, Method, Request, SipMessage, UdpTransport};
+use sip_core::{Headers, Method, Request, SipMessage, UdpTransport};
 
 fn cfg() -> DeviceConfig {
     DeviceConfig {
@@ -16,6 +16,7 @@ fn cfg() -> DeviceConfig {
         server_host: "127.0.0.1".into(),
         server_port: 5060,
         server_domain: "3402000000".into(),
+        inbound_identity_mode: common::InboundIdentityMode::Compatible,
         transport: Transport::Udp,
         register_expires_secs: 3600,
         register_retry_max_secs: 60,
@@ -63,15 +64,22 @@ async fn inject_and_collect(
     sim: &Arc<DeviceSimulator>,
     device_tp: &Arc<dyn SipTransport>,
     platform_tp: &Arc<dyn SipTransport>,
-    platform_addr: std::net::SocketAddr,
     call_id: &str,
     body: &str,
 ) -> Vec<String> {
     let mut reply = platform_tp.register_inbound("3402000000");
-    let incoming = Incoming {
-        message: message("p1", call_id, body),
-        from: platform_addr,
-    };
+    let mut inbound = device_tp.register_inbound("34020000001110000001");
+    platform_tp
+        .send_to(
+            &message("p1", call_id, body),
+            device_tp.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
+    let incoming = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
+        .await
+        .expect("设备未收到注入命令")
+        .expect("设备入站路由关闭");
     sim.answer_inbound(device_tp, &incoming).await.unwrap();
     let mut bodies = Vec::new();
     // 应答为独立 MESSAGE(入 AOR 路由);等首条应答即可,500ms 兜底超时。
@@ -89,7 +97,6 @@ async fn 全部查询命令注入应答() {
     let sim = Arc::new(DeviceSimulator::new(cfg()));
     let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
     let platform_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let platform_addr = platform_tp.local_addr().unwrap();
     // 让设备知道本端地址(应答 From 填充用)。
     sim.set_local_addr_for_test("127.0.0.1", device_tp.local_addr().unwrap().port());
 
@@ -109,15 +116,7 @@ async fn 全部查询命令注入应答() {
 
     for (i, (name, body)) in queries.iter().enumerate() {
         let call_id = format!("q-{i}");
-        let bodies = inject_and_collect(
-            &sim,
-            &device_tp,
-            &platform_tp,
-            platform_addr,
-            &call_id,
-            body,
-        )
-        .await;
+        let bodies = inject_and_collect(&sim, &device_tp, &platform_tp, &call_id, body).await;
         let joined = bodies.join("\n");
         assert!(
             joined.contains(&format!("<CmdType>{name}</CmdType>")),
@@ -132,21 +131,12 @@ async fn 设备配置控制注入应答() {
     let sim = Arc::new(DeviceSimulator::new(cfg()));
     let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
     let platform_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let platform_addr = platform_tp.local_addr().unwrap();
     sim.set_local_addr_for_test("127.0.0.1", device_tp.local_addr().unwrap().port());
     let dev = "34020000001110000001";
 
     // DeviceConfig 修改 → 应答 CmdType=DeviceConfig(A.2.6.8)。
     let body = format!("<Control><CmdType>DeviceConfig</CmdType><SN>1</SN><DeviceID>{dev}</DeviceID><BasicParam><Name>NewName</Name></BasicParam></Control>");
-    let bodies = inject_and_collect(
-        &sim,
-        &device_tp,
-        &platform_tp,
-        platform_addr,
-        "cfg-1",
-        &body,
-    )
-    .await;
+    let bodies = inject_and_collect(&sim, &device_tp, &platform_tp, "cfg-1", &body).await;
     let joined = bodies.join("\n");
     assert!(
         joined.contains("<CmdType>DeviceConfig</CmdType>"),
@@ -157,15 +147,7 @@ async fn 设备配置控制注入应答() {
 
     // DeviceControl(录像) → 应答 CmdType=DeviceControl。
     let body2 = format!("<Control><CmdType>DeviceControl</CmdType><SN>2</SN><DeviceID>{dev}</DeviceID><RecordCmd>Record</RecordCmd></Control>");
-    let bodies2 = inject_and_collect(
-        &sim,
-        &device_tp,
-        &platform_tp,
-        platform_addr,
-        "ctrl-1",
-        &body2,
-    )
-    .await;
+    let bodies2 = inject_and_collect(&sim, &device_tp, &platform_tp, "ctrl-1", &body2).await;
     let joined2 = bodies2.join("\n");
     assert!(
         joined2.contains("<CmdType>DeviceControl</CmdType>"),
@@ -184,7 +166,6 @@ async fn 多通道子通道点播建立会话() {
     sim.load_catalog_template("nvr-8ch");
     let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
     let platform_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let platform_addr = platform_tp.local_addr().unwrap();
     sim.set_local_addr_for_test("127.0.0.1", device_tp.local_addr().unwrap().port());
 
     // 子通道 ID(nvr-8ch 模板第 1 个视频通道)。
@@ -207,15 +188,21 @@ async fn 多通道子通道点播建立会话() {
     h.set("Call-ID", "invite-ch-1");
     h.set("CSeq", "1 INVITE");
     h.set("Content-Type", "application/sdp");
-    let inc = Incoming {
-        message: SipMessage::Request(Request {
-            method: Method::Invite,
-            uri: format!("sip:{}@127.0.0.1", ch.id),
-            headers: h,
-            body: sdp.into_bytes(),
-        }),
-        from: platform_addr,
-    };
+    let request = SipMessage::Request(Request {
+        method: Method::Invite,
+        uri: format!("sip:{}@127.0.0.1", ch.id),
+        headers: h,
+        body: sdp.into_bytes(),
+    });
+    let mut inbound = device_tp.register_inbound(&ch.id);
+    platform_tp
+        .send_to(&request, device_tp.local_addr().unwrap())
+        .await
+        .unwrap();
+    let inc = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
+        .await
+        .expect("设备未收到子通道 INVITE")
+        .expect("子通道路由关闭");
     // 应答不报错(建立会话);再发 BYE 停止,避免残留。
     let ok = sim.answer_inbound(&device_tp, &inc).await;
     assert!(ok.is_ok(), "子通道 INVITE 应成功建立会话,实际: {ok:?}");

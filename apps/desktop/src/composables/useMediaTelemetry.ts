@@ -8,6 +8,7 @@
 // 推事件等于给 webview 灌洪水,500ms 轮询已经比 RR 本身的周期密得多。
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { formatError } from "../lib/ipcError";
 
 /** 平台回报的收流质量(对应 Rust 侧 media_rtp::RtcpFeedbackSnapshot)。 */
 export interface RtcpFeedback {
@@ -124,7 +125,7 @@ async function poll() {
     lastError.value = "";
   } catch (e) {
     // 设备未启动/无会话后端已按 null 返回,落到这里的才是真异常。
-    lastError.value = String(e);
+    lastError.value = formatError(e, "读取推流质量失败");
     telemetry.value = null;
   }
 }

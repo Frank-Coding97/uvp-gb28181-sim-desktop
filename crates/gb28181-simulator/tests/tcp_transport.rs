@@ -28,6 +28,7 @@ fn tcp_cfg(server_host: &str, server_port: u16, channels: usize) -> DeviceConfig
         server_host: server_host.into(),
         server_port,
         server_domain: "34020000002000000001".into(),
+        inbound_identity_mode: common::InboundIdentityMode::Compatible,
         transport: Transport::Tcp,
         heartbeat_interval_secs: 3600,
         register_expires_secs: 600,

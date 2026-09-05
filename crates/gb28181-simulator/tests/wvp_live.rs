@@ -22,6 +22,7 @@ fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
             .parse()
             .expect("WVP_SERVER_PORT 非法"),
         server_domain: required_env("WVP_SERVER_DOMAIN"),
+        inbound_identity_mode: common::InboundIdentityMode::Compatible,
         transport: Transport::Udp,
         register_expires_secs: 3600,
         register_retry_max_secs: 60,

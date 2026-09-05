@@ -6,6 +6,7 @@ const platform = {
   server_host: " 192.168.1.10 ",
   server_port: 5060,
   server_domain: " 34020000002000000001 ",
+  inbound_identity_mode: "strict" as const,
   transport: "udp",
 };
 
@@ -52,6 +53,7 @@ describe("buildScenarioToml", () => {
     const toml = buildScenarioToml(form(), platform);
     expect(toml).toContain('server_host = "192.168.1.10"');
     expect(toml).toContain('server_domain = "34020000002000000001"');
+    expect(toml).toContain('inbound_identity_mode = "strict"');
     expect(toml).toContain('transport = "UDP"');
     expect(toml).toContain("server_port = 5060");
   });
@@ -84,6 +86,7 @@ describe("buildScenarioToml", () => {
     for (const key of [
       "base_device_id",
       "server_host",
+      "inbound_identity_mode",
       "transport",
       "heartbeat_interval_secs",
       "ramp_per_second",

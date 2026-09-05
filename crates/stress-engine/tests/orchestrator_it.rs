@@ -66,6 +66,7 @@ fn scenario_for(port: u16) -> LinearScenario {
         server_host: "127.0.0.1".into(),
         server_port: port,
         server_domain: "34020000002000000001".into(),
+        inbound_identity_mode: common::InboundIdentityMode::Compatible,
         transport: common::Transport::Udp,
         heartbeat_interval_secs: 3600,
         register_expires_secs: 3600,
@@ -107,7 +108,11 @@ async fn 编排器批量注册_平台收到全部() {
 
     // 停止并等待退出。
     let _ = stop_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), run).await;
+    tokio::time::timeout(std::time::Duration::from_secs(3), run)
+        .await
+        .expect("编排器应在停止后 3 秒内完成")
+        .expect("编排器任务不应 panic")
+        .expect("主动停止应正常完成");
 
     // 平台应至少收到 N 个 REGISTER(可能因重传更多)。
     assert!(

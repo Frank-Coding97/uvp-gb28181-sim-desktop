@@ -5,6 +5,7 @@
 // 500 ms 一次足够让音量条看起来是活的。
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { formatError } from "../lib/ipcError";
 
 /** 收流统计(对应 Rust 侧 media_rtp::RecvStatsSnapshot)。 */
 export interface RecvStats {
@@ -75,7 +76,7 @@ async function poll() {
     lastError.value = "";
   } catch (e) {
     // 设备未启动等情形后端已按"无会话"返回,这里剩下的才是真异常。
-    lastError.value = String(e);
+    lastError.value = formatError(e, "读取语音广播状态失败");
     session.value = null;
   }
 }
@@ -102,7 +103,7 @@ async function hangup(): Promise<{ ok: boolean; message: string }> {
     await poll();
     return { ok: true, message };
   } catch (e) {
-    return { ok: false, message: String(e) };
+    return { ok: false, message: formatError(e, "挂断语音广播失败") };
   }
 }
 

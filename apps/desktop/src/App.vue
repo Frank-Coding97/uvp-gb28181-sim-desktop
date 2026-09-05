@@ -20,8 +20,16 @@ import GitNetworkOutline from "@vicons/ionicons5/es/GitNetworkOutline.js";
 import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
+import type { InboundIdentityMode, PlatformTransport, SignalingEncoding } from "./platform";
 import { useDevice } from "./device";
 import { useTheme } from "./theme";
+import {
+  consumeStorageIssues,
+  subscribeStorageIssues,
+  type StorageIssue,
+  type StorageIssueType,
+} from "./lib/versionedStorage";
+import { formatError, type IpcErrorDto } from "./lib/ipcError";
 
 const route = useRoute();
 const router = useRouter();
@@ -68,7 +76,16 @@ const profileOptions = computed(() =>
 const editOpen = ref(false);
 let editTargetId: string | null = null;
 // password 是「待写入钥匙串」的一次性输入,留空表示不改动已保存的密码。
-const editForm = ref({ name: "", server_host: "", server_port: 5060, server_domain: "", password: "", transport: "UDP", signaling_encoding: "GB18030" });
+const editForm = ref({
+  name: "",
+  server_host: "",
+  server_port: 5060,
+  server_domain: "",
+  password: "",
+  transport: "UDP" as PlatformTransport,
+  signaling_encoding: "GB18030" as SignalingEncoding,
+  inbound_identity_mode: "compatible" as InboundIdentityMode,
+});
 const secretHint = computed(() =>
   activeHasSecret.value ? "已保存到系统钥匙串,留空则不改动" : "尚未配置,注册前必须填写"
 );
@@ -85,13 +102,16 @@ function openEditModal() {
 }
 async function saveEdit() {
   const { password, ...profile } = editForm.value;
-  updateProfile(activeId.value, profile);
+  if (!updateProfile(activeId.value, profile)) {
+    topMessage.value = { text: "平台档案保存失败，当前更改未提交", ok: false };
+    return;
+  }
   if (password) {
     try {
       const msg = await savePassword(activeId.value, password);
       topMessage.value = { text: msg, ok: true };
     } catch (e) {
-      topMessage.value = { text: `密码保存失败:${String(e)}`, ok: false };
+      topMessage.value = { text: formatError(e, "密码保存失败"), ok: false };
       return; // 密码没存上就别关窗,让用户重试
     }
   }
@@ -100,8 +120,13 @@ async function saveEdit() {
   editOpen.value = false;
 }
 function addNew() {
-  addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
-    server_domain: "34020000002000000001", transport: "UDP", signaling_encoding: "GB18030" });
+  const id = addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
+    server_domain: "34020000002000000001", inbound_identity_mode: "compatible",
+    transport: "UDP", signaling_encoding: "GB18030" });
+  if (!id) {
+    topMessage.value = { text: "平台档案保存失败，未新增档案", ok: false };
+    return;
+  }
   openEdit();
 }
 // App.vue **本身**渲染 n-dialog-provider,所以它自己不能用 useDialog()
@@ -130,6 +155,10 @@ const transportOptions = [
 const encodingOptions = [
   { label: "GB18030(国标默认)", value: "GB18030" },
   { label: "UTF-8", value: "UTF-8" },
+];
+const inboundIdentityOptions = [
+  { label: "兼容模式", value: "compatible" },
+  { label: "严格模式", value: "strict" },
 ];
 
 const activeKey = computed(() => route.path);
@@ -176,24 +205,62 @@ watch(topMessage, (v) => {
 });
 
 // 全局错误条:订阅后端运行时错误(如点播采集失败),所有页面可见。
-interface DeviceError { scope: string; message: string; ts_ms: number; }
-const lastError = ref<DeviceError | null>(null);
+// 新事件为 { scope, error: IpcError, ts_ms }；message 保留一个版本兼容。
+interface DeviceErrorEvent {
+  scope: string;
+  error?: IpcErrorDto;
+  message?: string;
+  ts_ms: number;
+}
+interface DisplayDeviceError { scope: string; message: string; ts_ms: number; }
+const lastError = ref<DisplayDeviceError | null>(null);
 function dismissError() { lastError.value = null; }
 const errorScopeLabel: Record<string, string> = {
-  capture: "视频源采集", invite: "点播", stream: "推流", register: "注册",
+  capture: "视频源采集", invite: "点播", stream: "推流", broadcast: "语音广播", register: "注册",
 };
+function acceptDeviceError(payload: DeviceErrorEvent) {
+  const fallback = `${errorScopeLabel[payload.scope] ?? payload.scope}失败`;
+  lastError.value = {
+    scope: payload.scope,
+    message: formatError(payload.error ?? payload.message ?? "未知错误", fallback),
+    ts_ms: payload.ts_ms,
+  };
+}
+
+// 配置恢复/迁移/修复/锁定/存储失败为持久、可关闭提示。这里只展示工具层生成的非敏感摘要。
+const storageIssues = ref<StorageIssue[]>([]);
+const storageIssueLabels: Record<StorageIssueType, string> = {
+  recovery: "配置恢复",
+  migration: "配置迁移",
+  repair: "配置修复",
+  "future-version": "版本保护",
+  "storage-unavailable": "存储不可用",
+  "save-failed": "保存失败",
+};
+function appendStorageIssue(issue: StorageIssue) {
+  if (!storageIssues.value.some((existing) => existing.id === issue.id)) {
+    storageIssues.value.push(issue);
+  }
+}
+function dismissStorageIssue(id: number) {
+  storageIssues.value = storageIssues.value.filter((issue) => issue.id !== id);
+}
+let unsubscribeStorageIssues: (() => void) | null = null;
 
 let unlisten: UnlistenFn | null = null;
 let unlistenErr: UnlistenFn | null = null;
 onMounted(async () => {
+  // mounted 时 provider 已可用；先订阅后消费启动阶段积累的事件，并按 id 去重。
+  unsubscribeStorageIssues = subscribeStorageIssues(appendStorageIssue);
+  for (const issue of consumeStorageIssues()) appendStorageIssue(issue);
   unlisten = await listen<string>("device_state", (e) => {
     const s = e.payload as DState;
     deviceState.value = s;
     if (s === "Registered" && !startedAt.value) startedAt.value = Date.now();
     if (s === "Disconnected" || s === "Failed") startedAt.value = null;
   });
-  unlistenErr = await listen<DeviceError>("device_error", (e) => {
-    lastError.value = e.payload;
+  unlistenErr = await listen<DeviceErrorEvent>("device_error", (e) => {
+    acceptDeviceError(e.payload);
   });
   uptimeTimer = window.setInterval(tickUptime, 1000);
   // app 启动/刷新后与引擎对账,反映后台是否已有设备在跑。
@@ -208,7 +275,12 @@ onMounted(async () => {
   }
   await refreshSecretStatus();
 });
-onUnmounted(() => { unlisten?.(); unlistenErr?.(); if (uptimeTimer) clearInterval(uptimeTimer); });
+onUnmounted(() => {
+  unlisten?.();
+  unlistenErr?.();
+  unsubscribeStorageIssues?.();
+  if (uptimeTimer) clearInterval(uptimeTimer);
+});
 
 const themeOverrides = {
   common: {
@@ -299,6 +371,16 @@ const themeOverrides = {
                       <n-input v-model:value="editForm.server_host" size="small" placeholder="平台 IP" />
                       <n-input-number v-model:value="editForm.server_port" size="small" :min="1" :max="65535" style="width:100%" placeholder="SIP 端口" />
                       <n-input v-model:value="editForm.server_domain" size="small" placeholder="平台域 ID" />
+                      <div>
+                        <n-select
+                          v-model:value="editForm.inbound_identity_mode"
+                          size="small"
+                          :options="inboundIdentityOptions"
+                        />
+                        <p class="pe-hint">
+                          兼容模式保持现有入站处理。严格模式要求可信来源 IP，且 From 用户匹配平台域 ID；这不是双向 Digest，可能不兼容级联/SBC。平台地址仍需填写字面 IP，当前不支持域名。
+                        </p>
+                      </div>
                       <div class="pe-secret">
                         <n-input
                           v-model:value="editForm.password"
@@ -374,9 +456,22 @@ const themeOverrides = {
               <!-- 全局错误条:后端运行时错误(如点播采集失败),所有页面可见,可关闭。 -->
               <div v-if="lastError" class="error-bar" role="alert" aria-live="assertive">
                 <span class="eb-icon">⚠</span>
-                <span class="eb-scope">{{ errorScopeLabel[lastError.scope] ?? lastError.scope }}失败</span>
+                <span class="eb-scope">{{ errorScopeLabel[lastError.scope] ?? lastError.scope }}</span>
                 <span class="eb-msg" :title="lastError.message">{{ lastError.message }}</span>
                 <button class="eb-close" type="button" aria-label="关闭错误提示" @click="dismissError">✕</button>
+              </div>
+              <div v-if="storageIssues.length" class="storage-notices" aria-live="polite">
+                <div v-for="issue in storageIssues" :key="issue.id" class="storage-notice" role="status">
+                  <span class="sn-icon" aria-hidden="true">ⓘ</span>
+                  <span class="sn-kind">{{ storageIssueLabels[issue.type] }}</span>
+                  <span class="sn-summary">{{ issue.summary }}</span>
+                  <button
+                    class="sn-close"
+                    type="button"
+                    :aria-label="`关闭${storageIssueLabels[issue.type]}提示`"
+                    @click="dismissStorageIssue(issue.id)"
+                  >✕</button>
+                </div>
               </div>
               <section class="content" role="main" aria-label="页面内容">
                 <!-- keep-alive:切换标签页不销毁组件,保留各页表单/运行/曲线状态。 -->
@@ -497,6 +592,25 @@ const themeOverrides = {
   color: var(--error); font-size: var(--fs-sm); padding: 1px 4px; border-radius: 4px;
 }
 .eb-close:hover { background: color-mix(in srgb, var(--error) 20%, transparent); }
+
+.storage-notices {
+  flex-shrink: 0; display: flex; flex-direction: column; gap: 3px;
+  margin: 3px 16px 0;
+}
+.storage-notice {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--text-primary); font-size: var(--fs-sm);
+}
+.sn-icon { flex: 0 0 auto; color: var(--accent); }
+.sn-kind { flex: 0 0 auto; color: var(--accent); font-weight: 700; }
+.sn-summary { flex: 1 1 auto; min-width: 0; }
+.sn-close {
+  flex: 0 0 auto; background: none; border: none; cursor: pointer;
+  color: var(--text-secondary); font-size: var(--fs-sm); padding: 1px 4px; border-radius: 4px;
+}
+.sn-close:hover { background: var(--bg-hover); color: var(--text-primary); }
 
 .content { flex: 1; overflow-y: auto; padding: 8px 16px 16px; }
 
