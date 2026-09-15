@@ -16,7 +16,7 @@ mod tests {
         let nonce = format!(
             "{}-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test"),
+            TEMP_NONCE.fetch_add(1, Ordering::Relaxed),
             name
         );
         std::env::temp_dir().join(format!("uvp-file-profile-{nonce}.mp4"))

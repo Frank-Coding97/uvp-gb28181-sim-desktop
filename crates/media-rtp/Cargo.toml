@@ -24,3 +24,10 @@ openh264 = "=0.6.5"
 screencapturekit = { version = "=8.0.1", features = ["macos_15_0"] }
 objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGSession"] }
+
+[target.'cfg(windows)'.dependencies]
+# Media Foundation device and sample APIs for cameras that DirectShow cannot open.
+# 注：`windows` 0.61 没有 `Media_MediaFoundation` 这个 feature（WinRT 命名空间下不存在，
+# 会被 cargo 在**依赖解析阶段**拒绝：failed to select a version for `windows`）。
+# 暂时也未在代码中引用 Media Foundation API，故先不声明该依赖；后续接入时按
+# `Win32_Media_MediaFoundation` + `Win32_System_Com` 的形式重新加回。

@@ -1025,17 +1025,29 @@ async fn list_live_sources() -> Result<LiveSourceCatalogDto, String> {
 
 /// 启动一次短时采集探测。请求音频时，用户应确保麦克风或系统正在产生声音。
 #[tauri::command]
-async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
+async fn probe_live_source(
+    uri: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<LiveProbeDto, String> {
     let spec = media_rtp::LiveSourceSpec::parse(uri.trim()).map_err(|error| error.to_string())?;
     let canonical_uri = uri.trim().to_string();
     let audio_requested = match spec {
         media_rtp::LiveSourceSpec::Camera { audio_index, .. } => audio_index.is_some(),
         media_rtp::LiveSourceSpec::Screen { audio, .. } => audio.is_enabled(),
     };
+    let store = app_config_store(&state, &app)?;
+    let profile = {
+        let _io = state.config_io.lock().await;
+        tokio::task::spawn_blocking(move || store.load())
+            .await
+            .map_err(|error| format!("读取采集配置失败: {error}"))??
+            .media
+    };
     tokio::task::spawn_blocking(move || {
         use media_rtp::VideoSource;
 
-        let mut source = media_rtp::LiveSource::capture(&canonical_uri, 30, None)
+        let mut source = media_rtp::LiveSource::capture_with_profile(&canonical_uri, profile, None)
             .map_err(|error| error.to_string())?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut video_ready = false;
@@ -1061,7 +1073,7 @@ async fn probe_live_source(uri: String) -> Result<LiveProbeDto, String> {
         } else if video_ready && audio_requested {
             "视频采集正常，但未检测到音频；请播放系统声音或对麦克风说话后重试".to_string()
         } else {
-            "未检测到视频帧，请检查设备占用和 macOS 隐私权限".to_string()
+            "未检测到视频帧，请检查设备占用和系统摄像头权限".to_string()
         };
         Ok(LiveProbeDto {
             uri: canonical_uri,
@@ -1104,6 +1116,15 @@ impl PreviewEventSink for TauriPreviewEvents {
 struct PreviewAttachDto {
     token: u64,
     status: media_rtp::PreviewStatus,
+}
+
+/// WebView2 can report document.visibilityState=visible while its native window is minimized.
+#[tauri::command]
+async fn is_preview_window_visible(window: tauri::WebviewWindow) -> Result<bool, String> {
+    window
+        .is_minimized()
+        .map(|minimized| !minimized)
+        .map_err(|error| error.to_string())
 }
 
 /// 页面挂载应用级唯一预览通道。重复调用会原子替换当前目标，不会重启媒体。
@@ -1225,9 +1246,9 @@ async fn start_device(
                         .iter()
                         .any(|camera| camera.index == video_index) =>
                 {
-                    return Err(catalog.avfoundation_error.unwrap_or_else(|| {
-                        format!("未找到 AVFoundation 摄像头索引 {video_index}")
-                    }));
+                    return Err(catalog
+                        .avfoundation_error
+                        .unwrap_or_else(|| format!("未找到摄像头索引 {video_index}")));
                 }
                 media_rtp::LiveSourceSpec::Camera {
                     audio_index: Some(index),
@@ -1239,7 +1260,7 @@ async fn start_device(
                 {
                     return Err(catalog
                         .avfoundation_error
-                        .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                        .unwrap_or_else(|| format!("未找到麦克风索引 {index}")));
                 }
                 media_rtp::LiveSourceSpec::Screen {
                     audio: media_rtp::LiveAudioSource::Microphone(index),
@@ -1251,7 +1272,7 @@ async fn start_device(
                 {
                     return Err(catalog
                         .avfoundation_error
-                        .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}")));
+                        .unwrap_or_else(|| format!("未找到麦克风索引 {index}")));
                 }
                 media_rtp::LiveSourceSpec::Screen { display_id, .. }
                     if display_id != 0
@@ -2039,6 +2060,16 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Focused(_)
+            ) {
+                if let Ok(minimized) = window.is_minimized() {
+                    let _ = window.emit("preview_window_visibility", !minimized);
+                }
+            }
+        })
         .setup(|app| {
             // 日志落盘。内存环形缓冲只够 UI 翻看，排查采集/预览这类"跑一次才复现"
             // 的问题时拿不出来——落到文件才能事后直接读。
@@ -2082,6 +2113,7 @@ pub fn run() {
             export_report,
             list_live_sources,
             probe_live_source,
+            is_preview_window_visible,
             start_binary_preview,
             stop_binary_preview,
             retry_binary_preview,

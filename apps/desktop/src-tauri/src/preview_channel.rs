@@ -43,6 +43,7 @@ pub struct DesktopPreviewBus {
     statuses: tokio::sync::watch::Sender<PreviewStatus>,
     order: std::sync::Mutex<BusOrder>,
     published: std::sync::atomic::AtomicU64,
+    active: std::sync::atomic::AtomicBool,
 }
 
 impl DesktopPreviewBus {
@@ -60,6 +61,7 @@ impl DesktopPreviewBus {
                 phase: PreviewPhase::Idle,
             }),
             published: std::sync::atomic::AtomicU64::new(0),
+            active: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -74,13 +76,33 @@ impl DesktopPreviewBus {
     pub fn latest_status(&self) -> PreviewStatus {
         self.statuses.borrow().clone()
     }
+
+    pub fn set_active(&self, active: bool) {
+        let Ok(_order) = self.order.lock() else {
+            return;
+        };
+        let previous = self.active.swap(active, std::sync::atomic::Ordering::AcqRel);
+        if previous != active {
+            tracing::info!(active, "preview visibility demand changed");
+        }
+        if !active {
+            self.frames.send_replace(None);
+        }
+    }
 }
 
 impl PreviewSink for DesktopPreviewBus {
+    fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn publish(&self, frame: PreviewJpeg) {
         let Ok(mut order) = self.order.lock() else {
             return;
         };
+        if !self.is_active() {
+            return;
+        }
         if frame.generation < order.generation
             || (frame.generation == order.generation && frame.sequence <= order.last_sequence)
             || (frame.generation == order.generation && order.phase == PreviewPhase::Stopped)
@@ -93,8 +115,6 @@ impl PreviewSink for DesktopPreviewBus {
             order.phase = PreviewPhase::PreviewStarting;
         }
         order.last_sequence = frame.sequence;
-        drop(order);
-
         let published = self
             .published
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -145,9 +165,9 @@ impl PreviewSink for DesktopPreviewBus {
             published = self.published.load(std::sync::atomic::Ordering::Relaxed),
             "preview_bus stopped"
         );
-        self.frames.send_replace(None);
         if let Ok(mut order) = self.order.lock() {
             order.phase = PreviewPhase::Stopped;
+            self.frames.send_replace(None);
             let mut status = self.statuses.borrow().clone();
             status.generation = order.generation;
             status.preview_generation = order.preview_generation.max(1);
@@ -193,6 +213,7 @@ mod tests {
     #[test]
     fn 订阅者只拿到最新帧() {
         let bus = DesktopPreviewBus::new();
+        bus.set_active(true);
         let mut receiver = bus.subscribe();
         bus.publish(frame(4, 1, 1));
         bus.publish(frame(4, 2, 2));
@@ -224,6 +245,7 @@ mod tests {
     #[test]
     fn 旧代际帧和状态不能覆盖新代际() {
         let bus = DesktopPreviewBus::new();
+        bus.set_active(true);
         bus.status(status(2, 1, PreviewPhase::Playing));
         bus.publish(frame(2, 8, 80));
         bus.status(status(1, 9, PreviewPhase::Unavailable));
@@ -237,6 +259,7 @@ mod tests {
     #[test]
     fn stopped是当前预览代际的终态() {
         let bus = DesktopPreviewBus::new();
+        bus.set_active(true);
         bus.status(status(3, 4, PreviewPhase::Playing));
         bus.publish(frame(3, 10, 100));
         bus.stopped();
@@ -258,5 +281,28 @@ mod tests {
         assert_eq!(current.generation, 5);
         assert_eq!(current.preview_generation, 2);
         assert_eq!(current.phase, PreviewPhase::Playing);
+    }
+
+    #[test]
+    fn hidden_preview_discards_cached_and_late_jpeg() {
+        let bus = DesktopPreviewBus::new();
+        let receiver = bus.subscribe();
+        assert!(
+            !bus.is_active(),
+            "internal watch receivers are not visible demand"
+        );
+        bus.set_active(true);
+        bus.publish(frame(7, 1, 10));
+        assert!(receiver.borrow().is_some());
+        bus.set_active(false);
+        bus.publish(frame(7, 2, 20));
+        assert!(receiver.borrow().is_none());
+        bus.set_active(true);
+        assert!(
+            receiver.borrow().is_none(),
+            "reconnect must wait for a fresh JPEG"
+        );
+        bus.publish(frame(7, 3, 30));
+        assert_eq!(receiver.borrow().as_ref().unwrap().sequence, 3);
     }
 }

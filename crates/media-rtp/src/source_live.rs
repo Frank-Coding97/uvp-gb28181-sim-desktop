@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::Condvar;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -20,6 +20,21 @@ use crate::profile::{MediaAudioCodec, MediaProfile, MediaVideoCodec};
 #[cfg(target_os = "macos")]
 #[path = "camera_modes.rs"]
 mod camera_modes;
+
+#[cfg(windows)]
+#[path = "windows_capture.rs"]
+mod windows_capture;
+
+#[cfg(windows)]
+#[path = "windows_camera.rs"]
+mod windows_camera;
+
+#[cfg(windows)]
+#[path = "windows_timing.rs"]
+mod windows_timing;
+#[cfg(windows)]
+#[path = "windows_media_foundation.rs"]
+mod windows_media_foundation;
 
 const DEFAULT_SCREEN_WIDTH: u32 = 1280;
 const DEFAULT_SCREEN_HEIGHT: u32 = 720;
@@ -59,7 +74,7 @@ impl LiveVideoCodec {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     const fn ffmpeg_format(self) -> &'static str {
         match self {
             Self::H264 => "h264",
@@ -729,7 +744,49 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
             avfoundation_error,
         })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let (cameras, microphones, avfoundation_error) = match ffmpeg.as_deref() {
+            Some(binary) => match windows_camera::list_devices(binary) {
+                Ok(devices) => (
+                    devices
+                        .cameras
+                        .into_iter()
+                        .map(|device| LiveAvDevice {
+                            index: device.index,
+                            name: device.name,
+                        })
+                        .collect(),
+                    devices
+                        .microphones
+                        .into_iter()
+                        .map(|device| LiveAvDevice {
+                            index: device.index,
+                            name: device.name,
+                        })
+                        .collect(),
+                    None,
+                ),
+                Err(error) => (Vec::new(), Vec::new(), Some(error.to_string())),
+            },
+            None => (
+                Vec::new(),
+                Vec::new(),
+                Some("Windows 摄像头枚举需要 FFmpeg DirectShow 支持".into()),
+            ),
+        };
+        Ok(LiveSourceCatalog {
+            ffmpeg_available: ffmpeg.is_some(),
+            aac_available,
+            opus_available,
+            screens: Vec::new(),
+            cameras,
+            microphones,
+            screen_error: Some("Windows 屏幕采集尚未实现".into()),
+            avfoundation_error,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         Ok(LiveSourceCatalog {
             ffmpeg_available: ffmpeg.is_some(),
@@ -982,14 +1039,14 @@ impl LiveCaptureClock {
 /// pipes in either order.  Wait for the first AU on both streams before
 /// choosing the shared origin so AAC's negative priming PTS is retained even
 /// when the video reader wins the scheduling race.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(Clone, Copy)]
 enum CameraTimingStream {
     Video,
     Audio,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(Default)]
 struct CameraTimingState {
     first_video_pts: Option<i128>,
@@ -997,14 +1054,14 @@ struct CameraTimingState {
     origin_pts: Option<i128>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 struct CameraTimingClock {
     state: Mutex<CameraTimingState>,
     ready: Condvar,
     has_audio: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl CameraTimingClock {
     fn new(has_audio: bool) -> Self {
         Self {
@@ -1417,16 +1474,20 @@ impl EncodedFrameHub {
     fn send_frame_at(&self, frame: Frame, capture_pts_90k: Option<u64>) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let captured_at_ms = crate::source::now_ms();
-        let preview_frame = self.preview.as_ref().map(|_| {
-            CapturedAccessUnit::with_codec(
-                self.generation,
-                sequence,
-                frame.data.clone(),
-                frame.key_frame,
-                captured_at_ms,
-                self.codec.ps_codec(),
-            )
-        });
+        let preview_frame = self
+            .preview
+            .as_ref()
+            .filter(|input| input.is_active())
+            .map(|_| {
+                CapturedAccessUnit::with_codec(
+                    self.generation,
+                    sequence,
+                    frame.data.clone(),
+                    frame.key_frame,
+                    captured_at_ms,
+                    self.codec.ps_codec(),
+                )
+            });
 
         // 这条顺序是硬合同：任何预览错误都发生在主路已经拿到 AU 之后。
         if let Some(events) = &self.timed_events {
@@ -1596,9 +1657,13 @@ impl LiveSource {
     ) -> Result<Self> {
         let capture_profile = LiveCaptureProfile::from_media(&profile)?;
         let spec = LiveSourceSpec::parse(uri)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             match spec {
+                #[cfg(windows)]
+                LiveSourceSpec::Screen { .. } => {
+                    Err(Error::Media("Windows 屏幕采集尚未实现".into()))
+                }
                 LiveSourceSpec::Camera {
                     video_index,
                     audio_index,
@@ -1610,6 +1675,7 @@ impl LiveSource {
                     preview,
                     true,
                 ),
+                #[cfg(target_os = "macos")]
                 LiveSourceSpec::Screen {
                     display_id, audio, ..
                 } => {
@@ -1617,7 +1683,7 @@ impl LiveSource {
                 }
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = (capture_profile, preview);
             match spec {
@@ -1635,14 +1701,19 @@ impl LiveSource {
     pub fn capture(uri: &str, fps: u32, preview: Option<Arc<dyn PreviewSink>>) -> Result<Self> {
         let spec = LiveSourceSpec::parse(uri)?;
         let fps = fps.max(1);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             match spec {
+                #[cfg(windows)]
+                LiveSourceSpec::Screen { .. } => {
+                    Err(Error::Media("Windows 屏幕采集尚未实现".into()))
+                }
                 LiveSourceSpec::Camera {
                     video_index,
                     audio_index,
                     audio_codec,
                 } => Self::capture_camera(video_index, audio_index, audio_codec, fps, preview),
+                #[cfg(target_os = "macos")]
                 LiveSourceSpec::Screen {
                     display_id,
                     audio,
@@ -1651,7 +1722,7 @@ impl LiveSource {
                 } => Self::capture_screen(display_id, audio, audio_codec, profile, fps),
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = fps;
             let _ = preview;
@@ -1666,8 +1737,8 @@ impl LiveSource {
         }
     }
 
-    /// 启动唯一 AVFoundation 采集；预览只消费它产出的 H.264 AU 副本。
-    #[cfg(target_os = "macos")]
+    /// 启动唯一平台摄像头采集；预览只消费它产出的编码 AU 副本。
+    #[cfg(any(target_os = "macos", windows))]
     fn capture_camera(
         video_index: u32,
         audio_index: Option<u32>,
@@ -1684,7 +1755,7 @@ impl LiveSource {
         )
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     fn capture_camera_profile(
         video_index: u32,
         audio_index: Option<u32>,
@@ -1694,6 +1765,7 @@ impl LiveSource {
     ) -> Result<Self> {
         let audio_codec = profile.audio_codec;
         let fps = profile.video_fps;
+        #[cfg(target_os = "macos")]
         if macos_console_screen_locked() {
             return Err(Error::Media(camera_startup_timeout_message(
                 "video",
@@ -1708,11 +1780,12 @@ impl LiveSource {
             )));
         }
         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
-            Error::Media("macOS camera capture requires ffmpeg with AVFoundation support".into())
+            Error::Media("camera capture requires an available FFmpeg platform backend".into())
         })?;
         if audio_index.is_some() {
             ensure_audio_encoder(&ffmpeg, audio_codec)?;
         }
+        #[cfg(target_os = "macos")]
         let input_mode = camera_modes::probe_camera_mode(
             &ffmpeg,
             video_index,
@@ -1720,6 +1793,23 @@ impl LiveSource {
             profile.height,
             fps,
         )?;
+        #[cfg(windows)]
+        let devices = windows_camera::list_devices(&ffmpeg)?;
+        #[cfg(windows)]
+        let video_device = windows_camera::camera(&devices, video_index)?;
+        #[cfg(windows)]
+        let audio_device = audio_index
+            .map(|index| {
+                devices
+                    .microphones
+                    .iter()
+                    .find(|device| device.index == index)
+                    .ok_or_else(|| Error::Media(format!("未找到 DirectShow 麦克风索引 {index}")))
+            })
+            .transpose()?;
+        #[cfg(windows)]
+        let input_mode =
+            windows_camera::probe_mode(&ffmpeg, video_device, profile.width, profile.height, fps)?;
         let input_fps = input_mode.fps;
         tracing::info!(
             video_index,
@@ -1733,11 +1823,30 @@ impl LiveSource {
         );
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let mut command = Command::new(&ffmpeg);
+        #[cfg(target_os = "macos")]
         let mut camera_args =
             camera_command_args_for_profile(video_index, audio_index, &profile, input_mode);
-        let mut timing_video_stats_reader: Option<std::fs::File> = None;
-        let mut timing_audio_stats_reader: Option<std::fs::File> = None;
+        #[cfg(windows)]
+        let mut camera_args = windows_capture::command_args(
+            // Logitech C925e's PnP moniker can fail DirectShow pin
+            // negotiation while the friendly name succeeds in Windows Camera.
+            // Prefer the friendly name for this family and retain the stable
+            // moniker for all other devices.
+            if video_device.name.to_ascii_lowercase().contains("logitech") {
+                &video_device.name
+            } else {
+                &video_device.input_name
+            },
+            audio_device.map(|device| device.input_name.as_str()),
+            &profile,
+            &input_mode.input_args,
+        );
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut timing_video_stats_reader: Option<Box<dyn Read + Send>> = None;
+        let mut timing_audio_stats_reader: Option<Box<dyn Read + Send>> = None;
+        #[cfg(target_os = "macos")]
         let mut timing_stats_writers: Option<(std::fs::File, Option<std::fs::File>)> = None;
+        #[cfg(target_os = "macos")]
         if timed {
             append_camera_timing_stats_args(&mut camera_args);
             #[cfg(unix)]
@@ -1779,8 +1888,9 @@ impl LiveSource {
                         Ok(())
                     });
                 }
-                timing_video_stats_reader = Some(reader);
-                timing_audio_stats_reader = audio_reader;
+                timing_video_stats_reader = Some(Box::new(reader));
+                timing_audio_stats_reader =
+                    audio_reader.map(|reader| Box::new(reader) as Box<dyn Read + Send>);
                 timing_stats_writers = Some((writer, audio_writer));
             }
             #[cfg(not(unix))]
@@ -1790,19 +1900,65 @@ impl LiveSource {
                 ));
             }
         }
+        #[cfg(windows)]
+        let mut audio_stats_url: Option<String> = None;
+        #[cfg(windows)]
+        if timed {
+            let reader = windows_timing::StatsReader::bind(Arc::clone(&stop_flag))
+                .map_err(|error| Error::Media(format!("创建视频时间戳通道失败: {error}")))?;
+            let position = camera_args
+                .iter()
+                .rposition(|arg| arg == "pipe:1")
+                .expect("video output");
+            camera_args.splice(
+                position..position,
+                [
+                    "-stats_enc_post:v".into(),
+                    reader.url(),
+                    "-stats_enc_post_fmt:v".into(),
+                    "{pts} {tb}".into(),
+                ],
+            );
+            timing_video_stats_reader = Some(Box::new(reader));
+            if audio_index.is_some() {
+                let reader = windows_timing::StatsReader::bind(Arc::clone(&stop_flag))
+                    .map_err(|error| Error::Media(format!("创建音频时间戳通道失败: {error}")))?;
+                audio_stats_url = Some(reader.url());
+                timing_audio_stats_reader = Some(Box::new(reader));
+            }
+        }
         command.args(&camera_args);
         if audio_index.is_some() {
             // One AVFoundation session owns both Continuity Camera tracks. A second
             // process can make an iPhone microphone stall while video is active.
             command.args(["-map", "0:a:0"]);
+            #[cfg(windows)]
+            {
+                // Preserve capture-time gaps as silence instead of packing
+                // intermittent DirectShow audio buffers into a shorter track.
+                let mut filter = format!("aresample={}:async=1", profile.audio_sample_rate_hz);
+                // The raw G.711 parser emits 160-byte packets. Each encoder
+                // stats line must describe exactly one such packet, even when
+                // DirectShow delivers larger or variable-sized audio buffers.
+                if matches!(audio_codec, LiveAudioCodec::G711A | LiveAudioCodec::G711U) {
+                    filter.push_str(",asetnsamples=n=160:p=0");
+                }
+                command.args(["-af", &filter]);
+            }
             if timed {
+                #[cfg(target_os = "macos")]
+                let audio_stats_url = "pipe:4";
+                #[cfg(windows)]
+                let audio_stats_url = audio_stats_url.as_deref().expect("requested audio stats");
                 command.args([
                     "-stats_enc_post:a",
-                    "pipe:4",
+                    audio_stats_url,
                     "-stats_enc_post_fmt:a",
                     "{pts} {tb}",
                 ]);
             }
+            #[cfg(windows)]
+            command.args(["-flush_packets", "1"]);
             audio_codec.append_ffmpeg_output_with_sample_rate(
                 &mut command,
                 profile.audio_sample_rate_hz,
@@ -1818,9 +1974,11 @@ impl LiveSource {
         // The child owns fd 3/4 after pre_exec duplicates them. Closing the
         // parent writers is required so both stats readers observe child
         // shutdown.
+        #[cfg(target_os = "macos")]
         drop(timing_stats_writers);
 
         let mut startup = StartupChildren::new(video);
+        startup.stop_flag = Some(Arc::clone(&stop_flag));
         let video_tail = if audio_index.is_some() {
             Arc::new(Mutex::new(VecDeque::new()))
         } else {
@@ -1830,7 +1988,6 @@ impl LiveSource {
         };
         let video_ready = Arc::new(AtomicBool::new(false));
         let producer_alive = Arc::new(AtomicBool::new(true));
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
         let generation = crate::preview::next_capture_generation();
         let (preview_input, preview_worker) = preview.map_or((None, None), |sink| {
@@ -1979,7 +2136,7 @@ impl LiveSource {
             );
             if !video_stop.load(Ordering::Acquire) {
                 if let Ok(mut error) = video_error.lock() {
-                    *error = Some(format!("AVFoundation {video_label} stopped unexpectedly"));
+                    *error = Some(format!("camera {video_label} stopped unexpectedly"));
                 }
             }
             alive.store(false, Ordering::Release);
@@ -1991,7 +2148,7 @@ impl LiveSource {
         let mut audio_tail = None;
         if let Some(index) = audio_index {
             let label = format!(
-                "camera audio index {index} ({}) in shared AVFoundation session",
+                "camera audio index {index} ({}) in shared camera session",
                 audio_codec.as_str()
             );
             let ready = Arc::new(AtomicBool::new(false));
@@ -2067,7 +2224,7 @@ impl LiveSource {
                 }
                 if !audio_stop.load(Ordering::Acquire) {
                     if let Ok(mut error) = audio_error.lock() {
-                        *error = Some(format!("AVFoundation {label} stopped unexpectedly"));
+                        *error = Some(format!("camera {label} stopped unexpectedly"));
                     }
                 }
             });
@@ -2110,6 +2267,7 @@ impl LiveSource {
             terminal_error,
             preview_worker,
             preview_control,
+            #[cfg(target_os = "macos")]
             screen_stream: None,
             last_key: None,
             consecutive_empty: 0,
@@ -3156,9 +3314,9 @@ fn create_camera_timing_stats_pipe() -> Result<(std::fs::File, std::fs::File)> {
     Ok((reader, writer))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn spawn_camera_timing_stats_reader(
-    reader: std::fs::File,
+    reader: impl Read + Send + 'static,
     timing_pts: Arc<Mutex<VecDeque<Option<u64>>>>,
     timing_clock: Arc<CameraTimingClock>,
     stream: CameraTimingStream,
@@ -3283,7 +3441,7 @@ fn screen_hevc_command_args(profile: &LiveCaptureProfile) -> Vec<String> {
     ]
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(Debug, Clone, Copy)]
 struct CameraStartup {
     video_index: u32,
@@ -3308,7 +3466,7 @@ fn macos_console_screen_locked() -> bool {
         .is_some_and(|value| value.value())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn camera_startup_timeout_message(
     missing: &str,
     camera: CameraStartup,
@@ -3323,25 +3481,27 @@ fn camera_startup_timeout_message(
         );
     }
     format!(
-        "AVFoundation produced no {missing} data within 15 seconds; video index {} at input {} fps, audio index {:?}; video stderr: {video_stderr}; audio stderr: {audio_stderr}",
+        "camera produced no {missing} data within 15 seconds; video index {} at input {} fps, audio index {:?}; video stderr: {video_stderr}; audio stderr: {audio_stderr}",
         camera.video_index, camera.input_fps, camera.audio_index
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 struct StartupChildren {
     children: Vec<Child>,
     worker_threads: Vec<JoinHandle<()>>,
     armed: bool,
+    stop_flag: Option<Arc<AtomicBool>>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl StartupChildren {
     fn empty() -> Self {
         Self {
             children: Vec::new(),
             worker_threads: Vec::new(),
             armed: true,
+            stop_flag: None,
         }
     }
 
@@ -3350,6 +3510,7 @@ impl StartupChildren {
             children: vec![child],
             worker_threads: Vec::new(),
             armed: true,
+            stop_flag: None,
         }
     }
 
@@ -3366,10 +3527,13 @@ impl StartupChildren {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl Drop for StartupChildren {
     fn drop(&mut self) {
         if self.armed {
+            if let Some(stop) = &self.stop_flag {
+                stop.store(true, Ordering::Release);
+            }
             let _ = stop_owned_children_and_threads(
                 &mut self.children,
                 &mut self.worker_threads,
@@ -3406,7 +3570,7 @@ fn capture_stderr_tail(child: &mut Child, label: &str) -> Result<StderrCapture> 
     Ok((tail, join))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn wait_for_ffmpeg_startup(
     children: &mut [Child],
     video_ready: &AtomicBool,
@@ -3433,7 +3597,7 @@ fn wait_for_ffmpeg_startup(
                 kill_children(children);
                 let kind = if position == 0 { "video" } else { "audio" };
                 return Err(Error::Media(format!(
-                    "AVFoundation {kind} capture exited before startup ({status}); video index {} at input {} fps, audio index {:?}; video stderr: {}; audio stderr: {}",
+                    "camera {kind} capture exited before startup ({status}); video index {} at input {} fps, audio index {:?}; video stderr: {}; audio stderr: {}",
                     camera.video_index,
                     camera.input_fps,
                     camera.audio_index,
@@ -3455,14 +3619,23 @@ fn wait_for_ffmpeg_startup(
                 camera,
                 &locked_tail(video_tail),
                 &audio_tail.map_or_else(|| "n/a".into(), locked_tail),
-                macos_console_screen_locked(),
+                {
+                    #[cfg(target_os = "macos")]
+                    {
+                        macos_console_screen_locked()
+                    }
+                    #[cfg(windows)]
+                    {
+                        false
+                    }
+                },
             )));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kill_children(children: &mut [Child]) {
     for child in children {
         let _ = child.kill();
@@ -3554,7 +3727,7 @@ fn stderr_tail(stderr: &str) -> String {
         .join(" | ")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn drain_hevc_frames<S: FrameSender>(buf: &mut Vec<u8>, tx: &S) {
     let mut starts = Vec::new();
     let mut index = 0;
@@ -4274,6 +4447,7 @@ mod tests {
         assert!(!message.contains("produced no video data within 15 seconds"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn cfr输出必须显式指定目标帧率() {
         assert_eq!(cfr_output_args("30"), ["-r", "30", "-fps_mode", "cfr"]);
@@ -4838,6 +5012,56 @@ mod tests {
         assert_eq!(access_unit.sequence, 1);
         assert!(access_unit.config_keyframe);
         assert!(access_unit.captured_at_ms > 0);
+    }
+
+    #[test]
+    fn hidden_preview_preserves_live_main_bytes_and_capture_pts() {
+        struct InactiveSink;
+        impl PreviewSink for InactiveSink {
+            fn is_active(&self) -> bool {
+                false
+            }
+            fn publish(&self, _frame: crate::preview::PreviewJpeg) {
+                panic!("hidden preview must not publish");
+            }
+        }
+        let (input, mut worker) = crate::preview_worker::spawn_preview_worker(
+            "unused-hidden-preview-ffmpeg".into(),
+            25,
+            91,
+            Arc::new(InactiveSink),
+        );
+        let primary = Arc::new(LatestFrameQueue::new(2));
+        let events = Arc::new(LiveEventQueue::new(4));
+        let hub = EncodedFrameHub::new_with_timing(
+            primary.clone(),
+            Some(input),
+            91,
+            Some(events.clone()),
+            25,
+            LiveVideoCodec::H264,
+        );
+        for index in 0..10 {
+            let bytes = vec![0, 0, 0, 1, 1, index as u8];
+            let pts = 9_000 + index * 3_600;
+            hub.send_frame_at(
+                Frame {
+                    data: bytes.clone(),
+                    key_frame: false,
+                },
+                Some(pts),
+            );
+            assert_eq!(primary.pop().unwrap().data, bytes);
+            let Some(crate::source::MediaEvent::Video(video)) = events.pop() else {
+                panic!("main timed event must remain available");
+            };
+            assert_eq!(video.data, bytes);
+            assert_eq!(video.pts_90k, pts);
+            assert_eq!(video.duration_90k, 3_600);
+            assert!(!primary.take_dropped());
+        }
+        assert_eq!(hub.generation, 91);
+        worker.stop();
     }
 
     #[test]

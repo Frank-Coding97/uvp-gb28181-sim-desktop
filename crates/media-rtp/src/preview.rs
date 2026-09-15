@@ -107,6 +107,7 @@ pub enum PreviewPhase {
     PreviewStarting,
     WaitingKeyframe,
     Playing,
+    Paused,
     Recovering,
     Unavailable,
     Stopping,
@@ -146,6 +147,11 @@ impl PreviewStatus {
 
 /// 预览帧接收端。实现方只保留最新帧即可——旧帧对实时预览没有价值。
 pub trait PreviewSink: Send + Sync {
+    /// 是否存在可见预览需求；暂停只影响预览旁路，不影响主媒体源。
+    fn is_active(&self) -> bool {
+        true
+    }
+
     fn publish(&self, frame: PreviewJpeg);
 
     fn status(&self, status: PreviewStatus) {

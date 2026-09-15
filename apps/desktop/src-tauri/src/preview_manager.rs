@@ -51,8 +51,11 @@ impl PreviewManager {
     ) -> u64 {
         self.ensure_worker(events).await;
         let token = self.next_token.fetch_add(1, Ordering::Relaxed).max(1);
-        self.targets
-            .send_replace(Some(ActiveTarget { token, target }));
+        self.targets.send_if_modified(|slot| {
+            *slot = Some(ActiveTarget { token, target });
+            self.bus.set_active(true);
+            true
+        });
         token
     }
 
@@ -61,6 +64,7 @@ impl PreviewManager {
         self.targets.send_if_modified(|slot| {
             if slot.as_ref().is_some_and(|target| target.token == token) {
                 *slot = None;
+                self.bus.set_active(false);
                 true
             } else {
                 false
@@ -75,7 +79,11 @@ impl PreviewManager {
 
     pub async fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        self.targets.send_replace(None);
+        self.targets.send_if_modified(|slot| {
+            *slot = None;
+            self.bus.set_active(false);
+            true
+        });
         let worker = self.worker.lock().await.take();
         if let Some(mut worker) = worker {
             if tokio::time::timeout(Duration::from_millis(600), &mut worker)
@@ -118,7 +126,7 @@ async fn forward_preview(
     let initial_target = { targets.borrow().clone() };
     let initial_frame = { frames.borrow().clone() };
     if let (Some(target), Some(frame)) = (initial_target, initial_frame) {
-        send_or_detach(&targets, target, encode_preview_frame(&frame));
+        send_or_detach(&bus, &targets, target, encode_preview_frame(&frame));
     }
     tracing::info!("preview manager worker started");
 
@@ -128,10 +136,10 @@ async fn forward_preview(
                 if changed.is_err() {
                     break;
                 }
-                let frame = frames.borrow_and_update().clone();
                 let target = { targets.borrow().clone() };
+                let frame = frames.borrow_and_update().clone();
                 if let (Some(frame), Some(target)) = (frame, target) {
-                    send_or_detach(&targets, target, encode_preview_frame(&frame));
+                    send_or_detach(&bus, &targets, target, encode_preview_frame(&frame));
                 }
             }
             changed = statuses.changed() => {
@@ -146,8 +154,9 @@ async fn forward_preview(
                 }
                 let target = target_changes.borrow_and_update().clone();
                 events.publish_status(&statuses.borrow().clone());
-                if let (Some(target), Some(frame)) = (target, frames.borrow().clone()) {
-                    send_or_detach(&targets, target, encode_preview_frame(&frame));
+                let frame = frames.borrow().clone();
+                if let (Some(target), Some(frame)) = (target, frame) {
+                    send_or_detach(&bus, &targets, target, encode_preview_frame(&frame));
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -157,6 +166,7 @@ async fn forward_preview(
 }
 
 fn send_or_detach(
+    bus: &DesktopPreviewBus,
     targets: &tokio::sync::watch::Sender<Option<ActiveTarget>>,
     active: ActiveTarget,
     bytes: Vec<u8>,
@@ -170,6 +180,7 @@ fn send_or_detach(
             .is_some_and(|target| target.token == active.token)
         {
             *slot = None;
+            bus.set_active(false);
             true
         } else {
             false
@@ -215,6 +226,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_demand_tracks_current_target_only() {
+        let bus = Arc::new(DesktopPreviewBus::new());
+        let manager = PreviewManager::new(bus.clone());
+        assert!(
+            !bus.is_active(),
+            "internal bus must not create preview demand"
+        );
+        let first = manager
+            .attach(Arc::new(FakeTarget::default()), Arc::new(FakeEvents))
+            .await;
+        assert!(bus.is_active());
+        let second = manager
+            .attach(Arc::new(FakeTarget::default()), Arc::new(FakeEvents))
+            .await;
+        assert!(!manager.detach(first));
+        assert!(
+            bus.is_active(),
+            "stale detach must keep current preview active"
+        );
+        assert!(manager.detach(second));
+        assert!(
+            !bus.is_active(),
+            "last target leaving must stop preview work"
+        );
+        manager
+            .attach(Arc::new(FakeTarget::default()), Arc::new(FakeEvents))
+            .await;
+        assert!(bus.is_active());
+        manager.shutdown().await;
+        assert!(!bus.is_active());
+    }
+
+    #[tokio::test]
     async fn 重复attach替换目标且旧token不能detach新目标() {
         let bus = Arc::new(crate::preview_channel::DesktopPreviewBus::new());
         let manager = PreviewManager::new(bus.clone());
@@ -247,6 +291,10 @@ mod tests {
         bus.publish(frame(1));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(manager.active_token(), None);
+        assert!(
+            !bus.is_active(),
+            "closed channel must release preview demand"
+        );
 
         let replacement = Arc::new(FakeTarget::default());
         manager
@@ -255,6 +303,25 @@ mod tests {
         bus.publish(frame(2));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!replacement.frames.lock().unwrap().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cached_frame_to_closed_replacement_releases_demand() {
+        let bus = Arc::new(DesktopPreviewBus::new());
+        let manager = PreviewManager::new(bus.clone());
+        let first = Arc::new(FakeTarget::default());
+        manager.attach(first.clone(), Arc::new(FakeEvents)).await;
+        bus.publish(frame(1));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!first.frames.lock().unwrap().is_empty());
+        let closed = Arc::new(FakeTarget::default());
+        closed.closed.store(true, Ordering::Release);
+        manager.attach(closed, Arc::new(FakeEvents)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(manager.active_token(), None);
+        assert!(!bus.is_active());
+        assert!(bus.subscribe().borrow().is_none());
         manager.shutdown().await;
     }
 }

@@ -60,6 +60,9 @@ impl PreviewingSource {
 
     fn dispatch_video(&mut self, data: &[u8], codec: crate::ps::VideoCodec, key_frame: bool) {
         self.sequence = self.sequence.wrapping_add(1).max(1);
+        if !self.preview_input.is_active() {
+            return;
+        }
         let access_unit = CapturedAccessUnit::with_codec(
             self.generation,
             self.sequence,
@@ -285,5 +288,52 @@ mod tests {
         assert_eq!(frame.data, vec![0, 0, 0, 1, 1, 0]);
         assert_eq!(source.next_audio(), vec![vec![7, 8]]);
         assert!(source.next_frame().is_none());
+    }
+
+    #[test]
+    fn visibility_changes_preserve_main_video_audio_and_timestamps() {
+        struct DemandSink(std::sync::atomic::AtomicBool);
+        impl PreviewSink for DemandSink {
+            fn is_active(&self) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+            fn publish(&self, _frame: crate::preview::PreviewJpeg) {}
+        }
+        let sink = Arc::new(DemandSink(std::sync::atomic::AtomicBool::new(false)));
+        let events = (0..12)
+            .flat_map(|index| {
+                let pts = index * 3_600;
+                [
+                    MediaEvent::Video(TimedVideoAu::new(
+                        vec![0, 0, 0, 1, 1, index as u8],
+                        VideoCodec::H264,
+                        false,
+                        pts,
+                        3_600,
+                    )),
+                    MediaEvent::Audio(TimedAudioAu::with_duration(
+                        vec![index as u8; 16],
+                        AudioCodec::Aac,
+                        16_000,
+                        640,
+                        pts,
+                        3_600,
+                    )),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let (source, reads, _) = new_timed_source(events.clone());
+        let mut source = PreviewingSource::new(Box::new(source), 25, sink.clone())
+            .expect("测试需要可用的 ffmpeg");
+        let generation = source.generation;
+        for (index, expected) in events.iter().enumerate() {
+            sink.0.store(index % 4 == 0, Ordering::Release);
+            assert_eq!(source.next_media_event().as_ref(), Some(expected));
+            assert_eq!(
+                source.generation, generation,
+                "visibility must not recreate the source"
+            );
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), events.len());
     }
 }
