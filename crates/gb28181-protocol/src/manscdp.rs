@@ -2511,6 +2511,63 @@ impl PtzPreciseStatusResponse {
     }
 }
 
+/// PTZ 精准状态通知(PTZPosition,GB-2022,设备 → 平台)。
+///
+/// 与查询应答 [`PtzPreciseStatusResponse`] 使用同一组姿态字段,但语义与根元素不同:
+/// 通知是**事件型**上报(根元素 `<Notify>`),由设备在姿态真正发生变化时主动发出;
+/// 应答只在平台下发单次查询后返回一次。两者的区别是协议层的硬约束 ——
+/// 平台按 SIP 方法分流(`NOTIFY` → 通知入口落库,`MESSAGE` → 查询应答入口),
+/// 用 MESSAGE 承载周期上报会被当作"查询应答"丢弃。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct PtzPreciseNotify {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: u32,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    /// 上报时刻(ISO8601,校时后)。
+    #[serde(rename = "Time")]
+    pub time: String,
+    /// 水平角(度,%.2f)。
+    #[serde(rename = "Pan")]
+    pub pan: String,
+    /// 俯仰角(度,%.2f)。
+    #[serde(rename = "Tilt")]
+    pub tilt: String,
+    /// 变倍(≥1.00,%.2f)。
+    #[serde(rename = "Zoom")]
+    pub zoom: String,
+}
+
+impl PtzPreciseNotify {
+    /// 用变化后的姿态构造一条通知(格式化为 %.2f)。
+    pub fn new(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        pan: f32,
+        tilt: f32,
+        zoom: f32,
+    ) -> Self {
+        PtzPreciseNotify {
+            cmd_type: "PTZPosition".into(),
+            sn,
+            device_id: device_id.into(),
+            time: time.into(),
+            pan: format!("{pan:.2}"),
+            tilt: format!("{tilt:.2}"),
+            zoom: format!("{zoom:.2}"),
+        }
+    }
+
+    /// 序列化为完整 XML。
+    pub fn to_xml(&self) -> Result<String> {
+        manscdp_to_xml(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3165,6 +3222,23 @@ mod tests {
         assert!(xml.contains("<Pan>123.46</Pan>"));
         assert!(xml.contains("<Tilt>-15.00</Tilt>"));
         assert!(xml.contains("<Zoom>3.50</Zoom>"));
+    }
+
+    #[test]
+    fn ptz精准状态通知_根元素为notify且含时间() {
+        // 事件型上报必须用 <Notify> 根元素:平台按 SIP 方法分流,只有 NOTIFY 进通知入口落库。
+        let xml = PtzPreciseNotify::new("dev", 8, "2026-09-15T16:40:00", 12.345, -3.2, 1.0)
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<Notify>"));
+        assert!(!xml.contains("<Response>"));
+        assert!(xml.contains("<CmdType>PTZPosition</CmdType>"));
+        assert!(xml.contains("<SN>8</SN>"));
+        assert!(xml.contains("<DeviceID>dev</DeviceID>"));
+        assert!(xml.contains("<Time>2026-09-15T16:40:00</Time>"));
+        assert!(xml.contains("<Pan>12.35</Pan>"));
+        assert!(xml.contains("<Tilt>-3.20</Tilt>"));
+        assert!(xml.contains("<Zoom>1.00</Zoom>"));
     }
 
     #[test]

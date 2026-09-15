@@ -277,6 +277,13 @@ pub struct DeviceSimulator {
     alarm_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
     /// 目录订阅对话(平台 `SUBSCRIBE + Catalog` 时记录):CRUD 变更后据此发对话内增量 NOTIFY。
     catalog_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
+    /// PTZ 精准状态订阅对话(平台 `SUBSCRIBE + PTZPosition` 时记录)。
+    ///
+    /// 该订阅是**事件型**:平台构造订阅查询时按规范不带 `Interval`,设备只在精确姿态
+    /// 真正发生变化时发一条对话内 NOTIFY。存在对话时才会上报,设备下线时清理。
+    ptz_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
+    /// PTZ 精准状态已上报次数(供前端「活跃订阅面板」显示)。
+    ptz_notify_count: std::sync::atomic::AtomicU32,
     /// 预置位表(编号 → 名称)。PTZ 预置位设置/删除命令更新,PresetQuery 返回。
     presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
     /// 设备控制态(布防/看守位/巡航/精准姿态)。扩展查询与控制命令共同维护(FR-17/18)。
@@ -480,6 +487,8 @@ impl DeviceSimulator {
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
             catalog_dialog: tokio::sync::Mutex::new(None),
+            ptz_dialog: tokio::sync::Mutex::new(None),
+            ptz_notify_count: std::sync::atomic::AtomicU32::new(0),
             presets: std::sync::Mutex::new(default_presets()),
             control_state: std::sync::Mutex::new(ControlState::default()),
             runtime_config: std::sync::Mutex::new(runtime_config),
@@ -1564,90 +1573,126 @@ impl DeviceSimulator {
         tracing::info!(interval = secs, "移动位置订阅已建立,开始周期上报");
     }
 
-    /// 启动(或重建)PTZ 精准位置事件订阅的周期上报任务(GB28181-2022 §9.11.2)。
+    /// 登记(或替换)PTZ 精准状态**事件订阅**,并补推一次当前姿态(GB28181-2022 §9.11.2)。
     ///
-    /// 平台 `SUBSCRIBE + PTZPosition`(携 Interval)后调用:按 interval 秒周期发
-    /// PTZ 精准状态 NOTIFY(独立 MESSAGE,复用 PTZPosition 应答体)。真实设备应在姿态
-    /// 变化时触发;模拟器按周期上报当前 precise_pose。
-    async fn start_ptz_position_subscription(
+    /// 平台下发 `SUBSCRIBE + PTZPosition` 后调用。该订阅是事件型:平台按规范构造订阅
+    /// 查询时**不带 `Interval`**(只有移动位置 MobilePosition 才带上报周期),设备应只在
+    /// 精确姿态发生变化时发对话内 NOTIFY。因此这里不启动任何周期任务,只记录对话供
+    /// 后续变化时上报;订阅建立后补推一条当前姿态,给平台一个基线读数。
+    async fn register_ptz_position_subscription(
         self: &Arc<Self>,
         transport: &Arc<UdpTransport>,
-        interval: Option<u64>,
+        dialog: builder::NotifyDialog,
+        dst: SocketAddr,
     ) {
-        let secs = interval.filter(|s| *s > 0).unwrap_or(5);
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let sim = Arc::clone(self);
-        let tp = Arc::clone(transport);
-        let local_host = self.local_host();
-        let local_port = self.local_port();
-        let notify_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counter = notify_count.clone();
-        let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs));
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => break,
-                    _ = ticker.tick() => {
-                        if let Err(e) = sim
-                            .report_ptz_position(&tp, &local_host, local_port)
-                            .await
-                        {
-                            tracing::warn!(error=%e, "PTZ 精准位置订阅周期上报失败");
-                        } else {
-                            let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            sim.observer.on_event(common::DeviceEvent::SubscriptionChanged {
-                                kind: "PTZPosition".into(),
-                                active: true,
-                                notify_count: n,
-                            });
-                        }
-                    }
-                }
-            }
-        });
-
-        let mut subs = self.subscriptions.lock().await;
-        subs.insert(
-            "PTZPosition".to_string(),
-            Subscription {
-                _task: task,
-                stop_tx,
-            },
-        );
+        *self.ptz_dialog.lock().await = Some((dialog.clone(), dst));
+        self.ptz_notify_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.observer
             .on_event(common::DeviceEvent::SubscriptionChanged {
                 kind: "PTZPosition".into(),
                 active: true,
                 notify_count: 0,
             });
-        tracing::info!(interval = secs, "PTZ 精准位置订阅已建立,开始周期上报");
+        tracing::info!("PTZ 精准位置事件订阅已建立,姿态变化时上报");
+
+        let sim = Arc::clone(self);
+        let tp = Arc::clone(transport);
+        // 事件型订阅不保证后续一定再有变化,初值先推一条;NOTIFY 走事务要等平台确认。
+        tokio::spawn(async move {
+            if let Err(e) = sim.notify_ptz_position(&tp, dst, &dialog).await {
+                tracing::warn!(error=%e, "PTZ 精准位置初始上报失败");
+            }
+        });
     }
 
-    /// 主动上报一条 PTZ 精准状态 NOTIFY(GB28181-2022 §9.11.2)。
-    /// 复用 PTZPosition 应答体(Pan/Tilt/Zoom),独立 MESSAGE fire-and-forget。
-    pub async fn report_ptz_position(
-        &self,
-        transport: &Arc<UdpTransport>,
-        local_host: &str,
-        local_port: u16,
-    ) -> Result<()> {
-        let sn = self.next_cseq();
-        let (pan, tilt, zoom) = self
-            .control_state
+    /// 读取当前精确姿态(Pan/Tilt/Zoom)。
+    fn precise_pose(&self) -> (f32, f32, f32) {
+        self.control_state
             .lock()
             .map(|s| s.precise_pose)
-            .unwrap_or((0.0, 0.0, 1.0));
-        let notify = gb28181_protocol::manscdp::PtzPreciseStatusResponse::new(
+            .unwrap_or((0.0, 0.0, 1.0))
+    }
+
+    /// 精确姿态确实变了、且存在 PTZ 订阅时,异步发一条对话内 NOTIFY。
+    ///
+    /// `before` 为本次控制命令处理前的姿态;未变化则不发(事件型语义,替代原先的
+    /// 无条件周期上报)。无订阅时静默返回,平台会在下次订阅或查询时同步。
+    async fn notify_ptz_if_pose_changed(
+        self: &Arc<Self>,
+        transport: &Arc<UdpTransport>,
+        before: (f32, f32, f32),
+    ) {
+        if self.precise_pose() == before {
+            return;
+        }
+        let Some((dialog, dst)) = self.ptz_dialog.lock().await.clone() else {
+            return;
+        };
+        self.mark_runtime_change("ptz_position_changed");
+        let sim = Arc::clone(self);
+        let tp = Arc::clone(transport);
+        // NOTIFY 走事务要等平台确认,不能占用入站信令循环。
+        tokio::spawn(async move {
+            if let Err(e) = sim.notify_ptz_position(&tp, dst, &dialog).await {
+                tracing::warn!(error=%e, "PTZ 精准位置变化上报失败");
+            }
+        });
+    }
+
+    /// 在订阅对话内发一条 PTZ 精准状态 NOTIFY(GB28181-2022 §9.11.2)。
+    ///
+    /// 必须是 SIP **NOTIFY** 方法 + `<Notify>` 根元素:平台按方法分流,只有 NOTIFY 才进
+    /// 通知入口(`OnPTZNotify`)落库;用 MESSAGE 承载会被当成"查询应答"去关联 operation,
+    /// 关联不上就丢弃。
+    pub async fn notify_ptz_position(
+        &self,
+        transport: &Arc<UdpTransport>,
+        dst: SocketAddr,
+        dialog: &builder::NotifyDialog,
+    ) -> Result<u16> {
+        let (pan, tilt, zoom) = self.precise_pose();
+        let sn = self.next_cseq();
+        let notify = gb28181_protocol::manscdp::PtzPreciseNotify::new(
             self.config.device_id.as_str(),
             sn,
+            common::clock::synced_iso8601(),
             pan,
             tilt,
             zoom,
         );
         let xml = notify.to_xml()?;
-        self.send_message_xml_oneshot(transport, local_host, local_port, &xml)
-            .await
+        let cseq = self.next_cseq();
+        let request = builder::notify_in_dialog(
+            &self.config,
+            dialog,
+            cseq,
+            &self.local_host(),
+            self.local_port(),
+            &xml,
+        );
+        let mut rx = transport.register(dialog.call_id.clone());
+        let result = sip_core::client_transact(
+            transport,
+            dst,
+            &request,
+            &mut rx,
+            query_response_timing(),
+        )
+        .await;
+        transport.unregister(&dialog.call_id);
+        let status = result?.status;
+        let n = self
+            .ptz_notify_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.observer
+            .on_event(common::DeviceEvent::SubscriptionChanged {
+                kind: "PTZPosition".into(),
+                active: true,
+                notify_count: n,
+            });
+        Ok(status)
     }
 
     /// 停止全部活跃订阅(设备下线/重注册时调,避免残留周期任务)。
@@ -1658,6 +1703,9 @@ impl DeviceSimulator {
         }
         *self.alarm_dialog.lock().await = None;
         *self.catalog_dialog.lock().await = None;
+        // PTZ 事件订阅同样随设备下线失效:清对话后
+        // notify_ptz_if_pose_changed 会静默跳过,不再向上报(平台侧订阅也会被标 expired)。
+        *self.ptz_dialog.lock().await = None;
     }
 
     /// 处理一条入站请求:OPTIONS 简单回 200;MESSAGE 解析 XML 查询并应答;
@@ -1694,6 +1742,9 @@ impl DeviceSimulator {
                             body_str.contains("<Control>") || body_str.contains("<Control ");
                         if is_control {
                             if let Ok(ctrl) = gb28181_protocol::manscdp::Control::parse(body_str) {
+                                // 精确云台控制会改变姿态。记录处理前的值,处理完后据此判断
+                                // 是否需要向 PTZ 事件订阅推一条 NOTIFY(事件型:只在变化时上报)。
+                                let pose_before = self.precise_pose();
                                 let (xml, upgrade_dispatch) = if ctrl.device_upgrade.is_some() {
                                     self.handle_control_with_dispatch(&ctrl).await?
                                 } else {
@@ -1712,6 +1763,8 @@ impl DeviceSimulator {
                                     });
                                 // 抓拍/升级等需设备主动发 NOTIFY 的命令:回 200/结果后异步执行。
                                 self.spawn_control_side_effects(transport, &ctrl, upgrade_dispatch);
+                                self.notify_ptz_if_pose_changed(transport, pose_before)
+                                    .await;
                             }
                         } else if body_str.contains("Broadcast") {
                             // 语音广播:回 Broadcast Response(OK/ERROR),接受则反向发 INVITE。
@@ -1849,10 +1902,14 @@ impl DeviceSimulator {
                                     *self.alarm_dialog.lock().await = Some((dialog, incoming.from));
                                 }
                                 // PTZ 精准位置事件订阅(GB28181-2022 §9.11.1/9.11.2):
-                                // 启动周期 PTZ 精准状态 NOTIFY(独立 MESSAGE 路径,与位置订阅一致)。
+                                // 事件型 —— 只登记订阅对话,姿态变化时发对话内 NOTIFY,不周期上报。
                                 "PTZPosition" => {
-                                    self.start_ptz_position_subscription(transport, query.interval)
-                                        .await;
+                                    self.register_ptz_position_subscription(
+                                        transport,
+                                        dialog,
+                                        incoming.from,
+                                    )
+                                    .await;
                                 }
                                 _ => {}
                             }
@@ -4942,6 +4999,214 @@ mod tests {
         // 下线清理:对话应被清除。
         sim.stop_subscriptions().await;
         assert!(sim.alarm_dialog.lock().await.is_none());
+    }
+
+    /// 平台侧对设备发来的请求回 200,结束设备的事务并抑制重传。
+    async fn ack_platform_request(platform: &Arc<UdpTransport>, incoming: &sip_core::Incoming) {
+        let SipMessage::Request(req) = &incoming.message else {
+            return;
+        };
+        let mut h = Headers::new();
+        h.set("Call-ID", req.headers.call_id().unwrap_or_default().to_string());
+        h.set("CSeq", req.headers.cseq().unwrap_or_default().to_string());
+        let resp = SipMessage::Response(Response {
+            status: 200,
+            reason: "OK".into(),
+            headers: h,
+            body: Vec::new(),
+        });
+        let _ = platform.send_to(&resp, incoming.from).await;
+    }
+
+    /// 平台下发 PTZPosition 事件订阅(GB-2022 事件型语义,**不带 Interval**)。
+    async fn subscribe_ptz_position(
+        sim: &Arc<DeviceSimulator>,
+        device_tp: &Arc<UdpTransport>,
+        platform_addr: SocketAddr,
+        call_id: &str,
+    ) {
+        use sip_core::{Method, Request};
+
+        let sub_xml = r#"<?xml version="1.0"?>
+<Query><CmdType>PTZPosition</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID></Query>"#;
+        let mut h = Headers::new();
+        h.set("Call-ID", call_id);
+        h.set("CSeq", "1 SUBSCRIBE");
+        h.set(
+            "From",
+            "<sip:34020000002000000001@34020000002000000001>;tag=plat9",
+        );
+        h.set("To", "<sip:34020000001320000001@34020000002000000001>");
+        h.set("Event", "PTZPosition");
+        h.set("Expires", "3600");
+        let sub_req = Request {
+            method: Method::Subscribe,
+            uri: "sip:34020000001320000001@127.0.0.1".into(),
+            headers: h,
+            body: sub_xml.as_bytes().to_vec(),
+        };
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(sub_req),
+            from: platform_addr,
+        };
+        assert!(sim.answer_inbound(device_tp, &incoming).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ptz位置订阅_回200记录对话且不启动周期上报() {
+        use sip_core::Method;
+
+        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+
+        let sim = Arc::new(DeviceSimulator::new(test_cfg(
+            "127.0.0.1",
+            platform_addr.port(),
+        )));
+
+        // 对话内 NOTIFY 沿用订阅 Call-ID,平台按同一 Call-ID 收(200 响应与入站 NOTIFY 同路由)。
+        let mut pdlg = platform_tp.register("ptz-sub-1");
+        subscribe_ptz_position(&sim, &device_tp, platform_addr, "ptz-sub-1").await;
+
+        // (1) 订阅 200。
+        let ok = tokio::time::timeout(std::time::Duration::from_secs(2), pdlg.recv())
+            .await
+            .expect("超时未收到订阅 200")
+            .expect("关闭");
+        match ok.message {
+            SipMessage::Response(r) => {
+                assert_eq!(r.status, 200);
+                assert!(r.headers.get("To").unwrap().contains("tag="));
+            }
+            _ => panic!("应先收到 200"),
+        }
+
+        // 对话已登记供后续变化时上报。
+        let stored = sim.ptz_dialog.lock().await.clone();
+        let (dialog, dst) = stored.expect("应记录 PTZ 订阅对话");
+        assert_eq!(dialog.call_id, "ptz-sub-1");
+        assert_eq!(dialog.event, "PTZPosition");
+        assert_eq!(dialog.expires, 3600);
+        assert!(dialog.remote_from.contains("tag=plat9"));
+        assert_eq!(dst, platform_addr);
+
+        // (2) 事件型订阅建立后补推一次当前姿态:必须是 NOTIFY + <Notify> 根元素,
+        //     而不是旧的 MESSAGE 周期上报(后者会被平台当查询应答丢弃)。
+        let notify = tokio::time::timeout(std::time::Duration::from_secs(2), pdlg.recv())
+            .await
+            .expect("超时未收到初始姿态 NOTIFY")
+            .expect("关闭");
+        match &notify.message {
+            SipMessage::Request(r) => {
+                assert_eq!(r.method, Method::Notify);
+                assert_eq!(r.headers.call_id(), Some("ptz-sub-1"));
+                assert_eq!(r.headers.get("Event"), Some("PTZPosition"));
+                let body_str = std::str::from_utf8(&r.body).unwrap();
+                assert!(body_str.contains("<CmdType>PTZPosition</CmdType>"));
+                assert!(body_str.contains("<Pan>0.00</Pan>"));
+                assert!(!body_str.contains("<Interval>"));
+            }
+            _ => panic!("应为对话内 NOTIFY 请求"),
+        }
+        ack_platform_request(&platform_tp, &notify).await;
+
+        // (3) 事件型订阅不占周期任务:订阅表里不应有 PTZPosition 周期任务。
+        assert!(!sim.subscriptions.lock().await.contains_key("PTZPosition"));
+        // 短时间内不应再收到第二条(证明没有 5 秒周期上报)。
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(800), pdlg.recv()).await;
+        assert!(extra.is_err(), "事件型订阅不应周期上报");
+
+        // 下线清理:对话应被清除。
+        sim.stop_subscriptions().await;
+        assert!(sim.ptz_dialog.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ptz姿态变化_发对话内notify_未变化不发() {
+        use sip_core::{Method, Request};
+
+        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+
+        let sim = Arc::new(DeviceSimulator::new(test_cfg(
+            "127.0.0.1",
+            platform_addr.port(),
+        )));
+
+        let mut pdlg = platform_tp.register("ptz-sub-2");
+        subscribe_ptz_position(&sim, &device_tp, platform_addr, "ptz-sub-2").await;
+
+        // 订阅 200 + 初始姿态 NOTIFY,均消费掉(并把初始 NOTIFY 应答掉以免重传)。
+        let ok = tokio::time::timeout(std::time::Duration::from_secs(2), pdlg.recv())
+            .await
+            .expect("超时未收到订阅 200")
+            .expect("关闭");
+        assert!(matches!(ok.message, SipMessage::Response(_)));
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(2), pdlg.recv())
+            .await
+            .expect("超时未收到初始姿态 NOTIFY")
+            .expect("关闭");
+        ack_platform_request(&platform_tp, &initial).await;
+
+        // 平台下发精确云台控制(改姿态):pan=90 tilt=10 zoom=2。
+        let control_xml = r#"<?xml version="1.0"?>
+<Control><CmdType>DeviceControl</CmdType><SN>2</SN><DeviceID>34020000001320000001</DeviceID><PTZPreciseCtrl><Pan>90.00</Pan><Tilt>10.00</Tilt><Zoom>2.00</Zoom></PTZPreciseCtrl></Control>"#;
+        let mut h = Headers::new();
+        h.set("Call-ID", "ctl-msg-1");
+        h.set("CSeq", "2 MESSAGE");
+        h.set("From", "<sip:34020000002000000001@34020000002000000001>;tag=plat9");
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(Request {
+                method: Method::Message,
+                uri: "sip:34020000001320000001@127.0.0.1".into(),
+                headers: h,
+                body: control_xml.as_bytes().to_vec(),
+            }),
+            from: platform_addr,
+        };
+        assert!(sim.answer_inbound(&device_tp, &incoming).await.unwrap());
+        assert_eq!(
+            sim.control_state.lock().unwrap().precise_pose,
+            (90.0, 10.0, 2.0)
+        );
+
+        // 姿态确实变了 ⇒ 应发一条对话内 NOTIFY,携带新姿态。
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(2), pdlg.recv())
+            .await
+            .expect("姿态变化后超时未收到 NOTIFY")
+            .expect("关闭");
+        match &changed.message {
+            SipMessage::Request(r) => {
+                assert_eq!(r.method, Method::Notify);
+                assert_eq!(r.headers.call_id(), Some("ptz-sub-2"));
+                let body_str = std::str::from_utf8(&r.body).unwrap();
+                assert!(body_str.contains("<Pan>90.00</Pan>"));
+                assert!(body_str.contains("<Tilt>10.00</Tilt>"));
+                assert!(body_str.contains("<Zoom>2.00</Zoom>"));
+            }
+            _ => panic!("应为对话内 NOTIFY 请求"),
+        }
+        ack_platform_request(&platform_tp, &changed).await;
+
+        // 同一姿态再下发一次:未变化 ⇒ 不应再上报(事件型语义)。
+        let mut h2 = Headers::new();
+        h2.set("Call-ID", "ctl-msg-2");
+        h2.set("CSeq", "3 MESSAGE");
+        h2.set("From", "<sip:34020000002000000001@34020000002000000001>;tag=plat9");
+        let incoming2 = sip_core::Incoming {
+            message: SipMessage::Request(Request {
+                method: Method::Message,
+                uri: "sip:34020000001320000001@127.0.0.1".into(),
+                headers: h2,
+                body: control_xml.as_bytes().to_vec(),
+            }),
+            from: platform_addr,
+        };
+        assert!(sim.answer_inbound(&device_tp, &incoming2).await.unwrap());
+        let repeat = tokio::time::timeout(std::time::Duration::from_millis(800), pdlg.recv()).await;
+        assert!(repeat.is_err(), "姿态未变化不应上报 NOTIFY");
     }
 
     #[tokio::test]
