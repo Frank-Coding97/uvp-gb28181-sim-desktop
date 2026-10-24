@@ -1082,8 +1082,10 @@ fn group_into_frames(nals: Vec<Nal<'_>>, codec: crate::ps::VideoCodec) -> Vec<Fr
 #[path = "source_live.rs"]
 mod live;
 pub use live::{
-    list_live_sources, LiveAudioCodec, LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource,
-    LiveSourceCatalog, LiveSourceSpec, LiveVideoCodec, LiveVideoProfile,
+    list_live_sources, show_share_picker, LiveAudioCodec, LiveAudioSource, LiveAvDevice,
+    LiveScreenDevice, LiveSource, LiveSourceCatalog, LiveSourceSpec, LiveVideoCodec,
+    LiveVideoProfile, PickedShareTarget, ScreenCaptureTarget, SharePickerHandle,
+    SHARE_PICKER_TIMEOUT,
 };
 
 // Superseded implementation retained disabled so the surrounding user changes remain reviewable

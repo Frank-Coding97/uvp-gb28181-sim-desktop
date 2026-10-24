@@ -16,4 +16,4 @@ serde.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 openh264 = "=0.6.5"
-screencapturekit = { version = "=8.0.1", features = ["macos_13_0"] }
+screencapturekit = { version = "=8.0.1", features = ["macos_13_0", "macos_14_0"] }

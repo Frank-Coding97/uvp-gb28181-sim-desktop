@@ -56,10 +56,34 @@ export interface ParsedCameraSource extends VideoProfile {
   audioCodec: AudioCodec;
 }
 
+/**
+ * 屏幕采集目标:整块显示器 / 单个窗口 / 某个应用的全部窗口。
+ *
+ * 窗口与应用只能由 macOS 系统选择器(`SCContentSharingPicker`)给出身份 ——
+ * 应用自己列窗口既拿不到跨应用的稳定 id,也不符合系统授权习惯。
+ * `label` 只在本次会话内用于展示,不写进 URI(URI 只带稳定身份)。
+ */
+export type ShareTarget =
+  | { kind: "display"; displayId: number }
+  | { kind: "window"; windowId: number; label?: string }
+  | { kind: "application"; bundleId: string; label?: string };
+
 export interface ParsedScreenSource extends VideoProfile {
-  displayId: number;
+  target: ShareTarget;
   audio: ScreenAudioSource;
   audioCodec: AudioCodec;
+}
+
+/** 目标在 URI 里的 `live:<scheme>:<value>` 前缀。 */
+export function shareTargetPrefix(target: ShareTarget): string {
+  switch (target.kind) {
+    case "display":
+      return `live:screen:${target.displayId}`;
+    case "window":
+      return `live:window:${target.windowId}`;
+    case "application":
+      return `live:app:${target.bundleId}`;
+  }
 }
 
 export function isAudioCodec(value: string): value is AudioCodec {
@@ -115,12 +139,27 @@ export function parseCameraSource(source: string): ParsedCameraSource | null {
   return { videoIndex, audio: audio!, audioCodec, ...profile };
 }
 
-/** 解析屏幕源 URI;非法或非屏幕 URI 返回 null。 */
+/** 解析屏幕源 URI(整屏 / 窗口 / 应用);非法或非屏幕 URI 返回 null。 */
 export function parseScreenSource(source: string): ParsedScreenSource | null {
-  const match = source.match(/^live:screen:(\d+)\?(.+)$/);
+  const display = source.match(/^live:screen:(\d+)\?(.+)$/);
+  const window = source.match(/^live:window:(\d+)\?(.+)$/);
+  const application = source.match(/^live:app:([A-Za-z0-9._-]+)\?(.+)$/);
+  const match = display ?? window ?? application;
   if (!match) return null;
-  const displayId = Number(match[1]);
-  if (!Number.isSafeInteger(displayId) || displayId <= 0) return null;
+
+  let target: ShareTarget;
+  if (display) {
+    const displayId = Number(match[1]);
+    if (!Number.isSafeInteger(displayId) || displayId <= 0) return null;
+    target = { kind: "display", displayId };
+  } else if (window) {
+    const windowId = Number(match[1]);
+    if (!Number.isSafeInteger(windowId) || windowId <= 0) return null;
+    target = { kind: "window", windowId };
+  } else {
+    target = { kind: "application", bundleId: match[1] };
+  }
+
   const params = new URLSearchParams(match[2]);
   const audio = params.get("audio");
   const audioCodec = params.get("audio_codec") ?? "g711a";
@@ -128,7 +167,7 @@ export function parseScreenSource(source: string): ParsedScreenSource | null {
   if (!validAudio || !isAudioCodec(audioCodec)) return null;
   const profile = parseVideoProfile(params);
   if (!profile) return null;
-  return { displayId, audio: audio as ScreenAudioSource, audioCodec, ...profile };
+  return { target, audio: audio as ScreenAudioSource, audioCodec, ...profile };
 }
 
 /** 构造摄像头源 URI。 */
@@ -139,11 +178,11 @@ export function buildCameraUri(source: ParsedCameraSource): string {
   );
 }
 
-/** 构造屏幕源 URI。 */
-export function buildScreenUri(profile: ParsedScreenSource): string {
+/** 构造屏幕源 URI(整屏 / 窗口 / 应用共用同一套查询参数)。 */
+export function buildScreenUri(source: ParsedScreenSource): string {
   return (
-    `live:screen:${profile.displayId}?audio=${profile.audio}` +
-    `&audio_codec=${profile.audioCodec}&${videoProfileQuery(profile)}`
+    `${shareTargetPrefix(source.target)}?audio=${source.audio}` +
+    `&audio_codec=${source.audioCodec}&${videoProfileQuery(source)}`
   );
 }
 

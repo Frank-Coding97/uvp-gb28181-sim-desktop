@@ -11,7 +11,8 @@ export type PreviewTone = "idle" | "live" | "warn";
 export type VideoFit = "contain" | "cover";
 
 const { form } = useDevice();
-const { mediaMode, selectedMicrophone, selectedScreenAudio } = useLiveSources();
+const { mediaMode, selectedMicrophone, selectedScreenAudio, selectedShareTarget } =
+  useLiveSources();
 
 const videoPreviewEl = ref<HTMLVideoElement | null>(null);
 const previewUrl = ref("");
@@ -38,6 +39,9 @@ const previewMeta = computed(() => {
   }
   if (mediaMode.value === "camera") {
     return "预览使用 WebView 本地媒体流；实际推流使用后端 FFmpeg 采集";
+  }
+  if (selectedShareTarget.value && selectedShareTarget.value.kind !== "display") {
+    return "采集目标为窗口/应用：本地预览无法反映它（WebView 只能整屏共享），平台收到的是该目标";
   }
   return "预览使用屏幕共享授权；实际推流使用后端 ScreenCaptureKit";
 });
@@ -97,6 +101,17 @@ async function refreshVideoPreview(auto = false) {
         video: true,
         audio: selectedMicrophone.value !== "none",
       });
+    } else if (
+      selectedShareTarget.value &&
+      selectedShareTarget.value.kind !== "display"
+    ) {
+      // 窗口/应用目标只有后端 ScreenCaptureKit 能采:WebView 的 getDisplayMedia 只能
+      // 整屏共享,拿它当预览会让用户以为"选的目标没生效"——这里如实说明并跳过预览。
+      previewState.value = {
+        tone: "warn",
+        text: "该目标由系统选择器指定(窗口/应用),本地预览不可用;请到平台侧确认画面",
+      };
+      return;
     } else {
       previewStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,

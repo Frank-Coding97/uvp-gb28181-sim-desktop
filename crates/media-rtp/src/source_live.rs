@@ -283,6 +283,236 @@ impl LiveAudioSource {
     }
 }
 
+/// 屏幕采集目标:整块显示器 / 单个窗口 / 某个应用的全部窗口。
+///
+/// 为什么不能只有"显示器":macOS 的系统内容选择器(`SCContentSharingPicker`)让用户
+/// 按「显示器 / 窗口 / 应用」挑共享内容。只按显示器采集会让用户的选择**完全失效**
+/// —— 在系统界面里选了某个 app,推出去的仍然是全屏。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenCaptureTarget {
+    /// 整块显示器(ScreenCaptureKit `display_id`)。`0` 表示主显示器。
+    Display(u32),
+    /// 单个窗口(`CGWindowID`)。
+    Window(u32),
+    /// 某个应用的全部窗口(bundle identifier)。
+    Application(String),
+}
+
+impl ScreenCaptureTarget {
+    /// URI 里的目标段:`live:<scheme>:<value>?…`。
+    pub const fn uri_scheme(&self) -> &'static str {
+        match self {
+            Self::Display(_) => "screen",
+            Self::Window(_) => "window",
+            Self::Application(_) => "app",
+        }
+    }
+
+    /// URI 里的取值段。
+    pub fn uri_value(&self) -> String {
+        match self {
+            Self::Display(id) | Self::Window(id) => id.to_string(),
+            Self::Application(bundle) => bundle.clone(),
+        }
+    }
+
+    /// 报错信息里的人类可读目标描述。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Display(id) => format!("display {id}"),
+            Self::Window(id) => format!("window #{id}"),
+            Self::Application(bundle) => format!("application {bundle}"),
+        }
+    }
+
+    /// 解析 `live:<scheme>:<value>` 的 scheme 与 value。
+    fn parse(scheme: &str, value: &str) -> Result<Self> {
+        match scheme {
+            "screen" => {
+                let id = parse_decimal(value, "ScreenCaptureKit display_id")?;
+                if id == 0 {
+                    return Err(Error::Media(
+                        "canonical screen URI requires a non-zero ScreenCaptureKit display_id"
+                            .into(),
+                    ));
+                }
+                Ok(Self::Display(id))
+            }
+            "window" => {
+                let id = parse_decimal(value, "CGWindowID")?;
+                if id == 0 {
+                    return Err(Error::Media(
+                        "window URI requires a non-zero CGWindowID".into(),
+                    ));
+                }
+                Ok(Self::Window(id))
+            }
+            "app" => {
+                if value.is_empty()
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                {
+                    return Err(Error::Media(
+                        "app URI requires a bundle identifier ([A-Za-z0-9._-])".into(),
+                    ));
+                }
+                Ok(Self::Application(value.to_string()))
+            }
+            other => Err(Error::Media(format!(
+                "unknown screen capture target '{other}'; expected screen, window, or app"
+            ))),
+        }
+    }
+}
+
+/// 系统内容选择器返回的采集目标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickedShareTarget {
+    /// 用户在系统选择器里选定的目标。
+    pub target: ScreenCaptureTarget,
+    /// 供界面展示的标签(窗口标题 / 应用名 / 显示器编号)。
+    pub label: String,
+}
+
+/// 系统选择器的等待上限。选择器是模态 UI,用户不选也不取消时不能让调用方永久挂住。
+pub const SHARE_PICKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// 选择器回调送出的结果(平台无关,便于调用方在自己的线程上等待)。
+enum PickerOutcome {
+    Picked(PickedShareTarget),
+    Cancelled,
+    Failed(String),
+}
+
+/// 系统内容选择器的等待句柄。
+///
+/// 为什么拆成"先 show 再 wait":选择器必须在**主线程**呈现,而等待用户选择不能占住
+/// 主线程 —— 回调要走主队列,阻塞主线程会直接死锁。于是呈现与等待分成两步。
+pub struct SharePickerHandle {
+    outcome: Option<std::sync::mpsc::Receiver<PickerOutcome>>,
+}
+
+impl SharePickerHandle {
+    /// 等待用户选定或取消。用户取消返回 `Ok(None)`;超时或回调丢失返回错误。
+    pub fn wait(self, timeout: std::time::Duration) -> Result<Option<PickedShareTarget>> {
+        let Some(rx) = self.outcome else {
+            return Err(Error::Media(
+                "system content picker is unavailable on this platform".into(),
+            ));
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(PickerOutcome::Picked(picked)) => Ok(Some(picked)),
+            Ok(PickerOutcome::Cancelled) => Ok(None),
+            Ok(PickerOutcome::Failed(error)) => Err(Error::Media(error)),
+            Err(_) => Err(Error::Media(
+                "system content picker timed out without a selection".into(),
+            )),
+        }
+    }
+}
+
+/// 在主线程呈现 macOS 系统内容选择器(非阻塞,立即返回等待句柄)。
+///
+/// **必须在主线程调用**;拿到句柄后在任意线程 `wait()`。
+#[cfg(target_os = "macos")]
+pub fn show_share_picker() -> Result<SharePickerHandle> {
+    use screencapturekit::content_sharing_picker::{
+        SCContentSharingPicker, SCContentSharingPickerConfiguration, SCContentSharingPickerMode,
+    };
+    use std::sync::mpsc;
+
+    let mut config = SCContentSharingPickerConfiguration::new();
+    config.set_allowed_picker_modes(&[
+        SCContentSharingPickerMode::SingleDisplay,
+        SCContentSharingPickerMode::SingleWindow,
+        SCContentSharingPickerMode::SingleApplication,
+    ]);
+    // 允许用户在采集过程中从系统 UI 改选目标(选择器会重新弹出)。
+    config.set_allows_changing_selected_content(true);
+
+    let (tx, rx) = mpsc::channel();
+    SCContentSharingPicker::show(&config, move |outcome| {
+        // 回调可能在任何线程触发,把结果搬进 channel 交给 wait()。
+        let _ = tx.send(convert_picker_outcome(outcome));
+    });
+    Ok(SharePickerHandle { outcome: Some(rx) })
+}
+
+/// 把系统选择器的结果翻译成本模块的目标模型。
+#[cfg(target_os = "macos")]
+fn convert_picker_outcome(
+    outcome: screencapturekit::content_sharing_picker::SCPickerOutcome,
+) -> PickerOutcome {
+    use screencapturekit::content_sharing_picker::{SCPickedSource, SCPickerOutcome};
+
+    match outcome {
+        SCPickerOutcome::Picked(result) => {
+            let (target, label) = match result.source() {
+                SCPickedSource::Display(id) => {
+                    (ScreenCaptureTarget::Display(id), format!("显示器 {id}"))
+                }
+                SCPickedSource::Window(title) => {
+                    let Some(window_id) = result
+                        .windows()
+                        .first()
+                        .map(screencapturekit::shareable_content::SCWindow::window_id)
+                    else {
+                        return PickerOutcome::Failed(
+                            "system content picker returned a window without an id".into(),
+                        );
+                    };
+                    let label = if title.trim().is_empty() {
+                        format!("窗口 #{window_id}")
+                    } else {
+                        title
+                    };
+                    (ScreenCaptureTarget::Window(window_id), label)
+                }
+                SCPickedSource::Application(name) => {
+                    let Some(bundle) = result
+                        .applications()
+                        .first()
+                        .map(
+                            screencapturekit::shareable_content::SCRunningApplication::bundle_identifier,
+                        )
+                        .filter(|bundle| !bundle.is_empty())
+                    else {
+                        return PickerOutcome::Failed(
+                            "system content picker returned an application without a bundle id"
+                                .into(),
+                        );
+                    };
+                    let label = if name.trim().is_empty() {
+                        bundle.clone()
+                    } else {
+                        name
+                    };
+                    (ScreenCaptureTarget::Application(bundle), label)
+                }
+                SCPickedSource::Unknown => {
+                    return PickerOutcome::Failed(
+                        "system content picker returned no usable content".into(),
+                    )
+                }
+            };
+            PickerOutcome::Picked(PickedShareTarget { target, label })
+        }
+        SCPickerOutcome::Cancelled => PickerOutcome::Cancelled,
+        SCPickerOutcome::Error(error) => {
+            PickerOutcome::Failed(format!("system content picker failed: {error}"))
+        }
+    }
+}
+
+/// 非 macOS 平台没有该系统选择器。
+#[cfg(not(target_os = "macos"))]
+pub fn show_share_picker() -> Result<SharePickerHandle> {
+    Err(Error::Media(
+        "system content picker is only available on macOS".into(),
+    ))
+}
+
 /// A fully parsed live-source URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveSourceSpec {
@@ -293,9 +523,9 @@ pub enum LiveSourceSpec {
         audio_codec: LiveAudioCodec,
         profile: LiveVideoProfile,
     },
-    /// ScreenCaptureKit display ID, optional system/microphone audio, and output profile.
+    /// ScreenCaptureKit 采集目标(显示器/窗口/应用)、可选系统声音或麦克风,以及输出档。
     Screen {
-        display_id: u32,
+        target: ScreenCaptureTarget,
         audio: LiveAudioSource,
         audio_codec: LiveAudioCodec,
         profile: LiveVideoProfile,
@@ -311,7 +541,7 @@ impl LiveSourceSpec {
                 "legacy live URI is deprecated; mapping it to the primary screen"
             );
             return Ok(Self::Screen {
-                display_id: 0,
+                target: ScreenCaptureTarget::Display(0),
                 audio: LiveAudioSource::None,
                 audio_codec: LiveAudioCodec::default(),
                 profile: LiveVideoProfile::default(),
@@ -334,16 +564,16 @@ impl LiveSourceSpec {
             });
         }
 
-        if let Some(rest) = uri.strip_prefix("live:screen:") {
-            let (id, audio, audio_codec, profile) = parse_screen_query(rest)?;
-            let display_id = parse_decimal(id, "ScreenCaptureKit display_id")?;
-            if display_id == 0 {
-                return Err(Error::Media(
-                    "canonical screen URI requires a non-zero ScreenCaptureKit display_id".into(),
-                ));
-            }
+        // 屏幕采集三种目标共用一套查询参数:`live:screen:<id>`、`live:window:<id>`、
+        // `live:app:<bundle_id>`(后者来自系统选择器选中的窗口/应用)。
+        if let Some((scheme, rest)) = uri
+            .strip_prefix("live:")
+            .and_then(|rest| rest.split_once(':'))
+            .filter(|(scheme, _)| matches!(*scheme, "screen" | "window" | "app"))
+        {
+            let (value, audio, audio_codec, profile) = parse_screen_query(rest)?;
             return Ok(Self::Screen {
-                display_id,
+                target: ScreenCaptureTarget::parse(scheme, value)?,
                 audio,
                 audio_codec,
                 profile,
@@ -351,7 +581,7 @@ impl LiveSourceSpec {
         }
 
         Err(Error::Media(format!(
-            "invalid live URI '{uri}'; expected live:camera:<video_index>?audio=<audio_index|none>&audio_codec=<g711a|g711u|aac|opus> or live:screen:<display_id>?audio=<system|microphone:index|none>&audio_codec=<g711a|g711u|aac|opus>, both optionally with &width=<even>&height=<even>&bitrate=<kbps>&codec=<h264|h265>&gop=<frames>"
+            "invalid live URI '{uri}'; expected live:camera:<video_index>?audio=<audio_index|none>&audio_codec=<g711a|g711u|aac|opus> or live:<screen|window|app>:<target>?audio=<system|microphone:index|none>&audio_codec=<g711a|g711u|aac|opus>, both optionally with &width=<even>&height=<even>&bitrate=<kbps>&codec=<h264|h265>&gop=<frames>"
         )))
     }
 
@@ -370,12 +600,14 @@ impl LiveSourceSpec {
                 profile.as_query(),
             ),
             Self::Screen {
-                display_id,
+                target,
                 audio,
                 audio_codec,
                 profile,
             } => format!(
-                "live:screen:{display_id}?audio={}&audio_codec={}&{}",
+                "live:{}:{}?audio={}&audio_codec={}&{}",
+                target.uri_scheme(),
+                target.uri_value(),
                 audio.as_uri_value(),
                 audio_codec.as_str(),
                 profile.as_query(),
@@ -634,7 +866,7 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
                                 height,
                                 name: format!("Display {display_id} ({width}x{height})"),
                                 uri: LiveSourceSpec::Screen {
-                                    display_id,
+                                    target: ScreenCaptureTarget::Display(display_id),
                                     audio: LiveAudioSource::None,
                                     audio_codec: LiveAudioCodec::default(),
                                     profile: LiveVideoProfile::default(),
@@ -838,11 +1070,11 @@ impl LiveSource {
                     profile,
                 } => Self::capture_camera(video_index, audio_index, audio_codec, profile, fps),
                 LiveSourceSpec::Screen {
-                    display_id,
+                    target,
                     audio,
                     audio_codec,
                     profile,
-                } => Self::capture_screen(display_id, audio, audio_codec, profile, fps),
+                } => Self::capture_screen(target, audio, audio_codec, profile, fps),
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1173,7 +1405,7 @@ impl LiveSource {
 
     #[cfg(target_os = "macos")]
     fn capture_screen(
-        display_id: u32,
+        target: ScreenCaptureTarget,
         audio: LiveAudioSource,
         audio_codec: LiveAudioCodec,
         profile: LiveVideoProfile,
@@ -1201,21 +1433,55 @@ impl LiveSource {
         if displays.is_empty() {
             return Err(Error::Media("ScreenCaptureKit reported no displays".into()));
         }
-        let display = if display_id == 0 {
-            displays.first()
-        } else {
-            displays.iter().find(|d| d.display_id() == display_id)
-        }
-        .ok_or_else(|| {
-            Error::Media(format!(
-                "ScreenCaptureKit display_id {display_id} not found"
-            ))
-        })?;
-
-        let filter = SCContentFilter::create()
-            .with_display(display)
-            .with_excluding_windows(&[])
-            .build();
+        // 过滤器按采集目标构造:整屏 / 单个窗口 / 某个应用的全部窗口。
+        // 窗口与应用都按"选择时拿到的 id"在当下的可共享内容里重新解析 ——
+        // 每次 INVITE 都会重建采集管道,只有这样才能让同一次选择跨会话稳定生效。
+        let filter = match &target {
+            ScreenCaptureTarget::Display(display_id) => {
+                let display = if *display_id == 0 {
+                    displays.first()
+                } else {
+                    displays.iter().find(|d| d.display_id() == *display_id)
+                }
+                .ok_or_else(|| {
+                    Error::Media(format!(
+                        "ScreenCaptureKit display_id {display_id} not found"
+                    ))
+                })?;
+                SCContentFilter::create()
+                    .with_display(display)
+                    .with_excluding_windows(&[])
+                    .build()
+            }
+            ScreenCaptureTarget::Window(window_id) => {
+                let windows = content.windows();
+                let window = windows
+                    .iter()
+                    .find(|window| window.window_id() == *window_id)
+                    .ok_or_else(|| {
+                        Error::Media(format!(
+                            "capture target window #{window_id} is gone; pick it again with the system picker"
+                        ))
+                    })?;
+                SCContentFilter::create()
+                    .with_including_windows(&[window])
+                    .build()
+            }
+            ScreenCaptureTarget::Application(bundle_id) => {
+                let applications = content.applications();
+                let application = applications
+                    .iter()
+                    .find(|application| application.bundle_identifier() == *bundle_id)
+                    .ok_or_else(|| {
+                        Error::Media(format!(
+                            "capture target application {bundle_id} is not running; pick it again with the system picker"
+                        ))
+                    })?;
+                SCContentFilter::create()
+                    .with_including_applications(&[application], &[])
+                    .build()
+            }
+        };
         let config = SCStreamConfiguration::new()
             .with_width(profile.width)
             .with_height(profile.height)
@@ -1696,8 +1962,8 @@ impl LiveSource {
 
         stream.start_capture().map_err(|e| {
             Error::Media(format!(
-                "ScreenCaptureKit failed to start display {} (check permission): {e}",
-                display.display_id()
+                "ScreenCaptureKit failed to start {} (check permission): {e}",
+                target.describe()
             ))
         })?;
         let deadline = Instant::now()
@@ -1717,8 +1983,8 @@ impl LiveSource {
             if !producer_alive.load(Ordering::Acquire) {
                 let _ = stream.stop_capture();
                 return Err(Error::Media(format!(
-                    "ScreenCaptureKit display {} stopped before startup completed",
-                    display.display_id()
+                    "ScreenCaptureKit {} stopped before startup completed",
+                    target.describe()
                 )));
             }
             for child in &mut screen_startup.children {
@@ -1745,8 +2011,8 @@ impl LiveSource {
                     (true, true) => unreachable!(),
                 };
                 return Err(Error::Media(format!(
-                    "screen source produced no {missing} data before startup timeout; display {}; microphone stderr: {}",
-                    display.display_id(),
+                    "screen source produced no {missing} data before startup timeout; {}; microphone stderr: {}",
+                    target.describe(),
                     microphone_tail
                         .as_ref()
                         .map_or_else(|| "n/a".into(), locked_tail)
@@ -2457,9 +2723,48 @@ mod tests {
     fn legacy_短屏幕_uri_仍兼容() {
         for uri in ["live:0", "live:ffmpeg:0"] {
             let spec = LiveSourceSpec::parse(uri).expect("parse");
-            assert!(matches!(spec, LiveSourceSpec::Screen { display_id: 0, .. }));
+            assert!(matches!(
+                spec,
+                LiveSourceSpec::Screen {
+                    target: ScreenCaptureTarget::Display(0),
+                    ..
+                }
+            ));
         }
         // 规范形式则要求非零 display_id。
         assert!(LiveSourceSpec::parse("live:screen:0?audio=none").is_err());
+    }
+
+    #[test]
+    fn 系统选择器的窗口与应用目标_可解析可往返() {
+        let window = LiveSourceSpec::parse("live:window:4291?audio=none").expect("parse window");
+        assert_eq!(
+            window,
+            LiveSourceSpec::Screen {
+                target: ScreenCaptureTarget::Window(4291),
+                audio: LiveAudioSource::None,
+                audio_codec: LiveAudioCodec::default(),
+                profile: LiveVideoProfile::default(),
+            }
+        );
+        assert_eq!(window.canonical_uri(), "live:window:4291?audio=none&audio_codec=g711a&width=1280&height=720&bitrate=2500&codec=h264&gop=50");
+
+        let app = LiveSourceSpec::parse("live:app:com.apple.Safari?audio=system&codec=h265&width=1920&height=1080&bitrate=6000&gop=50")
+            .expect("parse app");
+        assert_eq!(app.canonical_uri(), "live:app:com.apple.Safari?audio=system&audio_codec=g711a&width=1920&height=1080&bitrate=6000&codec=h265&gop=50");
+        assert_eq!(
+            LiveSourceSpec::parse(&app.canonical_uri()).expect("re-parse"),
+            app
+        );
+    }
+
+    #[test]
+    fn 非法采集目标被拒() {
+        // 窗口号必须是非零十进制;bundle id 只允许 [A-Za-z0-9._-]。
+        assert!(LiveSourceSpec::parse("live:window:0?audio=none").is_err());
+        assert!(LiveSourceSpec::parse("live:window:abc?audio=none").is_err());
+        assert!(LiveSourceSpec::parse("live:app:?audio=none").is_err());
+        assert!(LiveSourceSpec::parse("live:app:com.apple Safari?audio=none").is_err());
+        assert!(LiveSourceSpec::parse("live:display:1?audio=none").is_err());
     }
 }

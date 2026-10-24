@@ -16,6 +16,7 @@ import {
   type MediaMode,
   type ScreenAudioSource,
   type ScreenCodec,
+  type ShareTarget,
 } from "../lib/liveSource";
 import { persistForm, useDevice } from "../device";
 import { formatError } from "../lib/ipcError";
@@ -40,6 +41,19 @@ export interface LiveSourceCatalog {
   microphones: LiveAvDevice[];
   screen_error: string | null;
   avfoundation_error: string | null;
+}
+/**
+ * 系统内容选择器的返回值(Rust 侧 `pick_share_target`)。
+ *
+ * `uri` 是可直接落库的 `live:<scheme>:<目标>` 前缀,`label` 只用于展示。
+ */
+export interface ShareTargetDto {
+  kind: "display" | "window" | "application";
+  display_id: number | null;
+  window_id: number | null;
+  bundle_id: string | null;
+  label: string;
+  uri: string;
 }
 export interface LiveProbeResult {
   uri: string;
@@ -71,7 +85,14 @@ const mediaMode = ref<MediaMode>(inferMediaMode(initialSource));
 const selectedCameraIndex = ref<number | null>(cameraSource?.videoIndex ?? null);
 const selectedMicrophone = ref(cameraSource?.audio ?? "none");
 const selectedCameraAudioCodec = ref<AudioCodec>(cameraSource?.audioCodec ?? "g711a");
-const selectedDisplayId = ref<number | null>(screenSource?.displayId ?? null);
+const selectedDisplayId = ref<number | null>(
+  screenSource?.target.kind === "display" ? screenSource.target.displayId : null
+);
+// 采集目标:整屏(默认)或系统选择器选定的窗口/应用。窗口/应用没有可枚举的 id 列表,
+// 只能来自系统选择器,所以这里存的是"身份",不是当前是否存在。
+const selectedShareTarget = ref<ShareTarget | null>(screenSource?.target ?? null);
+/** 系统选择器给出的展示标签;重启后无法从 URI 还原,只在本次会话内有效。 */
+const shareTargetLabel = ref<string | null>(null);
 const selectedScreenAudio = ref<ScreenAudioSource>(screenSource?.audio ?? "none");
 const selectedScreenAudioCodec = ref<AudioCodec>(screenSource?.audioCodec ?? "g711a");
 const selectedScreenWidth = ref(initialProfile.width);
@@ -94,6 +115,8 @@ const liveCatalog = ref<LiveSourceCatalog>({
 });
 const sourceLoading = ref(false);
 const probeState = ref<ProbeState | null>(null);
+/** 系统选择器是否正在等待用户选择(防止连点弹出多个系统窗口)。 */
+const sharePickerBusy = ref(false);
 
 /** 音频规格由编码格式决定(与 Rust 侧 LiveAudioCodec 一致),不是可自由设置的项。 */
 export function audioSpecText(codec: AudioCodec): string {
@@ -183,15 +206,99 @@ function syncLiveSourceUri() {
             ...currentProfile(),
           });
   } else if (mediaMode.value === "screen") {
+    // 目标优先级:系统选择器选定的窗口/应用 > 显示器下拉框。
+    // 窗口/应用目标时显示器下拉框不参与(采集范围由系统选择器决定)。
+    const target =
+      selectedShareTarget.value ??
+      (selectedDisplayId.value === null
+        ? null
+        : ({ kind: "display", displayId: selectedDisplayId.value } as ShareTarget));
     form.value.video_source =
-      selectedDisplayId.value === null || !screenProfileValid.value
+      target === null || !screenProfileValid.value
         ? ""
         : buildScreenUri({
-            displayId: selectedDisplayId.value,
+            target,
             audio: selectedScreenAudio.value,
             audioCodec: selectedScreenAudioCodec.value,
             ...currentProfile(),
           });
+  }
+}
+
+/** 采集目标是否已由系统选择器锁定到某个窗口/应用(此时显示器下拉框不适用)。 */
+const shareTargetPinned = computed(
+  () =>
+    mediaMode.value === "screen" &&
+    selectedShareTarget.value !== null &&
+    selectedShareTarget.value.kind !== "display"
+);
+
+/** 采集目标的人类可读描述(界面展示用)。 */
+const shareTargetText = computed(() => {
+  const target = selectedShareTarget.value;
+  if (mediaMode.value !== "screen" || target === null) return "未选择";
+  if (target.kind === "display") {
+    const screen = liveCatalog.value.screens.find(
+      (item) => item.display_id === target.displayId
+    );
+    return `整块显示器 · ${screen?.name ?? `Display ${target.displayId}`}`;
+  }
+  const kind = target.kind === "window" ? "窗口" : "应用";
+  if (shareTargetLabel.value) return `${kind} · ${shareTargetLabel.value}`;
+  // 重启后标签丢失:URI 只带稳定身份,这里如实显示身份而不是编一个标题。
+  return target.kind === "window"
+    ? `${kind} #${target.windowId}(标题需重新选择才能显示)`
+    : `${kind} ${target.bundleId}`;
+});
+
+/** 把当前目标切回整块显示器(清除窗口/应用目标)。 */
+function useDisplayTarget() {
+  selectedShareTarget.value =
+    selectedDisplayId.value === null
+      ? null
+      : { kind: "display", displayId: selectedDisplayId.value };
+  shareTargetLabel.value = null;
+  syncLiveSourceUri();
+  persistForm();
+}
+
+/**
+ * 弹出 macOS 系统内容选择器,让用户按「显示器 / 窗口 / 应用」挑真正要推的画面。
+ *
+ * 这一步只确定**目标身份**;真正采集由后端 ScreenCaptureKit 按该身份重建过滤器,
+ * 所以每次平台 INVITE 重建采集管道时目标都不会丢。
+ */
+async function pickShareTarget(): Promise<{ ok: boolean; label?: string; error?: string }> {
+  if (sharePickerBusy.value) {
+    return { ok: false, error: "系统选择器已经打开,请先在系统窗口里完成选择" };
+  }
+  sharePickerBusy.value = true;
+  try {
+    const picked = await invoke<ShareTargetDto | null>("pick_share_target");
+    if (!picked) return { ok: true }; // 用户取消,不是错误
+    const target: ShareTarget =
+      picked.kind === "display"
+        ? { kind: "display", displayId: picked.display_id ?? 0 }
+        : picked.kind === "window"
+          ? { kind: "window", windowId: picked.window_id ?? 0 }
+          : { kind: "application", bundleId: picked.bundle_id ?? "" };
+    if (
+      (target.kind === "display" && target.displayId <= 0) ||
+      (target.kind === "window" && target.windowId <= 0) ||
+      (target.kind === "application" && !target.bundleId)
+    ) {
+      return { ok: false, error: "系统选择器返回了无法识别的采集目标" };
+    }
+    selectedShareTarget.value = target;
+    shareTargetLabel.value = picked.label;
+    if (target.kind === "display") selectedDisplayId.value = target.displayId;
+    syncLiveSourceUri();
+    persistForm();
+    return { ok: true, label: picked.label };
+  } catch (e) {
+    return { ok: false, error: formatError(e, "系统选择器失败") };
+  } finally {
+    sharePickerBusy.value = false;
   }
 }
 
@@ -298,6 +405,8 @@ export function useLiveSources() {
     selectedMicrophone,
     selectedCameraAudioCodec,
     selectedDisplayId,
+    selectedShareTarget,
+    shareTargetLabel,
     selectedScreenAudio,
     selectedScreenAudioCodec,
     selectedScreenWidth,
@@ -308,12 +417,17 @@ export function useLiveSources() {
     selectedGop,
     // 派生
     screenResolutionOptions,
+    shareTargetPinned,
+    shareTargetText,
+    sharePickerBusy,
     screenProfileValidationError,
     screenProfileValid,
     selectedLiveAudioCodecAvailable,
     canProbeSource,
     // 动作
     applyScreenResolution,
+    pickShareTarget,
+    useDisplayTarget,
     syncLiveSourceUri,
     setMediaMode,
     pickVideoSource,

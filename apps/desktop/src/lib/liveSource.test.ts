@@ -96,7 +96,7 @@ describe("屏幕源 URI", () => {
 
   it("解析全参数 URI", () => {
     expect(parseScreenSource(full)).toEqual({
-      displayId: 1,
+      target: { kind: "display", displayId: 1 },
       audio: "system",
       audioCodec: "g711u",
       width: 1920,
@@ -130,7 +130,7 @@ describe("屏幕源 URI", () => {
 
   it("构造与解析可往返", () => {
     const profile = {
-      displayId: 2,
+      target: { kind: "display" as const, displayId: 2 },
       audio: "microphone:1" as const,
       audioCodec: "aac" as const,
       width: 1280,
@@ -140,6 +140,50 @@ describe("屏幕源 URI", () => {
       gop: 50,
     };
     expect(parseScreenSource(buildScreenUri(profile))).toEqual(profile);
+  });
+
+  it("系统选择器的窗口/应用目标可往返", () => {
+    const windowTarget = {
+      target: { kind: "window" as const, windowId: 4291 },
+      audio: "none" as const,
+      audioCodec: "g711a" as const,
+      width: 1280,
+      height: 720,
+      bitrateKbps: 2500,
+      codec: "h264" as const,
+      gop: 50,
+    };
+    const windowUri = buildScreenUri(windowTarget);
+    expect(windowUri.startsWith("live:window:4291?")).toBe(true);
+    expect(parseScreenSource(windowUri)).toEqual(windowTarget);
+
+    const appTarget = {
+      target: { kind: "application" as const, bundleId: "com.apple.Safari" },
+      audio: "system" as const,
+      audioCodec: "g711a" as const,
+      width: 1920,
+      height: 1080,
+      bitrateKbps: 6000,
+      codec: "h265" as const,
+      gop: 50,
+    };
+    const appUri = buildScreenUri(appTarget);
+    expect(appUri.startsWith("live:app:com.apple.Safari?")).toBe(true);
+    expect(parseScreenSource(appUri)).toEqual(appTarget);
+  });
+
+  it("窗口/应用目标非法时判为非法 URI", () => {
+    expect(parseScreenSource("live:window:0?audio=none")).toBeNull();
+    expect(parseScreenSource("live:window:abc?audio=none")).toBeNull();
+    expect(parseScreenSource("live:app:?audio=none")).toBeNull();
+    expect(parseScreenSource("live:app:com.apple Safari?audio=none")).toBeNull();
+    // 目标类型必须是 screen/window/app 三种之一
+    expect(parseScreenSource("live:display:1?audio=none")).toBeNull();
+  });
+
+  it("窗口/应用目标也能被识别为屏幕模式", () => {
+    expect(inferMediaMode("live:window:12?audio=none")).toBe("screen");
+    expect(inferMediaMode("live:app:com.apple.Safari?audio=none")).toBe("screen");
   });
 });
 

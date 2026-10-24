@@ -1011,6 +1011,40 @@ struct LiveSourceCatalogDto {
     avfoundation_error: Option<String>,
 }
 
+/// 系统内容选择器(SCContentSharingPicker)的返回值。
+///
+/// 前端把它拼进 `live:screen|window|app:<目标>` URI:选中的是**目标身份**
+/// (显示器 id / 窗口号 / bundle id),不是一次性的过滤器对象 —— 这样同一次选择
+/// 才能跨会话复用(每次平台 INVITE 都会重建采集管道)。
+#[derive(Serialize)]
+struct ShareTargetDto {
+    /// `display` / `window` / `application`。
+    kind: String,
+    display_id: Option<u32>,
+    window_id: Option<u32>,
+    bundle_id: Option<String>,
+    /// 界面展示用标签(窗口标题 / 应用名 / 显示器编号)。
+    label: String,
+}
+
+impl From<media_rtp::PickedShareTarget> for ShareTargetDto {
+    fn from(picked: media_rtp::PickedShareTarget) -> Self {
+        use media_rtp::ScreenCaptureTarget as Target;
+        let (kind, display_id, window_id, bundle_id) = match &picked.target {
+            Target::Display(id) => ("display", Some(*id), None, None),
+            Target::Window(id) => ("window", None, Some(*id), None),
+            Target::Application(bundle) => ("application", None, None, Some(bundle.clone())),
+        };
+        Self {
+            kind: kind.into(),
+            display_id,
+            window_id,
+            bundle_id,
+            label: picked.label,
+        }
+    }
+}
+
 fn sanitize_catalog_error(message: String) -> String {
     if message.to_ascii_lowercase().contains("ffmpeg") {
         "FFmpeg 设备枚举失败（详细输出已隐藏，请查看系统日志）".to_string()
@@ -1288,12 +1322,14 @@ async fn start_device(
                             .unwrap_or_else(|| format!("未找到 AVFoundation 麦克风索引 {index}"))
                             .into());
                     }
-                    media_rtp::LiveSourceSpec::Screen { display_id, .. }
-                        if display_id != 0
-                            && !catalog
-                                .screens
-                                .iter()
-                                .any(|screen| screen.display_id == display_id) =>
+                    media_rtp::LiveSourceSpec::Screen {
+                        target: media_rtp::ScreenCaptureTarget::Display(display_id),
+                        ..
+                    } if display_id != 0
+                        && !catalog
+                            .screens
+                            .iter()
+                            .any(|screen| screen.display_id == display_id) =>
                     {
                         return Err(catalog
                             .screen_error
@@ -2072,6 +2108,37 @@ async fn export_diagnostics(
     Ok(path.display().to_string())
 }
 
+/// 弹出 macOS 系统内容选择器(`SCContentSharingPicker`),让用户按
+/// 「显示器 / 窗口 / 应用」挑选要推流的画面。
+///
+/// 为什么必须走系统选择器:平台侧要的是"某一块画面",而"哪一块"只有用户知道;
+/// 应用自己列窗口既拿不到跨应用的稳定身份,也不符合 macOS 的授权习惯。
+/// 选择器只在主线程呈现,等待结果放在阻塞线程池 —— 主线程被占住会让回调
+/// (走主队列)永远回不来。
+///
+/// 用户取消时返回 `None`(不是错误)。
+#[tauri::command]
+async fn pick_share_target(app: AppHandle) -> IpcResult<Option<ShareTargetDto>> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        // 呈现动作本身是非阻塞的:把句柄送回异步上下文后再等结果。
+        let _ = ready_tx.send(media_rtp::show_share_picker());
+    })
+    .map_err(|error| IpcError::internal(format!("无法在主线程呈现系统选择器: {error}")))?;
+
+    let handle = ready_rx
+        .await
+        .map_err(|_| IpcError::internal("系统选择器未能呈现(主线程已退出)"))?
+        .map_err(|error| IpcError::new("media.picker_failed", error.to_string()))?;
+
+    let picked = tokio::task::spawn_blocking(move || handle.wait(media_rtp::SHARE_PICKER_TIMEOUT))
+        .await
+        .map_err(|error| IpcError::internal(format!("系统选择器等待任务异常: {error}")))?
+        .map_err(|error| IpcError::new("media.picker_failed", error.to_string()))?;
+
+    Ok(picked.map(ShareTargetDto::from))
+}
+
 /// 弹出系统文件对话框让用户选一个视频源文件,并**同时**授权它的 asset 预览。
 ///
 /// 对话框由 Rust 侧弹出而不是前端 —— 这样"哪个路径被授权"完全由用户的真实选择决定,
@@ -2268,6 +2335,7 @@ pub fn run() {
             get_log_level,
             get_recent_logs,
             allow_media_preview,
+            pick_share_target,
             pick_video_source,
             export_diagnostics,
             secrets::save_platform_secret,

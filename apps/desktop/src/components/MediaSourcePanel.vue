@@ -19,11 +19,16 @@ const {
   selectedMicrophone,
   selectedCameraAudioCodec,
   selectedDisplayId,
+  shareTargetPinned,
+  shareTargetText,
+  sharePickerBusy,
   selectedScreenAudio,
   selectedScreenAudioCodec,
   screenProfileValidationError,
   canProbeSource,
   syncLiveSourceUri,
+  pickShareTarget,
+  useDisplayTarget,
   setMediaMode,
   pickVideoSource,
   refreshLiveSources,
@@ -44,6 +49,24 @@ async function onRefreshLiveSources() {
   const result = await refreshLiveSources();
   if (result.ok) message.success("采集设备列表已刷新");
   else message.error(result.error ?? "设备枚举失败");
+}
+
+async function onPickShareTarget() {
+  const result = await pickShareTarget();
+  if (!result.ok) {
+    message.error(result.error ?? "系统选择器失败");
+    return;
+  }
+  if (result.label) {
+    message.success(`采集目标已设为「${result.label}」，重启设备后生效`);
+  } else {
+    message.info("已取消选择，采集目标未改变");
+  }
+}
+
+function onUseDisplayTarget() {
+  useDisplayTarget();
+  message.info("采集目标已切回整块显示器");
 }
 
 async function onProbeLiveSource() {
@@ -200,6 +223,36 @@ async function onProbeLiveSource() {
       <span class="cap-badge ok">ScreenCaptureKit</span>
       <span>原生屏幕与系统音频采集</span>
     </div>
+    <div class="capture-target">
+      <div class="capture-target-head">
+        <span class="capture-target-label">采集目标</span>
+        <span class="capture-target-value" :class="{ pinned: shareTargetPinned }">
+          {{ shareTargetText }}
+        </span>
+      </div>
+      <p class="capture-target-hint">
+        用 macOS 系统选择器挑「显示器 / 窗口 / 应用」——选中的是什么,推给平台的就是什么。
+        注意:右下角本地预览走的是 WebView 自己的屏幕共享授权,与这里的目标无关。
+      </p>
+      <div class="capture-target-actions">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          :disabled="startDisabled || sourceLoading || sharePickerBusy"
+          @click="onPickShareTarget"
+        >
+          {{ sharePickerBusy ? "等待系统选择器…" : "用系统选择器选择窗口 / 应用…" }}
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost"
+          :disabled="startDisabled || sourceLoading || !shareTargetPinned"
+          @click="onUseDisplayTarget"
+        >
+          改为整屏(显示器)
+        </button>
+      </div>
+    </div>
     <div class="media-param-columns">
       <MediaVideoFields title="屏幕画面参数" :disabled="startDisabled || sourceLoading">
         <template #device>
@@ -208,9 +261,9 @@ async function onProbeLiveSource() {
             <select
               id="screen-device-select"
               v-model.number="selectedDisplayId"
-              :disabled="startDisabled || sourceLoading"
+              :disabled="startDisabled || sourceLoading || shareTargetPinned"
               class="inp"
-              @change="syncLiveSourceUri"
+              @change="onUseDisplayTarget"
             >
               <option v-if="!liveCatalog.screens.length && selectedDisplayId === null" :value="null" disabled>
                 未发现可用显示器
@@ -292,6 +345,16 @@ async function onProbeLiveSource() {
   border: 1px solid var(--border-default); background: var(--bg-card);
 }
 .media-param-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 4px; }
+.capture-target {
+  margin-bottom: 6px; padding: 6px 8px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default); background: var(--bg-elevated, var(--bg-card));
+}
+.capture-target-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.capture-target-label { font-size: var(--fs-sm); color: var(--text-secondary); font-weight: 600; }
+.capture-target-value { font-size: var(--fs-sm); color: var(--text-primary); font-weight: 600; }
+.capture-target-value.pinned { color: var(--accent); }
+.capture-target-hint { margin: 4px 0 6px; font-size: var(--fs-xs); line-height: 1.35; color: var(--text-secondary); }
+.capture-target-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .source-capability {
   display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
   color: var(--text-secondary); font-size: var(--fs-xs);

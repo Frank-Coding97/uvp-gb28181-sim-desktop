@@ -47,7 +47,17 @@ localStorage。迁移、修复、版本保护和存储失败会在全局显示�
 ```
 live:camera:<video_index>?audio=<none|audio_index>&audio_codec=<g711a|g711u|aac|opus>[&width=&height=&bitrate=&codec=&gop=]
 live:screen:<display_id>?audio=<none|system|microphone:N>&audio_codec=<g711a|g711u|aac|opus>[&width=&height=&bitrate=&codec=&gop=]
+live:window:<CGWindowID>?…     # 系统选择器选中的单个窗口
+live:app:<bundle_id>?…         # 系统选择器选中的某个应用(该应用全部窗口)
 ```
+
+屏幕采集的**目标**由 macOS 系统内容选择器(`SCContentSharingPicker`)决定,面板上的
+「用系统选择器选择窗口 / 应用…」按钮调用 `pick_share_target`,把选中的身份(显示器 id /
+窗口号 / bundle id)写进上面的 URI。URI 只带稳定身份,不带一次性过滤器对象,因此每次平台
+INVITE 重建采集管道时目标都不会丢。窗口/应用被关掉后采集会明确报错,重新选一次即可。
+
+> 注意:右下角**本地预览**走的是 WebView 自己的 `getDisplayMedia`(它也有一个系统选择器),
+> 与实际推流是两条链路。选了窗口/应用目标时本地预览会如实提示不可用,以平台侧画面为准。
 
 `width/height/bitrate/codec` 必须成组出现(省略则整体取默认档 1280×720 / 2500 kbps / H.264),`gop` 可单独给(默认 50 帧)。GOP 在 OpenH264 屏幕编码路径上通过每 N 帧 `force_intra_frame()` 实现,在 ffmpeg 路径(摄像头、H.265 屏幕)上通过 `-g` 实现。
 

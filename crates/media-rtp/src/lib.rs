@@ -30,9 +30,10 @@ pub use rtcp::{
 pub use rtp::{build_rtcp_sr, PreparedMedia, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
     capture_drop_stats, ffmpeg_bin, list_live_sources, prepare_video_source,
-    prepare_video_source_at, work_dir, FileSource, Frame, LightSource, LiveAudioCodec,
-    LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource, LiveSourceCatalog, LiveSourceSpec,
-    LiveVideoCodec, LiveVideoProfile, NoneSource, VideoSource,
+    prepare_video_source_at, show_share_picker, work_dir, FileSource, Frame, LightSource,
+    LiveAudioCodec, LiveAudioSource, LiveAvDevice, LiveScreenDevice, LiveSource, LiveSourceCatalog,
+    LiveSourceSpec, LiveVideoCodec, LiveVideoProfile, NoneSource, PickedShareTarget,
+    ScreenCaptureTarget, SharePickerHandle, VideoSource, SHARE_PICKER_TIMEOUT,
 };
 
 /// RTP 发送模式。
