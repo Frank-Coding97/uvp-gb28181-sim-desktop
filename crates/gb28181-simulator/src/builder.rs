@@ -207,6 +207,33 @@ pub fn response_ok_tagged(request: &sip_core::Request, to_tag: &str) -> sip_core
     response_status_tagged(request, 200, "OK", to_tag)
 }
 
+/// INVITE 的 200 OK:在通用 2xx 之上补 **Contact** 与 **Subject**。
+///
+/// 为什么 Contact 不是可选项:
+///
+/// - RFC 3261 §12.1.1:对 INVITE 的 2xx **必须**带 Contact,它是这条对话的
+///   远端目标(逐跳可达地址)。
+/// - RFC 3261 §13.2.2.4:UAC 的 ACK **按应答里的 Contact 定目的地**。缺了它,
+///   平台只能退回用 INVITE 的 Request-URI(`sip:<通道ID>@<平台域>`)当目标 ——
+///   报文会被发往平台自己而不是设备。实测:UVP 平台(sipgo UAC)在缺 Contact 时
+///   把 ACK 的目标算成 `<平台域>:5060`,ACK 到不了设备,平台判定 INVITE 失败 →
+///   回滚 → 关掉 ZLM 收流端口;设备侧表现为媒体 TCP 连接被对端关闭
+///   (Broken pipe),而 SIP 侧连 ACK 都收不到。
+/// - GB/T 28181 附录 K:设备应答里回填"媒体流发送者ID:发送方序列号",
+///   平台据此把这条码流与点播会话关联。
+pub fn response_ok_invite(
+    request: &sip_core::Request,
+    contact: &str,
+    subject: Option<&str>,
+) -> sip_core::Response {
+    let mut resp = response_ok(request);
+    resp.headers.set("Contact", contact);
+    if let Some(subject) = subject {
+        resp.headers.set("Subject", subject);
+    }
+    resp
+}
+
 fn response_status_tagged(
     request: &sip_core::Request,
     status: u16,

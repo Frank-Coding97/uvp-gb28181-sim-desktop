@@ -609,7 +609,11 @@ impl fmt::Display for SessionDescription {
             write_media(f, audio)?;
         }
         if let Some(ssrc) = self.media.ssrc {
-            write!(f, "y={}\r\n", ssrc)?;
+            // 附录 F/G:`y=` 是**固定 10 位**的十进制字符串,第 1 位是实时/历史标志
+            // (0=实时,1=历史)。平台下发 `y=0100000005` 时,若应答按整型回写成
+            // `y=100000005`(9 位、首位变成 1),严格平台会把它读成"历史流"甚至
+            // 判为非法 SSRC;按 10 位零填充回写才与下发的字面量一致。
+            write!(f, "y={ssrc:010}\r\n")?;
         }
         // f= 排在 y= 之后:附录 G 的字段顺序里 y 在 f 之前。
         if let Some(ref format) = self.format {
@@ -670,7 +674,7 @@ pub fn build_broadcast_offer(
         sdp.push_str("a=setup:active\r\n");
         sdp.push_str("a=connection:new\r\n");
     }
-    sdp.push_str(&format!("y={ssrc}\r\n"));
+    sdp.push_str(&format!("y={ssrc:010}\r\n"));
     sdp.push_str(&format!("f={}\r\n", MediaFormat::g711_audio().to_field()));
     sdp
 }
@@ -743,8 +747,9 @@ mod tests {
         assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"));
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"));
         assert!(sdp.contains("a=recvonly\r\n"));
-        assert!(sdp.contains("y=4660\r\n")); // 0x1234
-                                             // §9.12.1.3.2 的音频参数描述。
+        // 附录 F/G:y= 固定 10 位十进制(首位 0=实时),不足补零。
+        assert!(sdp.contains("y=0000004660\r\n"), "实际:{sdp}"); // 0x1234
+                                                                 // §9.12.1.3.2 的音频参数描述。
         assert!(sdp.contains("f=v/////a/1/8/1\r\n"), "实际:{sdp}");
         // TCP 变体带 setup/connection + TCP/RTP/AVP。
         let tcp = build_broadcast_offer("d", ip, 30000, 1, true);

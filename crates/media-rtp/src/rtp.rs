@@ -148,6 +148,13 @@ async fn bind_rtp_pair(local: &str) -> Result<(UdpSocket, Option<Arc<UdpSocket>>
 /// 连续 8 次都撞上说明本机端口紧张,这时退化成无 RR 比一直重试更合理。
 const RTP_PAIR_ATTEMPTS: usize = 8;
 
+/// TCP-PASSIVE 等待平台连入的上限。
+///
+/// 平台收到 200 OK 后应当立即连入;无限等下去会让推流任务**永久挂起** ——
+/// 此时它还没进入监听 `stop` 的 select,停设备/重播都收不到停止信号,
+/// 监听 socket 也一直占着。上限取得远大于正常握手耗时,超时按推流失败上报。
+const TCP_PASSIVE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn udp_channel(socket: UdpSocket, rtcp_socket: Option<Arc<UdpSocket>>, dst: SocketAddr) -> Channel {
     Channel::Udp {
         socket,
@@ -316,7 +323,24 @@ impl RtpSender {
     ///
     /// 之前只实现了 TCP-ACTIVE,平台要求设备被动时直接收不到流。
     pub async fn accept_tcp(listener: tokio::net::TcpListener, ssrc: u32) -> Result<Self> {
-        let (stream, peer) = listener.accept().await.map_err(Error::Io)?;
+        Self::accept_tcp_within(listener, ssrc, TCP_PASSIVE_ACCEPT_TIMEOUT).await
+    }
+
+    /// 带等待上限的被动接受,便于单测覆盖超时分支。
+    async fn accept_tcp_within(
+        listener: tokio::net::TcpListener,
+        ssrc: u32,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let (stream, peer) = tokio::time::timeout(timeout, listener.accept())
+            .await
+            .map_err(|_| {
+                Error::Media(format!(
+                    "TCP-PASSIVE: 平台未在 {}s 内连入本端媒体端口(检查 NAT/防火墙)",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(Error::Io)?;
         tracing::info!(%peer, "TCP-PASSIVE 平台已连入设备收流端口");
         stream.set_nodelay(true).ok();
         Ok(Self::from_tcp(stream, ssrc))
@@ -818,6 +842,26 @@ mod tests {
             assert_eq!(marker, i == expect_payloads.len() - 1);
             off += 2 + len;
         }
+    }
+
+    /// 平台声明 active 却一直不连:必须有上限,否则推流任务永久挂起。
+    #[tokio::test]
+    async fn tcp_passive_等不到平台连入时报错而不是永久挂起() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = match RtpSender::accept_tcp_within(
+            listener,
+            0x1234,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        {
+            Ok(_) => panic!("平台未连入时应超时报错,而不是返回发送器"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("TCP-PASSIVE"),
+            "错误信息应指明是被动等待超时,实际: {error}"
+        );
     }
 
     #[tokio::test]

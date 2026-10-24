@@ -429,6 +429,17 @@ pub struct DeviceSimulator {
 /// 形如 `<sip:34020000002000000001@192.168.1.20:5060>` → `192.168.1.20:5060`。
 /// 缺端口按 SIP 默认 5060;域名(非字面 IP)返回 None —— 上层会给出明确报错,
 /// 而不是静默连到一个猜出来的地址。
+/// 该地址是否几乎不可能被公网平台直连(内网 / 环回 / 链路本地)。
+///
+/// 只在 TCP-PASSIVE(平台主动连设备)下用于给出明确告警:设备在 NAT 后面时,
+/// SDP 里回填的就是这类地址,平台永远连不进来,而现场只看到"播放失败"。
+fn is_private_or_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
 fn contact_addr(contact: &str) -> Option<SocketAddr> {
     let inside = contact
         .split_once('<')
@@ -853,6 +864,51 @@ impl DeviceSimulator {
     /// 本端信令端口(run 启动后有效,未设时回退 0)。
     fn local_port(&self) -> u16 {
         self.local_addr.get().map(|(_, p)| *p).unwrap_or(0)
+    }
+
+    /// TCP-PASSIVE 时把"平台该连哪个地址"打进日志,并在地址不可公网直达时告警。
+    ///
+    /// 这条链路失败时现场只有"平台播放失败",而设备侧连一行"在等谁连进来"都没有;
+    /// 内网地址更是必须点名 —— 那不是配置错误,是 NAT 拓扑上根本连不通。
+    fn log_passive_listener(&self, local_ip: std::net::IpAddr, port: u16) {
+        tracing::info!(
+            %local_ip, port,
+            "TCP-PASSIVE:设备监听媒体端口,等平台连入(200 OK 的 SDP 已回填该地址)"
+        );
+        if is_private_or_loopback(local_ip) {
+            tracing::warn!(
+                %local_ip, port,
+                "TCP-PASSIVE:该地址是内网/环回地址,平台在 NAT 后连不进来;需设备公网可达或做端口映射"
+            );
+        }
+    }
+
+    /// INVITE 200 OK 的 Contact 值(RFC 3261 §12.1.1)。
+    ///
+    /// 平台的 ACK 按应答里的 Contact 定目的地(§13.2.2.4)。缺了它,平台只能退回
+    /// 用 INVITE 的 Request-URI —— 那是 `sip:<通道ID>@<平台域>`,于是 ACK 被发往
+    /// 平台自己而不是设备;平台随后判定点播失败并回滚(关 ZLM 收流端口),设备侧
+    /// 表现为媒体 TCP 连接被对端关闭(Broken pipe),SIP 侧连 ACK 都收不到。
+    fn invite_contact(&self) -> String {
+        format!(
+            "<sip:{}@{}:{}>",
+            self.config.device_id,
+            self.local_host(),
+            self.local_port()
+        )
+    }
+
+    /// INVITE 200 OK 的 Subject(GB/T 28181 附录 K/L):
+    /// `媒体流发送者ID:发送方媒体流序列号,媒体流接收者ID:接收方媒体流序列号`。
+    ///
+    /// 发送方序列号用 SSRC 的 10 位十进制写法(实时流首位 0),与 SDP 的 `y=` 同源,
+    /// 平台据此把这条码流与点播会话关联起来。
+    fn invite_subject(&self, channel: &str, ssrc: u32, req: &sip_core::Request) -> String {
+        let platform_id = req
+            .headers
+            .from_uri_user()
+            .unwrap_or(self.config.server_domain.as_str());
+        sip_core::Subject::realtime(channel, ssrc, platform_id, 0).to_string()
     }
 
     /// 只读访问配置。
@@ -4117,6 +4173,9 @@ impl DeviceSimulator {
             .local_host()
             .parse()
             .unwrap_or_else(|_| transport.local_addr().map(|a| a.ip()).unwrap_or(rtp_host));
+        if use_tcp && local_passive {
+            self.log_passive_listener(local_ip, local_rtp_port);
+        }
         // o= 用户名填被点播的通道 ID(取 INVITE Request-URI 的 user 部分)。
         let channel = req
             .uri
@@ -4133,7 +4192,11 @@ impl DeviceSimulator {
         );
         let sdp_body = local_sdp.to_string();
 
-        let mut resp = builder::response_ok(req);
+        let mut resp = builder::response_ok_invite(
+            req,
+            &self.invite_contact(),
+            Some(&self.invite_subject(channel, ssrc, req)),
+        );
         resp.headers.set("Content-Type", "application/sdp");
         resp.body = sdp_body.as_bytes().to_vec();
         // 会话内主动发 BYE 需要本端 To-tag:必须取自实际发出的那条 200 OK,
@@ -4325,6 +4388,9 @@ impl DeviceSimulator {
                 .map(|a| a.ip())
                 .unwrap_or(rtp_dst.ip())
         });
+        if use_tcp && local_passive {
+            self.log_passive_listener(local_ip, local_rtp_port);
+        }
         let channel = req
             .uri
             .strip_prefix("sip:")
@@ -4339,7 +4405,11 @@ impl DeviceSimulator {
             use_tcp.then_some(local_setup),
         );
 
-        let mut resp = builder::response_ok(req);
+        let mut resp = builder::response_ok_invite(
+            req,
+            &self.invite_contact(),
+            Some(&self.invite_subject(channel, ssrc, req)),
+        );
         resp.headers.set("Content-Type", "application/sdp");
         resp.body = local_sdp.to_string().as_bytes().to_vec();
         let local_tag = resp
@@ -6181,6 +6251,238 @@ y=0100000001\r\n";
 
         // 会话应仍是那一个(没有被重复建流)。
         assert!(sim.session.lock().await.is_some());
+    }
+
+    /// 点播 200 OK 必须带 Contact 与 10 位 y=,否则平台的 ACK 到不了设备。
+    ///
+    /// 现场故障链(实测 UVP 平台 + ZLM 收流):设备应答缺 Contact → 平台(sipgo UAC)
+    /// 只能把 ACK 的目标算成 INVITE 的 Request-URI 域(平台自己),ACK 到不了设备 →
+    /// 平台判定 INVITE 失败 → 回滚关掉 ZLM 收流端口 → 设备的媒体 TCP 连接被对端关闭,
+    /// 前端只看到"推流失败:Broken pipe"。SIP 侧连 ACK 都收不到是这条链的指纹。
+    #[tokio::test]
+    async fn invite_200带contact与subject且y为10位() {
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+
+        let mut cfg = test_cfg(&platform_addr.ip().to_string(), platform_addr.port());
+        // B 档轻量伪流:不依赖 ffmpeg / 文件。
+        cfg.light_bitrate_kbps = Some(128);
+        let sim = Arc::new(DeviceSimulator::new(cfg));
+        sim.set_local_addr_for_test(&device_addr.ip().to_string(), device_addr.port());
+
+        // 与真实平台一致:y= 是 10 位十进制(首位 0=实时),缺了首位就是另一路流。
+        let sdp = "v=0\r\n\
+o=34020000002000000001 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 40000 RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+y=0100000005\r\n";
+
+        let mut h = Headers::new();
+        h.set("Call-ID", "invite-contact");
+        h.set("CSeq", "1 INVITE");
+        h.set(
+            "Via",
+            "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-inv-contact",
+        );
+        h.set(
+            "From",
+            "<sip:34020000002000000001@34020000002000000001>;tag=p",
+        );
+        h.set("To", "<sip:34020000001320000132@34020000002000000001>");
+        h.set("Content-Type", "application/sdp");
+        let invite = Request {
+            method: Method::Invite,
+            uri: "sip:34020000001320000132@127.0.0.1".into(),
+            headers: h,
+            body: sdp.as_bytes().to_vec(),
+        };
+
+        let mut prx = platform_tp.register("invite-contact");
+        let incoming = deliver_udp_request(&device_tp, &platform_tp, invite).await;
+        assert!(sim.answer_inbound(&device_tp, &incoming).await.unwrap());
+
+        let mut ok = None;
+        for _ in 0..2 {
+            let inc = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+                .await
+                .expect("超时")
+                .expect("关闭");
+            if let SipMessage::Response(r) = inc.message {
+                if r.status == 200 {
+                    ok = Some(r);
+                    break;
+                }
+            }
+        }
+        let resp = ok.expect("应收到 200 OK");
+
+        // RFC 3261 §12.1.1:2xx 必须带 Contact,且必须指向本端信令地址。
+        let contact = resp.headers.get("Contact").expect("200 OK 缺 Contact");
+        assert_eq!(
+            contact.trim(),
+            format!(
+                "<sip:34020000001320000001@{}:{}>",
+                device_addr.ip(),
+                device_addr.port()
+            ),
+            "Contact 必须是本端可逐跳到达的地址,平台按它发 ACK"
+        );
+
+        // 附录 K:Subject 标识媒体流发送者(通道)与接收者(平台)。
+        let subject = resp.headers.get("Subject").expect("200 OK 缺 Subject");
+        assert!(
+            subject.starts_with("34020000001320000132:0100000005,"),
+            "Subject 应以 通道:10位SSRC 开头,实际 {subject}"
+        );
+
+        // 附录 F/G:y= 固定 10 位,必须与平台下发的字面量一致(不能丢首位 0)。
+        let body = String::from_utf8(resp.body.clone()).expect("SDP 应为 UTF-8");
+        assert!(
+            body.contains("y=0100000005\r\n"),
+            "y= 必须是 10 位且回显平台值,实际 SDP:\n{body}"
+        );
+        assert!(body.contains("m=video "), "应答应含本端媒体端口:{body}");
+    }
+
+    /// TCP-PASSIVE:平台 SDP 声明 `a=setup:active` 时,设备监听,平台连入后收到 RTP。
+    ///
+    /// 这条链路此前只有 SDP 文本级单测,发现不了"监听端口没写进 200 OK 的 m= 行"
+    /// 或"a=setup 取反写反"这类问题 —— 那两种情况下平台会永远连不上,而设备侧看起来
+    /// 一切正常。这里按平台的做法真的连进去,并校验 RFC 4571 分帧与 RTP 头。
+    #[tokio::test]
+    async fn tcp_被动_平台连入设备收流端口并收到rtp() {
+        use tokio::io::AsyncReadExt;
+
+        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp: Arc<dyn SipTransport> = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+
+        let mut cfg = test_cfg(&platform_addr.ip().to_string(), platform_addr.port());
+        cfg.light_bitrate_kbps = Some(128); // B 档轻量伪流:不依赖 ffmpeg
+        let sim = Arc::new(DeviceSimulator::new(cfg));
+        sim.set_local_addr_for_test(&device_addr.ip().to_string(), device_addr.port());
+
+        // 平台是主动方(由它来连设备):m= 端口按 RFC 4145 用 discard 端口 9。
+        let sdp = "v=0\r\n\
+o=34020000002000000001 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 9 TCP/RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+a=setup:active\r\n\
+a=connection:new\r\n\
+y=0100000005\r\n";
+
+        let mut h = Headers::new();
+        h.set("Call-ID", "invite-tcp-passive");
+        h.set("CSeq", "1 INVITE");
+        h.set(
+            "Via",
+            "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-inv-tcp-passive",
+        );
+        h.set(
+            "From",
+            "<sip:34020000002000000001@34020000002000000001>;tag=p",
+        );
+        h.set("To", "<sip:34020000001320000132@34020000002000000001>");
+        h.set("Content-Type", "application/sdp");
+        let invite = Request {
+            method: Method::Invite,
+            uri: "sip:34020000001320000132@127.0.0.1".into(),
+            headers: h,
+            body: sdp.as_bytes().to_vec(),
+        };
+
+        let mut prx = platform_tp.register("invite-tcp-passive");
+        let incoming = deliver_udp_request(&device_tp, &platform_tp, invite).await;
+        assert!(sim.answer_inbound(&device_tp, &incoming).await.unwrap());
+
+        let mut ok = None;
+        for _ in 0..2 {
+            let inc = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+                .await
+                .expect("超时")
+                .expect("关闭");
+            if let SipMessage::Response(r) = inc.message {
+                if r.status == 200 {
+                    ok = Some(r);
+                    break;
+                }
+            }
+        }
+        let resp = ok.expect("应收到 200 OK");
+        let body = String::from_utf8(resp.body.clone()).expect("SDP 应为 UTF-8");
+        assert!(
+            body.contains("a=setup:passive\r\n"),
+            "平台 active → 设备必须回 passive,实际 SDP:\n{body}"
+        );
+
+        // 平台按应答里的端口连入:端口 0 表示媒体被禁用,平台不会来连。
+        let port: u16 = body
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("m=video "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .expect("200 OK 的 m= 行必须带本端监听端口");
+        assert_ne!(port, 0, "端口 0 表示媒体被禁用,平台不会来连");
+
+        let mut conn = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .expect("连接设备监听端口超时")
+        .expect("连接设备监听端口失败");
+
+        // RFC 4571:2 字节大端长度 + RTP 包。
+        let mut len = [0u8; 2];
+        tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_exact(&mut len))
+            .await
+            .expect("超时未收到长度前缀")
+            .expect("读取长度前缀失败");
+        let rtp_len = u16::from_be_bytes(len) as usize;
+        assert!(rtp_len >= 12, "长度前缀应是 RTP 包长,实际 {rtp_len}");
+        let mut packet = vec![0u8; rtp_len];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_exact(&mut packet),
+        )
+        .await
+        .expect("超时未收到 RTP 包")
+        .expect("读取 RTP 包失败");
+        assert_eq!(packet[0], 0x80, "RTP V=2");
+        assert_eq!(packet[1] & 0x7f, 96, "PS 流负载类型应为 96");
+        assert_eq!(
+            u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
+            100000005,
+            "SSRC 必须用平台下发的 y=0100000005"
+        );
+    }
+
+    #[test]
+    fn 内网地址判定只用于被动模式告警() {
+        for private in [
+            "192.168.1.10",
+            "10.0.0.5",
+            "172.16.3.4",
+            "127.0.0.1",
+            "169.254.1.1",
+        ] {
+            assert!(
+                is_private_or_loopback(private.parse().unwrap()),
+                "{private} 应判为不可公网直达"
+            );
+        }
+        assert!(is_private_or_loopback("::1".parse().unwrap()));
+        // 公网地址不告警:平台本来就连得进来。
+        assert!(!is_private_or_loopback("62.234.152.39".parse().unwrap()));
     }
 
     #[tokio::test]
