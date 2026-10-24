@@ -2,15 +2,46 @@
 
 **状态:M2 完成** · RTP/PS 封装与推流引擎。
 
-> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带安全原子缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **TCP(RFC 4571)推流**(ACTIVE 主动连 / PASSIVE 被动等连)✅ · **音频收发**(裸 G.711 上行 + `AudioReceiver` 下行收流与电平)🟢 · **RTCP 双向**(周期发 SR、接收平台 RR;设备作为接收方按 RFC 3550 回报 RR)🟢 · 单测 83 全绿。
+> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带安全原子缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **TCP(RFC 4571)推流**(ACTIVE 主动连 / PASSIVE 被动等连)✅ · **音频收发**(裸 G.711 上行 + `AudioReceiver` 下行收流与电平)🟢 · **RTCP 双向**(周期发 SR、接收平台 RR;设备作为接收方按 RFC 3550 回报 RR)🟢 · 单测 87 全绿。
 
 ## 容器格式支持(FileSource)
 
 引擎推流只吃 **H.264/H.265 Annex B 裸流**(按起始码切帧)。为支持常见容器(MP4/FLV/MKV/MOV):
-`FileSource::from_path` 检测文件非 Annex B 时,调用系统 **ffmpeg** 转封装为 Annex B 裸流
-(`-c:v copy -bsf:v h264_mp4toannexb`,失败回退重编码),结果按 canonical path + size +
-高精度 mtime 缓存。ffmpeg 为**可选**外部依赖:仅容器格式需要;裸流(.h264/.h265)
-不依赖它。ffmpeg 缺失时对容器文件报明确错误。
+`FileSource::from_path_av` 检测文件非 Annex B 时,调用系统 **ffmpeg** **归一化**为 Annex B 裸流,
+结果按 canonical path + size + 高精度 mtime + **目标帧率**缓存。ffmpeg 为**可选**外部依赖:
+仅容器格式需要;裸流(.h264/.h265)不依赖它。ffmpeg 缺失时对容器文件报明确错误。
+
+**为什么不再用 `-c:v copy` 只做转封装**:副本会保留容器里的原始帧率与 B 帧解码顺序,
+而推流端是固定帧率取帧、按发送顺序直接打 PTS。源 30fps 而推流 25fps 时速度被拖慢 17%;
+有 B 帧时解码序 ≠ 显示序,帧序错乱会表现为抖动,严重时解码花屏。归一化参数:
+
+```
+-vf fps=<推流帧率>,format=yuv420p -c:v libx264 -preset veryfast -crf 20 -bf 0 -g <2×fps>
+```
+
+代价是首次加载一次转码(缓存后瞬时返回);收益是本地视频的每一帧显示时刻严格等于
+`发送序号 × 1/fps`,与推流节拍一致。
+
+## 时间基与采集帧率
+
+三条实时源(屏幕 / 摄像头 / 本地视频)必须在**同一时间基**上产出:
+
+- **时间戳按真实媒体时钟推进**(`pusher`):由 `Instant` 累积"非暂停的经过时间 × 倍速",
+  RTP 时间戳与 PS PTS 都由它推导,而不是"已发帧数 × 帧间隔"。后者一旦供帧抖动跳过几拍、
+  或缓冲快进丢掉一段帧,时间线就永久落后墙钟,平台表现为延迟单调增长、音画渐移。
+- **摄像头强制 CFR**:AVFoundation 输入按 30/60 采集,而推流按设备配置帧率消费。
+  编码侧 `-vf ...,fps=<目标帧率>` 做帧率归一化;否则缓冲每秒净增 5 帧,触顶后快进丢到
+  最近关键帧,表现为每几秒瞬跳一次(与机器性能无关)。
+- **屏幕采集**由 `SCStreamConfiguration::with_fps()` 直接按目标帧率出帧,不存在上述错配。
+- **编码质量**:摄像头 x264 用 `veryfast` + `high` profile + `nal-hrd=cbr:force-cfr=1`,
+  固定 GOP、关闭场景切换。`ultrafast` 关闭 CABAC/亚像素搜索,运动场景同码率下块效应明显。
+
+## 采集丢弃可观测性
+
+`capture_drop_stats()` 返回 (重同步丢弃字节数, 通道满/编码器跳帧数),进程级累计。
+`SessionTelemetry` 在会话建立时记录基线,`capture_drops()` 返回本会话增量,供设备控制台
+区分"本机供不上帧"与"网络丢包"。计数覆盖三处此前静默的丢弃:屏幕 `raw_tx` 通道满、
+OpenH264 `enable_skip_frame` 返回空码流、Annex B 切帧缓冲超限重同步。
 
 ### 临时文件与外部进程安全边界
 
@@ -29,6 +60,20 @@
   启动失败或 `LiveSource::drop` 在子进程收尾后删除。
 - 上层停止等待超时后必须 `JoinHandle::abort()` 再 await；仅丢弃 handle 会 detach 任务，
   使持有 `LiveSource` 的 future 不被 drop，最终留下 FFmpeg 孤儿进程。
+
+## 现成组件评估(调研结论:不引入)
+
+| 组件 | 定位 | 结论 |
+|---|---|---|
+| **gb28181-rs** | Rust 设备侧 UAC:SIP + MANSCDP + PS/RTP 推流,时间戳取自真实采集时间 | 与本项目覆盖面高度重合,但其 SIP 事务/目录/压测模型与本仓库不同,整体替换等于重写。**已借鉴其"按真实采集时间打时间戳"的做法**,未引依赖 |
+| **ffmpeg**(已在用) | 采集 / 编码 / 封装 | 继续作为统一编码后端:摄像头走 avfoundation,屏幕 H.265 走 `hevc_videotoolbox`;本轮补齐 CBR/CFR/高质量 preset |
+| **scap / pinray** | Rust 屏幕采集(封装 ScreenCaptureKit) | 项目已直接用 `screencapturekit` crate 并拿到像素缓冲,再套一层只增加依赖与回调抽象,无收益 |
+| **nokhwa** | 跨平台摄像头采集 | 只做采集不含硬件编码;现有 ffmpeg avfoundation 已覆盖内置/USB/ Continuity Camera,不换 |
+| **Cap(开源录屏)** | 采集/编码/封装分 crate、muxer 独立进程 | 架构可借鉴(编码与封装分离),但其产物是 MP4 录制,不涉及 PS/RTP,不能直接复用 |
+| **GStreamer** | 全功能媒体管线(mpegpsmux 等) | 依赖体积与运行时分发成本远超收益;GB28181 的 PS-over-RTP 仍要自己写 payloader |
+
+结论:**采集与封装继续用现有自研 + ffmpeg**,真正缺的不是"轮子",而是时间基与帧率归一化 ——
+本轮已在不引入新依赖的前提下补齐。
 
 ## 职责
 
@@ -51,7 +96,9 @@ pub mod rtcp;     // RTCP 复合包解析 + 接收报告(RR)反馈统计
 - `RtpSender`:RTP 头构造、SSRC/序号/时间戳递增、UDP 发送、TCP(RFC 4571)发送;发送速率统计(供指标 send_bitrate)。
 - `set_payload_type()`:默认 96(PS);语音流按附录 C.2.4 用 8(PCMA)。
 - `send_frame()` 按 MTU 切片;`send_audio()` **不切片** —— 附录 C.2.4 要求一个 RTP 包装整数个
-  音频编码帧,切了对端解不出帧。
+  音频编码帧,切了对端解不出帧。**TCP 下整帧的 RTP 分片拼成一块缓冲、一次 `write_all` 写出**
+  (每包仍带 RFC 4571 两字节长度前缀):把一帧的几十次 syscall 压成一次,平台读得慢时也不容易
+  在包之间被调度打断。
 - **RTCP 端口对**:UDP 下 `bind_rtp_pair()` 抢 `p` / `p+1` 相邻端口对(最多重试 8 次,
   抢不到就退化成只发 SR 不收 RR)。SR **从 RTCP socket 发出**,源端口 = RTP 端口 +1 ——
   否则严格按 RFC 3550 实现的平台会把 RR 回到一个我们没在听的端口。

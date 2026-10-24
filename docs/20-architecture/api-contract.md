@@ -49,7 +49,7 @@
 | `fire_position` | `{ longitude: number, latitude: number }` | `string` | 主动上报一条 GPS 位置 | ✅ |
 | `get_broadcast_status` | — | `BroadcastSnapshot \| null` | 查当前语音广播会话(§9.12.1)。**设备未启动或无会话返回 `null` 而不是报错** —— 界面就该显示"空闲" | ✅ |
 | `hangup_broadcast` | — | `string` | 设备侧主动挂断语音广播,按附录 K a) 发会话内 BYE | ✅ |
-| `get_media_telemetry` | — | `MediaTelemetrySnapshot \| null` | 查当前推流会话的发送统计 + 平台回的 RTCP 接收报告(丢包率/累计丢包/抖动/RTT)。**无会话或发送通道未就绪返回 `null`**;`feedback.reports == 0` 表示平台一条 RR 都没回,与"回报 0% 丢包"是两种不同状态 | ✅ |
+| `get_media_telemetry` | — | `MediaTelemetrySnapshot \| null` | 查当前推流会话的发送统计 + 平台回的 RTCP 接收报告(丢包率/累计丢包/抖动/RTT)+ **本会话采集侧丢弃增量**(`capture_dropped_frames` / `capture_resync_bytes`,用于区分"本机供不上帧"与"网络丢包")。**无会话或发送通道未就绪返回 `null`**;`feedback.reports == 0` 表示平台一条 RR 都没回,与"回报 0% 丢包"是两种不同状态 | ✅ |
 
 > 当前设备状态**只经 `device_state` 事件**推送(见 §3),没有同名查询命令。
 >

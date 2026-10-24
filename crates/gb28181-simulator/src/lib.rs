@@ -12,5 +12,5 @@ pub use device::{
     CATALOG_NOTIFY_MAX_DELAY, DEFAULT_REGISTER_EXPIRES, DEFAULT_REGISTER_RETRY_MAX_SECS,
 };
 
-// 转出媒体侧的视频源预处理(桌面在设备上线前预热容器转封装缓存,避免 INVITE 阻塞)。
-pub use media_rtp::prepare_video_source;
+// 转出媒体侧的视频源预处理(桌面在设备上线前预热归一化缓存,避免 INVITE 阻塞)。
+pub use media_rtp::{prepare_video_source, prepare_video_source_at};

@@ -188,11 +188,21 @@ fn starts_with_annexb(b: &[u8]) -> bool {
 
 /// 把视频源解析为可直接切帧的 **Annex B 裸流文件路径**。
 ///
-/// 裸流(.h264/.h265)原样返回;容器(MP4/FLV/MKV/MOV)经 ffmpeg 转封装并缓存后返回。
-/// **应在设备启动时预调用一次**(预热缓存):容器转封装可能耗时数秒,若放到 INVITE
+/// 裸流(.h264/.h265)原样返回;容器(MP4/FLV/MKV/MOV)经 ffmpeg 归一化并缓存后返回。
+/// **应在设备启动时预调用一次**(预热缓存):容器转码可能耗时数秒,若放到 INVITE
 /// 处理里同步执行,会阻塞 200 OK 与首包推流,导致平台收流超时。预热后 INVITE 时
 /// [`FileSource::from_path`] 命中缓存瞬时返回。
+///
+/// 不传帧率的版本按 25fps 预热(与 [`FileSource::from_path`] 的默认值一致)。
+/// 设备配置了别的帧率时请用 [`prepare_video_source_at`],否则会预热出错误的缓存。
 pub fn prepare_video_source(path: &str) -> Result<PathBuf> {
+    prepare_video_source_at(path, 25)
+}
+
+/// 同 [`prepare_video_source`],但显式指定推流帧率。
+///
+/// 帧率会参与归一化转码与缓存键:不同帧率的同一素材是两个不同的缓存产物。
+pub fn prepare_video_source_at(path: &str, fps: u32) -> Result<PathBuf> {
     let head = {
         let mut f = File::open(path).map_err(Error::Io)?;
         let mut buf = [0u8; 8];
@@ -202,7 +212,7 @@ pub fn prepare_video_source(path: &str) -> Result<PathBuf> {
     if starts_with_annexb(&head) {
         Ok(PathBuf::from(path))
     } else {
-        ensure_annexb(path)
+        ensure_annexb(path, fps)
     }
 }
 
@@ -531,10 +541,19 @@ pub fn ffmpeg_bin() -> Option<String> {
     None
 }
 
-/// 把容器视频文件(MP4/FLV/MKV/MOV 等)转封装为 H.264 Annex B 裸流,返回裸流文件路径。
-fn ensure_annexb(src: &str) -> Result<PathBuf> {
+/// 把容器视频文件(MP4/FLV/MKV/MOV 等)归一化为推流可用的 H.264 Annex B 裸流,返回路径。
+///
+/// 这里**不做无损转封装**,而是重编码为 `fps=<推流帧率>` 的恒定帧率流并强制 `-bf 0`:
+///   · `-c:v copy` 会保留容器里的原始帧率。源 30fps、推流 25fps 时速度被拖慢 17%;
+///     源 24fps 时又被拉快,观感就是"不流畅"。
+///   · 副本还会保留 B 帧:解码顺序与显示顺序不同,而推流端按发送顺序直接打 PTS,
+///     帧序错乱会表现为抖动,严重时解码器直接花屏。
+/// 归一化后每一帧的显示时刻 = 发送序号 × 1/fps,与推流的固定节拍严格一致。
+/// 代价是首次加载需要一次转码(结果按"文件 + 帧率"缓存,后续命中瞬时返回)。
+fn ensure_annexb(src: &str, fps: u32) -> Result<PathBuf> {
+    let fps = fps.max(1);
     let identity = source_identity(src)?;
-    let key = source_cache_key(&identity, "annexb-h264-v1");
+    let key = source_cache_key(&identity, &format!("annexb-h264-cfr{fps}-v2"));
     let out = secure_work_dir()?.join(format!("annexb-{key:016x}.h264"));
     if cache_hit(&out, CacheKind::AnnexB).map_err(Error::Io)? {
         return Ok(out);
@@ -542,59 +561,41 @@ fn ensure_annexb(src: &str) -> Result<PathBuf> {
 
     let ffmpeg = ffmpeg_bin().ok_or_else(|| {
         Error::Media(format!(
-            "视频源是容器格式({src}),需要 ffmpeg 转封装,但未找到 ffmpeg;\
+            "视频源是容器格式({src}),需要 ffmpeg 归一化,但未找到 ffmpeg;\
              请安装 ffmpeg(brew install ffmpeg),或直接提供 .h264/.h265 Annex B 裸流"
         ))
     })?;
 
-    // First try a lossless remux. FFmpeg writes only the high-entropy staging
-    // path; the cache name becomes visible only after validation and rename.
+    // FFmpeg writes only the high-entropy staging path; the cache name becomes
+    // visible only after validation and rename.
     let staging = StagedFile::create(out.parent().expect("cache has parent"), "annexb", "h264")
         .map_err(Error::Io)?;
-    let mut copy = Command::new(&ffmpeg);
-    copy.args(["-nostdin", "-y", "-i"])
-        .arg(&identity.canonical_path)
-        .args(["-c:v", "copy", "-bsf:v", "h264_mp4toannexb"])
-        .arg(&staging.path);
-    if let Ok(output) = run_command_bounded(&mut copy, OFFLINE_CONVERSION_TIMEOUT) {
-        if !output.timed_out
-            && output.status.success()
-            && cache_file_is_valid(&staging.path, CacheKind::AnnexB).unwrap_or(false)
-            && publish_cache(&staging, &out, CacheKind::AnnexB).is_ok()
-        {
-            return Ok(out);
-        }
-    }
-    drop(staging);
-
-    // Fall back to H.264 encoding for codecs/containers that cannot be remuxed.
-    let staging = StagedFile::create(out.parent().expect("cache has parent"), "annexb", "h264")
-        .map_err(Error::Io)?;
+    let filter = format!("fps={fps},format=yuv420p");
+    let gop = fps.saturating_mul(2).max(1).to_string();
     let mut encode = Command::new(&ffmpeg);
     encode
         .args(["-nostdin", "-y", "-i"])
         .arg(&identity.canonical_path)
         .args([
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-f",
-            "h264",
+            "-an", "-vf", &filter, "-c:v", "libx264",
+            // veryfast 在保证实时/近实时转码的同时保留 CABAC 与完整运动估计;
+            // crf 20 对监控素材接近视觉无损,又不会像 ultrafast 那样在运动处糊成块。
+            "-preset", "veryfast", "-crf", "20",
+            // 无 B 帧:发送顺序即显示顺序,推流端才能按序号安全地打 PTS。
+            "-bf", "0", "-g", &gop, "-f", "h264",
         ])
         .arg(&staging.path);
     let output = run_command_bounded(&mut encode, OFFLINE_CONVERSION_TIMEOUT)
-        .map_err(|error| Error::Media(format!("ffmpeg 执行失败: {error}")))?;
+        .map_err(|error| Error::Media(format!("ffmpeg 归一化失败: {error}")))?;
     if output.timed_out {
         return Err(Error::Media(format!(
-            "ffmpeg 转封装/重编码超时({src}, 120s):{}",
+            "ffmpeg 归一化超时({src}, 120s):{}",
             command_tail(&output)
         )));
     }
     if !output.status.success() {
         return Err(Error::Media(format!(
-            "ffmpeg 转封装/重编码失败({src}):{}",
+            "ffmpeg 归一化失败({src}):{}",
             command_tail(&output)
         )));
     }
@@ -810,17 +811,21 @@ impl FileSource {
         let identity = source_identity(path)?;
         let key = source_cache_key(
             &identity,
-            if with_audio {
-                "media-asset-av-v1"
-            } else {
-                "media-asset-video-v1"
-            },
+            &format!(
+                "{}-cfr{}",
+                if with_audio {
+                    "media-asset-av-v2"
+                } else {
+                    "media-asset-video-v2"
+                },
+                fps.max(1)
+            ),
         );
         if let Some(asset) = asset_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
             return Ok(Self::from_asset(asset, fps));
         }
 
-        let annexb = prepare_video_source(path)?;
+        let annexb = prepare_video_source_at(path, fps)?;
         let bytes = std::fs::read(&annexb).map_err(Error::Io)?;
         let (frames, codec) = parse_annexb_frames(&bytes)?;
         let mut audio: Vec<Bytes> = Vec::new();
@@ -958,16 +963,28 @@ impl VideoSource for FileSource {
     }
 }
 
-/// 从 NAL 流探测视频编码。H.265 存在 VPS(nal_type=32),H.264 无此类型;
-/// 以此区分。NAL 头首字节 = bytes[3](起始码后),H.265 type=(b>>1)&0x3F。
+/// 从 NAL 流探测视频编码。
+///
+/// 不能只看"某个字节的 H.265 解释是否等于 32(VPS)":H.264 的 P 切片 NAL 头
+/// `0x41`(nal_ref_idc=2, type=1)按 H.265 解释恰好也是 type=32,会被误判成 VPS,
+/// 进而把整段 H.264 当 H.265 分组(只剩 1 帧)。这里按参数集特征判断,并利用
+/// 首字节奇偶性区分两种头部布局:H.265 的 byte0 由 `type<<1 | layer_id 高位`
+/// 组成,通常为偶数;H.264 的 VCL 类型 1/5 使 byte0 为奇数。
 fn detect_codec(nals: &[Nal<'_>]) -> crate::ps::VideoCodec {
-    for nal in nals {
-        if let Some(&b) = nal.bytes.get(3) {
-            let h265_type = (b >> 1) & 0x3F;
-            // VPS(32)/SPS(33)/PPS(34) 为 H.265 参数集;VPS 在 H.264 中不存在,最可靠。
-            if h265_type == 32 {
-                return crate::ps::VideoCodec::H265;
-            }
+    for nal in nals.iter().take(8) {
+        let Some(&b) = nal.bytes.get(3) else {
+            continue;
+        };
+        let h264_type = b & 0x1f;
+        let h265_type = (b >> 1) & 0x3F;
+        // H.264 参数集/AUD:SPS=7, PPS=8, AUD=9。
+        if matches!(h264_type, 7..=9) {
+            return crate::ps::VideoCodec::H264;
+        }
+        // H.265 参数集:VPS=32, SPS=33, PPS=34。仅当首字节为偶数时才按 H.265
+        // 解释,避免把 H.264 的 0x41/0x61 类切片误认成 VPS。
+        if b & 1 == 0 && matches!(h265_type, 32..=34) {
+            return crate::ps::VideoCodec::H265;
         }
     }
     crate::ps::VideoCodec::H264
@@ -1806,6 +1823,35 @@ mod tests {
             }
         }
         assert!(n > 0, "应从 MP4 切出帧");
+    }
+
+    // 容器归一化依赖系统 ffmpeg,默认忽略;需要时:
+    //   ffmpeg -y -f lavfi -i testsrc2=duration=2:size=320x240:rate=30 \
+    //     -c:v libx264 -bf 3 /tmp/uvp_norm_test.mp4
+    //   cargo test -p media-rtp -- --ignored mp4_按推流帧率归一化
+    #[test]
+    #[ignore = "需系统 ffmpeg + /tmp/uvp_norm_test.mp4"]
+    fn mp4_按推流帧率归一化() {
+        // 源是 30fps(2s=60 帧)。按 25fps 归一化后应约 50 帧 —— 若仍是 60 帧,
+        // 说明走了无损转封装,帧率错配与 B 帧帧序问题会原样带进推流。
+        let s = FileSource::from_path_av("/tmp/uvp_norm_test.mp4", 25).expect("应能归一化加载");
+        let n = s.len();
+        assert!(
+            (48..=52).contains(&n),
+            "25fps 归一化应产出约 50 帧,实际 {n}(源为 30fps/60 帧)"
+        );
+    }
+
+    /// 回归:0x41 是 H.264 的 P 切片(nal_ref_idc=2, type=1),按 H.265 解释
+    /// 恰好是 VPS(32)。旧实现会因此把整段 H.264 当 H.265 分组,只剩 1 帧。
+    #[test]
+    fn 编码探测_不把_h264_p切片误判成_h265() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A]);
+        data.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9B]);
+        let (frames, codec) = parse_annexb_frames(&data).expect("应能切帧");
+        assert_eq!(codec, crate::ps::VideoCodec::H264);
+        assert_eq!(frames.len(), 2, "两个 P 切片应切成两帧");
     }
 
     #[test]

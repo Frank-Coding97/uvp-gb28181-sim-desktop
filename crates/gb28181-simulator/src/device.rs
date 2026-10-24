@@ -762,6 +762,12 @@ pub struct MediaTelemetrySnapshot {
     pub sent_rtcp: u64,
     /// 本地发送失败次数。
     pub send_errors: u64,
+    /// 本会话采集侧丢弃的帧数(通道满 / 编码器主动跳帧)。
+    ///
+    /// 与 `send_errors` 是两种不同故障:"发得出去但没东西可发"。
+    pub capture_dropped_frames: u64,
+    /// 本会话 Annex B 切帧缓冲超限被整体丢弃的字节数(重同步)。
+    pub capture_resync_bytes: u64,
     /// 平台回报的收流质量;从未收到 RR 时字段 `reports` 为 0。
     pub feedback: media_rtp::RtcpFeedbackSnapshot,
 }
@@ -3733,6 +3739,7 @@ impl DeviceSimulator {
         let session = guard.as_ref()?;
         let telemetry = session.control.telemetry()?;
         let (sent_packets, sent_bytes, sent_rtcp, send_errors) = telemetry.stats.full_snapshot();
+        let (capture_resync_bytes, capture_dropped_frames) = telemetry.capture_drops();
         Some(MediaTelemetrySnapshot {
             is_history: session.is_history,
             media_source: session.media_source.clone(),
@@ -3741,6 +3748,8 @@ impl DeviceSimulator {
             sent_bytes,
             sent_rtcp,
             send_errors,
+            capture_dropped_frames,
+            capture_resync_bytes,
             // age 的原点必须是发送通道建立时刻(与 RtcpFeedback 内部同一刻度)。
             feedback: telemetry
                 .feedback

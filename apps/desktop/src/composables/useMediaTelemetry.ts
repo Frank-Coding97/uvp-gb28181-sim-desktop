@@ -46,6 +46,10 @@ export interface MediaTelemetry {
   sent_bytes: number;
   sent_rtcp: number;
   send_errors: number;
+  /** 本会话采集侧丢弃的帧数(通道满 / 编码器主动跳帧)。>0 说明本机供不上帧。 */
+  capture_dropped_frames: number;
+  /** 本会话 Annex B 切帧缓冲超限被丢弃的字节数(重同步)。 */
+  capture_resync_bytes: number;
   feedback: RtcpFeedback;
 }
 

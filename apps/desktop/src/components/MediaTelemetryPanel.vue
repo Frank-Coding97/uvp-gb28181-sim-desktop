@@ -71,6 +71,22 @@ const {
                 {{ telemetry.send_errors }}
               </dd>
             </div>
+            <div class="tm-item">
+              <dt>采集丢帧</dt>
+              <dd
+                class="mono"
+                :class="{ bad: telemetry.capture_dropped_frames > 0 }"
+                title="通道满 / 编码器主动跳帧。>0 表示本机供给不足,不是网络丢包"
+              >
+                {{ telemetry.capture_dropped_frames }}
+              </dd>
+            </div>
+            <div class="tm-item">
+              <dt>重同步丢弃</dt>
+              <dd class="mono" :class="{ bad: telemetry.capture_resync_bytes > 0 }">
+                {{ formatBytes(telemetry.capture_resync_bytes) }}
+              </dd>
+            </div>
           </dl>
         </section>
 

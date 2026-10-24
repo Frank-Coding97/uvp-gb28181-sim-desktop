@@ -53,6 +53,8 @@ function telemetry(overrides: Partial<MediaTelemetry> = {}): MediaTelemetry {
     sent_bytes: 1_440_000,
     sent_rtcp: 4,
     send_errors: 0,
+    capture_dropped_frames: 0,
+    capture_resync_bytes: 0,
     feedback: feedback(),
     ...overrides,
   };

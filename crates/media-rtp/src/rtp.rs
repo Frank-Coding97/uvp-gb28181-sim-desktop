@@ -196,6 +196,11 @@ pub struct RtpSender {
     /// 发送缓冲:每包复用,避免每个 RTP 包一次堆分配 + 一次载荷拷贝。
     /// TCP 模式下前 2 字节留给 RFC 4571 长度前缀,从而整包一次 write_all 写出。
     buf: Vec<u8>,
+    /// TCP 整帧发送缓冲:一帧的所有 RTP 分片拼在一起,只做一次 write_all。
+    ///
+    /// 单帧 10~70 个包时,逐包 write 会把一次帧发送拆成几十次 syscall;
+    /// 平台读得慢时还更容易在包之间被调度器打断,放大发送抖动。
+    frame_buf: Vec<u8>,
     /// 本次会话起始的 RTP 时间戳偏移(随机初值,RFC 3550 §5.1)。
     ts_offset: u32,
     stats: Arc<SendStats>,
@@ -226,6 +231,7 @@ impl RtpSender {
             seq: rand::random(),
             max_payload: 1400,
             buf: Vec::with_capacity(1500),
+            frame_buf: Vec::with_capacity(64 * 1024),
             ts_offset: rand::random(),
             stats: Arc::new(SendStats::default()),
             feedback: Arc::new(crate::rtcp::RtcpFeedback::default()),
@@ -492,6 +498,10 @@ impl RtpSender {
 
     /// 发送一个 PS 访问单元(一帧):按 max_payload 切片成多个 RTP 包,
     /// 同一 timestamp,最后一包置 marker。
+    ///
+    /// TCP 下把整帧拼进一块缓冲、一次 write_all 写出:一是把一帧的几十次
+    /// syscall 压成一次,二是长度前缀连续写可以让平台按帧边界及时聚合,
+    /// 减少"包之间被调度打断"造成的发送抖动。UDP 下仍逐包 send_to。
     pub async fn send_frame(&mut self, ps: &[u8], timestamp: u32) -> Result<()> {
         if ps.is_empty() {
             return Ok(());
@@ -499,6 +509,11 @@ impl RtpSender {
         let ts = timestamp.wrapping_add(self.ts_offset);
         let total = ps.len();
         let step = self.max_payload.max(1);
+
+        if matches!(&self.channel, Channel::Tcp { .. }) {
+            return self.send_frame_tcp(ps, ts, total, step).await;
+        }
+
         let mut offset = 0usize;
         while offset < total {
             let end = (offset + step).min(total);
@@ -508,6 +523,60 @@ impl RtpSender {
             offset = end;
         }
         Ok(())
+    }
+
+    /// TCP 整帧批量发送:每包 = RFC 4571 的 2 字节长度前缀 + RTP 头 + 载荷。
+    async fn send_frame_tcp(
+        &mut self,
+        ps: &[u8],
+        ts: u32,
+        total: usize,
+        step: usize,
+    ) -> Result<()> {
+        // 先把复用缓冲取出来,避免与 `&mut self.channel` 的可变借用来回打架。
+        let mut frame = std::mem::take(&mut self.frame_buf);
+        frame.clear();
+        let mut seq = self.seq;
+        let mut offset = 0usize;
+        let mut packets = 0u64;
+        while offset < total {
+            let end = (offset + step).min(total);
+            let payload = &ps[offset..end];
+            let rtp_len = (12 + payload.len()) as u16;
+            frame.extend_from_slice(&rtp_len.to_be_bytes());
+            frame.extend_from_slice(&rtp_header(
+                self.payload_type,
+                end == total,
+                seq,
+                ts,
+                self.ssrc,
+            ));
+            frame.extend_from_slice(payload);
+            seq = seq.wrapping_add(1);
+            packets += 1;
+            offset = end;
+        }
+
+        let result = match &mut self.channel {
+            Channel::Tcp { writer } => writer.write_all(&frame).await,
+            // 调用方已按 TCP 分流,这里不可达。
+            _ => unreachable!("send_frame_tcp 只用于 TCP 通道"),
+        };
+        let bytes = frame.len() as u64 - packets * 2;
+        self.frame_buf = frame;
+
+        match result {
+            Ok(()) => {
+                self.seq = seq;
+                self.stats.packets.fetch_add(packets, Ordering::Relaxed);
+                self.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                Err(Error::Io(error))
+            }
+        }
     }
 }
 

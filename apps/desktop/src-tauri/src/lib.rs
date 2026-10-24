@@ -1377,17 +1377,19 @@ async fn start_device(
         signaling_encoding: common::SignalingEncoding::from_str_lenient(&config.signaling_encoding),
     };
 
-    // 预热视频源:容器(MP4 等)转封装可能耗时数秒,若留到 INVITE 时同步做会阻塞
+    // 预热视频源:容器(MP4 等)归一化转码可能耗时数秒,若留到 INVITE 时同步做会阻塞
     // 200 OK 与首包推流,导致平台收流超时。这里在设备上线前先转好、缓存,
     // INVITE 时命中缓存瞬时加载。ffmpeg 是阻塞调用,放 spawn_blocking。
-    // 实时采集(live:)无文件可预热,跳过;仅对文件源(C 档容器)做转封装预热。
+    // 实时采集(live:)无文件可预热,跳过;仅对文件源(C 档容器)做归一化预热。
+    // 帧率必须与设备配置一致:归一化产物按帧率缓存,预热错帧率等于白转。
     if let Some(ref vs) = config.video_source {
         if !vs.trim().is_empty() && !vs.trim().starts_with("live:") {
             let vs = vs.clone();
-            let prepared =
-                tokio::task::spawn_blocking(move || gb28181_simulator::prepare_video_source(&vs))
-                    .await
-                    .map_err(|error| IpcError::internal(format!("视频源准备任务异常: {error}")))?;
+            let prepared = tokio::task::spawn_blocking(move || {
+                gb28181_simulator::prepare_video_source_at(&vs, video_fps)
+            })
+            .await
+            .map_err(|error| IpcError::internal(format!("视频源准备任务异常: {error}")))?;
             prepared?;
         }
     }
@@ -2400,7 +2402,8 @@ mod tests {
 
     #[tokio::test]
     async fn stress_completion不早于guard销毁被观察到() {
-        let dir = std::env::temp_dir().join(format!("uvp-completion-seq-{}", artifacts::unique_suffix()));
+        let dir =
+            std::env::temp_dir().join(format!("uvp-completion-seq-{}", artifacts::unique_suffix()));
         artifacts::create_secure_dir(&dir).expect("建目录");
         let (completion_tx, mut rx) = tokio::sync::watch::channel(false);
         let writer = series::SeriesWriter::new(&dir, 999).expect("创建 writer");
@@ -2409,7 +2412,10 @@ mod tests {
 
         // 模拟 supervisor 尾部：先释放 writer guard，再发送 completion=true
         drop(writer);
-        assert!(!artifacts::is_registered_active(&inprogress_path), "guard 销毁后注销活跃注册");
+        assert!(
+            !artifacts::is_registered_active(&inprogress_path),
+            "guard 销毁后注销活跃注册"
+        );
         completion_tx.send(true).expect("发送 completion");
 
         assert!(wait_stress_completion(&mut rx).await);
@@ -2423,7 +2429,8 @@ mod tests {
         let app_state = AppState::new(None);
         let (tx, _) = tokio::sync::broadcast::channel(1);
         let (_, rx) = tokio::sync::watch::channel(false);
-        let dir = std::env::temp_dir().join(format!("uvp-no-orphan-{}", artifacts::unique_suffix()));
+        let dir =
+            std::env::temp_dir().join(format!("uvp-no-orphan-{}", artifacts::unique_suffix()));
         artifacts::create_secure_dir(&dir).expect("建目录");
 
         // 模拟前序压测正在运行
@@ -2451,7 +2458,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".inprogress"))
             .count();
-        assert_eq!(inprogress_count, 0, "拒绝启动路径下绝不创建任何 .inprogress 文件");
+        assert_eq!(
+            inprogress_count, 0,
+            "拒绝启动路径下绝不创建任何 .inprogress 文件"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

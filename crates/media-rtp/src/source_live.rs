@@ -881,10 +881,17 @@ impl LiveSource {
             |index| format!("{video_index}:{index}"),
         );
         // 输出编码参数全部来自 URI(前端"摄像头视频参数"那一列),不再硬编码 1280x720/libx264。
+        //
+        // `fps=<目标帧率>` 是必须的:AVFoundation 输入按 30/60 帧采集(见
+        // `camera_input_fps`),而推流循环按设备配置的帧率消费。若不做帧率归一化,
+        // 30fps 的编码结果会被 25fps 的消费者"追不上",缓冲每秒净增 5 帧,触顶后
+        // 快进丢弃到最近关键帧 —— 表现为每隔几秒画面瞬跳一次,跟机器性能无关。
+        // `format=yuv420p` 则保证无论源是什么像素格式,输出都是平台能解的 4:2:0。
         let scale_filter = format!(
-            "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
+            "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p",
             w = profile.width,
-            h = profile.height
+            h = profile.height,
+            fps = fps
         );
         let bitrate = format!("{}k", profile.bitrate_kbps);
         // 恒定码率的缓冲上限取 2 倍码率:低延迟场景不希望 VBV 攒太久。
@@ -914,8 +921,10 @@ impl LiveSource {
             "0:v:0",
             "-c:v",
             video_encoder,
+            // ultrafast 关闭 CABAC/亚像素搜索,运动场景同码率下块效应明显;
+            // veryfast 在 720p/1080p 实时编码上 CPU 代价仍可控,画面显著更干净。
             "-preset",
-            "ultrafast",
+            "veryfast",
             "-tune",
             "zerolatency",
             "-pix_fmt",
@@ -934,13 +943,24 @@ impl LiveSource {
             "passthrough",
         ]);
         // x264 的 slice 参数是 libx264 专属;libx265 用 -x265-params 表达同样的意图。
+        // 两者都固定 GOP/关闭场景切换:GB28181 平台按关键帧起播,关键帧间隔必须可预期;
+        // CBR + force-cfr 则保证运动时码率不塌、时间基稳定(花屏与抖动的直接来源)。
         match profile.codec {
             LiveVideoCodec::H264 => {
-                command.args(["-x264-params", "slices=1:sliced-threads=0"]);
+                let params = format!(
+                    "nal-hrd=cbr:force-cfr=1:keyint={gop}:min-keyint={gop}:scenecut=0:slices=1:sliced-threads=0",
+                    gop = profile.gop
+                );
+                command.args(["-profile:v", "high"]);
+                command.args(["-x264-params", &params]);
                 command.args(["-f", "h264"]);
             }
             LiveVideoCodec::H265 => {
-                command.args(["-x265-params", "log-level=error"]);
+                let params = format!(
+                    "log-level=error:keyint={gop}:min-keyint={gop}:scenecut=0",
+                    gop = profile.gop
+                );
+                command.args(["-x265-params", &params]);
                 command.args(["-tag:v", "hvc1", "-f", "hevc"]);
             }
         }
@@ -1282,6 +1302,10 @@ impl LiveSource {
                                 // 通道满/断开:丢这一帧并计数(消费侧还会快进到最近关键帧)。
                                 crate::source::note_dropped_frame();
                             }
+                        } else if encoded > 1 {
+                            // OpenH264 在码率控制下会主动跳帧(enable_skip_frame),
+                            // 返回空码流。之前这里静默 continue,丢帧完全不可见。
+                            crate::source::note_dropped_frame();
                         }
                     }
                     encoder_alive.store(false, Ordering::Release);
@@ -1437,7 +1461,11 @@ impl LiveSource {
                         let start = y * stride;
                         packed.extend_from_slice(&source[start..start + row_bytes]);
                     }
-                    let _ = raw_tx.try_send(packed);
+                    // 编码器跟不上时这里会丢帧:必须计数,否则现场只能看到"平台卡",
+                    // 看不到"本机采集已经在丢"。
+                    if raw_tx.try_send(packed).is_err() {
+                        crate::source::note_dropped_frame();
+                    }
                 },
                 SCStreamOutputType::Screen,
             )

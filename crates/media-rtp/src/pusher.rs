@@ -50,12 +50,26 @@ pub struct SessionTelemetry {
     /// 发送通道建立的时刻。`RtcpFeedback` 里的"最近一次报告"记的是相对这个
     /// 时刻的毫秒数,消费方算"报告有多旧"必须用同一个原点。
     pub started: std::time::Instant,
+    /// 会话开始时的采集丢弃计数基线(重同步字节数, 通道满丢帧数)。
+    ///
+    /// `capture_drop_stats()` 是进程级累计值:不回填基线的话,压测多路会话会互相
+    /// 污染,单设备页也会把"上一场推流"的丢弃算到当前会话头上。
+    pub capture_base: (u64, u64),
 }
 
 impl SessionTelemetry {
     /// 距发送通道建立至今的毫秒数(传给 `RtcpFeedback::snapshot`)。
     pub fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// 本会话开始以来的采集侧丢弃增量 (重同步丢弃字节数, 通道满/编码器跳帧数)。
+    pub fn capture_drops(&self) -> (u64, u64) {
+        let (resync, dropped) = crate::source::capture_drop_stats();
+        (
+            resync.saturating_sub(self.capture_base.0),
+            dropped.saturating_sub(self.capture_base.1),
+        )
     }
 }
 
@@ -98,6 +112,11 @@ impl PlaybackControl {
     /// 当前倍速(浮点)。
     pub fn speed(&self) -> f32 {
         self.speed_milli.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    /// 当前倍速的千分比(整数,避免浮点累积误差)。
+    pub fn speed_per_mille(&self) -> u32 {
+        self.speed_milli.load(Ordering::Relaxed)
     }
 
     /// 暂停推流。
@@ -207,6 +226,7 @@ pub async fn push_stream_prepared(
         local_rtcp_port,
         clock_hz: CLOCK_HZ,
         started: sender.started(),
+        capture_base: crate::source::capture_drop_stats(),
     });
     tracing::info!(%dst, ssrc = format!("{ssrc:#x}"), use_tcp, fps, live = source.is_live(), local_rtcp_port, "推流开始:已建立发送通道");
     // PSM stream_type 跟随源编码,并按源能力稳定声明音频 ES。
@@ -218,11 +238,16 @@ pub async fn push_stream_prepared(
         PsMuxer::with_video(source.codec())
     };
     let fps = fps.max(1);
-    let ts_step = CLOCK_HZ / fps;
     let base_interval_us = 1_000_000f32 / fps as f32;
-    let mut timestamp: u32 = 0; // RTP timestamp wraps at 32 bits.
-    let mut ps_timestamp: u64 = 0; // MPEG-PS SCR/PTS uses a 33-bit clock.
     const PS_CLOCK_MASK: u64 = 0x1_FFFF_FFFF;
+    // 媒体时钟:按"真实经过的媒体时间"累积(暂停不计时、倍速按倍率放大),
+    // RTP 与 PS 时间戳都由它推导。
+    //
+    // 之前时间戳按"已发出帧数 × 帧间隔"推进:一旦供帧抖动跳过几拍,或缓冲快进
+    // 丢掉一段帧,时间线就永久落后墙钟 —— 平台侧表现为延迟单调增长、音画渐移。
+    // 墙钟推导则天然自校正:丢帧只会在时间戳上留下一个真实的空洞,平台按空档跳帧。
+    let mut media_us: u64 = 0;
+    let mut last_clock = tokio::time::Instant::now();
     // 实时音频使用独立 33-bit/90kHz 时钟；每个访问单元按真实帧时长推进。
     let mut audio_timestamp: Option<u64> = None;
 
@@ -267,6 +292,20 @@ pub async fn push_stream_prepared(
                 break Ok(());
             }
             _ = sleep => {
+                // 推进媒体时钟(暂停期间冻结)。单拍最多记 1s:系统休眠或长挂起
+                // 恢复后不让时间戳瞬跳,避免平台把一段空档误判成时间线异常。
+                let now = tokio::time::Instant::now();
+                let elapsed = now.saturating_duration_since(last_clock);
+                last_clock = now;
+                if !control.is_paused() {
+                    let delta = elapsed.min(std::time::Duration::from_secs(1));
+                    let scaled = (delta.as_micros() as u64)
+                        .saturating_mul(u64::from(control.speed_per_mille()))
+                        / 1000;
+                    media_us = media_us.saturating_add(scaled);
+                }
+                let timestamp = ((media_us * 90) / 1000) as u32;
+                let ps_timestamp = ((media_us * 90) / 1000) & PS_CLOCK_MASK;
                 if let Some(error) = source.take_error() {
                     tracing::warn!(%error, frames_sent, "推流:实时采集后端异常停止");
                     break Err(Error::Media(error));
@@ -341,9 +380,6 @@ pub async fn push_stream_prepared(
                     if frames_sent % 100 == 0 {
                         tracing::debug!(frames_sent, keyframes_sent, bytes_sent, "推流进行中");
                     }
-                    timestamp = timestamp.wrapping_add(ts_step);
-                    ps_timestamp =
-                        ps_timestamp.wrapping_add(u64::from(ts_step)) & PS_CLOCK_MASK;
                     // 周期发 RTCP SR,把发送包数/字节数反馈给平台(FR-32)。
                     if tokio::time::Instant::now() >= next_rtcp {
                         if let Err(error) = sender.send_rtcp_sr(timestamp).await {

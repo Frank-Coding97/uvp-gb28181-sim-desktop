@@ -60,7 +60,7 @@ live:screen:<display_id>?audio=<none|system|microphone:N>&audio_codec=<g711a|g71
 5. 平台下发 PTZ/预置位 → 后端 emit `ptz_action`/`ptz_preset` → 前端云台动画。
 6. 信令追踪开关 → `set_sip_trace({enabled})`;开启时后端 emit `sip_trace` 事件流。
 7. 平台下发语音广播 → 设备回广播应答后**主动发 INVITE** 收音频;前端 500 ms 轮询 `get_broadcast_status` 刷新统计,`hangup_broadcast` 可主动挂断。
-8. 平台点播 → 设备推流的同时,前端 500 ms 轮询 `get_media_telemetry`,把本端发送统计与平台回的 RTCP RR 一起显示在「推流质量」卡。
+8. 平台点播 → 设备推流的同时,前端 500 ms 轮询 `get_media_telemetry`,把本端发送统计、**采集侧丢弃增量**(通道满/编码器跳帧、重同步字节)与平台回的 RTCP RR 一起显示在「推流质量」卡。采集丢帧 > 0 时说明本机供给不足,不是网络丢包。
 8. 「注销」→ `stop_device()` → 按附录 K b) 先拆媒体链路(发会话内 BYE)再 REGISTER Expires=0。
 
 > 广播状态用轮询而不是事件推送:收流统计每 20 ms 就变一次,推成事件等于给 webview 灌洪水。
