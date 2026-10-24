@@ -11,6 +11,8 @@ pub(crate) fn engine_version() -> String {
 }
 
 /// 入站信令安全能力。静态显式暴露边界，避免 UI 把“严格模式”误解为双向 Digest。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub(crate) struct InboundSecurityCapabilities {
     pub(crate) source_ip_filter: bool,

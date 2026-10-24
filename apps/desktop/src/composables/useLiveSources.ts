@@ -21,40 +21,17 @@ import {
 import { persistForm, useDevice } from "../device";
 import { formatError } from "../lib/ipcError";
 
-export interface LiveAvDevice {
-  index: number;
-  name: string;
-}
-export interface LiveScreenDevice {
-  display_id: number;
-  width: number;
-  height: number;
-  name: string;
-  uri: string;
-}
-export interface LiveSourceCatalog {
-  ffmpeg_available: boolean;
-  aac_available: boolean;
-  opus_available: boolean;
-  screens: LiveScreenDevice[];
-  cameras: LiveAvDevice[];
-  microphones: LiveAvDevice[];
-  screen_error: string | null;
-  avfoundation_error: string | null;
-}
-/**
- * 系统内容选择器的返回值(Rust 侧 `pick_share_target`)。
- *
- * `uri` 是可直接落库的 `live:<scheme>:<目标>` 前缀,`label` 只用于展示。
- */
-export interface ShareTargetDto {
-  kind: "display" | "window" | "application";
-  display_id: number | null;
-  window_id: number | null;
-  bundle_id: string | null;
-  label: string;
-  uri: string;
-}
+// 类型来自 Rust 侧 ts-rs 生成(见 src/types/generated),别名保持既有导入路径稳定。
+import type { LiveAvDeviceDto } from "../types/generated/LiveAvDeviceDto";
+import type { LiveScreenDto } from "../types/generated/LiveScreenDto";
+import type { LiveSourceCatalogDto } from "../types/generated/LiveSourceCatalogDto";
+import type { ShareTargetDto } from "../types/generated/ShareTargetDto";
+
+type LiveAvDevice = LiveAvDeviceDto;
+type LiveScreenDevice = LiveScreenDto;
+type LiveSourceCatalog = LiveSourceCatalogDto;
+export type { LiveAvDevice, LiveScreenDevice, LiveSourceCatalog, ShareTargetDto };
+
 export interface LiveProbeResult {
   uri: string;
   video_ready: boolean;

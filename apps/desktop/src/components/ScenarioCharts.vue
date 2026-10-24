@@ -20,65 +20,14 @@ useECharts([
   CanvasRenderer,
 ]);
 
-export interface LatencySnapshot {
-  count: number;
-  avg_ms: number;
-  p50_ms: number;
-  p95_ms: number;
-  p99_ms: number;
-  max_ms: number;
-}
+// 指标类型来自 Rust 侧 ts-rs 生成(见 src/types/generated),别名保持既有导入路径稳定。
+// 此前手写副本已与 Rust 定义漂移(transport 统计缺 3 个字段),现在由门禁保证零漂移。
+import type { LatencySnapshot } from "../types/generated/LatencySnapshot";
+import type { MetricsSnapshot } from "../types/generated/MetricsSnapshot";
+import type { TransportStatsSnapshot } from "../types/generated/TransportStatsSnapshot";
 
-export interface TransportStats {
-  received: number;
-  parse_errors: number;
-  rejected_source: number;
-  rate_limited: number;
-  rate_limited_bytes: number;
-  anti_amplification_blocked: number;
-  dropped_queue_full: number;
-  unrouted: number;
-  sent: number;
-  send_errors: number;
-  oversized_sent: number;
-}
-
-export interface MetricsSnapshot {
-  register_attempted: number;
-  register_first_attempt: number;
-  register_retry: number;
-  register_succeeded: number;
-  register_failed: number;
-  register_success_rate: number;
-  device_success_rate: number;
-  heartbeat_succeeded: number;
-  heartbeat_failed: number;
-  active_streams: number;
-  devices_online: number;
-  devices_online_peak: number;
-  fail_timeout: number;
-  fail_rejected: number;
-  fail_rejected_auth: number;
-  fail_rejected_overload: number;
-  fail_rejected_other: number;
-  fail_local: number;
-  fail_other: number;
-  first_failure_online: number | null;
-  ramp_throttled: number;
-  failure_samples: Array<{
-    device_id: string;
-    kind: string;
-    status?: number;
-    online_at_failure: number;
-  }>;
-  position_reported: number;
-  alarm_reported: number;
-  register_latency: LatencySnapshot;
-  heartbeat_latency: LatencySnapshot;
-  transport?: TransportStats;
-  local_pressure: number;
-  results_trustworthy: boolean;
-}
+type TransportStats = TransportStatsSnapshot;
+export type { LatencySnapshot, MetricsSnapshot, TransportStats };
 
 const MAX_POINTS = 86_400;
 const times: string[] = [];

@@ -7,6 +7,8 @@ use common::DeviceId;
 use super::*;
 
 /// 目录节点 DTO(前端多通道管理 ⇄ 引擎 CatalogNode)。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub(crate) struct ChannelNodeDto {
     id: String,

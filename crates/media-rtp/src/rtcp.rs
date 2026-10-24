@@ -319,9 +319,12 @@ impl RtcpFeedback {
 }
 
 /// [`RtcpFeedback`] 的可序列化快照(给 Tauri 命令与压测报表)。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RtcpFeedbackSnapshot {
     /// 累计收到的接收报告块数。
+    #[ts(type = "number")]
     pub reports: u64,
     /// 最近一次报告的丢包率,百分比。
     pub loss_percent: f64,
@@ -336,10 +339,12 @@ pub struct RtcpFeedbackSnapshot {
     /// 报告方(平台)SSRC。
     pub reporter_ssrc: u32,
     /// 距最近一次报告的毫秒数;从未收到为 None。
+    #[ts(type = "number | null")]
     pub age_ms: Option<u64>,
     /// 平台是否发过 RTCP BYE。
     pub peer_bye: bool,
     /// 无法解析的 RTCP 包数。
+    #[ts(type = "number")]
     pub unparsed: u64,
 }
 

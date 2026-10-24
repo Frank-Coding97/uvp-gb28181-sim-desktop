@@ -128,21 +128,37 @@ pub struct TransportStats {
 /// 汇总成一份,而调用方**不该在加字段时被迫改动累加代码** ——
 /// 之前那里是手写的逐字段初始化 + 逐字段相加,每加一个计数器就编译不过一次,
 /// 更糟的是漏加一个字段编译器不会报错。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct TransportStatsSnapshot {
+    #[ts(type = "number")]
     pub received: u64,
+    #[ts(type = "number")]
     pub parse_errors: u64,
+    #[ts(type = "number")]
     pub rejected_source: u64,
+    #[ts(type = "number")]
     pub rate_limited: u64,
+    #[ts(type = "number")]
     pub rate_limited_bytes: u64,
+    #[ts(type = "number")]
     pub anti_amplification_blocked: u64,
+    #[ts(type = "number")]
     pub dropped_queue_full: u64,
+    #[ts(type = "number")]
     pub unrouted: u64,
+    #[ts(type = "number")]
     pub sent: u64,
+    #[ts(type = "number")]
     pub send_errors: u64,
+    #[ts(type = "number")]
     pub oversized_sent: u64,
+    #[ts(type = "number")]
     pub rejected_connections: u64,
+    #[ts(type = "number")]
     pub timed_out_connections: u64,
+    #[ts(type = "number")]
     pub recv_errors: u64,
 }
 

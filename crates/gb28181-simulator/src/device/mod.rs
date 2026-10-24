@@ -512,6 +512,8 @@ struct BroadcastSession {
 ///
 /// 设备侧一直只能看到"我发了多少",看不到"平台收到了多少" ——
 /// 现场排"画面卡但设备说在发"这类问题时,平台回的 RTCP RR 才是关键证据。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MediaTelemetrySnapshot {
     /// 会话是回放/下载(true)还是实时(false)。
@@ -521,24 +523,32 @@ pub struct MediaTelemetrySnapshot {
     /// 本端 RTCP 端口;TCP 模式或未抢到 RTP+1 时为 None,此时收不到 RR。
     pub local_rtcp_port: Option<u16>,
     /// 已发送 RTP 包数。
+    #[ts(type = "number")]
     pub sent_packets: u64,
     /// 已发送字节数(含 RTP 头)。
+    #[ts(type = "number")]
     pub sent_bytes: u64,
     /// 已发送 RTCP SR 包数。
+    #[ts(type = "number")]
     pub sent_rtcp: u64,
     /// 本地发送失败次数。
+    #[ts(type = "number")]
     pub send_errors: u64,
     /// 本会话采集侧丢弃的帧数(通道满 / 编码器主动跳帧)。
     ///
     /// 与 `send_errors` 是两种不同故障:"发得出去但没东西可发"。
+    #[ts(type = "number")]
     pub capture_dropped_frames: u64,
     /// 本会话 Annex B 切帧缓冲超限被整体丢弃的字节数(重同步)。
+    #[ts(type = "number")]
     pub capture_resync_bytes: u64,
     /// 平台回报的收流质量;从未收到 RR 时字段 `reports` 为 0。
     pub feedback: media_rtp::RtcpFeedbackSnapshot,
 }
 
 /// 语音广播会话快照(给前端面板)。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BroadcastSnapshot {
     /// 语音流发送者 ID。

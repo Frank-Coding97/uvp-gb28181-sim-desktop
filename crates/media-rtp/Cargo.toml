@@ -13,6 +13,7 @@ bytes.workspace = true
 tracing.workspace = true
 rand.workspace = true
 serde.workspace = true
+ts-rs.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 openh264 = "=0.6.5"

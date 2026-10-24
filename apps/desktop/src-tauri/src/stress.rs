@@ -717,6 +717,8 @@ pub(crate) async fn stop_stress_graceful(state: &AppState) -> bool {
     true
 }
 
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(serde::Serialize)]
 pub(crate) struct ScenarioSummary {
     name: String,

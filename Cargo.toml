@@ -35,6 +35,8 @@ parking_lot = "0.12"
 md-5 = "0.10"
 rand = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
+# Rust→TS 类型导出(#[derive(TS)] + export feature);生成物落在前端 src/types/generated/。
+ts-rs = "11"
 
 [workspace.package]
 edition = "2021"

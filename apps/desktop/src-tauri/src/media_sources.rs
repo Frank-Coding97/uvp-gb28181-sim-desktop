@@ -5,6 +5,8 @@ use tauri::{AppHandle, Manager}; // Tauri 2 emit/state 需要对应 trait
 
 use super::*;
 
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(Serialize)]
 pub(crate) struct LiveScreenDto {
     display_id: u32,
@@ -14,12 +16,16 @@ pub(crate) struct LiveScreenDto {
     uri: String,
 }
 
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(Serialize)]
 pub(crate) struct LiveAvDeviceDto {
     index: u32,
     name: String,
 }
 
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(Serialize)]
 pub(crate) struct LiveSourceCatalogDto {
     ffmpeg_available: bool,
@@ -37,6 +43,8 @@ pub(crate) struct LiveSourceCatalogDto {
 /// 前端把它拼进 `live:screen|window|app:<目标>` URI:选中的是**目标身份**
 /// (显示器 id / 窗口号 / bundle id),不是一次性的过滤器对象 —— 这样同一次选择
 /// 才能跨会话复用(每次平台 INVITE 都会重建采集管道)。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(Serialize)]
 pub(crate) struct ShareTargetDto {
     /// `display` / `window` / `application`。
@@ -113,6 +121,8 @@ impl From<media_rtp::LiveSourceCatalog> for LiveSourceCatalogDto {
     }
 }
 
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
 #[derive(Serialize)]
 pub(crate) struct LiveProbeDto {
     uri: String,

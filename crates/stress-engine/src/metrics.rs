@@ -107,13 +107,20 @@ impl LatencyHistogram {
 }
 
 /// 延迟分布快照。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct LatencySnapshot {
+    #[ts(type = "number")]
     pub count: u64,
     pub avg_ms: f64,
+    #[ts(type = "number")]
     pub p50_ms: u64,
+    #[ts(type = "number")]
     pub p95_ms: u64,
+    #[ts(type = "number")]
     pub p99_ms: u64,
+    #[ts(type = "number")]
     pub max_ms: u64,
 }
 
@@ -221,6 +228,8 @@ impl Default for Metrics {
 pub const MAX_FAILURE_SAMPLES: usize = 20;
 
 /// 一条失败样本。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FailureSample {
     /// 失败设备国标编号。
@@ -231,6 +240,7 @@ pub struct FailureSample {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     /// 出现该失败时的在线设备数 —— 定位"在什么水位上发生的"。
+    #[ts(type = "number")]
     pub online_at_failure: u64,
 }
 
@@ -454,37 +464,60 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 }
 
 /// 指标只读快照(可序列化,推 UI / 落库)。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricsSnapshot {
+    #[ts(type = "number")]
     pub register_attempted: u64,
+    #[ts(type = "number")]
     pub register_first_attempt: u64,
+    #[ts(type = "number")]
     pub register_retry: u64,
+    #[ts(type = "number")]
     pub register_succeeded: u64,
+    #[ts(type = "number")]
     pub register_failed: u64,
     pub register_success_rate: f64,
     pub device_success_rate: f64,
+    #[ts(type = "number")]
     pub heartbeat_succeeded: u64,
+    #[ts(type = "number")]
     pub heartbeat_failed: u64,
+    #[ts(type = "number")]
     pub active_streams: u64,
+    #[ts(type = "number")]
     pub devices_online: u64,
+    #[ts(type = "number")]
     pub devices_online_peak: u64,
+    #[ts(type = "number")]
     pub fail_timeout: u64,
+    #[ts(type = "number")]
     pub fail_rejected: u64,
     /// 拒绝里的凭据/权限档(401/403/407):加并发不会变好,去核对账号配置。
+    #[ts(type = "number")]
     pub fail_rejected_auth: u64,
     /// 拒绝里的忙/过载档(480/486/500/503/504):真正的承载力信号。
+    #[ts(type = "number")]
     pub fail_rejected_overload: u64,
     /// 拒绝里的其它状态码(常见 404:编号不被平台接受)。
+    #[ts(type = "number")]
     pub fail_rejected_other: u64,
+    #[ts(type = "number")]
     pub fail_local: u64,
+    #[ts(type = "number")]
     pub fail_other: u64,
     /// 首次失败时的在线设备数(失败水位);从未失败为 None。
+    #[ts(type = "number | null")]
     pub first_failure_online: Option<u64>,
     /// 爬坡因本地背压减速的次数。非 0 说明本机已经跟不上设定的爬坡速率。
+    #[ts(type = "number")]
     pub ramp_throttled: u64,
     /// 失败设备样本(最多 20 条),供挑一台复现。
     pub failure_samples: Vec<FailureSample>,
+    #[ts(type = "number")]
     pub position_reported: u64,
+    #[ts(type = "number")]
     pub alarm_reported: u64,
     pub register_latency: LatencySnapshot,
     pub heartbeat_latency: LatencySnapshot,
@@ -492,6 +525,7 @@ pub struct MetricsSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<sip_core::TransportStatsSnapshot>,
     /// 本地压力总量(队列丢弃 + 发送失败 + 解析失败 + 本地归因失败)。
+    #[ts(type = "number")]
     pub local_pressure: u64,
     /// 结论是否可信:本地压力为 0 时,失败可归因于平台;否则先扩本机再测。
     pub results_trustworthy: bool,

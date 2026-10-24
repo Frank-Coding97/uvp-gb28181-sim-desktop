@@ -110,22 +110,31 @@ impl Default for RecvStats {
 }
 
 /// [`RecvStats`] 的可序列化快照。
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/types/generated/")]
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct RecvStatsSnapshot {
+    #[ts(type = "number")]
     pub packets: u64,
+    #[ts(type = "number")]
     pub payload_bytes: u64,
+    #[ts(type = "number")]
     pub lost: u64,
+    #[ts(type = "number")]
     pub reordered: u64,
+    #[ts(type = "number")]
     pub malformed: u64,
     /// 最近一包负载类型;尚未收到时为 None。
     pub payload_type: Option<u8>,
     /// 最近一包音量百分比(0~100)。
     pub level_pct: u32,
     /// 距最近一次收包的毫秒数;尚未收到时为 None。
+    #[ts(type = "number | null")]
     pub idle_ms: Option<u64>,
     /// 到达间隔抖动,毫秒(按 G.711 8 kHz 时钟换算)。
     pub jitter_ms: f64,
     /// 已向平台发出的 RTCP RR 包数。
+    #[ts(type = "number")]
     pub rr_sent: u64,
     /// 是否收到过平台的 RTCP SR(收到才说明平台的 RTCP 也通)。
     pub peer_sr_seen: bool,

@@ -13,6 +13,18 @@
 
 所有负载为 **JSON**,字段用 `snake_case`(Rust serde 默认),TS 侧定义等价接口。
 
+### TS 类型零漂移(ts-rs 生成)
+
+跨语言类型**不再手写副本**:16 个高频漂移面(指标快照/遥测/媒体源目录/通道树等)在 Rust 侧
+`#[derive(ts_rs::TS)] + #[ts(export, export_to=…)]`,`cargo test` 时自动生成到
+`apps/desktop/src/types/generated/`,前端 `import type` 消费并在 composable/组件里
+以别名再导出(保持既有导入路径稳定)。u64/i64 字段按 Tauri IPC 实际行为标
+`#[ts(type = "number")]`(JSON 数字,而非 ts-rs 默认的 bigint)。
+
+- 重新生成:`cargo test -p sip-core -p media-rtp -p gb28181-simulator -p stress-engine -p uvp-desktop --lib`
+- 漂移门禁:`scripts/check-ts-bindings.sh`(重新生成 + `git diff` 校验生成物已提交且最新)
+- 本表仍为命令/事件的**语义**契约(何时调用、错误含义),字段级契约以生成物为准。
+
 ---
 
 ## 2. 命令(Command)

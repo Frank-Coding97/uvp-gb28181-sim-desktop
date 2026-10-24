@@ -27,6 +27,7 @@ encoding_rs       = { workspace = true }
 common            = { path = "../../../crates/common" }
 tauri = { version = "=2.11.5", features = ["protocol-asset"] }
 serde.workspace = true
+ts-rs.workspace = true
 serde_json.workspace = true
 toml = "=0.8.2"
 tokio.workspace = true

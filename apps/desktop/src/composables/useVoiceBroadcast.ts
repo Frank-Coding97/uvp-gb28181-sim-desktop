@@ -7,37 +7,13 @@ import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../lib/ipcError";
 
-/** 收流统计(对应 Rust 侧 media_rtp::RecvStatsSnapshot)。 */
-export interface RecvStats {
-  packets: number;
-  payload_bytes: number;
-  lost: number;
-  reordered: number;
-  malformed: number;
-  /** 最近一包的 RTP 负载类型;8=PCMA、0=PCMU。尚未收到时为 null。 */
-  payload_type: number | null;
-  /** 最近一包的音量百分比(0~100)。 */
-  level_pct: number;
-  /** 距最近一次收包的毫秒数;尚未收到时为 null。 */
-  idle_ms: number | null;
-  /** 到达间隔抖动,毫秒(RFC 3550 A.8,按 G.711 8 kHz 时钟换算)。 */
-  jitter_ms: number;
-  /** 设备已向平台回报的 RTCP RR 包数(设备是接收方,按 RFC 3550 应回报)。 */
-  rr_sent: number;
-  /** 是否收到过平台的 RTCP SR(收到才说明平台侧 RTCP 也通)。 */
-  peer_sr_seen: boolean;
-}
+// 类型来自 Rust 侧 ts-rs 生成(见 src/types/generated),别名保持既有导入路径稳定。
+import type { BroadcastSnapshot } from "../types/generated/BroadcastSnapshot";
+import type { RecvStatsSnapshot } from "../types/generated/RecvStatsSnapshot";
 
-/** 语音广播会话快照(对应 Rust 侧 BroadcastSnapshot)。 */
-export interface BroadcastSession {
-  /** 语音流发送者 ID(平台侧 SourceID)。 */
-  source_id: string;
-  /** 本端收流端口。 */
-  local_port: number;
-  /** 会话 Call-ID。 */
-  call_id: string;
-  recv: RecvStats;
-}
+type RecvStats = RecvStatsSnapshot;
+type BroadcastSession = BroadcastSnapshot;
+export type { BroadcastSession, RecvStats };
 
 /** 轮询周期:音量条要看起来连续,又不至于把 IPC 打满。 */
 const POLL_MS = 500;
