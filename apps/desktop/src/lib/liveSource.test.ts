@@ -2,14 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_SCREEN_PROFILE,
+  MAX_SCREEN_BITRATE_KBPS,
   buildCameraUri,
   buildScreenUri,
   inferMediaMode,
   isAudioCodec,
   isLikelyPlayableFile,
+  kbpsToMbps,
+  mbpsToKbps,
   parseCameraSource,
   parseScreenNumber,
   parseScreenSource,
+  suggestBitrateKbps,
   validateVideoProfile,
 } from "./liveSource";
 
@@ -216,9 +220,11 @@ describe("视频编码参数校验", () => {
     expect(validateVideoProfile({ ...base, width: 4096, height: 2160 })).toMatch("3840×2160");
   });
 
-  it("码率越界被拒", () => {
+  it("码率越界被拒;上限 250 Mbps,全 I 帧所需的高码率合法", () => {
     expect(validateVideoProfile({ ...base, bitrateKbps: 64 })).toMatch("码率");
-    expect(validateVideoProfile({ ...base, bitrateKbps: 30_000 })).toMatch("码率");
+    expect(validateVideoProfile({ ...base, bitrateKbps: 300_000 })).toMatch("码率");
+    // 200 Mbps 是 4K@30 全 I 帧的合理码率,不该被拒。
+    expect(validateVideoProfile({ ...base, bitrateKbps: 200_000 })).toBeNull();
   });
 
   it("未知编码被拒", () => {
@@ -261,5 +267,39 @@ describe("其它", () => {
     expect(isLikelyPlayableFile("/a/b.MOV")).toBe(true);
     expect(isLikelyPlayableFile("/a/b.h264")).toBe(false);
     expect(isLikelyPlayableFile("/a/b.h265")).toBe(false);
+  });
+});
+
+describe("推荐码率", () => {
+  it("默认档 720p@25 gop=50 → 约 2.6 Mbps(与历史默认 2.5 同量级)", () => {
+    expect(suggestBitrateKbps(1280, 720, 25, 50)).toBe(2600);
+  });
+
+  it("GOP 越小码率推荐越高:全 I 帧(gop=1)约 8 倍", () => {
+    const normal = suggestBitrateKbps(1280, 720, 25, 50);
+    const allIntra = suggestBitrateKbps(1280, 720, 25, 1);
+    expect(allIntra).toBe(18400);
+    expect(allIntra / normal).toBeGreaterThan(6);
+  });
+
+  it("分辨率与帧率近似线性参与(0.1 Mbps 步进内取整)", () => {
+    const hd = suggestBitrateKbps(1280, 720, 25, 50);
+    const fhd = suggestBitrateKbps(1920, 1080, 25, 50);
+    expect(fhd / hd).toBeGreaterThan(2.1);
+    expect(fhd / hd).toBeLessThan(2.4);
+    // 帧率翻倍 → 推荐码率近似翻倍(取整容差 ±100 kbps)。
+    expect(Math.abs(suggestBitrateKbps(1280, 720, 50, 50) - hd * 2)).toBeLessThanOrEqual(100);
+  });
+
+  it("结果按 0.1 Mbps 步进并夹在合法区间", () => {
+    expect(suggestBitrateKbps(160, 160, 15, 600)).toBeGreaterThanOrEqual(128);
+    expect(suggestBitrateKbps(3840, 2160, 60, 1)).toBeLessThanOrEqual(MAX_SCREEN_BITRATE_KBPS);
+  });
+
+  it("Mbps↔kbps 换算取整收敛", () => {
+    expect(mbpsToKbps(2.5)).toBe(2500);
+    expect(mbpsToKbps(0.128)).toBe(128);
+    expect(kbpsToMbps(2500)).toBe(2.5);
+    expect(mbpsToKbps(kbpsToMbps(18432))).toBe(18432);
   });
 });

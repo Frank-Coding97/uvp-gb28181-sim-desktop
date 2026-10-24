@@ -59,7 +59,18 @@ INVITE 重建采集管道时目标都不会丢。窗口/应用被关掉后采集
 > 注意:右下角**本地预览**走的是 WebView 自己的 `getDisplayMedia`(它也有一个系统选择器),
 > 与实际推流是两条链路。选了窗口/应用目标时本地预览会如实提示不可用,以平台侧画面为准。
 
-`width/height/bitrate/codec` 必须成组出现(省略则整体取默认档 1280×720 / 2500 kbps / H.264),`gop` 可单独给(默认 50 帧)。GOP 在 OpenH264 屏幕编码路径上通过每 N 帧 `force_intra_frame()` 实现,在 ffmpeg 路径(摄像头、H.265 屏幕)上通过 `-g` 实现。
+`width/height/bitrate/codec` 必须成组出现(省略则整体取默认档 1280×720 / 2.5 Mbps / H.264),`gop` 可单独给(默认 50 帧)。GOP 在 OpenH264 屏幕编码路径上通过每 N 帧 `force_intra_frame()` 实现,在 ffmpeg 路径(摄像头、H.265 屏幕)上通过 `-g` 实现。
+
+**码率(单位 Mbps)**:URI 与引擎内部仍以 kbps 表示,UI 输入 Mbps(`liveSource.ts` 的
+`mbpsToKbps`/`kbpsToMbps` 收拢换算)。上限为 250 Mbps 的合理性防护而非业务约束 ——
+全 I 帧流(小 GOP)的码率需求是普通 GOP 的约 8 倍(4K@30 全 I 帧约 200 Mbps),
+20 Mbps 级别的旧上限会把"小 GOP + 高码率"的低延迟组合堵死。
+
+**码率自动推荐**:切换分辨率、帧率或 GOP 时,按 `suggestBitrateKbps` 自动回填推荐码率
+(每像素每帧 ≈0.1 bit × I 帧开销乘子 `1 + 7/gop`),如 720p@25 gop=50 → 2.6 Mbps、
+gop=1(全 I 帧)→ 18.4 Mbps。推荐值可手改;再次切换参数时会被重新推荐覆盖。
+这是防止"GOP=1 而码率不动 → 码控打满 → 画面灰闪"的护栏 —— 灰闪是极限量化
+(QP 顶格、残差被量化为零)的典型表现。
 
 ## 3. 交互流程(对应 IPC,见 `20-architecture/api-contract.md`)
 

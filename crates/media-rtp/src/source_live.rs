@@ -20,7 +20,11 @@ const MIN_SCREEN_DIMENSION: u32 = 160;
 const MAX_SCREEN_LONG_SIDE: u32 = 3840;
 const MAX_SCREEN_SHORT_SIDE: u32 = 2160;
 const MIN_SCREEN_BITRATE_KBPS: u32 = 128;
-const MAX_SCREEN_BITRATE_KBPS: u32 = 20_000;
+/// 只做"填错了"级别的合理性防护(250 Mbps),不限制真实业务:
+/// 全 I 帧流(GOP=1)的码率需求是普通 GOP 的 ~8 倍,4K@30 全 I 帧要 ~200 Mbps,
+/// 原来的 20 Mbps 会把"小 GOP + 高码率"的低延迟组合直接堵死。与前端
+/// `MAX_SCREEN_BITRATE_KBPS` 保持一致。
+const MAX_SCREEN_BITRATE_KBPS: u32 = 250_000;
 const STDERR_TAIL_LINES: usize = 32;
 
 /// Video codec actually available for native live-screen capture.
@@ -94,8 +98,14 @@ impl LiveVideoProfile {
             )));
         }
         if !(MIN_SCREEN_BITRATE_KBPS..=MAX_SCREEN_BITRATE_KBPS).contains(&self.bitrate_kbps) {
+            // 摄像头与屏幕共用这套 profile,报错不带 "screen" 前缀;单位给出 UI
+            // 同款 Mbps,避免用户对着界面上的 2.5 找不到 2500 在哪里。
             return Err(Error::Media(format!(
-                "screen bitrate must be between {MIN_SCREEN_BITRATE_KBPS} and {MAX_SCREEN_BITRATE_KBPS} kbps"
+                "bitrate must be between {} and {} Mbps ({}–{} kbps)",
+                MIN_SCREEN_BITRATE_KBPS as f64 / 1000.0,
+                MAX_SCREEN_BITRATE_KBPS as f64 / 1000.0,
+                MIN_SCREEN_BITRATE_KBPS,
+                MAX_SCREEN_BITRATE_KBPS
             )));
         }
         if !(MIN_GOP..=MAX_GOP).contains(&self.gop) {
@@ -2766,5 +2776,23 @@ mod tests {
         assert!(LiveSourceSpec::parse("live:app:?audio=none").is_err());
         assert!(LiveSourceSpec::parse("live:app:com.apple Safari?audio=none").is_err());
         assert!(LiveSourceSpec::parse("live:display:1?audio=none").is_err());
+    }
+
+    /// 码率上限是"合理性防护"而非业务约束:全 I 帧流(小 GOP)需要普通 GOP 约
+    /// 8 倍的码率,4K@30 全 I 帧约 200 Mbps。锁定 250 Mbps 边界,防止将来又收窄。
+    #[test]
+    fn 码率上限_250mbps_全i帧高码率合法且超界被拒() {
+        let profile = |kbps: u32| LiveVideoProfile {
+            bitrate_kbps: kbps,
+            ..LiveVideoProfile::default()
+        };
+        profile(250_000).validate().expect("250 Mbps 应合法");
+        let oversized = profile(250_001).validate().expect_err("超上限应被拒");
+        assert!(
+            oversized.to_string().contains("250"),
+            "报错应给出上限: {oversized}"
+        );
+        // 全 I 帧 4K@30 的真实需求场景,不许被上限挡住。
+        profile(200_000).validate().expect("200 Mbps 应合法");
     }
 }

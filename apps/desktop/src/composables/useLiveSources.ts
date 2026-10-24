@@ -11,6 +11,7 @@ import {
   inferMediaMode,
   parseCameraSource,
   parseScreenSource,
+  suggestBitrateKbps,
   validateVideoProfile,
   type AudioCodec,
   type MediaMode,
@@ -283,7 +284,25 @@ function applyScreenResolution() {
   const [width, height] = selectedScreenResolution.value.split("x").map(Number);
   selectedScreenWidth.value = width;
   selectedScreenHeight.value = height;
+  autoFillBitrate();
+}
+
+/**
+ * 按当前分辨率/帧率/GOP 重算推荐码率并覆盖码率输入。
+ *
+ * 触发点:切换分辨率、改帧率、改 GOP —— 这三个变化都直接改变"每帧要多少比特",
+ * 尤其 GOP 调小(全 I 帧倾向)时码率不跟上会直接灰闪(见 suggestBitrateKbps 的注释)。
+ * 用户随后仍可手改;下次任一参数再变时会重新推荐覆盖。
+ */
+function autoFillBitrate() {
+  selectedScreenBitrate.value = suggestBitrateKbps(
+    selectedScreenWidth.value,
+    selectedScreenHeight.value,
+    form.value.video_fps ?? 25,
+    selectedGop.value
+  );
   syncLiveSourceUri();
+  persistForm();
 }
 
 function setMediaMode(mode: MediaMode) {
@@ -403,6 +422,7 @@ export function useLiveSources() {
     canProbeSource,
     // 动作
     applyScreenResolution,
+    autoFillBitrate,
     pickShareTarget,
     useDisplayTarget,
     syncLiveSourceUri,

@@ -37,9 +37,53 @@ export const MIN_SCREEN_DIMENSION = 160;
 export const MAX_SCREEN_LONG_SIDE = 3840;
 export const MAX_SCREEN_SHORT_SIDE = 2160;
 export const MIN_SCREEN_BITRATE_KBPS = 128;
-export const MAX_SCREEN_BITRATE_KBPS = 20_000;
+/**
+ * 码率上限:250 Mbps,只做"填错了"级别的合理性防护,不再是实际约束。
+ *
+ * 原来限 20 Mbps,但全 I 帧流(GOP 很小)的码率需求是普通 GOP 的 5~8 倍:
+ * 4K@30 全 I 帧要 ~200 Mbps,1080p@25 全 I 帧要 ~60 Mbps,20 Mbps 会把
+ * "小 GOP + 高码率"这条低延迟路线直接堵死。UI 码率单位是 Mbps,这个数只在
+ * URI/引擎内部以 kbps 表示。
+ */
+export const MAX_SCREEN_BITRATE_KBPS = 250_000;
 export const MIN_GOP = 1;
 export const MAX_GOP = 600;
+
+/**
+ * 按分辨率/帧率/GOP 推荐一个"不塌质量"的码率(kbps)。
+ *
+ * 模型:每像素每帧比特数 bpp≈0.1(H.264 运动画面可接受质量的常见经验值),
+ * 再按 GOP 做 I 帧开销放大 —— GOP 越小 I 帧占比越高,而一张 I 帧的代价约是
+ * P 帧的 8 倍,等效乘子 ≈ 1 + 7/gop:
+ *   · 1280×720@25, gop=50 → ~2.6 Mbps(与历史默认 2.5 基本一致)
+ *   · 1280×720@25, gop=1(全 I 帧) → ~18 Mbps(这就是之前 GOP=1 灰闪的解药)
+ *   · 1920×1080@25, gop=50 → ~5.9 Mbps
+ * 结果四舍五入到 0.1 Mbps 并夹在合法区间内。
+ */
+export function suggestBitrateKbps(
+  width: number,
+  height: number,
+  fps: number,
+  gop: number
+): number {
+  const safeGop = Math.max(1, Math.floor(gop));
+  const safeFps = Math.max(1, Math.floor(fps));
+  const baseKbps = (width * height * safeFps * 0.1) / 1000;
+  const intraBoost = 1 + 7 / safeGop;
+  const raw = baseKbps * intraBoost;
+  const rounded = Math.round(raw / 100) * 100; // 0.1 Mbps 步进
+  return Math.min(MAX_SCREEN_BITRATE_KBPS, Math.max(MIN_SCREEN_BITRATE_KBPS, rounded));
+}
+
+/** UI 码率以 Mbps 输入,URI/引擎以 kbps 表示 —— 转换收拢在这里避免各处各自取整。 */
+export function mbpsToKbps(mbps: number): number {
+  return Math.round(mbps * 1000);
+}
+
+/** kbps → Mbps(显示用,保留两位小数以内的浮点误差无害)。 */
+export function kbpsToMbps(kbps: number): number {
+  return kbps / 1000;
+}
 
 /** 视频编码参数,摄像头与屏幕共用。 */
 export interface VideoProfile {
@@ -220,7 +264,7 @@ export function validateVideoProfile(input: {
     bitrateKbps < MIN_SCREEN_BITRATE_KBPS ||
     bitrateKbps > MAX_SCREEN_BITRATE_KBPS
   ) {
-    return `码率必须在 ${MIN_SCREEN_BITRATE_KBPS}–${MAX_SCREEN_BITRATE_KBPS} kbps 之间`;
+    return `码率必须在 ${kbpsToMbps(MIN_SCREEN_BITRATE_KBPS)}–${kbpsToMbps(MAX_SCREEN_BITRATE_KBPS)} Mbps 之间`;
   }
   if (codec !== "h264" && codec !== "h265") {
     return "编码格式必须为 H.264 或 H.265";
