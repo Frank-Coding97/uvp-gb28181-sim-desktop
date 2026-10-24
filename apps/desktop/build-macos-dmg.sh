@@ -13,7 +13,16 @@ cd "$(dirname "$0")"
 # rustup 安装的 cargo 在非交互 shell 中可能不在 PATH。
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
-VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+# 版本唯一来源是根 Cargo.toml 的 [workspace.package](tauri.conf.json 按约定不写 version,
+# Tauri 留空时取 crate 版本 —— 所以这里也必须从 Cargo.toml 取,与 check-version.sh 同源)。
+VERSION="$(awk '
+  /^\[workspace\.package\]/ { in_section = 1; next }
+  /^\[/ { in_section = 0 }
+  in_section && /^version *=/ {
+    gsub(/^version *= *"/, ""); gsub(/".*$/, ""); print; exit
+  }
+' ../../Cargo.toml)"
+[ -n "$VERSION" ] || { echo "无法从根 Cargo.toml 读出版本号" >&2; exit 1; }
 ARCH="$(uname -m | sed 's/x86_64/x64/;s/arm64/aarch64/')"
 APP_DIR="../../target/release/bundle/macos/UVP GB28181 Desktop.app"
 DMG_DIR="../../target/release/bundle/dmg"
