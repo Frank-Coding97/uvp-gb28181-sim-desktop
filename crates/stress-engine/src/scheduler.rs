@@ -23,6 +23,69 @@ const DEVICES_PER_SOCKET: usize = 64;
 /// "本机根本跑不动这个规模",继续等下去只是把结论推迟。
 const MAX_GAP_MULTIPLIER: u32 = 16;
 
+/// 一个爬坡窗口的背压判定结果。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RampDecision {
+    /// 本机在窗口内出现新的本地压力,发放间隔翻倍(本次是首次触顶到新倍率)。
+    Throttled,
+    /// 压力停止增长,间隔倍率减半收回。
+    Recovered,
+    /// 维持现状(无压力且已在原速,或已封顶不再重复减速)。
+    Hold,
+}
+
+/// 爬坡闭环背压控制器:按窗口看一次本地压力增量,决定发放间隔倍率。
+///
+/// 判定规则(与 [`MAX_GAP_MULTIPLIER`] 注释中的策略一致):
+/// - 增量 > 0 → 倍率翻倍,封顶 [`MAX_GAP_MULTIPLIER`];**只有倍率真的变化**才记一次
+///   `ramp_throttled`(已在封顶时继续有压力不算新节流,否则计数会按窗口无限累加)。
+/// - 增量 = 0 且倍率 > 1 → 倍率减半(下限 1),逐步收回而不是一次跳回原速
+///   (一次跳回容易立刻再次触发,变成振荡)。
+/// - 其余维持。
+///
+/// 抽成独立结构是为了让"翻倍/收回/封顶不重复计数"这些边界可以单测 ——
+/// 它们直接决定 UI 上"爬坡被节流"的告警是否可信。
+#[derive(Debug)]
+struct RampController {
+    multiplier: u32,
+    pressure_at_window: u64,
+}
+
+impl RampController {
+    fn new(pressure: u64) -> Self {
+        Self {
+            multiplier: 1,
+            pressure_at_window: pressure,
+        }
+    }
+
+    /// 当前发放间隔倍率(1 = 未减速)。
+    fn multiplier(&self) -> u32 {
+        self.multiplier
+    }
+
+    /// 用窗口末的本地压力累计值做一次判定并更新内部状态。
+    fn on_window(&mut self, pressure_now: u64) -> RampDecision {
+        let delta = pressure_now.saturating_sub(self.pressure_at_window);
+        self.pressure_at_window = pressure_now;
+        if delta > 0 {
+            let next = (self.multiplier * 2).min(MAX_GAP_MULTIPLIER);
+            let decision = if next != self.multiplier {
+                RampDecision::Throttled
+            } else {
+                RampDecision::Hold
+            };
+            self.multiplier = next;
+            decision
+        } else if self.multiplier > 1 {
+            self.multiplier = (self.multiplier / 2).max(1);
+            RampDecision::Recovered
+        } else {
+            RampDecision::Hold
+        }
+    }
+}
+
 /// 一个传输分片:共享 socket + 本端地址。
 struct TransportShard {
     transport: Arc<dyn SipTransport>,
@@ -278,8 +341,7 @@ impl Orchestrator {
         // 现在每个爬坡窗口结束时看一次本地压力增量:涨了就把间隔翻倍(上限
         // [`MAX_GAP_MULTIPLIER`]),没涨就逐步收回。这是控制"加压速率"而不是
         // "目标台数",所以不会偷偷少起设备,只会起得慢一些。
-        let mut gap_multiplier: u32 = 1;
-        let mut pressure_at_window = self.local_pressure();
+        let mut ramp_ctl = RampController::new(self.local_pressure());
 
         // 批量启动设备 run 任务。
         let mut handles = tokio::task::JoinSet::new();
@@ -287,7 +349,7 @@ impl Orchestrator {
             // 爬坡等待必须可被停止打断,否则停止后仍会继续创建新设备,且晚订阅者
             // 收不到之前已经发送过的 broadcast 信号。
             if let Some(gap) = base_gap {
-                next_slot += gap * gap_multiplier;
+                next_slot += gap * ramp_ctl.multiplier();
                 tokio::select! {
                     _ = ramp_stop.recv() => {
                         externally_stopping = true;
@@ -302,33 +364,25 @@ impl Orchestrator {
                         .metrics
                         .devices_online
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    let pressure = self.local_pressure();
-                    let delta = pressure.saturating_sub(pressure_at_window);
-                    pressure_at_window = pressure;
-
-                    if delta > 0 {
-                        // 本机在这一窗口里丢过东西:减速。
-                        let before = gap_multiplier;
-                        gap_multiplier = (gap_multiplier * 2).min(MAX_GAP_MULTIPLIER);
-                        if gap_multiplier != before {
+                    match ramp_ctl.on_window(self.local_pressure()) {
+                        RampDecision::Throttled => {
+                            // 本机在这一窗口里丢过东西:减速。
                             self.metrics.on_ramp_throttled();
+                            tracing::warn!(
+                                started = i + 1,
+                                online,
+                                effective_ramp_per_sec = ramp / ramp_ctl.multiplier().max(1),
+                                "本机出现背压(丢包/发送失败),爬坡减速 ——                              此时的失败不能算作平台承载上限"
+                            );
                         }
-                        tracing::warn!(
-                            started = i + 1,
-                            online,
-                            local_pressure_delta = delta,
-                            effective_ramp_per_sec = ramp / gap_multiplier.max(1),
-                            "本机出现背压(丢包/发送失败),爬坡减速 ——                              此时的失败不能算作平台承载上限"
-                        );
-                    } else if gap_multiplier > 1 {
-                        // 压力停止增长:逐步收回速率,而不是一次跳回原速
-                        // (一次跳回容易立刻再次触发,变成振荡)。
-                        gap_multiplier = (gap_multiplier / 2).max(1);
-                        tracing::info!(
-                            started = i + 1,
-                            effective_ramp_per_sec = ramp / gap_multiplier.max(1),
-                            "本机压力缓解,爬坡恢复提速"
-                        );
+                        RampDecision::Recovered => {
+                            tracing::info!(
+                                started = i + 1,
+                                effective_ramp_per_sec = ramp / ramp_ctl.multiplier().max(1),
+                                "本机压力缓解,爬坡恢复提速"
+                            );
+                        }
+                        RampDecision::Hold => {}
                     }
 
                     tracing::info!(
@@ -489,6 +543,66 @@ mod tests {
         let sc = test_scenario();
         let orch = Orchestrator::new(&sc, 5).unwrap();
         assert_eq!(orch.device_count(), 5);
+    }
+
+    #[test]
+    fn 设备数越界被拒绝() {
+        let sc = test_scenario();
+        assert!(Orchestrator::new(&sc, 0).is_err(), "0 台应被拒绝");
+        assert!(
+            Orchestrator::new(&sc, 10_001).is_err(),
+            "超过 10000 台应被拒绝"
+        );
+    }
+
+    #[test]
+    fn 背压_压力增长时间隔翻倍至封顶() {
+        let mut ctl = RampController::new(0);
+        assert_eq!(ctl.multiplier(), 1, "初始为原速");
+        assert_eq!(ctl.on_window(5), RampDecision::Throttled);
+        assert_eq!(ctl.multiplier(), 2, "首次有压力 → 翻倍");
+        assert_eq!(ctl.on_window(9), RampDecision::Throttled);
+        assert_eq!(ctl.multiplier(), 4, "压力继续涨 → 再翻倍");
+        assert_eq!(ctl.on_window(100), RampDecision::Throttled);
+        assert_eq!(ctl.multiplier(), 8);
+        assert_eq!(ctl.on_window(101), RampDecision::Throttled);
+        assert_eq!(ctl.multiplier(), 16, "封顶 16 倍");
+    }
+
+    #[test]
+    fn 背压_已封顶后继续有压力不重复计节流() {
+        let mut ctl = RampController::new(0);
+        while ctl.on_window(ctl.multiplier() as u64 + 1) == RampDecision::Throttled {}
+        assert_eq!(ctl.multiplier(), MAX_GAP_MULTIPLIER);
+        // 已在封顶:压力继续涨只能是 Hold,否则 ramp_throttled 会按窗口无限累加。
+        assert_eq!(ctl.on_window(u64::MAX / 2), RampDecision::Hold);
+        assert_eq!(ctl.multiplier(), MAX_GAP_MULTIPLIER);
+    }
+
+    #[test]
+    fn 背压_压力停止增长逐步收回且不下探原速以下() {
+        let mut ctl = RampController::new(0);
+        ctl.on_window(10); // → 2
+        ctl.on_window(20); // → 4
+        assert_eq!(ctl.on_window(20), RampDecision::Recovered);
+        assert_eq!(ctl.multiplier(), 2, "无新增压力 → 减半");
+        assert_eq!(ctl.on_window(20), RampDecision::Recovered);
+        assert_eq!(ctl.multiplier(), 1);
+        assert_eq!(
+            ctl.on_window(20),
+            RampDecision::Hold,
+            "回到原速后维持,不会变成加速"
+        );
+        assert_eq!(ctl.multiplier(), 1);
+    }
+
+    #[test]
+    fn 背压_干净窗口从不节流() {
+        let mut ctl = RampController::new(7);
+        for _ in 0..10 {
+            assert_eq!(ctl.on_window(7), RampDecision::Hold);
+        }
+        assert_eq!(ctl.multiplier(), 1);
     }
 
     #[tokio::test]

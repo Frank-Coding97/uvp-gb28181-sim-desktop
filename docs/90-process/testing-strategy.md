@@ -20,7 +20,11 @@
 - **scenario**:合法/非法场景解析;DeviceConfig 生成。
 - **stress-engine**:成功率计算;爬坡速率(模拟时钟);指标并发聚合;
   失败归因分档(401/403 与 486/503 必须分开,处置动作完全不同)、失败水位只记第一次、
-  失败样本上限、爬坡减速计数。
+  失败样本上限、爬坡减速计数。**闭环背压**(`RampController` 单测:翻倍至 16 倍封顶、
+  封顶后不重复计数、压力缓解逐步收回、干净窗口从不节流)。**集成测试**
+  (`tests/orchestrator_it.rs`):批量注册闭环、爬坡中途停止不继续拉起设备、
+  健康爬坡零节流且结论可信、向共享传输灌垃圾报文后本地压力把 `results_trustworthy`
+  翻转为 false(传输计数 → local_pressure → 可信位的端到端链路)。
 - **前端**:`ipcError` 的错误映射(原文永不丢失、未知错误不编造建议);
   `device.ts` 的启停守卫(IPC 已发出但未返回这段窗口不可重复触发);
   `versionedStorage` 的 legacy 迁移、future schema 防覆盖、损坏备份去重/上限、quota/security 分类与
