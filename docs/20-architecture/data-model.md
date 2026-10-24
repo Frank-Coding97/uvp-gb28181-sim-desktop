@@ -1,6 +1,6 @@
 # 数据模型
 
-**状态:草案** · 定义当前的报告导出与核心内存结构,以及规划中的持久化 · 关联 FR-25、FR-26、FR-28。
+**状态:已实现(SQLite 历史索引 v1)** · 报告导出、内存结构与 SQLite 历史索引 · 关联 FR-25、FR-26、FR-28。
 
 ---
 
@@ -27,24 +27,70 @@ JSONL 内部的 sample 使用 `{kind,seq,ts_ms,metrics}` envelope 做顺序和�
 **裸 metrics object 数组**，不得把内部 envelope 暴露进报告。`export_report` 将脱敏
 场景、最终快照、完整性 metadata 和该兼容数组写入唯一命名的
 `report-<nanos>-<counter>.json`。文件 rename 成功即视为已发布；若随后父目录同步失败，
-真实 final 路径仍用于 registry/状态交接，同时记录 durability warning。SQLite 仍未引入
-（下节为草案）。
+真实 final 路径仍用于 registry/状态交接，同时记录 durability warning。SQLite 历史索引
+（跨运行对比）已落地,见 §1.1/§2。
 
-## 1.1 规划中(未实现):SQLite 持久化
+## 1.1 已实现(v1):SQLite 历史索引
 
-以下 SQLite 方案为设计草案,**尚未实现**。若后续引入,拟用 **SQLite**(单文件、零部署,符合 NFR-2),文件置于系统应用数据目录,如:
-- macOS `~/Library/Application Support/com.uvp.gb28181.desktop/`
-- Windows `%APPDATA%/com.uvp.gb28181.desktop/`
-- Linux `~/.local/share/com.uvp.gb28181.desktop/`
+2026-10 落地**压测历史索引**(源码 `apps/desktop/src-tauri/src/reports_db.rs`,rusqlite
+`bundled` 自带 sqlite3,零系统依赖)。定位是**紧凑二次索引**而非事实源:JSONL/报告文件
+仍是一切结论的来源;SQLite 回答的是"这次比上次好还是差、过载拐点在不在同一水位"这类
+跨运行问题。库文件置于应用数据目录(与 `uvp-reports/` 同级,`uvp-stress-history.db`),
+不会被产物清理碰到(清理只识别本应用的严格文件名)。
 
-不引入 PostgreSQL/MySQL(桌面安装负担)。压测高频指标先在内存聚合,按秒/批落库,避免逐包写盘。
+- **写入时机**:压测终结时一次性落库(run 行 + 全部秒级样本,tick 热路径不写库),
+  尽力而为 —— 失败只告警,绝不影响压测结论;`export_report` 成功后回填报告路径。
+- **查询**:`list_stress_runs` / `get_stress_run_series` IPC(见 api-contract.md),
+  前端压测工作台「历史运行」面板消费,支持任选两条做关键指标对比。
+- **保留**:与文件产物对齐的 30 天窗口,过期 run 连同样本级联删除(报告文件不受影响)。
+- **迁移**:`PRAGMA user_version` 轻量迁移,开库时执行。
+
+`platform` / `scenario` 两张表仍在草案中(平台档案当前由前端 localStorage + OS 钥匙串
+管理,迁库前需先定义迁移路径)。
 
 ---
 
-## 2. SQLite 表结构(规划中,未实现)
+## 2. SQLite 表结构(v1 已实现 + 草案)
 
 ```sql
--- 平台连接配置
+-- ✅ v1 已实现:压测运行汇总(一 run 一行,重跑同号覆盖)
+CREATE TABLE run (
+    run_id                   INTEGER PRIMARY KEY,  -- supervisor 分配的单调 run_id
+    outcome                  TEXT NOT NULL,        -- completed|stopped|failed
+    started_at_ms            INTEGER NOT NULL,
+    ended_at_ms              INTEGER NOT NULL,
+    device_count             INTEGER NOT NULL,
+    profile_id               TEXT,                 -- 目标平台档案 id
+    register_succeeded       INTEGER NOT NULL,     -- ↓ 对比关键项(冗余列,免 JSON 反解)
+    device_success_rate      REAL NOT NULL,
+    register_latency_p95_ms  INTEGER NOT NULL,
+    devices_online_peak      INTEGER NOT NULL,
+    fail_timeout             INTEGER NOT NULL,
+    fail_rejected_auth       INTEGER NOT NULL,
+    fail_rejected_overload   INTEGER NOT NULL,
+    fail_local               INTEGER NOT NULL,
+    ramp_throttled           INTEGER NOT NULL,
+    results_trustworthy      INTEGER NOT NULL,
+    summary_json             TEXT NOT NULL,        -- 完整 MetricsSnapshot(未来详情页)
+    report_path              TEXT                  -- export_report 成功后回填
+);
+
+-- ✅ v1 已实现:秒级样本(tick 序号×1s 为运行相对时间;WITHOUT ROWID 省一半空间)
+CREATE TABLE metric_sample (
+    run_id                 INTEGER NOT NULL REFERENCES run(run_id) ON DELETE CASCADE,
+    ts_ms                  INTEGER NOT NULL,
+    register_attempted     INTEGER NOT NULL,
+    register_succeeded     INTEGER NOT NULL,
+    register_latency_p95   INTEGER NOT NULL,
+    heartbeat_failed       INTEGER NOT NULL,
+    devices_online         INTEGER NOT NULL,
+    device_success_rate    REAL NOT NULL,
+    fail_rejected_overload INTEGER NOT NULL,
+    active_streams         INTEGER NOT NULL,
+    PRIMARY KEY (run_id, ts_ms)
+) WITHOUT ROWID;
+
+-- ⬜ 以下仍为草案(未实现):平台档案迁库与场景库
 CREATE TABLE platform (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -54,7 +100,6 @@ CREATE TABLE platform (
     created_at  INTEGER NOT NULL      -- epoch ms
 );
 
--- 压测场景(保存的 TOML 原文 + 摘要)
 CREATE TABLE scenario (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
@@ -63,38 +108,6 @@ CREATE TABLE scenario (
     media_mode  TEXT NOT NULL,        -- none|light|real
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
-);
-
--- 压测运行记录
-CREATE TABLE run (
-    id            TEXT PRIMARY KEY,   -- run_id (uuid)
-    scenario_name TEXT NOT NULL,
-    state         TEXT NOT NULL,      -- starting|running|completed|failed|stopped
-    started_at    INTEGER NOT NULL,
-    ended_at      INTEGER,
-    summary_json  TEXT                -- 结束时的汇总指标
-);
-
--- 指标时间序列(每秒一行,供报告绘曲线)
-CREATE TABLE metric_sample (
-    run_id                TEXT NOT NULL REFERENCES run(id),
-    ts_ms                 INTEGER NOT NULL,
-    register_attempted    INTEGER NOT NULL,
-    register_succeeded    INTEGER NOT NULL,
-    register_latency_p95  INTEGER,
-    heartbeat_success_rate REAL,
-    invite_succeeded      INTEGER,
-    active_streams        INTEGER,
-    send_bitrate_kbps     INTEGER,
-    PRIMARY KEY (run_id, ts_ms)
-);
-
--- 失败明细归因(按 run + 类别聚合)
-CREATE TABLE failure_stat (
-    run_id    TEXT NOT NULL REFERENCES run(id),
-    category  TEXT NOT NULL,          -- timeout|rejected|other
-    count     INTEGER NOT NULL,
-    PRIMARY KEY (run_id, category)
 );
 ```
 
@@ -165,4 +178,6 @@ JSONL；报告导出时解析该 JSONL，并显式报告 `series_complete`、样
 
 ## 5. 演进
 
-表结构变更走轻量迁移(启动时检测版本 + 增量 DDL)。当前为设计草案,M3 落库前定稿。
+表结构变更走轻量迁移(`PRAGMA user_version`,开库时执行增量 DDL)。v1 已落 run /
+metric_sample 两表;platform / scenario 迁库(平台档案从 localStorage + 钥匙串迁入)
+与逐秒曲线叠加视图为后续项。

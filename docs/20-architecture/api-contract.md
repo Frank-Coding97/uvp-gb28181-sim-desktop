@@ -37,6 +37,8 @@
 | `stop_stress` | — | `string` | 停止当前压测(无入参,返回提示文案) | ✅ |
 | `get_metrics` | — | `string`(JSON) | 按需查询当前 `MetricsSnapshot`(实时更新走 `metrics_tick` 事件) | ✅ |
 | `get_stress_status` | — | `{ running: bool, device_count: number }` | 查压测运行态(页面切换后与引擎对账,防组件重建丢状态) | ✅ |
+| `list_stress_runs` | `{ limit?: number }` | `StressRunSummaryDto[]` | 查询 SQLite 历史索引中最近的压测运行(新→旧,默认 20,上限 100)。含成功率/p95/失败归因分档/结论可信位,供「历史运行」列表与跨运行对比;JSONL/报告文件仍是事实源 | ✅ |
+| `get_stress_run_series` | `{ runId: number }` | `StressSampleDto[]` | 查某次历史运行的完整秒级样本(旧→新,tick 序号×1s 为运行相对时间),供对比曲线 | ✅ |
 | `export_report` | — | `string`(文件路径) | 导出报告：脱敏场景 TOML + 设备数 + 最终快照 + **全量时序及完整性 metadata**，原子写入 app 数据目录的应用托管 `uvp-reports/` 并返回当前路径；默认按 30 天/100 文件/1 GiB 自动清理，不承诺永久保存 | ✅ |
 | `save_platform_secret` | `{ profileId, password }` | `{ backend, message }` | 把平台密码写入 OS 钥匙串(见 `SECURITY.md`) | ✅ |
 | `delete_platform_secret` | `{ profileId }` | — | 删除钥匙串条目 | ✅ |

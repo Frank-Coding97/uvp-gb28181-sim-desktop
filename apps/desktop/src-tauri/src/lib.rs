@@ -7,6 +7,7 @@ mod artifacts;
 mod diagnostics;
 mod ipc_error;
 mod media_access;
+mod reports_db;
 mod secrets;
 mod series;
 
@@ -54,6 +55,8 @@ struct AppState {
     /// 之前时序只活在前端图表内存里,且只保留 60 个点 —— 跑 10 分钟只剩最后一分钟,
     /// 报告里连时序都没有。现在引擎每秒追加一行,导出报告时一并打包。
     last_series: Mutex<Option<std::path::PathBuf>>,
+    /// 最近一次(含进行中)压测的 run_id:导出报告后回填历史库的报告路径用。
+    last_run_id: AtomicU64,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
     /// 用户经**系统文件对话框**授权预览的媒体文件集合(见 media_access 模块文档)。
@@ -138,6 +141,7 @@ impl AppState {
         AppState {
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
+            last_run_id: AtomicU64::new(0),
             metrics: Mutex::new(None),
             last_metrics: Mutex::new(None),
             last_scenario: Mutex::new(None),
@@ -384,6 +388,8 @@ pub fn run() {
             hangup_broadcast,
             set_sip_trace,
             get_stress_status,
+            list_stress_runs,
+            get_stress_run_series,
             get_device_status,
             load_catalog_template,
             get_catalog_tree,

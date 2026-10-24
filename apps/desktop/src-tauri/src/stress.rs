@@ -128,6 +128,11 @@ pub(crate) async fn start_stress(
     };
 
     let run_id = state.next_stress_id.fetch_add(1, Ordering::Relaxed);
+    state.last_run_id.store(run_id, Ordering::Relaxed);
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     let reports_dir = reports_dir(&app);
     // 此时生命周期锁确认无活跃 run；清理失败只降级并告警，绝不阻止压测。
     let cleanup_dir = reports_dir.clone();
@@ -307,6 +312,43 @@ pub(crate) async fn start_stress(
                 outcome = finalized.outcome.as_str(),
                 "压测时序已完整发布"
             );
+        }
+        // 历史库(尽力而为):JSONL/报告仍是事实源,这里把终结快照与秒级样本写进
+        // 紧凑索引,供「历史运行对比」跨运行查询。失败只告警,不影响压测结论。
+        if let Some(finalized) = &finalized_series {
+            let read = series::read_series(&finalized.path);
+            let samples = samples_for_history(&read);
+            let record = crate::reports_db::RunSummaryInput {
+                outcome: outcome.as_str(),
+                started_at_ms,
+                ended_at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(started_at_ms),
+                device_count: count as i64,
+                profile_id: Some(profile_id.clone()),
+                register_succeeded: final_metrics.register_succeeded as i64,
+                device_success_rate: final_metrics.device_success_rate,
+                register_latency_p95_ms: final_metrics.register_latency.p95_ms as i64,
+                devices_online_peak: final_metrics.devices_online_peak as i64,
+                fail_timeout: final_metrics.fail_timeout as i64,
+                fail_rejected_auth: final_metrics.fail_rejected_auth as i64,
+                fail_rejected_overload: final_metrics.fail_rejected_overload as i64,
+                fail_local: final_metrics.fail_local as i64,
+                ramp_throttled: final_metrics.ramp_throttled as i64,
+                results_trustworthy: final_metrics.results_trustworthy,
+                summary_json: serde_json::to_string(&final_metrics).unwrap_or_default(),
+                report_path: None, // export_report 成功后回填(见 set_report_path)
+            };
+            let db_path = history_db_path(&reports_dir);
+            let history_run_id = run_id;
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    crate::reports_db::record_run(&db_path, history_run_id, &record, &samples)
+                {
+                    tracing::warn!(%error, run_id = history_run_id, "压测历史落库失败(不影响报告与结论)");
+                }
+            });
         }
         if let Some(path) = &incomplete_series {
             preserve.insert(path.clone());
@@ -536,7 +578,7 @@ pub(crate) async fn export_report(
     app: AppHandle,
 ) -> IpcResult<String> {
     // 同一 run 的关联状态用 try_lock 在无 await 临界区复制，竞争时释放后重试。
-    let (snap, scenario, series_path) = loop {
+    let (snap, scenario, series_path, run_id) = loop {
         let stress_guard = state.stress.lock().await;
         let (Ok(metrics), Ok(last_metrics), Ok(scenario), Ok(last_series)) = (
             state.metrics.try_lock(),
@@ -559,10 +601,12 @@ pub(crate) async fn export_report(
             .as_ref()
             .and_then(|handle| handle.series_path.clone())
             .or_else(|| last_series.clone());
-        break (snap, scenario.clone(), series_path);
+        let run_id = state.last_run_id.load(Ordering::Relaxed);
+        break (snap, scenario.clone(), series_path, run_id);
     };
 
     let dir = reports_dir(&app);
+    let db_path = history_db_path(&dir);
     let path = tokio::task::spawn_blocking(move || -> IpcResult<std::path::PathBuf> {
         let policy = artifacts::RetentionPolicy::default();
         let mut preserve = std::collections::HashSet::new();
@@ -611,12 +655,91 @@ pub(crate) async fn export_report(
         }
         // published guard 保留到新报告进入 preserve 并完成 cleanup 交接。
         drop(published);
+        // 历史库回填报告路径(尽力而为):列表里的「查看报告」直接定位文件。
+        if run_id > 0 {
+            if let Err(error) =
+                crate::reports_db::set_report_path(&db_path, run_id, &path.to_string_lossy())
+            {
+                tracing::warn!(%error, run_id, "压测历史回填报告路径失败(不影响导出)");
+            }
+        }
         Ok(path)
     })
     .await
     .map_err(|error| IpcError::new("report.export_failed", format!("导出任务异常: {error}")))??;
 
     Ok(path.to_string_lossy().to_string())
+}
+
+/// 历史库文件:与 uvp-reports 同级。uvp-reports 的清理只识别本应用的严格
+/// 文件名(见 data-model.md §1),不会碰这个 .db。
+pub(crate) fn history_db_path(reports_dir: &std::path::Path) -> std::path::PathBuf {
+    reports_dir
+        .parent()
+        .unwrap_or(reports_dir)
+        .join("uvp-stress-history.db")
+}
+
+/// 从已发布 JSONL 的样本数组提取历史库秒级样本。
+///
+/// tick 是 1s 一拍,样本内的 `metrics` 不带时间戳 —— 用序号 × 1s 作为运行相对
+/// 时间,跨运行对比只看形状与相对拐点,不要求绝对墙钟。
+fn samples_for_history(read: &series::SeriesRead) -> Vec<crate::reports_db::SampleInput> {
+    read.samples
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let int = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+            crate::reports_db::SampleInput {
+                ts_ms: i as i64 * 1_000,
+                register_attempted: int("register_attempted"),
+                register_succeeded: int("register_succeeded"),
+                register_latency_p95: v
+                    .get("register_latency")
+                    .and_then(|l| l.get("p95_ms"))
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0),
+                heartbeat_failed: int("heartbeat_failed"),
+                devices_online: int("devices_online"),
+                device_success_rate: v
+                    .get("device_success_rate")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0),
+                fail_rejected_overload: int("fail_rejected_overload"),
+                active_streams: int("active_streams"),
+            }
+        })
+        .collect()
+}
+
+/// 查询最近的压测历史运行(新→旧),供工作台「历史运行」列表与跨运行对比。
+#[tauri::command]
+pub(crate) async fn list_stress_runs(
+    app: AppHandle,
+    limit: Option<u32>,
+) -> IpcResult<Vec<crate::reports_db::StressRunSummaryDto>> {
+    let db = history_db_path(&reports_dir(&app));
+    tokio::task::spawn_blocking(move || {
+        crate::reports_db::list_runs(&db, limit.unwrap_or(20).clamp(1, 100))
+            .map_err(|error| IpcError::new("history.query_failed", error))
+    })
+    .await
+    .map_err(|error| IpcError::internal(format!("历史查询任务异常: {error}")))?
+}
+
+/// 查询某次历史运行的完整秒级样本(旧→新),供对比曲线。
+#[tauri::command]
+pub(crate) async fn get_stress_run_series(
+    app: AppHandle,
+    run_id: u64,
+) -> IpcResult<Vec<crate::reports_db::StressSampleDto>> {
+    let db = history_db_path(&reports_dir(&app));
+    tokio::task::spawn_blocking(move || {
+        crate::reports_db::run_series(&db, run_id)
+            .map_err(|error| IpcError::new("history.query_failed", error))
+    })
+    .await
+    .map_err(|error| IpcError::internal(format!("历史查询任务异常: {error}")))?
 }
 
 // ── 单设备联调命令 ────────────────────────────────────────

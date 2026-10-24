@@ -20,6 +20,7 @@ import { buildScenarioToml } from "../lib/scenarioToml";
 import { formatError, type IpcErrorDto } from "../lib/ipcError";
 import ScenarioForm, { type ScenarioFormModel } from "../components/ScenarioForm.vue";
 import ScenarioCharts, { type MetricsSnapshot } from "../components/ScenarioCharts.vue";
+import StressHistoryPanel from "../components/StressHistoryPanel.vue";
 
 const message = useMessage();
 const { active: activePlatform, activeHasSecret, refreshSecretStatus } = usePlatform();
@@ -447,6 +448,7 @@ onUnmounted(() => {
       <!-- 左列：监控走势与深度失败归因 -->
       <div class="monitor-column">
         <ScenarioCharts ref="chartRef" />
+        <StressHistoryPanel />
 
         <div class="glass-card panel failure-panel">
           <div class="panel-head">

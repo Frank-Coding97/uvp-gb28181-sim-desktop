@@ -35,8 +35,9 @@
 | 媒体转封装 | 系统 ffmpeg(仅 MP4 等容器源 / 音频抽取时需要) |
 
 > 压测报告导出 JSON,包含最终快照 + **每秒一个采样点的时序**(引擎运行期追加写
-> `<app 数据目录>/uvp-reports/series-run<id>-<ts>.jsonl`)。落 SQLite 仍为规划中
-> (见 `docs/20-architecture/data-model.md`)。
+> `<app 数据目录>/uvp-reports/series-run<id>-<ts>.jsonl`);同时把运行汇总与秒级
+> 样本写入 SQLite 历史索引(`<app 数据目录>/uvp-stress-history.db`,保留 30 天),
+> 压测工作台可任选两次运行做关键指标对比(见 `docs/20-architecture/data-model.md`)。
 
 ### 压测结论的可信度
 
