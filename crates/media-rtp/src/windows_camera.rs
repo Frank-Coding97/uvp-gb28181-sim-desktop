@@ -73,7 +73,11 @@ pub(super) fn camera(devices: &WindowsCameraDevices, index: u32) -> Result<&Wind
         .ok_or_else(|| Error::Media(format!("未找到 DirectShow 摄像头索引 {index}")))
 }
 
-/// Probe and select a DirectShow input mode for an exact output size.
+/// Probe and select a DirectShow input mode for the requested output size.
+///
+/// The returned mode may be smaller than the requested size when the device
+/// cannot capture it; the caller passes the actual size to the encoder so the
+/// output profile stays at the configured resolution.
 pub(super) fn probe_mode(
     ffmpeg: &str,
     camera: &WindowsCameraDevice,
@@ -81,6 +85,42 @@ pub(super) fn probe_mode(
     height: u32,
     fps: u32,
 ) -> Result<WindowsCameraInputMode> {
+    let modes = probe_modes(ffmpeg, camera)?;
+    select_mode(&modes, width, height, fps).ok_or_else(|| {
+        Error::Media(format!(
+            "DirectShow 摄像头 {} 没有可用的采集模式（请求 {}x{}@{}fps），该设备支持: {}",
+            camera.index,
+            width,
+            height,
+            fps,
+            describe_modes(&modes)
+        ))
+    })
+}
+
+/// 枚举设备支持的全部模式，供音视频设置页限制可选分辨率/帧率。
+pub(super) fn list_modes(
+    ffmpeg: &str,
+    camera: &WindowsCameraDevice,
+) -> Result<Vec<super::LiveCameraMode>> {
+    Ok(probe_modes(ffmpeg, camera)?
+        .into_iter()
+        .map(|mode| super::LiveCameraMode {
+            width: mode.width,
+            height: mode.height,
+            min_fps: mode.min_fps,
+            max_fps: mode.max_fps,
+            format: mode
+                .vcodec
+                .or(mode.pixel_format)
+                .unwrap_or_else(|| "raw".to_string()),
+        })
+        .collect())
+}
+
+/// 让 FFmpeg 打开设备并列出能力表。`-list_options true` 会打印模式后
+/// 以「Error opening input file」收尾，退出码非零属正常现象。
+fn probe_modes(ffmpeg: &str, camera: &WindowsCameraDevice) -> Result<Vec<CameraModeRange>> {
     if camera.input_name.trim().is_empty() {
         return Err(Error::Media(format!(
             "DirectShow 摄像头 {} 没有可用的 alternative name",
@@ -103,16 +143,57 @@ pub(super) fn probe_mode(
     ]);
     let (_status, stderr) = run_stderr_command(command, probe_timeout(), "DirectShow 能力查询")?;
     let modes = parse_mode_listing(&stderr);
-    select_mode(&modes, width, height, fps).ok_or_else(|| {
-        Error::Media(format!(
-            "DirectShow 摄像头 {} 不支持精确尺寸 {}x{} 和至少 {} fps: {}",
+    if modes.is_empty() {
+        return Err(Error::Media(format!(
+            "DirectShow 摄像头 {}（{}）未报告任何可用的采集模式，请确认设备未被其他程序占用: {}",
             camera.index,
-            width,
-            height,
-            fps,
+            camera.name,
             stderr_tail(&stderr)
-        ))
-    })
+        )));
+    }
+    Ok(modes)
+}
+
+/// 把枚举到的模式压成一句人话，供错误提示直接展示。
+///
+/// 原始 stderr 是逐行 `vcodec=... min s=... max s=...` 的调试输出，
+/// 用户从中看不出「这台设备最高只有 720p」这个关键事实。
+fn describe_modes(modes: &[CameraModeRange]) -> String {
+    const MAX_ITEMS: usize = 6;
+    let mut entries: Vec<(&CameraModeRange, String)> = Vec::new();
+    for mode in modes {
+        let format = mode
+            .vcodec
+            .as_deref()
+            .or(mode.pixel_format.as_deref())
+            .unwrap_or("raw");
+        let label = format!("{}x{}@{}({format})", mode.width, mode.height, format_fps(mode.max_fps));
+        if entries.iter().any(|(existing, _)| {
+            existing.width == mode.width
+                && existing.height == mode.height
+                && (existing.max_fps - mode.max_fps).abs() < 0.001
+        }) {
+            continue;
+        }
+        entries.push((mode, label));
+    }
+    entries.sort_by(|left, right| {
+        let area = |mode: &CameraModeRange| u64::from(mode.width) * u64::from(mode.height);
+        area(right.0)
+            .cmp(&area(left.0))
+            .then_with(|| right.0.max_fps.total_cmp(&left.0.max_fps))
+    });
+    let hidden = entries.len().saturating_sub(MAX_ITEMS);
+    let mut text = entries
+        .iter()
+        .take(MAX_ITEMS)
+        .map(|(_, label)| label.clone())
+        .collect::<Vec<_>>()
+        .join("、");
+    if hidden > 0 {
+        text.push_str(&format!("，另有 {hidden} 种更小尺寸"));
+    }
+    text
 }
 
 /// Parse the device section of FFmpeg's DirectShow listing.
@@ -247,35 +328,52 @@ fn parse_mode_listing(stderr: &str) -> Vec<CameraModeRange> {
     modes
 }
 
-/// Select an exact-size mode whose supported range can provide at least the
-/// requested frame rate. A smaller or larger resolution is never substituted.
+/// Select a DirectShow input mode.
+///
+/// Preference order, each step only used when the previous one has no answer:
+/// 1. the requested size at the requested frame rate;
+/// 2. the requested size at the highest rate the device offers (cfr output
+///    duplicates frames instead of failing);
+/// 3. the closest supported size — same aspect ratio first, then the largest
+///    mode that does not exceed the requested area.
+///
+/// Step 3 mirrors the AVFoundation path, where the input mode is independent of
+/// the encoded output profile; the encoder scales/pads it back to the requested
+/// output size (`windows_capture::command_args`). `None` means the device
+/// reported no usable mode at all.
 fn select_mode(
     modes: &[CameraModeRange],
     width: u32,
     height: u32,
     fps: u32,
 ) -> Option<WindowsCameraInputMode> {
+    select_size_mode(modes, width, height, fps)
+        .or_else(|| select_nearest_mode(modes, width, height, fps))
+}
+
+/// Modes that capture the requested size, preferring one that reaches `fps`.
+fn select_size_mode(
+    modes: &[CameraModeRange],
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Option<WindowsCameraInputMode> {
     let requested_fps = f64::from(fps.max(1));
-    modes
+    let same_size: Vec<&CameraModeRange> = modes
         .iter()
-        .filter(|mode| {
-            mode.width == width
-                && mode.height == height
-                && mode.max_fps + f64::EPSILON >= requested_fps
-        })
+        .filter(|mode| mode.width == width && mode.height == height)
+        .collect();
+    if same_size.is_empty() {
+        return None;
+    }
+    let fps_reachable = same_size
+        .iter()
+        .any(|mode| mode.max_fps + f64::EPSILON >= requested_fps);
+    same_size
+        .into_iter()
+        .filter(|mode| !fps_reachable || mode.max_fps + f64::EPSILON >= requested_fps)
         .map(|mode| {
-            // Many Windows webcams expose a continuous-looking range but only
-            // negotiate stable discrete rates (notably 30/60 for MJPEG). Feed
-            // 30 fps to DirectShow for a 25 fps output profile when available;
-            // the encoder still emits the requested output rate.
-            let input_fps = if requested_fps == 25.0
-                && mode.max_fps >= 30.0
-                && mode.min_fps <= 30.0
-            {
-                30.0
-            } else {
-                requested_fps.max(mode.min_fps)
-            };
+            let input_fps = preferred_input_fps(mode, requested_fps);
             let format_rank = match (&mode.pixel_format, &mode.vcodec) {
                 (Some(_), _) => 0_u8,
                 (None, Some(_)) => 1,
@@ -283,6 +381,9 @@ fn select_mode(
             };
             (
                 (
+                    // 帧率缺口优先于格式:一个 60fps 的 MJPEG 模式
+                    // 优于同一尺寸下只有 10fps 的 raw 模式。
+                    (requested_fps - mode.max_fps).max(0.0),
                     format_rank,
                     (input_fps - requested_fps).max(0.0),
                     (mode.max_fps - requested_fps).max(0.0),
@@ -299,6 +400,73 @@ fn select_mode(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(_, mode, input_fps)| mode.to_input_mode(input_fps))
+}
+
+/// Closest supported mode for an output size the device cannot capture.
+///
+/// Ranking keeps the requested aspect ratio first (a 4:3 fallback would be
+/// letterboxed into 16:9), then prefers a mode that does not exceed the
+/// requested area — picking the largest such mode — so that a 1080p profile on
+/// a 720p webcam yields 720p rather than a smaller mode upscaled twice.
+fn select_nearest_mode(
+    modes: &[CameraModeRange],
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Option<WindowsCameraInputMode> {
+    let requested_fps = f64::from(fps.max(1));
+    let requested_area = u64::from(width) * u64::from(height);
+    let requested_ratio = f64::from(width) / f64::from(height.max(1));
+    // No mode may reach the requested rate: still start, `-fps_mode cfr`
+    // duplicates frames up to the output rate instead of failing the stream.
+    let fps_reachable = modes
+        .iter()
+        .any(|mode| mode.max_fps + f64::EPSILON >= requested_fps);
+    modes
+        .iter()
+        .map(|mode| {
+            let input_fps = preferred_input_fps(mode, requested_fps);
+            let area = u64::from(mode.width) * u64::from(mode.height);
+            let ratio_gap = (f64::from(mode.width) / f64::from(mode.height.max(1))
+                - requested_ratio)
+                .abs();
+            let format_rank = match (&mode.pixel_format, &mode.vcodec) {
+                (Some(_), _) => 0_u8,
+                (None, Some(_)) => 1,
+                (None, None) => 2,
+            };
+            (
+                (
+                    u8::from(fps_reachable && mode.max_fps + f64::EPSILON < requested_fps),
+                    // 0.0001 的量化精度足够区分常见宽高比(4:3 / 16:9 / 16:10)。
+                    (ratio_gap * 10_000.0).round() as u64,
+                    area.saturating_sub(requested_area),
+                    area.abs_diff(requested_area),
+                    format_rank,
+                    (requested_fps - mode.max_fps).max(0.0).round() as u64,
+                    mode.vcodec.as_deref().unwrap_or(""),
+                ),
+                mode,
+                input_fps,
+            )
+        })
+        .min_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, mode, input_fps)| mode.to_input_mode(input_fps))
+}
+
+/// DirectShow input frame rate for a mode.
+///
+/// Many Windows webcams expose a continuous-looking range but only negotiate
+/// stable discrete rates (notably 30/60 for MJPEG). Feed 30 fps to DirectShow
+/// for a 25 fps output profile when available; the encoder still emits the
+/// requested output rate.
+fn preferred_input_fps(mode: &CameraModeRange, requested_fps: f64) -> f64 {
+    let candidate = if requested_fps == 25.0 && mode.max_fps >= 30.0 && mode.min_fps <= 30.0 {
+        30.0
+    } else {
+        requested_fps
+    };
+    candidate.clamp(mode.min_fps, mode.max_fps)
 }
 
 fn probe_timeout() -> Duration {
@@ -604,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn directshow_mode_selection_requires_exact_size_and_source_fps() {
+    fn directshow_mode_selection_prefers_exact_size_then_nearest() {
         let modes = parse_mode_listing(MODE_LISTING);
 
         let hd = select_mode(&modes, 1280, 720, 30).expect("mjpeg can provide 720p30");
@@ -629,9 +797,32 @@ mod tests {
         let low = select_mode(&modes, 640, 480, 30).expect("yuyv422 can provide VGA30");
         assert_eq!(low.pixel_format.as_deref(), Some("yuyv422"));
 
-        assert!(select_mode(&modes, 1280, 720, 61).is_none());
-        assert!(select_mode(&modes, 640, 480, 31).is_none());
-        assert!(select_mode(&modes, 640, 360, 30).is_none());
+        // 尺寸命中但设备帧率不够：保留该尺寸，帧率压到上限，
+        // 输出端 cfr 会补帧，不因为差 1 fps 就整场采集失败。
+        let capped = select_mode(&modes, 1280, 720, 61).expect("same size, capped fps");
+        assert_eq!((capped.width, capped.height), (1280, 720));
+        assert!(capped.fps < 61.0);
+        assert_eq!(capped.vcodec.as_deref(), Some("mjpeg"));
+
+        let capped_vga = select_mode(&modes, 640, 480, 31).expect("same size, capped fps");
+        assert_eq!((capped_vga.width, capped_vga.height), (640, 480));
+        assert!((capped_vga.fps - 30.0).abs() < f64::EPSILON);
+
+        // 设备没有该尺寸(640x360)：退到同宽高比、且不超过请求面积的最近模式。
+        let substituted = select_mode(&modes, 640, 360, 30).expect("nearest 16:9 mode");
+        assert_eq!((substituted.width, substituted.height), (1280, 720));
+
+        assert!(select_mode(&[], 1280, 720, 30).is_none());
+    }
+
+    #[test]
+    fn describe_modes_summarizes_largest_sizes_first() {
+        let modes = parse_mode_listing(MODE_LISTING);
+        let text = describe_modes(&modes);
+
+        assert!(text.starts_with("1920x1080@30(mjpeg)"), "{text}");
+        assert!(text.contains("1280x720@60.0002(mjpeg)"), "{text}");
+        assert!(text.contains("640x480@30(yuyv422)"), "{text}");
     }
 
     #[test]

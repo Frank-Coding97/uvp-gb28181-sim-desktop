@@ -29,6 +29,11 @@ common            = { path = "../../../crates/common" }
 tauri = { version = "=2.11.5", features = ["protocol-asset"] }
 serde.workspace = true
 serde_json.workspace = true
+# 粘贴接入链接要直连平台兑换端点。走 Rust 侧而非 webview fetch:
+# 桌面端页面跑在 tauri:// 自定义协议下,跨源请求会被 CORS 拦;
+# 且自签证书需要显式决定信任策略,浏览器里没有这个操作空间。
+# feature 与 gb28181-simulator 保持一致(默认 + json),共用同一份 TLS 构建产物。
+reqwest = { version = "0.13.4", features = ["json"] }
 toml = "=0.8.2"
 tokio.workspace = true
 tracing.workspace = true

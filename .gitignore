@@ -38,3 +38,39 @@ semantic-review/
 assets/media/*.h264
 assets/media/*.ps
 .tokensave
+
+# ---- 通用构建 / 缓存中间产物 ----
+**/dist/
+**/build/
+**/coverage/
+**/.vite/
+**/.cache/
+**/.tmp/
+*.tsbuildinfo
+*.o
+*.obj
+*.pdb
+*.log
+*.tmp
+*.bak
+*~
+
+# ---- 本地环境变量与凭据 ----
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+Thumbs.db
+desktop.ini
+
+# ---- 打包 / 安装产物 ----
+*.exe
+*.msi
+*.dmg
+*.app/
+*.deb
+*.rpm
+*.zip
+*.tar.gz

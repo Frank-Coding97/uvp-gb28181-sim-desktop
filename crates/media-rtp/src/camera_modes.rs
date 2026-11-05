@@ -96,6 +96,23 @@ pub(super) fn probe_camera_mode(
         .ok_or_else(|| Error::Media(format!("摄像头 {index} 未返回可用的采集尺寸和帧率")))
 }
 
+/// 枚举摄像头支持的模式，供音视频设置页限制可选分辨率/帧率。
+///
+/// AVFoundation 的采集模式带像素格式固定为 uyvy422(见 `camera_command_args_for_profile`)，
+/// 因此这里只需要尺寸与帧率区间。
+pub(super) fn list_modes(ffmpeg: &str, index: u32) -> Result<Vec<super::LiveCameraMode>> {
+    Ok(probe_modes(ffmpeg, index, Duration::from_secs(10))?
+        .into_iter()
+        .map(|mode| super::LiveCameraMode {
+            width: mode.width,
+            height: mode.height,
+            min_fps: mode.min_fps,
+            max_fps: mode.max_fps,
+            format: "uyvy422".to_string(),
+        })
+        .collect())
+}
+
 fn probe_modes(ffmpeg: &str, index: u32, timeout: Duration) -> Result<Vec<CameraModeRange>> {
     // FFmpeg's AVFoundation backend has no list_formats option. An unsupported
     // input size enumerates all formats and exits before starting frame capture.

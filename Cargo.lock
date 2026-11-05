@@ -4536,6 +4536,7 @@ dependencies = [
  "gb28181-simulator",
  "if-addrs",
  "media-rtp",
+ "reqwest",
  "scenario",
  "serde",
  "serde_json",

@@ -5,6 +5,9 @@ pub(super) fn command_args(
     video: &str,
     audio: Option<&str>,
     profile: &LiveCaptureProfile,
+    // 摄像头实际能给的尺寸。与 profile 不一致时靠 scale/pad 补齐，
+    // 保证推出去的画面尺寸始终等于配置的输出分辨率。
+    input_size: (u32, u32),
     mode_args: &[String],
 ) -> Vec<String> {
     use super::LiveVideoCodec;
@@ -38,6 +41,19 @@ pub(super) fn command_args(
     }
     args.extend_from_slice(mode_args);
     args.extend(["-i".into(), input, "-map".into(), "0:v:0".into()]);
+    // 摄像头不支持配置的输出分辨率时(如 720p 摄像头配 1080p 档位),
+    // 先按比例缩放再用黑边补齐,而不是把 720p 原始帧直接推给平台:
+    // 平台的 SDP/目录里声明的是 profile 尺寸,实际帧也必须一致。
+    if input_size != (profile.width, profile.height) {
+        args.extend([
+            "-vf".into(),
+            format!(
+                "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
+                w = profile.width,
+                h = profile.height
+            ),
+        ]);
+    }
     let gop = profile.keyframe_interval_frames();
     let codec_args: Vec<String> = match profile.video_codec {
         LiveVideoCodec::H264 => [
@@ -108,6 +124,7 @@ mod tests {
             "@device_pnp_camera",
             None,
             &profile(LiveVideoCodec::H264),
+            (1920, 1080),
             &mode,
         );
         for pair in [
@@ -139,6 +156,7 @@ mod tests {
             "camera",
             Some("@device_cm_microphone"),
             &profile(LiveVideoCodec::H265),
+            (1920, 1080),
             &[],
         );
         assert!(args
@@ -150,5 +168,39 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-audio_buffer_size", "100"]));
+        // 输入尺寸已等于输出尺寸，不该再挂缩放滤镜。
+        assert!(!args.iter().any(|arg| arg == "-vf"));
+    }
+
+    #[test]
+    fn smaller_camera_input_is_scaled_back_to_the_output_profile() {
+        let mode = [
+            "-vcodec",
+            "mjpeg",
+            "-video_size",
+            "1280x720",
+            "-framerate",
+            "30",
+        ]
+        .map(str::to_string);
+        let args = command_args(
+            "camera",
+            None,
+            &profile(LiveVideoCodec::H264),
+            (1280, 720),
+            &mode,
+        );
+        let filter = args
+            .windows(2)
+            .find(|pair| pair[0] == "-vf")
+            .map(|pair| pair[1].as_str())
+            .expect("smaller input must be scaled");
+        assert!(filter.contains("scale=1920:1080"), "{filter}");
+        assert!(filter.contains("pad=1920:1080"), "{filter}");
+        // 滤镜必须挂在编码器之前，且输出帧率仍是配置值。
+        let vf = args.iter().position(|arg| arg == "-vf").unwrap();
+        let codec = args.iter().position(|arg| arg == "-c:v").unwrap();
+        assert!(vf < codec);
+        assert!(args.windows(2).any(|pair| pair == ["-r", "30"]));
     }
 }

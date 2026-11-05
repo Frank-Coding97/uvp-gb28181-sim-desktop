@@ -7,19 +7,25 @@ import {
   MEDIA_FPS_OPTIONS,
   MEDIA_GOP_OPTIONS,
   MEDIA_PRESETS,
-  MEDIA_RESOLUTIONS,
   MEDIA_SAMPLE_RATES,
   MEDIA_VIDEO_CODECS,
   applyMediaPreset,
+  cameraFpsOptions,
+  cameraResolutionOptions,
+  cameraSupportsResolution,
+  clampToCamera,
+  liveSourceCameraIndex,
   matchedPreset,
   mediaProfileEqual,
   mediaProfileSummary,
   validateMediaProfile,
+  type CameraMode,
   type MediaProfile,
   type MediaQualityPresetId,
 } from "../media-profile";
 import {
   usePlatform,
+  listCameraModes,
   listLocalIpAddresses,
   type BindMode,
   type DeviceSettings,
@@ -42,7 +48,7 @@ const settings = [
 const activeKey = computed(() => props.section);
 const saving = ref(false);
 const feedback = ref<{ ok: boolean; text: string } | null>(null);
-const { deviceLive, deviceState, effectiveConfig } = useDevice();
+const { deviceLive, deviceState, effectiveConfig, form } = useDevice();
 const {
   config,
   active: activePlatform,
@@ -147,18 +153,116 @@ const mediaDirty = computed(() => Boolean(
   config.value && mediaDraft.value && !mediaProfileEqual(mediaDraft.value, config.value.media),
 ));
 
+// ── 摄像头能力约束 ───────────────────────────────────────────────
+// 音视频设置里的分辨率/帧率必须是这台摄像头真能做到的档位，
+// 否则用户只能等启动采集时才拿到一个 DirectShow 报错。
+const cameraModes = ref<CameraMode[] | null>(null);
+const cameraModesLoading = ref(false);
+const cameraModesError = ref("");
+/** 已探测过能力的摄像头索引，避免反复拉起 FFmpeg 打开设备。 */
+const probedCameraIndex = ref<number | null>(null);
+
+const cameraIndex = computed(() => liveSourceCameraIndex(form.value.video_source));
+const resolutionOptions = computed(() => cameraResolutionOptions(cameraModes.value));
+const fpsOptions = computed(() => {
+  const draft = mediaDraft.value;
+  return draft
+    ? cameraFpsOptions(cameraModes.value, draft.width, draft.height)
+    : [...MEDIA_FPS_OPTIONS];
+});
+const cameraCapabilityNote = computed(() => {
+  if (cameraIndex.value === null) return "当前媒体源不是摄像头，分辨率按通用档位显示";
+  if (cameraModesLoading.value) return "正在读取摄像头支持的分辨率…";
+  if (cameraModesError.value) {
+    return `无法读取摄像头能力（${cameraModesError.value}），暂按通用档位显示`;
+  }
+  if (!cameraModes.value || cameraModes.value.length === 0) return "";
+  if (resolutionOptions.value.length === 0) {
+    return "该摄像头没有可用的输出分辨率（平台仅支持 640×480 / 1280×720 / 1920×1080），请更换摄像头或改用其它媒体源";
+  }
+  const sizes = resolutionOptions.value.map((item) => item.label.replace(/ /g, ""));
+  const maxFps = Math.max(...cameraModes.value.map((mode) => mode.max_fps));
+  return `摄像头支持：${sizes.join(" / ")}（最高 ${Math.round(maxFps)} FPS），设备做不到的档位已隐藏`;
+});
+
+function presetSupported(preset: { width: number; height: number }): boolean {
+  return cameraSupportsResolution(cameraModes.value, preset.width, preset.height);
+}
+
+/** 把草稿收敛到摄像头能力内；已保存的配置可能是给另一台设备配的。 */
+function applyCameraClamp() {
+  const draft = mediaDraft.value;
+  if (!draft || locked.value) return false;
+  const clamped = clampToCamera(draft, cameraModes.value);
+  if (!clamped) return false;
+  mediaDraft.value = clamped.profile;
+  feedback.value = { ok: true, text: `${clamped.notice}，确认后保存` };
+  return true;
+}
+
+async function refreshCameraModes() {
+  const index = cameraIndex.value;
+  if (index === null) {
+    cameraModes.value = null;
+    cameraModesError.value = "";
+    probedCameraIndex.value = null;
+    return;
+  }
+  if (cameraModesLoading.value || probedCameraIndex.value === index) return;
+  cameraModesLoading.value = true;
+  cameraModesError.value = "";
+  try {
+    cameraModes.value = await listCameraModes(index);
+    probedCameraIndex.value = index;
+    applyCameraClamp();
+  } catch (cause) {
+    // 探测失败不阻断设置页：退回通用档位，把原因写在提示里。
+    cameraModes.value = null;
+    cameraModesError.value = String(cause);
+  } finally {
+    cameraModesLoading.value = false;
+  }
+}
+
+watch([activeKey, cameraIndex], () => {
+  if (activeKey.value !== "media") return;
+  if (cameraIndex.value !== probedCameraIndex.value) {
+    // 换了摄像头：上一台设备的能力数据不再适用。
+    cameraModes.value = null;
+    cameraModesError.value = "";
+  }
+  void refreshCameraModes();
+}, { immediate: true });
+
+// 草稿晚于能力数据就绪时（先探测、后载入配置），同样要收敛一次，
+// 否则已保存的超能力配置会原样留在表单里。
+watch(mediaDraft, (draft) => {
+  if (draft && cameraModes.value) applyCameraClamp();
+});
+
 function selectMediaPreset(id: MediaQualityPresetId) {
   if (!mediaDraft.value || locked.value) return;
+  const preset = MEDIA_PRESETS.find((item) => item.id === id);
+  if (preset && !presetSupported(preset)) {
+    feedback.value = {
+      ok: false,
+      text: `摄像头不支持 ${preset.width}×${preset.height}，请选择已列出的分辨率`,
+    };
+    return;
+  }
   mediaDraft.value = applyMediaPreset(mediaDraft.value, id);
 }
 
 function setResolution(event: Event) {
   if (!mediaDraft.value) return;
   const width = Number((event.target as HTMLSelectElement).value);
-  const resolution = MEDIA_RESOLUTIONS.find((item) => item.width === width);
+  const resolution = resolutionOptions.value.find((item) => item.width === width);
   if (!resolution) return;
   mediaDraft.value.width = resolution.width;
   mediaDraft.value.height = resolution.height;
+  // 换到更低的分辨率后原帧率可能超出上限，一并收敛。
+  const maxFps = Math.max(...cameraFpsOptions(cameraModes.value, resolution.width, resolution.height));
+  if (mediaDraft.value.video_fps > maxFps) mediaDraft.value.video_fps = maxFps;
 }
 
 function toggleAudioCodec(codec: MediaProfile["audio_codec"]) {
@@ -166,16 +270,18 @@ function toggleAudioCodec(codec: MediaProfile["audio_codec"]) {
   mediaDraft.value.audio_codec = codec;
 }
 
-function isCommonFps(value: number): boolean {
-  return (MEDIA_FPS_OPTIONS as readonly number[]).includes(value);
-}
-
 function validateDraft(): string | null {
   const device = deviceDraft.value;
   const network = networkDraft.value;
   if (activeKey.value === "media") {
     if (!mediaDraft.value) return "配置尚未加载";
-    return validateMediaProfile(mediaDraft.value);
+    const invalid = validateMediaProfile(mediaDraft.value);
+    if (invalid) return invalid;
+    // 能力未知时不拦截（探测失败不该卡住保存），已知则必须拦下。
+    if (!cameraSupportsResolution(cameraModes.value, mediaDraft.value.width, mediaDraft.value.height)) {
+      return `摄像头不支持 ${mediaDraft.value.width}×${mediaDraft.value.height}，请重新选择输出分辨率`;
+    }
+    return null;
   }
   if (!device || !network) return "配置尚未加载";
   if (!/^\d{20}$/.test(device.device_id)) return "设备 ID 必须是 20 位数字";
@@ -315,8 +421,9 @@ function setBindMode(mode: BindMode) {
               type="button"
               class="media-preset"
               :class="{ selected: mediaPreset === preset.id }"
-              :disabled="locked"
+              :disabled="locked || !presetSupported(preset)"
               :aria-pressed="mediaPreset === preset.id"
+              :title="presetSupported(preset) ? '' : '摄像头不支持该分辨率'"
               @click="selectMediaPreset(preset.id)"
             >
               <strong>{{ preset.label }}</strong>
@@ -364,14 +471,14 @@ function setBindMode(mode: BindMode) {
             <label class="field">
               <span>输出分辨率</span>
               <select :value="mediaDraft.width" :disabled="locked" @change="setResolution">
-                <option v-for="resolution in MEDIA_RESOLUTIONS" :key="resolution.width" :value="resolution.width">{{ resolution.label }}</option>
+                <option v-for="resolution in resolutionOptions" :key="resolution.width" :value="resolution.width">{{ resolution.label }}</option>
               </select>
             </label>
             <label class="field">
               <span>视频帧率</span>
               <select v-model.number="mediaDraft.video_fps" :disabled="locked">
-                <option v-if="!isCommonFps(mediaDraft.video_fps)" :value="mediaDraft.video_fps">{{ mediaDraft.video_fps }} FPS（自定义）</option>
-                <option v-for="fps in MEDIA_FPS_OPTIONS" :key="fps" :value="fps">{{ fps }} FPS</option>
+                <option v-if="!fpsOptions.includes(mediaDraft.video_fps)" :value="mediaDraft.video_fps">{{ mediaDraft.video_fps }} FPS（当前值，摄像头不支持）</option>
+                <option v-for="fps in fpsOptions" :key="fps" :value="fps">{{ fps }} FPS</option>
               </select>
             </label>
             <label class="field">
@@ -387,6 +494,7 @@ function setBindMode(mode: BindMode) {
               </select>
             </label>
           </div>
+          <div v-if="cameraCapabilityNote" class="info-note camera-capability-note">{{ cameraCapabilityNote }}</div>
           <div class="info-note">保存后，下次启动设备时生效；运行中请先注销后修改。</div>
           <div class="media-save-row">
             <button class="btn primary" type="button" :disabled="locked || !config || !mediaDirty" @click="saveCurrent">保存音视频设置</button>

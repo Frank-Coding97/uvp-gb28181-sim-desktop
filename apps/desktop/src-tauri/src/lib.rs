@@ -37,6 +37,9 @@ use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
 struct AppState {
     /// Rust 端配置真相源；路径在首次 Tauri 命令时由 app_data_dir 初始化。
     config_store: OnceLock<ConfigStore>,
+    /// 应用数据根目录（配置 / 录像 / 升级状态共用）与它来自哪个候选。
+    /// 解析一次即缓存：探测要真写文件，不该在每次启动设备时重复做。
+    data_root: OnceLock<(std::path::PathBuf, String)>,
     /// 录像索引真相，设备停止后仍可查看历史文件。
     recording_store: OnceLock<Arc<RecordingStore>>,
     /// 配置文件读写串行化，避免并发保存与读取看到半次操作。
@@ -169,6 +172,7 @@ impl AppState {
         let preview_manager = Arc::new(PreviewManager::new(Arc::clone(&preview_bus)));
         AppState {
             config_store: OnceLock::new(),
+            data_root: OnceLock::new(),
             recording_store: OnceLock::new(),
             config_io: Mutex::new(()),
             media_preparation: std::sync::Mutex::new(None),
@@ -189,12 +193,12 @@ fn app_recording_store(state: &AppState, app: &AppHandle) -> Result<Arc<Recordin
     if let Some(store) = state.recording_store.get() {
         return Ok(Arc::clone(store));
     }
-    let directory = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法定位应用录像目录: {error}"))?
-        .join("recordings");
-    let store = Arc::new(RecordingStore::open(directory).map_err(|error| error.to_string())?);
+    // 与配置同一个根目录：这是「注册设备」失败的那一处，不能直接拼 app_data_dir()。
+    let directory = app_data_root(state, app)?.join("recordings");
+    let store = Arc::new(
+        RecordingStore::open(&directory)
+            .map_err(|error| format!("打开录像目录 {} 失败: {error}", directory.display()))?,
+    );
     let _ = state.recording_store.set(store);
     Ok(Arc::clone(
         state
@@ -204,14 +208,84 @@ fn app_recording_store(state: &AppState, app: &AppHandle) -> Result<Arc<Recordin
     ))
 }
 
+/// 依次探测候选目录，返回第一个**真的能写入**的目录。
+///
+/// 直接信任 `app_data_dir()` 是不够的。2026-11-05 在装了企业 VDI/DLP 客户端的
+/// 开发机上实测：`C:\Users\<user>\AppData` 下 `create_dir_all` 成功，但创建任何
+/// 文件都被拒绝（os error 5），`%TEMP%` 同样如此，而工程所在的 D 盘可写；目录 ACL
+/// 只有三条允许项、没有拒绝项，受控文件夹访问关闭、也没有 ASR 规则——是外部安全
+/// 产品按进程拦截。这种情况下 `app_data_dir()` 本身不报错，错误会一路拖到第一次
+/// 落盘，变成一句无法行动的“创建配置目录失败”。
+///
+/// 所以这里用真实写入探测，并把每个候选的失败原因汇总进最终错误，让下一次再遇到
+/// 类似环境时能直接看出是哪一层挡住、还有哪些位置可用。
+fn resolve_writable_dir(
+    candidates: Vec<(String, std::path::PathBuf)>,
+) -> Result<(std::path::PathBuf, String), String> {
+    let mut failures = Vec::new();
+    for (label, dir) in candidates {
+        let probe = dir.join(".uvp-write-probe");
+        let attempt = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&probe, b"probe"))
+            .and_then(|()| std::fs::remove_file(&probe));
+        match attempt {
+            Ok(()) => return Ok((dir, label)),
+            Err(error) => failures.push(format!("{label} {} -> {error}", dir.display())),
+        }
+    }
+    Err(format!("没有可写的应用数据目录：{}", failures.join("; ")))
+}
+
+/// 应用数据根目录：配置、录像、升级状态**三者共用**的一个真能写入的目录。
+///
+/// 之所以要共用：2026-11-05 在装了企业 VDI/DLP 的开发机上，`app_data_dir()` 建目录
+/// 可能成功、写文件必被拒（os error 5）。当初只把**配置**换成了可写探测，录像与
+/// 升级状态仍直接拼 `app_data_dir()`，于是「新增配置」好了、「注册设备」仍然失败，
+/// 而且报出来的是 `网络错误: 拒绝访问。 (os error 5)`——一个文件错误被贴上了网络标签。
+/// 三处必须走同一条解析，否则修一处漏两处。
+fn app_data_root(state: &AppState, app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    if let Some((dir, _)) = state.data_root.get() {
+        return Ok(dir.clone());
+    }
+
+    let mut candidates: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // 显式覆盖优先：受限环境里开发或部署时可以直接把数据目录挪到可写的位置。
+    if let Some(explicit) = std::env::var_os("UVP_CONFIG_DIR") {
+        candidates.push((
+            "UVP_CONFIG_DIR".to_string(),
+            std::path::PathBuf::from(explicit),
+        ));
+    }
+    for (label, resolved) in [
+        ("app_data_dir", app.path().app_data_dir()),
+        ("app_local_data_dir", app.path().app_local_data_dir()),
+    ] {
+        if let Ok(dir) = resolved {
+            candidates.push((label.to_string(), dir));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(("exe_dir/data".to_string(), parent.join("data")));
+        }
+    }
+
+    let (directory, source) = resolve_writable_dir(candidates)?;
+    tracing::info!(
+        target: "uvp::config",
+        "数据目录: {}（来源 {source}）",
+        directory.display()
+    );
+    let _ = state.data_root.set((directory.clone(), source));
+    Ok(directory)
+}
+
 fn app_config_store(state: &AppState, app: &AppHandle) -> Result<ConfigStore, String> {
     if let Some(store) = state.config_store.get() {
         return Ok(store.clone());
     }
-    let directory = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法定位应用配置目录: {error}"))?;
+
+    let directory = app_data_root(state, app)?;
     let store = ConfigStore::new(directory.join("desktop-config-v1.json"));
     let _ = state.config_store.set(store);
     Ok(state
@@ -257,6 +331,8 @@ impl DeviceObserver for StateEmitter {
             DeviceEvent::RegisterAttempt => "Registering",
             DeviceEvent::RegisterSuccess => "Registered",
             DeviceEvent::RegisterFailure { message, .. } => {
+                // 注册失败原先只推给前端、不落日志，排查时只能看到界面上那一句话。
+                tracing::warn!(target: "uvp::device", "注册失败: {message}");
                 let ts_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -375,6 +451,7 @@ impl DeviceObserver for StateEmitter {
             }
             // 运行时错误(如点播采集失败)→ 前端全局错误条。
             DeviceEvent::RuntimeError { scope, message } => {
+                tracing::warn!(target: "uvp::device", "运行期错误[{scope}]: {message}");
                 let ts_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -954,6 +1031,27 @@ struct LiveAvDeviceDto {
 }
 
 #[derive(Serialize)]
+struct LiveCameraModeDto {
+    width: u32,
+    height: u32,
+    min_fps: f64,
+    max_fps: f64,
+    format: String,
+}
+
+impl From<media_rtp::LiveCameraMode> for LiveCameraModeDto {
+    fn from(mode: media_rtp::LiveCameraMode) -> Self {
+        Self {
+            width: mode.width,
+            height: mode.height,
+            min_fps: mode.min_fps,
+            max_fps: mode.max_fps,
+            format: mode.format,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct LiveSourceCatalogDto {
     ffmpeg_available: bool,
     aac_available: bool,
@@ -1016,11 +1114,36 @@ struct LiveProbeDto {
 /// 枚举可用于规范实时源 URI 的摄像头、麦克风和显示器。
 #[tauri::command]
 async fn list_live_sources() -> Result<LiveSourceCatalogDto, String> {
-    tokio::task::spawn_blocking(media_rtp::list_live_sources)
+    let catalog = tokio::task::spawn_blocking(media_rtp::list_live_sources)
         .await
         .map_err(|error| format!("实时源枚举任务异常: {error}"))?
-        .map(LiveSourceCatalogDto::from)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // 枚举依赖 FFmpeg 的 DirectShow/AVFoundation 后端。FFmpeg 找不到时 catalog 是空的
+    // 且只有错误字段，界面上表现为“摄像头下拉框没有内容”。日志里留下判定依据，
+    // 免得再靠猜。
+    tracing::info!(
+        ffmpeg = %catalog.ffmpeg_path.as_deref().unwrap_or("<未找到>"),
+        cameras = catalog.cameras.len(),
+        microphones = catalog.microphones.len(),
+        screens = catalog.screens.len(),
+        device_error = catalog.avfoundation_error.as_deref().unwrap_or("-"),
+        "实时采集设备枚举完成"
+    );
+    Ok(LiveSourceCatalogDto::from(catalog))
+}
+
+/// 查询某台摄像头实际支持的分辨率与帧率。
+///
+/// 音视频设置页据此限制可选分辨率/帧率：设备做不到的档位不该出现在下拉框里，
+/// 否则用户只能在启动采集时才吃到一个 DirectShow 错误。
+#[tauri::command]
+async fn list_camera_modes(camera_index: u32) -> Result<Vec<LiveCameraModeDto>, String> {
+    let modes = tokio::task::spawn_blocking(move || media_rtp::list_camera_modes(camera_index))
+        .await
+        .map_err(|error| format!("摄像头能力查询任务异常: {error}"))?
+        .map_err(|error| error.to_string())?;
+    tracing::info!(camera_index, modes = modes.len(), "摄像头采集模式枚举完成");
+    Ok(modes.into_iter().map(LiveCameraModeDto::from).collect())
 }
 
 /// 启动一次短时采集探测。请求音频时，用户应确保麦克风或系统正在产生声音。
@@ -1426,11 +1549,7 @@ async fn start_device(
 
     // 带状态观察者的设备实例。
     let observer: Arc<dyn DeviceObserver> = Arc::new(StateEmitter { app: app.clone() });
-    let upgrade_state_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法定位应用固件升级状态目录: {error}"))?
-        .join("upgrade-state");
+    let upgrade_state_dir = app_data_root(&state, &app)?.join("upgrade-state");
     let sim = Arc::new(DeviceSimulator::with_observer_and_upgrade_state_dir(
         cfg,
         observer,
@@ -2052,6 +2171,176 @@ fn open_desktop_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+// ── 粘贴接入链接:一次性 token 兑换 SIP 接入参数 ──────────
+
+/// 平台 `/api/gb28181/sip/qr/exchange` 的统一响应信封(`{code,message,data}`)。
+#[derive(serde::Deserialize)]
+struct QrExchangeEnvelope {
+    code: i32,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: Option<QrProvisionPayload>,
+}
+
+/// 平台下发的 SIP 接入六元组。字段名与 Go 侧 `QRPayload` 的 json tag 一一对应。
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QrProvisionPayload {
+    pub server_id: String,
+    pub domain: String,
+    pub ip: String,
+    pub port: u16,
+    pub transport: String,
+    pub password: String,
+}
+
+/// 兑换失败的结构化原因。`code` 供前端分支判断,`message` 可直接展示给用户。
+#[derive(serde::Serialize)]
+pub struct QrProvisionError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl QrProvisionError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// 把 reqwest 的传输层错误归一成用户能处置的原因。
+///
+/// 证书失败必须单独分出来:内网绿色包普遍是自签 HTTPS,若只报「连不上平台」,
+/// 用户会去查网络和端口 —— 2026-10-08 扫码接入就是这么把排查带偏的。
+fn classify_exchange_transport_error(err: reqwest::Error) -> QrProvisionError {
+    if err.is_timeout() {
+        return QrProvisionError::new("unreachable", "连接平台超时,请确认地址可达、端口未被拦截");
+    }
+    let chain = error_chain(&err).to_lowercase();
+    if chain.contains("certificate")
+        || chain.contains("unknownissuer")
+        || chain.contains("notvalidforname")
+        || chain.contains("invalidpeer")
+    {
+        return QrProvisionError::new("cert", "平台证书不受信任(可能是自签名证书)");
+    }
+    if err.is_connect() {
+        return QrProvisionError::new("unreachable", "无法连接平台,请确认地址与端口可达");
+    }
+    QrProvisionError::new("unreachable", format!("请求平台失败:{err}"))
+}
+
+/// 拼接错误链全文。reqwest 只在最外层给出 "error sending request",
+/// 真正原因(证书/域名解析)藏在 source 里。
+///
+/// 用全限定调用而非 `err.source()`:`std::error::Error` 不在 prelude 里,
+/// 方法调用取决于本文件是否恰好 import 了它,不该赌这个。
+fn error_chain(err: &reqwest::Error) -> String {
+    let mut text = err.to_string();
+    let mut cursor = std::error::Error::source(err);
+    while let Some(source) = cursor {
+        text.push_str(" | ");
+        text.push_str(&source.to_string());
+        cursor = std::error::Error::source(source);
+    }
+    text
+}
+
+/// 用平台接入链接里的 token 兑换 SIP 接入参数。
+///
+/// 链接形态 `https://<平台>/gb28181/qr#t=<22 位 token>`。token 在 fragment 里,
+/// 由前端解析后单独传入 —— 这里只负责发请求,不参与 URL 语义判断。
+///
+/// `allow_insecure` 仅在用户对自签证书显式确认后由前端置真。默认严格校验:
+/// 放宽证书信任必须是一次可见的用户决定,不能是代码里的默认值。
+#[tauri::command]
+async fn exchange_sip_provision(
+    base_url: String,
+    token: String,
+    allow_insecure: Option<bool>,
+) -> Result<QrProvisionPayload, QrProvisionError> {
+    let base = base_url.trim().trim_end_matches('/');
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err(QrProvisionError::new(
+            "rejected",
+            "接入地址必须以 http:// 或 https:// 开头",
+        ));
+    }
+    // 与平台 isWellFormedQRToken 对齐(22 位 base64url 无填充)。先挡一遍形态,
+    // 避免明显错误输入去占用平台兑换端点的限流配额。
+    if token.len() != 22
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(QrProvisionError::new("invalid", "链接中的接入码格式不正确"));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .tls_danger_accept_invalid_certs(allow_insecure.unwrap_or(false))
+        .build()
+        .map_err(|e| QrProvisionError::new("server", format!("HTTP 客户端初始化失败:{e}")))?;
+
+    let response = client
+        .post(format!("{base}/api/gb28181/sip/qr/exchange"))
+        // token 走 body 而非 query:query 会被平台访问日志落盘。
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .map_err(classify_exchange_transport_error)?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| QrProvisionError::new("unreachable", format!("读取平台响应失败:{e}")))?;
+
+    // 失败响应同样是 {code,message} 信封;先按 HTTP 状态分流,
+    // 再把平台侧原始文案带出去(平台已刻意合并「过期」与「已使用」)。
+    let envelope: Option<QrExchangeEnvelope> = serde_json::from_str(&body).ok();
+    let platform_message = envelope
+        .as_ref()
+        .map(|item| item.message.trim().to_string())
+        .filter(|message| !message.is_empty());
+
+    match status.as_u16() {
+        200..=299 => {
+            let envelope = envelope
+                .ok_or_else(|| QrProvisionError::new("server", "平台响应不是预期的 JSON 结构"))?;
+            if envelope.code != 0 {
+                return Err(QrProvisionError::new(
+                    "server",
+                    platform_message
+                        .unwrap_or_else(|| format!("平台返回业务错误码 {}", envelope.code)),
+                ));
+            }
+            envelope
+                .data
+                .ok_or_else(|| QrProvisionError::new("server", "平台未返回接入信息"))
+        }
+        410 => Err(QrProvisionError::new(
+            "expired",
+            platform_message.unwrap_or_else(|| "接入码已失效".to_string()),
+        )),
+        429 => Err(QrProvisionError::new(
+            "rate_limited",
+            platform_message.unwrap_or_else(|| "尝试过于频繁".to_string()),
+        )),
+        400 | 422 => Err(QrProvisionError::new(
+            "invalid",
+            platform_message.unwrap_or_else(|| "链接内容不完整".to_string()),
+        )),
+        _ => Err(QrProvisionError::new(
+            "server",
+            platform_message.unwrap_or_else(|| format!("平台返回 HTTP {status}")),
+        )),
+    }
+}
+
 // ── 应用入口 ──────────────────────────────────────────────
 
 /// 初始化日志、注册命令、启动 Tauri 事件循环。
@@ -2073,10 +2362,22 @@ pub fn run() {
         .setup(|app| {
             // 日志落盘。内存环形缓冲只够 UI 翻看，排查采集/预览这类"跑一次才复现"
             // 的问题时拿不出来——落到文件才能事后直接读。
-            let log_path = app.path().app_log_dir().ok().map(|dir| {
-                let _ = std::fs::create_dir_all(&dir);
-                dir.join("desktop.log")
-            });
+            // 日志目录同样要走可写探测：受限环境里 AppData 能建目录但建不了文件，
+            // 原来的 `create_dir_all` 成功掩盖了这一点，日志会悄无声息地缺失。
+            let log_path = {
+                let mut candidates: Vec<(String, std::path::PathBuf)> = Vec::new();
+                if let Ok(dir) = app.path().app_log_dir() {
+                    candidates.push(("app_log_dir".to_string(), dir));
+                }
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(parent) = exe.parent() {
+                        candidates.push(("exe_dir/logs".to_string(), parent.join("logs")));
+                    }
+                }
+                resolve_writable_dir(candidates)
+                    .ok()
+                    .map(|(dir, _)| dir.join("desktop.log"))
+            };
             let file = log_path
                 .as_ref()
                 .and_then(|path| open_desktop_log(path).ok().map(std::sync::Mutex::new));
@@ -2096,6 +2397,8 @@ pub fn run() {
             });
             if let Some(path) = &log_path {
                 tracing::info!(path = %path.display(), "日志文件已接续");
+            } else {
+                tracing::warn!("没有可写的日志目录，本次运行只保留内存日志");
             }
 
             // 开发期首屏自愈。
@@ -2168,12 +2471,14 @@ pub fn run() {
             save_desktop_config,
             save_media_config,
             reset_desktop_config,
+            exchange_sip_provision,
             validate_scenario,
             start_stress,
             stop_stress,
             get_metrics,
             export_report,
             list_live_sources,
+            list_camera_modes,
             probe_live_source,
             is_preview_window_visible,
             start_binary_preview,

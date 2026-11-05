@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   DEFAULT_MEDIA_PROFILE,
   normalizeMediaProfile,
+  type CameraMode,
   type MediaProfile,
 } from "./media-profile.ts";
 
@@ -322,6 +323,16 @@ export async function resetDesktopConfig(): Promise<DesktopConfigV2> {
 
 export async function listLocalIpAddresses(): Promise<LocalIpOption[]> {
   return invoke<LocalIpOption[]>("list_local_ip_addresses");
+}
+
+/**
+ * 查询摄像头实际支持的分辨率与帧率。
+ *
+ * 每次调用都会让 FFmpeg 打开一次设备，耗时在百毫秒到数秒之间，
+ * 调用方应缓存结果，不要放在渲染热路径上。
+ */
+export async function listCameraModes(cameraIndex: number): Promise<CameraMode[]> {
+  return invoke<CameraMode[]>("list_camera_modes", { cameraIndex });
 }
 
 export function usePlatform() {

@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useRouter } from "vue-router";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { NButton, NIcon, NInput, NInputNumber, NPopconfirm, NSelect, useMessage } from "naive-ui";
+import { NButton, NIcon, NInput, NInputNumber, NModal, NPopconfirm, NSelect, useMessage } from "naive-ui";
 import {
   AddOutline,
   AlertCircleOutline,
@@ -13,6 +13,7 @@ import {
   DesktopOutline,
   DocumentOutline,
   FolderOpenOutline,
+  LinkOutline,
   LocationOutline,
   OptionsOutline,
   RadioOutline,
@@ -25,6 +26,14 @@ import {
 import { persistForm, useDevice } from "../device";
 import { usePlatform } from "../platform";
 import { buildLiveSourceUri, liveSourceAudio } from "../media-profile";
+import {
+  describeParseFailure,
+  describeProvisionGaps,
+  parseProvisionLink,
+  readProvisionFailure,
+  toProfilePatch,
+  type ProvisionPayload,
+} from "../provision-link";
 import { usePreviewSession } from "../composables/preview/session";
 
 type MediaMode = "camera" | "screen" | "file";
@@ -269,6 +278,21 @@ const screenOptions = computed(() =>
   })),
 );
 const mediaModeLabel = computed(() => mediaModes.find((item) => item.value === mediaMode.value)?.label ?? "未配置");
+// 设备列表为空时必须说明原因：枚举依赖 FFmpeg 的 DirectShow/AVFoundation 后端，
+// 找不到 FFmpeg 时后端只会返回空列表，界面上就变成一个打不开的下拉框。
+const sourceHint = computed(() => {
+  if (sourceLoading.value || deviceLive.value) return "";
+  if (mediaMode.value === "camera" && catalog.value.cameras.length === 0) {
+    if (!catalog.value.ffmpeg_available) {
+      return "未找到 FFmpeg，无法枚举摄像头：安装 FFmpeg 并加入 PATH，或用 UVP_FFMPEG_PATH 指向 ffmpeg.exe";
+    }
+    return catalog.value.avfoundation_error || "未检测到摄像头设备";
+  }
+  if (mediaMode.value === "screen" && catalog.value.screens.length === 0) {
+    return catalog.value.screen_error || "未检测到可采集的屏幕";
+  }
+  return "";
+});
 const mediaSourceReady = computed(() => form.value.video_source.trim().length > 0);
 const previewStateText = computed(() => ({
   idle: "等待启动",
@@ -308,6 +332,23 @@ const platformValid = computed(() =>
   (draft.server_domain === "" || /^\d{10}$/.test(draft.server_domain)),
 );
 const canSave = computed(() => editing.value && deviceIdValid.value && platformValid.value && !deviceLive.value);
+
+// 注册按钮为什么不可点。
+//
+// 之前按钮的 disabled 由四个条件直接拼在模板里，而页面底部的提示只看 SIP 三个字段，
+// 于是出现过「提示说 SIP 配置完整、可以启动模拟，按钮却是灰的」——实际卡在没选采集
+// 来源（video_source 为空）。这里把判定收成一处，模板和提示共用，保证说出来的原因
+// 就是真正挡住按钮的那一条。
+// 顺序即优先级：编辑态最先（此时连注销也不该点），其次是采集来源、传输方式、SIP 字段。
+const registerBlocker = computed(() => {
+  if (editing.value) return "正在编辑配置，点「完成」保存后再操作";
+  if (!deviceLive.value) {
+    if (!mediaSourceReady.value) return "先在左侧选择采集来源（摄像头 / 屏幕 / 视频文件）";
+    if (active.value?.transport === "TCP") return "信令 TCP 尚未接入，请把信令传输改成 UDP";
+    if (!deviceIdValid.value || !platformValid.value) return "服务器、服务器 ID、设备 ID 不能为空";
+  }
+  return "";
+});
 const displayedDevice = computed(() => effectiveConfig.value?.device ?? config.value?.device);
 const displayedProfile = computed(() => effectiveConfig.value?.profile ?? active.value);
 
@@ -342,12 +383,21 @@ async function switchSipProfile(id: string) {
   }
 }
 
+// 「配置 N」的默认名取第一个未被占用的序号:删掉过配置后,
+// 直接用 length+1 会和现存名称撞车,而 addProfile 不校验重名。
+function nextProfileName() {
+  const used = new Set(profiles.value.map((profile) => profile.name.trim()));
+  let index = profiles.value.length + 1;
+  while (used.has(`SIP 配置 ${index}`)) index += 1;
+  return `SIP 配置 ${index}`;
+}
+
 async function addSipProfile() {
   if (deviceLive.value) return;
   const source = active.value;
   try {
     await addProfile({
-      name: `SIP 配置 ${profiles.value.length + 1}`,
+      name: nextProfileName(),
       server_host: source?.server_host ?? "127.0.0.1",
       server_port: source?.server_port ?? 5060,
       server_id: source?.server_id ?? "34020000002000000001",
@@ -397,6 +447,103 @@ function clearDraft() {
   draft.password = "";
   draft.device_id = "";
   serverDomainManuallyEdited.value = false;
+}
+
+// ── 粘贴接入链接 ──────────────────────────────────────────
+// 平台「扫码接入」卡片里的链接本是给设备扫的,桌面端没有摄像头,
+// 粘贴成了唯一可用的传递方式。链路复用平台已有的一次性 token 兑换端点,
+// 所以这里不需要任何新的平台接口。
+const provisionVisible = ref(false);
+const provisionLink = ref("");
+const provisionName = ref("");
+const provisionBusy = ref(false);
+const provisionError = ref("");
+const provisionNeedsInsecure = ref(false);
+
+function openProvision() {
+  if (deviceLive.value) {
+    message.warning("设备运行中,请先注销设备再接入");
+    return;
+  }
+  provisionVisible.value = true;
+  provisionLink.value = "";
+  // 粘贴接入 = 新增一份配置,所以默认名沿用新增配置的编号规则。
+  provisionName.value = nextProfileName();
+  provisionError.value = "";
+  provisionNeedsInsecure.value = false;
+}
+
+async function applyProvision(allowInsecure: boolean) {
+  if (provisionBusy.value) return;
+  const parsed = parseProvisionLink(provisionLink.value);
+  if (!parsed.ok) {
+    provisionError.value = describeParseFailure(parsed.reason);
+    provisionNeedsInsecure.value = false;
+    return;
+  }
+  // 裸接入码不含平台地址。这里不拿当前配置的服务器地址去拼 ——
+  // 那个地址是「要注册到的 SIP 服务器」,未必是签发这张链接的平台。
+  if (!parsed.value.baseUrl) {
+    provisionError.value = "请粘贴完整链接(以 http:// 或 https:// 开头)";
+    provisionNeedsInsecure.value = false;
+    return;
+  }
+
+  // 名称与链接一样要在兑换前校验:兑换是「一次即消费」,
+  // 校验放到兑换之后,用户改个名字就得回平台重新生成一张码。
+  const name = provisionName.value.trim();
+  if (!name) {
+    provisionError.value = "请填写配置名称";
+    // 上一次若停在证书错误上,「仍然继续」不该在这一轮继续挂着。
+    provisionNeedsInsecure.value = false;
+    return;
+  }
+  if (profiles.value.some((profile) => profile.name.trim() === name)) {
+    provisionError.value = `已有同名配置「${name}」,请换一个名称`;
+    provisionNeedsInsecure.value = false;
+    return;
+  }
+
+  provisionBusy.value = true;
+  provisionError.value = "";
+  provisionNeedsInsecure.value = false;
+  try {
+    const payload = await invoke<ProvisionPayload>("exchange_sip_provision", {
+      baseUrl: parsed.value.baseUrl,
+      token: parsed.value.token,
+      allowInsecure,
+    });
+    const patch = toProfilePatch(payload);
+    // 新建一份配置,而不是把接入参数覆盖到当前配置上:
+    // 覆盖会把「本地平台」这份还能用的配置改成别的平台的地址,名称却还留在原处。
+    await addProfile({
+      name,
+      gb_version: active.value?.gb_version ?? "V2022",
+      signaling_encoding: active.value?.signaling_encoding ?? "Gb18030",
+      ...patch,
+    });
+    // 落盘后 active 已切到新配置,再进编辑态让用户核对/微调。
+    resetDraft();
+    // 域值来自平台,不能被「服务器 ID 前 10 位」的联动规则改写。
+    serverDomainManuallyEdited.value = true;
+    editing.value = true;
+    provisionVisible.value = false;
+    provisionLink.value = "";
+
+    const gaps = describeProvisionGaps(patch);
+    if (gaps.length) {
+      message.warning(`已新增配置「${name}」,但${gaps.join("、")}，请修正后保存`);
+    } else {
+      message.success(`已新增配置「${name}」,请核对后点击保存`);
+    }
+  } catch (cause) {
+    const failure = readProvisionFailure(cause);
+    provisionError.value = failure.message;
+    // 证书不受信任不是终点:是否信任由用户显式决定,重试时才放宽校验。
+    provisionNeedsInsecure.value = failure.code === "cert" && !allowInsecure;
+  } finally {
+    provisionBusy.value = false;
+  }
 }
 
 async function saveConfig() {
@@ -767,6 +914,10 @@ onUnmounted(() => {
           <span class="preparation-message">{{ mediaPreparation.message }}</span>
           <n-button v-if="mediaPreparation.phase === 'preparing'" size="tiny" quaternary @click="cancelMediaPreparation">取消准备</n-button>
         </div>
+        <div v-if="sourceHint" class="source-hint">
+          <n-icon :component="AlertCircleOutline" />
+          <span>{{ sourceHint }}</span>
+        </div>
         <div v-if="sourceProbe" class="source-feedback">{{ sourceProbe }}</div>
       </section>
 
@@ -777,7 +928,32 @@ onUnmounted(() => {
             <h2>SIP 配置</h2>
           </div>
           <div class="config-actions">
-            <n-button v-if="!editing" size="small" type="primary" secondary :disabled="deviceLive" @click="beginEdit">编辑配置</n-button>
+            <!-- 删除当前配置属破坏性操作,放在头部与「编辑配置」同处:
+                 配置文件行只承载「切换 / 接入 / 新增」三类正向动作,
+                 避免删除按钮和它们挤在同一行被挤断,也避免误点。 -->
+            <template v-if="!editing">
+              <n-button size="small" type="primary" secondary :disabled="deviceLive" @click="beginEdit">编辑配置</n-button>
+              <n-popconfirm
+                :disabled="deviceLive || profiles.length <= 1"
+                positive-text="删除"
+                negative-text="取消"
+                @positive-click="deleteSipProfile"
+              >
+                <template #trigger>
+                  <n-button
+                    size="small"
+                    type="error"
+                    secondary
+                    circle
+                    :disabled="deviceLive || profiles.length <= 1"
+                    :title="profiles.length <= 1 ? '至少保留一份 SIP 配置' : '删除当前 SIP 配置'"
+                  >
+                    <template #icon><n-icon><TrashOutline /></n-icon></template>
+                  </n-button>
+                </template>
+                删除“{{ active?.name }}”配置？
+              </n-popconfirm>
+            </template>
             <template v-else>
               <n-button size="small" quaternary @click="clearDraft">重置</n-button>
               <n-button size="small" quaternary @click="cancelEdit">取消</n-button>
@@ -806,6 +982,18 @@ onUnmounted(() => {
             aria-label="SIP 配置"
             @update:value="switchSipProfile"
           />
+          <!-- 接入链接会新建一份配置,与「新增」同类,所以共用同一组禁用条件。 -->
+          <n-button
+            size="small"
+            type="info"
+            secondary
+            :disabled="deviceLive || editing"
+            title="粘贴接入链接快速接入"
+            @click="openProvision"
+          >
+            <template #icon><n-icon><LinkOutline /></n-icon></template>
+            粘贴接入
+          </n-button>
           <n-button
             size="small"
             type="success"
@@ -817,26 +1005,6 @@ onUnmounted(() => {
           >
             <template #icon><n-icon><AddOutline /></n-icon></template>
           </n-button>
-          <n-popconfirm
-            :disabled="deviceLive || editing || profiles.length <= 1"
-            positive-text="删除"
-            negative-text="取消"
-            @positive-click="deleteSipProfile"
-          >
-            <template #trigger>
-              <n-button
-                size="small"
-                type="error"
-                secondary
-                circle
-                :disabled="deviceLive || editing || profiles.length <= 1"
-                title="删除当前 SIP 配置"
-              >
-                <template #icon><n-icon><TrashOutline /></n-icon></template>
-              </n-button>
-            </template>
-            删除“{{ active?.name }}”配置？
-          </n-popconfirm>
         </div>
 
         <div class="config-grid">
@@ -892,7 +1060,7 @@ onUnmounted(() => {
         </div>
 
         <div class="primary-actions">
-          <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy || editing || (!deviceLive && !mediaSourceReady) || (!deviceLive && active?.transport === 'TCP')" @click="toggleRegistration">
+          <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy || !!registerBlocker" :title="registerBlocker || undefined" @click="toggleRegistration">
             <template #icon><n-icon><RadioOutline /></n-icon></template>
             {{ registrationActionLabel }}
           </n-button>
@@ -954,15 +1122,89 @@ onUnmounted(() => {
         </section>
 
         <div class="config-foot">
-          <n-icon :component="deviceIdValid && platformValid ? CheckmarkCircleOutline : AlertCircleOutline" />
-          <span>{{ deviceIdValid && platformValid ? "SIP 配置完整，可以启动模拟" : "服务器、服务器 ID、设备 ID 不能为空" }}</span>
+          <n-icon :component="registerBlocker ? AlertCircleOutline : CheckmarkCircleOutline" />
+          <span>{{ registerBlocker || (deviceLive ? "SIP 已注册，设备运行中" : "SIP 配置完整，可以启动模拟") }}</span>
         </div>
       </aside>
     </main>
+
+    <n-modal
+      v-model:show="provisionVisible"
+      preset="card"
+      title="粘贴接入链接"
+      style="width: 520px; max-width: calc(100vw - 32px)"
+      :mask-closable="!provisionBusy"
+    >
+      <div class="provision-body">
+        <p class="provision-desc">
+          在平台「扫码接入」卡片里复制二维码链接，粘贴到下方即可自动生成一份 SIP 配置。
+        </p>
+        <label class="provision-field">
+          <span>配置名称</span>
+          <n-input
+            v-model:value="provisionName"
+            size="medium"
+            maxlength="40"
+            :disabled="provisionBusy"
+            placeholder="例如 会议室模拟器"
+          />
+        </label>
+        <label class="provision-field">
+          <span>接入链接</span>
+          <n-input
+            v-model:value="provisionLink"
+            type="textarea"
+            :rows="2"
+            :disabled="provisionBusy"
+            placeholder="https://gb28181.example.com/gb28181/qr#t=..."
+          />
+        </label>
+        <div v-if="provisionError" class="provision-error">
+          <n-icon><AlertCircleOutline /></n-icon>
+          <span>{{ provisionError }}</span>
+          <n-button
+            v-if="provisionNeedsInsecure"
+            size="tiny"
+            type="warning"
+            secondary
+            :loading="provisionBusy"
+            @click="applyProvision(true)"
+          >
+            仍然继续
+          </n-button>
+        </div>
+        <p class="provision-warning">
+          接入码一次性有效（平台侧 5 分钟）。兑换成功后原链接与二维码立即失效，不能再用手机扫。
+        </p>
+      </div>
+      <template #footer>
+        <div class="provision-actions">
+          <n-button :disabled="provisionBusy" @click="provisionVisible = false">取消</n-button>
+          <n-button
+            type="primary"
+            :loading="provisionBusy"
+            :disabled="!provisionLink.trim() || !provisionName.trim()"
+            @click="applyProvision(false)"
+          >
+            接入
+          </n-button>
+        </div>
+      </template>
+    </n-modal>
   </div>
 </template>
 
 <style scoped>
+/* 粘贴接入链接:一次性 token 的输入与失败反馈 */
+.provision-body { display: flex; flex-direction: column; gap: 10px; }
+.provision-desc { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.provision-field { display: grid; gap: 4px; }
+.provision-field > span { color: var(--text-secondary); font-size: 11px; font-weight: 650; }
+.provision-error { display: flex; gap: 6px; align-items: center; padding: 7px 9px; color: var(--error); font-size: 12px; line-height: 1.5; background: rgb(220 38 38 / 8%); border-radius: 6px; }
+.provision-error span { flex: 1; min-width: 0; }
+.provision-warning { margin: 0; color: var(--text-tertiary); font-size: 11px; line-height: 1.6; }
+.provision-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
 .home-page {
   width: min(1440px, 100%);
   height: 100%;
@@ -1062,6 +1304,7 @@ onUnmounted(() => {
 .file-source { width: 100%; height: 30px; overflow: hidden; padding: 0 9px; border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-secondary); background: #fff; cursor: pointer; font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .source-feedback { overflow: hidden; color: var(--text-secondary); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .media-preparation { display: flex; align-items: center; gap: 7px; min-width: 0; min-height: 25px; padding: 4px 8px; border-radius: 6px; background: var(--accent-dim); color: var(--text-secondary); font-size: 10.5px; }
+.source-hint { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 25px; padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb, var(--warning) 12%, transparent); color: var(--warning); font-size: 10.5px; }
 .media-preparation.ready { background: color-mix(in srgb, var(--success) 10%, transparent); color: var(--success); }
 .media-preparation.cancelled, .media-preparation.failed { background: color-mix(in srgb, var(--error) 10%, transparent); color: var(--error); }
 .preparation-message { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1069,7 +1312,9 @@ onUnmounted(() => {
 @keyframes media-preparation-spin { to { transform: rotate(360deg); } }
 
 .config-actions { display: flex; gap: 4px; }
-.sip-profile-switcher { display: grid; grid-template-columns: minmax(0, 1fr) 28px 28px; align-items: center; gap: 6px; margin-top: 8px; }
+/* 三列固定:名称输入/下拉 + 「粘贴接入」文字按钮 + 新增图标按钮。
+   列数必须与实际子元素数一致,否则多出来的元素会掉到下一行。 */
+.sip-profile-switcher { display: grid; grid-template-columns: minmax(0, 1fr) auto 28px; align-items: center; gap: 6px; margin-top: 8px; }
 .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
 .config-panel :deep(.n-input--disabled) {
   --n-text-color-disabled: var(--text-secondary) !important;

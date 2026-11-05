@@ -669,6 +669,45 @@ pub struct LiveAvDevice {
     pub name: String,
 }
 
+/// 一台摄像头支持的一种采集模式。
+///
+/// 音视频设置页用它把可选分辨率/帧率限制在设备真实能力内——摄像头不支持
+/// 1920x1080 时，界面就不该让用户选到它，而不是等到启动采集才报错。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveCameraMode {
+    pub width: u32,
+    pub height: u32,
+    pub min_fps: f64,
+    pub max_fps: f64,
+    /// 像素格式或压缩编码(mjpeg / yuyv422 / nv12 …)，仅用于展示与去重。
+    pub format: String,
+}
+
+/// 枚举指定摄像头支持的采集模式。
+///
+/// 与 `list_live_sources` 分开是因为每次探测都要让 FFmpeg 打开一次设备，
+/// 逐个摄像头探测会让设备列表变慢；只在用户进入音视频设置且选定了摄像头时调用。
+pub fn list_camera_modes(camera_index: u32) -> Result<Vec<LiveCameraMode>> {
+    let ffmpeg = ffmpeg_bin().ok_or_else(|| {
+        Error::Media("camera mode probing requires an available FFmpeg platform backend".into())
+    })?;
+    #[cfg(windows)]
+    {
+        let devices = windows_camera::list_devices(&ffmpeg)?;
+        let camera = windows_camera::camera(&devices, camera_index)?;
+        windows_camera::list_modes(&ffmpeg, camera)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        camera_modes::list_modes(&ffmpeg, camera_index)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (ffmpeg, camera_index);
+        Err(Error::Media("当前平台暂不支持查询摄像头采集模式".into()))
+    }
+}
+
 /// Discoverable live inputs. Permission or backend failures are reported per source family so
 /// one unavailable backend does not hide otherwise usable devices.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1826,6 +1865,18 @@ impl LiveSource {
             output_fps = fps,
             "selected supported camera input mode"
         );
+        // 降档不是静默行为:画面会被放大到配置尺寸,实际清晰度受摄像头上限约束。
+        // 留一条 warn,便于用户从日志解释「为什么 1080p 看起来不清」。
+        if (input_mode.width, input_mode.height) != (profile.width, profile.height) {
+            tracing::warn!(
+                video_index,
+                input_width = input_mode.width,
+                input_height = input_mode.height,
+                output_width = profile.width,
+                output_height = profile.height,
+                "摄像头不支持配置的输出分辨率，已按最接近的受支持尺寸采集并缩放补齐"
+            );
+        }
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let mut command = common::hidden_command(&ffmpeg);
         #[cfg(target_os = "macos")]
@@ -1844,6 +1895,7 @@ impl LiveSource {
             },
             audio_device.map(|device| device.input_name.as_str()),
             &profile,
+            (input_mode.width, input_mode.height),
             &input_mode.input_args,
         );
         let stop_flag = Arc::new(AtomicBool::new(false));

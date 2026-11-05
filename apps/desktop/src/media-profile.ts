@@ -38,6 +38,118 @@ export const MEDIA_RESOLUTIONS = [
 ] as const;
 
 export const MEDIA_FPS_OPTIONS = [15, 20, 25, 30] as const;
+
+/** 摄像头实际支持的一种采集模式（由后端 FFmpeg 探测得出）。 */
+export interface CameraMode {
+  width: number;
+  height: number;
+  min_fps: number;
+  max_fps: number;
+  format: string;
+}
+
+export interface CameraResolutionOption {
+  label: string;
+  width: number;
+  height: number;
+  /** 该分辨率下摄像头能给出的最高帧率；0 表示未知。 */
+  max_fps: number;
+}
+
+/**
+ * 摄像头支持的分辨率，与平台支持的输出分辨率取交集。
+ *
+ * `modes` 为 `null` 表示能力未知（未选摄像头 / 探测失败），此时退回通用档位——
+ * 宁可让用户看到完整选项，也不要因为一次探测失败把设置页锁死。
+ */
+export function cameraResolutionOptions(modes: readonly CameraMode[] | null): CameraResolutionOption[] {
+  if (!modes || modes.length === 0) {
+    return MEDIA_RESOLUTIONS.map((item) => ({ ...item, max_fps: 0 }));
+  }
+  return MEDIA_RESOLUTIONS
+    .map((item) => ({
+      ...item,
+      max_fps: cameraMaxFps(modes, item.width, item.height) ?? 0,
+    }))
+    .filter((item) => item.max_fps > 0);
+}
+
+/** 指定分辨率下摄像头能给出的最高帧率；设备不支持该尺寸时返回 null。 */
+export function cameraMaxFps(
+  modes: readonly CameraMode[] | null,
+  width: number,
+  height: number,
+): number | null {
+  if (!modes || modes.length === 0) return null;
+  const matched = modes.filter((mode) => mode.width === width && mode.height === height);
+  if (matched.length === 0) return null;
+  return matched.reduce((best, mode) => Math.max(best, mode.max_fps), 0);
+}
+
+/** 指定分辨率下可选的帧率：只保留摄像头能达到的档位。 */
+export function cameraFpsOptions(
+  modes: readonly CameraMode[] | null,
+  width: number,
+  height: number,
+): number[] {
+  const maxFps = cameraMaxFps(modes, width, height);
+  if (maxFps === null) return [...MEDIA_FPS_OPTIONS];
+  const allowed = MEDIA_FPS_OPTIONS.filter((fps) => fps <= maxFps + 0.001);
+  // 设备最高帧率低于最低档位(如只有 10 fps)时，至少保留一个可选项。
+  return allowed.length > 0 ? allowed : [Math.max(1, Math.floor(maxFps))];
+}
+
+/** 摄像头是否支持该输出分辨率。能力未知时不拦截。 */
+export function cameraSupportsResolution(
+  modes: readonly CameraMode[] | null,
+  width: number,
+  height: number,
+): boolean {
+  if (!modes || modes.length === 0) return true;
+  return cameraMaxFps(modes, width, height) !== null;
+}
+
+/**
+ * 把草稿收敛到摄像头能力范围内。
+ *
+ * 已保存的配置可能来自另一台设备（或手改过的配置文件），载入时若超出当前摄像头
+ * 能力，必须在保存前纠正，否则用户只能在启动采集时拿到一个采集失败。
+ * 返回 `null` 表示无需改动。
+ */
+export function clampToCamera(
+  profile: MediaProfile,
+  modes: readonly CameraMode[] | null,
+): { profile: MediaProfile; notice: string } | null {
+  if (!modes || modes.length === 0) return null;
+  const options = cameraResolutionOptions(modes);
+  if (options.length === 0) return null;
+
+  const next = cloneMediaProfile(profile);
+  const notices: string[] = [];
+  if (!cameraSupportsResolution(modes, next.width, next.height)) {
+    const target = options.reduce((best, item) =>
+      item.width * item.height > best.width * best.height ? item : best,
+    );
+    notices.push(`摄像头不支持 ${next.width}×${next.height}，已改为 ${target.label}`);
+    next.width = target.width;
+    next.height = target.height;
+  }
+
+  const fpsOptions = cameraFpsOptions(modes, next.width, next.height);
+  const maxFps = Math.max(...fpsOptions);
+  if (next.video_fps > maxFps) {
+    notices.push(`摄像头最高 ${maxFps} FPS，帧率已从 ${next.video_fps} 调整为 ${maxFps}`);
+    next.video_fps = maxFps;
+  }
+  return notices.length > 0 ? { profile: next, notice: notices.join("；") } : null;
+}
+
+/** 从媒体源 URI 里取出摄像头索引；不是摄像头源时返回 null。 */
+export function liveSourceCameraIndex(source: string): number | null {
+  const match = /^live:camera:(\d+)(?:\?|$)/.exec(source.trim());
+  return match ? Number(match[1]) : null;
+}
+
 export const MEDIA_BITRATE_OPTIONS = [600, 1200, 2000, 4000, 6000, 8000] as const;
 export const MEDIA_GOP_OPTIONS = [1, 2, 4] as const;
 export const MEDIA_VIDEO_CODECS: readonly { label: string; value: MediaVideoCodec }[] = [
