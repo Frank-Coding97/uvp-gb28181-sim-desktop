@@ -2097,6 +2097,68 @@ pub fn run() {
             if let Some(path) = &log_path {
                 tracing::info!(path = %path.display(), "日志文件已接续");
             }
+
+            // 开发期首屏自愈。
+            //
+            // 开发时窗口加载的是 devUrl（http://127.0.0.1:1420，已固定 IPv4，避免
+            // localhost 在 Windows 上解析到 ::1 造成导航 ERR_ABORTED），由另一个进程
+            // （npm run dev）提供。窗口可能早于 Vite 的模块图就绪就完成一次导航：
+            // index.html 拿到了，但 /src/main.ts 及其依赖没执行，页面就停在
+            // "无样式裸 DOM / 全白"。Tauri 不会重试导航，所以这里补一次。
+            //
+            // 关键约束：**只在页面确实没有进展时才重载**。
+            // 2026-11-05 实测：调试器拉起时首个导航可能整体冻结 60s 以上，
+            // 旧版本按固定间隔（3/4/6/8/10s）探活并 reload，5 次重载全部落在
+            // 冻结窗口里排队，解冻后一起执行，反而中断了 22 个正常请求。
+            // 现在改成页面内自驱：看 resource 计数，连续 30s 不增长才判定卡死，
+            // 且最多重载 3 次。发布构建不编译这段代码。
+            #[cfg(debug_assertions)]
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    // 多次注入是幂等的（页面内用 __uvpFirstPaintGuard 去重），
+                    // 这样即使第一次注入落在 about:blank 上，导航后还能补上。
+                    for delay_ms in [3_000u64, 7_000, 12_000] {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        let Some(window) = handle.get_webview_window("main") else {
+                            continue;
+                        };
+                        let _ = window.eval(
+                            r#"(function () {
+  try {
+    if (window.__uvpFirstPaintGuard) return;
+    window.__uvpFirstPaintGuard = true;
+    var TICK = 5000, GRACE_TICKS = 3, STALL_TICKS = 6, MAX_RELOAD = 3;
+    var ticks = 0, stalled = 0, lastRes = -1;
+    var reloads = parseInt(sessionStorage.getItem('uvp.reload_guard') || '0', 10) || 0;
+    var timer = setInterval(function () {
+      ticks++;
+      var app = document.getElementById('app');
+      if (app && app.children.length > 0 && document.styleSheets.length > 0) {
+        sessionStorage.removeItem('uvp.reload_guard');
+        clearInterval(timer);
+        return;
+      }
+      var res = performance.getEntriesByType('resource').length;
+      if (res > lastRes) { lastRes = res; stalled = 0; } else { stalled++; }
+      if (ticks < GRACE_TICKS || stalled < STALL_TICKS) return;
+      if (reloads >= MAX_RELOAD) {
+        console.warn('[uvp] 首屏连续 ' + MAX_RELOAD + ' 次未就绪，停止自动重载');
+        clearInterval(timer);
+        return;
+      }
+      reloads++;
+      sessionStorage.setItem('uvp.reload_guard', String(reloads));
+      console.warn('[uvp] 首屏 ' + (stalled * TICK / 1000) + 's 无新资源，自动重载第 ' + reloads + ' 次');
+      location.reload();
+    }, TICK);
+  } catch (e) {}
+})();"#,
+                        );
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
