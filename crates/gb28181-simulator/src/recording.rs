@@ -127,7 +127,7 @@ impl RecordingFinalizer for FfmpegRecordingFinalizer {
     fn finalize(&self, input: &Path, output: &Path, fps: u32) -> Result<()> {
         let ffmpeg = media_rtp::ffmpeg_bin()
             .ok_or_else(|| Error::Media("未找到 ffmpeg，无法收尾录像".into()))?;
-        let result = std::process::Command::new(ffmpeg)
+        let result = common::hidden_command(ffmpeg)
             .args(["-y", "-framerate"])
             .arg(fps.max(1).to_string())
             .arg("-i")
@@ -157,7 +157,7 @@ impl RecordingFinalizer for FfmpegRecordingFinalizer {
     ) -> Result<()> {
         let ffmpeg = media_rtp::ffmpeg_bin()
             .ok_or_else(|| Error::Media("未找到 ffmpeg，无法收尾录像".into()))?;
-        let mut command = std::process::Command::new(ffmpeg);
+        let mut command = common::hidden_command(ffmpeg);
         command
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(input)
@@ -235,7 +235,7 @@ struct ProbedRecordingAudio {
 fn probe_recording_audio(path: &Path) -> Result<ProbedRecordingAudio> {
     let ffprobe = recording_ffprobe_bin()
         .ok_or_else(|| Error::Media("未找到 ffprobe，无法验证录像音轨".into()))?;
-    let result = std::process::Command::new(ffprobe)
+    let result = common::hidden_command(ffprobe)
         .args([
             "-v",
             "error",
@@ -296,7 +296,7 @@ fn recording_ffprobe_bin() -> Option<PathBuf> {
             return Some(sibling);
         }
     }
-    std::process::Command::new("sh")
+    common::hidden_command("sh")
         .args(["-c", "command -v ffprobe"])
         .output()
         .ok()
@@ -1367,7 +1367,7 @@ mod tests {
         let alaw_path = root.join("source.alaw");
         let input_path = root.join("capture.ps.part");
         let output_path = root.join("capture.mp4");
-        let video = std::process::Command::new(&ffmpeg_path)
+        let video = common::hidden_command(&ffmpeg_path)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1390,7 +1390,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(video.status.success(), "合成 H.264 失败: {:?}", video);
-        let audio = std::process::Command::new(&ffmpeg_path)
+        let audio = common::hidden_command(&ffmpeg_path)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1447,7 +1447,7 @@ mod tests {
         FfmpegRecordingFinalizer
             .finalize_media(&input_path, &output_path, &spec)
             .unwrap();
-        let probe = std::process::Command::new(&ffprobe)
+        let probe = common::hidden_command(&ffprobe)
             .args([
                 "-v",
                 "error",
@@ -1473,7 +1473,7 @@ mod tests {
             report.contains("\"sample_rate\": \"8000\""),
             "采样率不符: {report}"
         );
-        let decoded = std::process::Command::new(&ffmpeg_path)
+        let decoded = common::hidden_command(&ffmpeg_path)
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(&output_path)
             .args(["-f", "null", "-"])
@@ -1503,7 +1503,7 @@ mod tests {
         FfmpegRecordingFinalizer
             .finalize_media(&video_only_input, &pure_video_output, &pure_video_spec)
             .unwrap();
-        let pure_video_probe = std::process::Command::new(&ffprobe)
+        let pure_video_probe = common::hidden_command(&ffprobe)
             .args([
                 "-v",
                 "error",
@@ -1539,7 +1539,7 @@ mod tests {
         let ulaw_path = root.join("source.mulaw");
         let input_path = root.join("capture.ps.part");
         let output_path = root.join("capture.mp4");
-        let video = std::process::Command::new(&ffmpeg_path)
+        let video = common::hidden_command(&ffmpeg_path)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1562,7 +1562,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(video.status.success(), "合成 H.264 失败: {:?}", video);
-        let audio = std::process::Command::new(&ffmpeg_path)
+        let audio = common::hidden_command(&ffmpeg_path)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1634,7 +1634,7 @@ mod tests {
         assert_eq!(probed.codec_name, "aac");
         assert_eq!(probed.sample_rate_hz, Some(8_000));
 
-        let decoded = std::process::Command::new(&ffmpeg_path)
+        let decoded = common::hidden_command(&ffmpeg_path)
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(&output_path)
             .args(["-map", "0:a:0", "-f", "null", "-"])
@@ -1645,7 +1645,7 @@ mod tests {
             "G.711U 录像音频解码失败: {:?}",
             decoded
         );
-        let duration = std::process::Command::new(&ffprobe)
+        let duration = common::hidden_command(&ffprobe)
             .args([
                 "-v",
                 "error",
@@ -1685,7 +1685,7 @@ mod tests {
         let root = temp_root("ffmpeg-aac-rates");
         fs::create_dir_all(&root).unwrap();
         let h264_path = root.join("source.h264");
-        let video = std::process::Command::new(&ffmpeg_path)
+        let video = common::hidden_command(&ffmpeg_path)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1721,7 +1721,7 @@ mod tests {
             let input_path = root.join(format!("capture-{sample_rate_hz}.ps.part"));
             let output_path = root.join(format!("capture-{sample_rate_hz}.mp4"));
             let sample_rate_arg = sample_rate_hz.to_string();
-            let audio = std::process::Command::new(&ffmpeg_path)
+            let audio = common::hidden_command(&ffmpeg_path)
                 .args([
                     "-hide_banner",
                     "-loglevel",
@@ -1784,7 +1784,7 @@ mod tests {
             assert_eq!(probed.codec_name, "aac");
             assert_eq!(probed.sample_rate_hz, Some(sample_rate_hz));
 
-            let decoded = std::process::Command::new(&ffmpeg_path)
+            let decoded = common::hidden_command(&ffmpeg_path)
                 .args(["-hide_banner", "-loglevel", "error", "-i"])
                 .arg(&output_path)
                 .args(["-map", "0:a:0", "-f", "null", "-"])
@@ -1794,7 +1794,7 @@ mod tests {
                 decoded.status.success(),
                 "AAC {sample_rate_hz}Hz 录像音频解码失败: {decoded:?}"
             );
-            let duration = std::process::Command::new(&ffprobe)
+            let duration = common::hidden_command(&ffprobe)
                 .args([
                     "-v",
                     "error",
@@ -1873,7 +1873,7 @@ mod tests {
                 args.extend(["-pix_fmt", "yuv420p"]);
             }
             args.extend(["-f", output_format]);
-            let result = std::process::Command::new(&ffmpeg_path)
+            let result = common::hidden_command(&ffmpeg_path)
                 .args(args)
                 .arg(&video_path)
                 .output()
@@ -1922,7 +1922,7 @@ mod tests {
                 audio_args.extend(["-b:a", "32k"]);
             }
             audio_args.extend(["-f", output_format]);
-            let result = std::process::Command::new(&ffmpeg_path)
+            let result = common::hidden_command(&ffmpeg_path)
                 .args(audio_args)
                 .arg(&audio_path)
                 .output()
@@ -1993,7 +1993,7 @@ mod tests {
                 assert_eq!(audio_probe.codec_name, "aac");
                 assert_eq!(audio_probe.sample_rate_hz, Some(sample_rate_hz));
 
-                let video_probe = std::process::Command::new(&ffprobe)
+                let video_probe = common::hidden_command(&ffprobe)
                     .args([
                         "-v",
                         "error",
@@ -2015,7 +2015,7 @@ mod tests {
                     String::from_utf8_lossy(&video_probe.stdout).trim(),
                     *expected_video_codec
                 );
-                let decoded = std::process::Command::new(&ffmpeg_path)
+                let decoded = common::hidden_command(&ffmpeg_path)
                     .args(["-hide_banner", "-loglevel", "error", "-i"])
                     .arg(&output_path)
                     .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
@@ -2025,7 +2025,7 @@ mod tests {
                     decoded.status.success(),
                     "{video_label}/{audio_label} 录像解码失败: {decoded:?}"
                 );
-                let duration = std::process::Command::new(&ffprobe)
+                let duration = common::hidden_command(&ffprobe)
                     .args([
                         "-v",
                         "error",

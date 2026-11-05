@@ -7,8 +7,10 @@ pub mod clock;
 pub mod error;
 pub mod logging;
 pub mod observer;
+pub mod process;
 pub mod types;
 
 pub use error::{Error, Result};
+pub use process::hidden_command;
 pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver};
 pub use types::{DeviceId, GbVersion, SignalingEncoding, Transport};

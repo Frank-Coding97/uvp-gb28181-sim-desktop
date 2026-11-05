@@ -807,7 +807,7 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
 }
 
 fn detect_audio_encoders(ffmpeg: &str) -> (bool, bool) {
-    let Ok(output) = Command::new(ffmpeg)
+    let Ok(output) = common::hidden_command(ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output()
     else {
@@ -847,7 +847,7 @@ fn ensure_audio_encoder(ffmpeg: &str, codec: LiveAudioCodec) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn enumerate_avfoundation(ffmpeg: &str) -> Result<(Vec<LiveAvDevice>, Vec<LiveAvDevice>)> {
-    let output = Command::new(ffmpeg)
+    let output = common::hidden_command(ffmpeg)
         .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
         .output()
         .map_err(|e| Error::Media(format!("failed to enumerate AVFoundation devices: {e}")))?;
@@ -1827,7 +1827,7 @@ impl LiveSource {
             "selected supported camera input mode"
         );
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
-        let mut command = Command::new(&ffmpeg);
+        let mut command = common::hidden_command(&ffmpeg);
         #[cfg(target_os = "macos")]
         let mut camera_args =
             camera_command_args_for_profile(video_index, audio_index, &profile, input_mode);
@@ -2518,7 +2518,7 @@ impl LiveSource {
                         "H.265 screen encoding requires the bundled FFmpeg executable".into(),
                     )
                 })?;
-                let mut child = Command::new(&ffmpeg)
+                let mut child = common::hidden_command(&ffmpeg)
                     .args(screen_hevc_command_args(&profile))
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -2809,7 +2809,7 @@ impl LiveSource {
                         ensure_audio_encoder(&ffmpeg, audio_codec)?;
                         let label = format!("{source_label} {} encoder", audio_codec.as_str());
                         let sample_rate = profile.audio_sample_rate_hz.to_string();
-                        let mut command = Command::new(&ffmpeg);
+                        let mut command = common::hidden_command(&ffmpeg);
                         command.args([
                             "-hide_banner",
                             "-nostdin",
@@ -2971,7 +2971,7 @@ impl LiveSource {
                 ensure_audio_encoder(&ffmpeg, audio_codec)?;
                 let label = format!("screen microphone index {index}");
                 let input = format!("none:{index}");
-                let mut command = Command::new(&ffmpeg);
+                let mut command = common::hidden_command(&ffmpeg);
                 command.args([
                     "-hide_banner",
                     "-nostdin",
@@ -4204,7 +4204,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn owned_ffmpeg_roles() -> (Vec<u32>, Vec<u32>) {
-        let output = Command::new("/bin/ps")
+        let output = common::hidden_command("/bin/ps")
             .args(["-Ao", "pid=,command="])
             .output()
             .expect("应能读取进程列表");
@@ -4564,7 +4564,7 @@ mod tests {
 
     #[test]
     fn AAC实时输出使用有效采样率和首版码率() {
-        let mut command = Command::new("ffmpeg");
+        let mut command = common::hidden_command("ffmpeg");
         LiveAudioCodec::Aac.append_ffmpeg_output_with_sample_rate(
             &mut command,
             8_000,
@@ -5084,7 +5084,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn owned子进程必须先终止再有界等待reader() {
-        let mut child = Command::new("/bin/cat")
+        let mut child = common::hidden_command("/bin/cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

@@ -48,9 +48,8 @@ pub fn prepare_video_source(path: &str) -> Result<std::path::PathBuf> {
 /// 旁的 `ffmpeg`/`ffmpeg.exe` 及 `resources/` 目录探测。
 pub fn ffmpeg_bin() -> Option<String> {
     use std::path::PathBuf;
-    use std::process::Command;
     let probe = |bin: &str| {
-        Command::new(bin)
+        common::hidden_command(bin)
             .arg("-version")
             .output()
             .map(|o| o.status.success())
@@ -92,7 +91,7 @@ pub fn ffmpeg_bin() -> Option<String> {
         }
     }
     // Windows 上 FFmpeg 通常装在 PATH 之外，或 PATH 是在应用进程启动之后才更新的。
-    // 装完 FFmpeg 后未重启编辑器，子进程继承的仍是旧环境，`Command::new("ffmpeg")`
+    // 装完 FFmpeg 后未重启编辑器，子进程继承的仍是旧环境，`common::hidden_command("ffmpeg")`
     // 就会失败——表现为摄像头列表为空且没有任何提示。这里显式枚举常见安装位置。
     #[cfg(windows)]
     for path in windows_ffmpeg_candidates() {
@@ -165,7 +164,6 @@ fn windows_ffmpeg_candidates() -> Vec<std::path::PathBuf> {
 ///
 /// 发布包缺少 FFmpeg 时应在打包阶段失败；运行时仍返回明确错误，便于开发环境诊断。
 fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
-    use std::process::Command;
 
     // 缓存键:源路径 + 修改时间(mtime),避免源文件更新后用旧缓存。
     let meta = std::fs::metadata(src).map_err(Error::Io)?;
@@ -192,7 +190,7 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     })?;
 
     // ① 无损转封装(copy + h264_mp4toannexb)。
-    let copy_ok = Command::new(&ffmpeg)
+    let copy_ok = common::hidden_command(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -213,7 +211,7 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     // ② 回退:重编码为 H.264 Annex B(兼容任意编码/容器)。
     // HEVC 容器使用不同的 Annex-B bitstream filter；先尝试无损保留
     // H.265，避免历史录像被静默重编码成 H.264 后时间轴/编码声明失真。
-    let hevc_copy_ok = Command::new(&ffmpeg)
+    let hevc_copy_ok = common::hidden_command(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -232,7 +230,7 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
     }
 
     let _ = std::fs::remove_file(&out);
-    let enc = Command::new(&ffmpeg)
+    let enc = common::hidden_command(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -266,7 +264,6 @@ fn ensure_annexb(src: &str) -> Result<std::path::PathBuf> {
 /// 用系统 ffmpeg(`-vn -c:a pcm_alaw -ar 8000 -ac 1 -f alaw`),结果按源路径+mtime 缓存。
 /// ffmpeg 缺失或无音频轨时返回空(调用方据此退化为纯视频)。
 fn extract_g711a(src: &str) -> Result<Vec<u8>> {
-    use std::process::Command;
 
     let meta = std::fs::metadata(src).map_err(Error::Io)?;
     let mtime = meta
@@ -287,7 +284,7 @@ fn extract_g711a(src: &str) -> Result<Vec<u8>> {
         return Ok(Vec::new()); // 无 ffmpeg:静默退化为纯视频。
     };
 
-    let res = Command::new(&ffmpeg)
+    let res = common::hidden_command(&ffmpeg)
         .args([
             "-y", "-i", src, "-vn", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1", "-f", "alaw",
         ])
@@ -610,7 +607,7 @@ pub fn frame_to_jpeg(frame: &Frame, codec: crate::ps::VideoCodec) -> Result<Vec<
     let input = std::env::temp_dir().join(format!("uvp-snapshot-{nonce}.{suffix}"));
     let output = std::env::temp_dir().join(format!("uvp-snapshot-{nonce}.jpg"));
     std::fs::write(&input, &frame.data)?;
-    let result = std::process::Command::new(ffmpeg)
+    let result = common::hidden_command(ffmpeg)
         .args(["-y", "-f", input_format, "-i"])
         .arg(&input)
         .args(["-frames:v", "1", "-f", "image2"])
@@ -1037,7 +1034,6 @@ fn looks_like_annexb(path: &std::path::Path) -> bool {
 
 fn history_ffprobe_bin() -> Option<String> {
     use std::path::PathBuf;
-    use std::process::Command;
     let mut candidates = Vec::<PathBuf>::new();
     if let Ok(path) = std::env::var("FFPROBE_BIN") {
         candidates.push(PathBuf::from(path));
@@ -1073,7 +1069,7 @@ fn history_ffprobe_bin() -> Option<String> {
     ]);
     candidates.into_iter().find_map(|candidate| {
         let executable = candidate.to_string_lossy().into_owned();
-        Command::new(&executable)
+        common::hidden_command(&executable)
             .arg("-version")
             .output()
             .ok()
@@ -1083,10 +1079,9 @@ fn history_ffprobe_bin() -> Option<String> {
 }
 
 fn run_history_ffprobe(path: &str, args: &[&str]) -> Result<serde_json::Value> {
-    use std::process::Command;
     let ffprobe = history_ffprobe_bin()
         .ok_or_else(|| Error::Media(format!("历史录像需要 ffprobe 读取源时间戳: {path}")))?;
-    let output = Command::new(ffprobe)
+    let output = common::hidden_command(ffprobe)
         .args(["-v", "error"])
         .args(args)
         .arg(path)
@@ -1386,7 +1381,6 @@ fn extract_historical_audio(
     codec: crate::ps::AudioCodec,
     packets: &[(i128, u64, u32, u32, usize)],
 ) -> Result<Vec<Vec<u8>>> {
-    use std::process::Command;
     let ffmpeg = ffmpeg_bin()
         .ok_or_else(|| Error::Media(format!("历史录像包含音频，需要 ffmpeg 抽取编码包: {path}")))?;
     let nonce = now_ms().wrapping_add(rand::random::<u32>() as u64);
@@ -1397,7 +1391,7 @@ fn extract_historical_audio(
         crate::ps::AudioCodec::Opus => ("data", "opus"),
     };
     let output_path = std::env::temp_dir().join(format!("uvp-history-audio-{nonce}.{suffix}"));
-    let output = Command::new(ffmpeg)
+    let output = common::hidden_command(ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(path)
         .args([
@@ -2006,7 +2000,7 @@ mod obsolete_live {
         /// 完整保留原有代码逻辑,方便切换对比。
         pub fn capture_ffmpeg(input: &str, fps: u32) -> Result<Self> {
             use std::io::Read;
-            use std::process::{Command, Stdio};
+            use std::process::Stdio;
 
             let ffmpeg = ffmpeg_bin().ok_or_else(|| {
                 Error::Media(
@@ -2033,7 +2027,7 @@ mod obsolete_live {
             };
 
             let vf_scale = "scale=min(1280\\,iw):min(720\\,ih):force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2";
-            let mut child = Command::new(&ffmpeg)
+            let mut child = common::hidden_command(&ffmpeg)
                 .args([
                     "-f",
                     fmt,
@@ -2298,7 +2292,7 @@ mod tests {
         // 不强求装了 ffmpeg;只验证查找逻辑健壮(PATH + 绝对路径探测)不 panic,
         // 且返回值要么 None 要么是真能跑 -version 的路径。
         if let Some(bin) = ffmpeg_bin() {
-            let ok = std::process::Command::new(&bin)
+            let ok = common::hidden_command(&bin)
                 .arg("-version")
                 .output()
                 .map(|o| o.status.success())
@@ -2506,7 +2500,6 @@ mod tests {
     #[test]
     #[ignore = "需系统 ffmpeg + ffprobe；验证历史 MP4 的源 PTS 与 AAC 音频事件"]
     fn 历史MP4按源PTS保留AAC事件() {
-        use std::process::Command;
 
         let ffmpeg = ffmpeg_bin().expect("需要 ffmpeg");
         assert!(history_ffprobe_bin().is_some(), "需要 ffprobe");
@@ -2515,7 +2508,7 @@ mod tests {
             now_ms(),
             rand::random::<u32>()
         ));
-        let output = Command::new(&ffmpeg)
+        let output = common::hidden_command(&ffmpeg)
             .args([
                 "-hide_banner",
                 "-loglevel",

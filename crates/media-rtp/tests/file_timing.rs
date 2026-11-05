@@ -4,7 +4,7 @@ use media_rtp::{ffmpeg_bin, MediaEvent, VideoSource};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -658,7 +658,7 @@ fn locate_ffprobe(ffmpeg: &str) -> Option<String> {
         PathBuf::from("/usr/bin/ffprobe"),
     ]);
     candidates.into_iter().find_map(|candidate| {
-        let output = Command::new(&candidate).arg("-version").output().ok()?;
+        let output = common::hidden_command(&candidate).arg("-version").output().ok()?;
         output
             .status
             .success()
@@ -711,7 +711,7 @@ fn first_frame_pts(ffprobe: &str, input: &Path, selector: &str, label: &str) -> 
 }
 
 fn probe_json(ffprobe: &str, args: Vec<&str>, input: &Path, label: &str) -> Value {
-    let output = Command::new(ffprobe)
+    let output = common::hidden_command(ffprobe)
         .args(args)
         .arg(input)
         .output()
@@ -726,7 +726,7 @@ fn probe_json(ffprobe: &str, args: Vec<&str>, input: &Path, label: &str) -> Valu
 }
 
 fn run_checked(program: &str, args: &[String], label: &str) {
-    let output = Command::new(program)
+    let output = common::hidden_command(program)
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("{label} 启动失败：{error}"));

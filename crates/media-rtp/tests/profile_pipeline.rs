@@ -6,7 +6,7 @@ use std::any::Any;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -1278,7 +1278,7 @@ fn decode_raw(
         "null".into(),
         "-".into(),
     ]);
-    let output = Command::new(ffmpeg)
+    let output = common::hidden_command(ffmpeg)
         .args(&args)
         .output()
         .unwrap_or_else(|error| panic!("启动 {kind} 解码失败：{error}"));
@@ -1327,7 +1327,7 @@ fn assert_source_has_motion(ffmpeg: &str, source: &Path) -> Vec<String> {
         "framemd5".into(),
         "-".into(),
     ];
-    let output = Command::new(ffmpeg)
+    let output = common::hidden_command(ffmpeg)
         .args(&args)
         .output()
         .expect("启动运动画面校验失败");
@@ -1403,7 +1403,7 @@ fn locate_ffprobe(ffmpeg: &str) -> Option<String> {
         PathBuf::from("/usr/bin/ffprobe"),
     ]);
     candidates.into_iter().find_map(|candidate| {
-        let output = Command::new(&candidate).arg("-version").output().ok()?;
+        let output = common::hidden_command(&candidate).arg("-version").output().ok()?;
         output
             .status
             .success()
@@ -1420,7 +1420,7 @@ fn probe_json(ffprobe: &str, args: &[String], input: &Path, operation: &str) -> 
 }
 
 fn run_checked(program: &str, args: &[String], operation: &str) -> Output {
-    let output = Command::new(program)
+    let output = common::hidden_command(program)
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("{operation}启动失败：{error}"));
@@ -1472,7 +1472,7 @@ fn video_codec_name(codec: MediaVideoCodec) -> &'static str {
 }
 
 fn tool_version(tool: &str) -> String {
-    let output = Command::new(tool)
+    let output = common::hidden_command(tool)
         .arg("-version")
         .output()
         .unwrap_or_else(|error| panic!("读取媒体工具版本失败：{error}"));

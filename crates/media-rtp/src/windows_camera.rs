@@ -40,7 +40,7 @@ pub(super) struct WindowsCameraInputMode {
 
 /// Enumerate DirectShow video and audio devices.
 pub(super) fn list_devices(ffmpeg: &str) -> Result<WindowsCameraDevices> {
-    let mut command = Command::new(ffmpeg);
+    let mut command = common::hidden_command(ffmpeg);
     command.args([
         "-hide_banner",
         "-nostdin",
@@ -88,7 +88,7 @@ pub(super) fn probe_mode(
         )));
     }
     let input = format!("video={}", camera.input_name);
-    let mut command = Command::new(ffmpeg);
+    let mut command = common::hidden_command(ffmpeg);
     command.args([
         "-hide_banner",
         "-nostdin",

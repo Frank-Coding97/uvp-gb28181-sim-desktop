@@ -169,9 +169,9 @@ fn windows_camera_real_capture_profile_pause_resume_and_release() {
     }
     // Decode metadata from the actual JPEG without writing camera imagery to disk.
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let probe = std::env::var("UVP_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into());
-    let mut child = Command::new(probe)
+    let mut child = common::hidden_command(probe)
         .args([
             "-v",
             "error",

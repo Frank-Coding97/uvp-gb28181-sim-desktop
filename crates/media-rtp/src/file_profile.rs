@@ -5,7 +5,6 @@ mod tests {
     use crate::source::MediaEvent;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::atomic::AtomicBool;
 
     fn ffmpeg() -> Option<String> {
@@ -24,7 +23,7 @@ mod tests {
 
     fn make_synthetic_input(path: &Path) {
         let ffmpeg = ffmpeg().expect("测试需要可用的 ffmpeg");
-        let output = Command::new(ffmpeg)
+        let output = common::hidden_command(ffmpeg)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1168,7 +1167,7 @@ fn transcode_source(
         MediaVideoCodec::H264 => "libx264",
         MediaVideoCodec::H265 => "libx265",
     };
-    let mut command = Command::new(ffmpeg);
+    let mut command = common::hidden_command(ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
     command.arg(source);
     command.args([
@@ -1236,7 +1235,7 @@ fn extract_video(
         MediaVideoCodec::H264 => ("h264", "h264_mp4toannexb"),
         MediaVideoCodec::H265 => ("hevc", "hevc_mp4toannexb"),
     };
-    let mut command = Command::new(ffmpeg);
+    let mut command = common::hidden_command(ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
     command.arg(container);
     command.args([
@@ -1265,7 +1264,7 @@ fn extract_audio(
         MediaAudioCodec::G711U => ("mulaw", "pcm_mulaw"),
         MediaAudioCodec::Aac => ("adts", "aac"),
     };
-    let mut command = Command::new(ffmpeg);
+    let mut command = common::hidden_command(ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
     command.arg(container);
     command.args(["-map", "0:a:0", "-c:a", "copy", "-f", format]);
@@ -1707,7 +1706,7 @@ fn run_probe<const N: usize>(
     cancel: &AtomicBool,
 ) -> Result<Value, String> {
     check_cancel(cancel)?;
-    let mut child = Command::new(ffprobe)
+    let mut child = common::hidden_command(ffprobe)
         .args(args)
         .arg(input)
         .stdout(Stdio::piped())
@@ -2141,7 +2140,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
 }
 
 fn tool_identity(path: &str) -> Result<String, String> {
-    let output = Command::new(path)
+    let output = common::hidden_command(path)
         .arg("-version")
         .output()
         .map_err(|error| format!("读取媒体工具版本失败: {error}"))?;
@@ -2198,7 +2197,7 @@ fn ffprobe_bin() -> Option<String> {
         PathBuf::from("/usr/bin/ffprobe"),
     ]);
     candidates.into_iter().find_map(|candidate| {
-        let output = Command::new(&candidate).arg("-version").output().ok()?;
+        let output = common::hidden_command(&candidate).arg("-version").output().ok()?;
         output
             .status
             .success()

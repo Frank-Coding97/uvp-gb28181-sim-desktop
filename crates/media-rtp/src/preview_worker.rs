@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -717,14 +719,14 @@ impl PreviewAttempt {
                 .take()
                 .ok_or_else(|| "preview test command was already consumed".to_string())?
         } else {
-            Command::new(ffmpeg)
+            common::hidden_command(ffmpeg)
         };
         #[cfg(test)]
         if !has_command_override {
             command.args(&args);
         }
         #[cfg(not(test))]
-        let mut command = Command::new(ffmpeg);
+        let mut command = common::hidden_command(ffmpeg);
         #[cfg(not(test))]
         command.args(&args);
         let mut child = command
@@ -1435,7 +1437,7 @@ mod tests {
         let Some(ffmpeg) = crate::source::ffmpeg_bin() else {
             return;
         };
-        let output = Command::new(&ffmpeg)
+        let output = common::hidden_command(&ffmpeg)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1555,7 +1557,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows隐藏期间大输入不会阻塞supervisor回收decoder() {
-        let mut command = Command::new("powershell.exe");
+        let mut command = common::hidden_command("powershell.exe");
         command.args([
             "-NoProfile",
             "-NonInteractive",
@@ -1588,7 +1590,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows停读期间单个大输入按写入期限回收decoder() {
-        let mut command = Command::new("powershell.exe");
+        let mut command = common::hidden_command("powershell.exe");
         command.args([
             "-NoProfile",
             "-NonInteractive",
@@ -1672,7 +1674,7 @@ mod tests {
         let Some(ffmpeg) = crate::source::ffmpeg_bin() else {
             return;
         };
-        let output = Command::new(&ffmpeg)
+        let output = common::hidden_command(&ffmpeg)
             .args([
                 "-hide_banner",
                 "-loglevel",

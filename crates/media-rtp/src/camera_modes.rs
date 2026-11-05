@@ -2,7 +2,7 @@
 
 use common::{Error, Result};
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,7 +99,7 @@ pub(super) fn probe_camera_mode(
 fn probe_modes(ffmpeg: &str, index: u32, timeout: Duration) -> Result<Vec<CameraModeRange>> {
     // FFmpeg's AVFoundation backend has no list_formats option. An unsupported
     // input size enumerates all formats and exits before starting frame capture.
-    let mut child = Command::new(ffmpeg)
+    let mut child = common::hidden_command(ffmpeg)
         .args([
             "-hide_banner",
             "-nostdin",
