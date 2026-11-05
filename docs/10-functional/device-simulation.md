@@ -91,11 +91,13 @@
 
 平台下发 `Broadcast` 通知后,设备以 UAC 身份反向 INVITE,`s=Broadcast`、`a=recvonly`、PCMA/PCMU;平台 200 OK 给出媒体地址后回 ACK,并按 `audio_transport` 收流:
 
-| 音频流传输 | offer | 收流方式 |
+| 对讲流传输模式 | offer | 收流方式 |
 |---|---|---|
 | UDP | `m=audio <port> RTP/AVP 8 0` | 绑定 UDP 端口收 RTP |
 | TCP 主动 | `m=audio <port> TCP/RTP/AVP 8 0` + `a=setup:active` | 收到 answer 后由设备 connect 平台 |
 | TCP 被动 | 同上 + `a=setup:passive` | 设备监听,等平台连入 |
+
+默认选择 **TCP 主动**(设备连平台),适合设备位于 NAT 后、平台侧可被动监听的环境;平台与设备直连时可改用 UDP 或 TCP 被动。
 
 RTP 按 RFC 4571 解帧(TCP),G.711A/U 解码为 8kHz 单声道 PCM;桌面端经 `broadcast_audio` 事件交给前端 Web Audio 播放,状态(通道/传输/包数)经 `broadcast_state` 显示在首页。平台 BYE 或设备下线时释放端口并尽力回 BYE。
 

@@ -179,7 +179,7 @@ const draft = reactive({
   password: "",
   device_id: "",
   transport: "UDP" as "UDP" | "TCP",
-  audio_transport: "UDP" as AudioTransport,
+  audio_transport: "TCP_ACTIVE" as AudioTransport,
 });
 const serverDomainManuallyEdited = ref(false);
 
@@ -209,15 +209,15 @@ const mediaModes = [
   { value: "file", label: "视频文件", icon: DocumentOutline },
 ] as const;
 const signalingTransportOptions = [
-  { label: "UDP（共享 socket）", value: "UDP" },
-  { label: "TCP（共享连接池）", value: "TCP" },
-];
-// 音频流传输独立于信令:语音广播/对讲下行的 RTP 走哪条路。
+  { label: "UDP", value: "UDP" },
+  { label: "TCP", value: "TCP" },
+] as const;
+// 对讲流传输独立于信令:语音广播/对讲下行的 RTP 走哪条路。
 const audioTransportOptions = [
-  { label: "UDP（兼容性最好）", value: "UDP" },
-  { label: "TCP 主动（设备连平台）", value: "TCP_ACTIVE" },
-  { label: "TCP 被动（设备监听，平台连入）", value: "TCP_PASSIVE" },
-];
+  { label: "UDP", value: "UDP" },
+  { label: "TCP 主动", value: "TCP_ACTIVE" },
+  { label: "TCP 被动", value: "TCP_PASSIVE" },
+] as const;
 const sipProfileOptions = computed(() =>
   profiles.value.map((profile) => ({ label: profile.name, value: profile.id })),
 );
@@ -314,7 +314,7 @@ function resetDraft() {
     draft.server_domain = active.value.server_domain;
     draft.password = active.value.password;
     draft.transport = active.value.transport;
-    draft.audio_transport = active.value.audio_transport ?? "UDP";
+    draft.audio_transport = active.value.audio_transport ?? "TCP_ACTIVE";
   }
   draft.device_id = config.value?.device.device_id ?? form.value.device_id;
   serverDomainManuallyEdited.value = false;
@@ -358,7 +358,7 @@ async function addSipProfile() {
       server_domain: source?.server_domain ?? "3402000000",
       password: "",
       transport: source?.transport ?? "UDP",
-      audio_transport: source?.audio_transport ?? "UDP",
+      audio_transport: source?.audio_transport ?? "TCP_ACTIVE",
       gb_version: source?.gb_version ?? "V2022",
       signaling_encoding: source?.signaling_encoding ?? "Gb18030",
     });
@@ -475,7 +475,7 @@ async function applyProvision(allowInsecure: boolean) {
       name,
       gb_version: active.value?.gb_version ?? "V2022",
       signaling_encoding: active.value?.signaling_encoding ?? "Gb18030",
-      audio_transport: "UDP",
+      audio_transport: "TCP_ACTIVE",
       ...patch,
     });
     // 落盘后 active 已切到新配置,再进编辑态让用户核对/微调。
@@ -918,6 +918,7 @@ onUnmounted(() => {
             v-if="editing"
             v-model:value="draft.name"
             size="medium"
+            clearable
             aria-label="配置名称"
             placeholder="例如 本地平台"
           />
@@ -959,55 +960,104 @@ onUnmounted(() => {
           <label class="field wide">
             <span>服务器</span>
             <div class="host-port">
-              <n-input v-model:value="draft.server_host" size="medium" :disabled="!editing" placeholder="例如 192.168.1.100" />
-              <n-input-number v-model:value="draft.server_port" size="medium" :disabled="!editing" :min="1" :max="65535" :show-button="false" placeholder="5060" />
+              <n-input v-model:value="draft.server_host" size="medium" clearable :disabled="!editing" placeholder="例如 192.168.1.100" />
+              <n-input-number v-model:value="draft.server_port" size="medium" clearable :disabled="!editing" :min="1" :max="65535" :show-button="false" placeholder="5060" />
             </div>
           </label>
-          <label class="field wide">
+          <label class="field">
             <span>服务器 ID</span>
             <n-input
               :value="draft.server_id"
               size="medium"
+              clearable
               :disabled="!editing"
               maxlength="20"
               placeholder="例如 34020000002000000001"
               @update:value="updateServerId"
-            />
+            >
+              <template #suffix>
+                <span class="char-count">{{ draft.server_id.length }}/20</span>
+              </template>
+            </n-input>
           </label>
           <label class="field">
             <span>服务器域</span>
             <n-input
               :value="draft.server_domain"
               size="medium"
+              clearable
               :disabled="!editing"
               maxlength="10"
               placeholder="例如 3402000000"
               @update:value="updateServerDomain"
-            />
+            >
+              <template #suffix>
+                <span class="char-count">{{ draft.server_domain.length }}/10</span>
+              </template>
+            </n-input>
           </label>
-          <label class="field">
+          <div class="field wide">
             <span>信令传输</span>
-            <n-select v-model:value="draft.transport" size="medium" :disabled="!editing" :options="signalingTransportOptions" />
-          </label>
+            <div class="transport-cards" role="radiogroup" aria-label="信令传输">
+              <button
+                v-for="option in signalingTransportOptions"
+                :key="option.value"
+                type="button"
+                role="radio"
+                class="transport-card"
+                :class="{ selected: draft.transport === option.value }"
+                :aria-checked="draft.transport === option.value"
+                :disabled="!editing"
+                @click="draft.transport = option.value"
+              >
+                <span class="transport-card-title">
+                  <n-icon v-if="draft.transport === option.value"><CheckmarkCircleOutline /></n-icon>
+                  {{ option.label }}
+                </span>
+              </button>
+            </div>
+          </div>
           <label class="field wide">
             <span>设备 ID</span>
             <n-input
               :value="draft.device_id"
               size="medium"
+              clearable
               :disabled="!editing"
               maxlength="20"
               placeholder="例如 34020000001310000001"
               @update:value="updateDeviceId"
-            />
+            >
+              <template #suffix>
+                <span class="char-count">{{ draft.device_id.length }}/20</span>
+              </template>
+            </n-input>
           </label>
           <label class="field wide">
             <span>注册密码</span>
-            <n-input v-model:value="draft.password" size="medium" :disabled="!editing" type="password" show-password-on="click" placeholder="上级平台配置的 SIP 密码" />
+            <n-input v-model:value="draft.password" size="medium" clearable :disabled="!editing" type="password" show-password-on="click" placeholder="上级平台配置的 SIP 密码" />
           </label>
-          <label class="field wide">
-            <span>音频流传输（语音广播 / 对讲下行）</span>
-            <n-select v-model:value="draft.audio_transport" size="medium" :disabled="!editing" :options="audioTransportOptions" />
-          </label>
+          <div class="field wide">
+            <span>对讲流传输模式</span>
+            <div class="transport-cards" role="radiogroup" aria-label="对讲流传输模式">
+              <button
+                v-for="option in audioTransportOptions"
+                :key="option.value"
+                type="button"
+                role="radio"
+                class="transport-card"
+                :class="{ selected: draft.audio_transport === option.value }"
+                :aria-checked="draft.audio_transport === option.value"
+                :disabled="!editing"
+                @click="draft.audio_transport = option.value"
+              >
+                <span class="transport-card-title">
+                  <n-icon v-if="draft.audio_transport === option.value"><CheckmarkCircleOutline /></n-icon>
+                  {{ option.label }}
+                </span>
+              </button>
+            </div>
+          </div>
         </div>
 
         <div class="primary-actions">
@@ -1091,6 +1141,7 @@ onUnmounted(() => {
           <n-input
             v-model:value="provisionName"
             size="medium"
+            clearable
             maxlength="40"
             :disabled="provisionBusy"
             placeholder="例如 会议室模拟器"
@@ -1102,6 +1153,7 @@ onUnmounted(() => {
             v-model:value="provisionLink"
             type="textarea"
             :rows="2"
+            clearable
             :disabled="provisionBusy"
             placeholder="https://gb28181.example.com/gb28181/qr#t=..."
           />
@@ -1276,6 +1328,33 @@ onUnmounted(() => {
 .field { display: grid; gap: 3px; min-width: 0; }
 .field.wide { grid-column: 1 / -1; }
 .field > span { color: var(--text-tertiary); font-size: 10px; }
+.transport-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; }
+.transport-card {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding: 7px 9px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: transparent;
+  transition: border-color .15s, background .15s;
+}
+.transport-card:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-primary, #2f7cf6) 55%, var(--border-default));
+}
+.transport-card.selected {
+  border-color: var(--accent-primary, #2f7cf6);
+  background: color-mix(in srgb, var(--accent-primary, #2f7cf6) 9%, transparent);
+}
+.transport-card:disabled { opacity: .65; cursor: not-allowed; }
+.transport-card:focus-visible { outline: 2px solid var(--accent-primary, #2f7cf6); outline-offset: 1px; }
+.transport-card-title { display: flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; }
+.transport-card-title .n-icon { color: var(--accent-primary, #2f7cf6); font-size: 14px; }
+.char-count { color: var(--text-tertiary); font-size: 10px; font-variant-numeric: tabular-nums; }
 .host-port { display: grid; grid-template-columns: minmax(0, 1fr) 78px; gap: 6px; }
 .primary-actions { display: grid; grid-template-columns: minmax(0, 1fr); margin-top: 10px; }
 .broadcast-indicator {

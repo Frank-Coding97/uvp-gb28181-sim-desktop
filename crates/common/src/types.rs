@@ -27,17 +27,18 @@ impl fmt::Display for Transport {
 
 /// 音频流(语音广播/对讲下行)的媒体传输方式。
 ///
-/// 与信令传输 [`Transport`] 相互独立:信令固定走 UDP,音频可以单独选择
-/// UDP / TCP 主动 / TCP 被动。语义对齐移动端模拟器的 `AudioTransportType`:
-/// - `TcpActive`:设备是 TCP 客户端,offer 写 `a=setup:active`(NAT 后常用);
-/// - `TcpPassive`:设备监听端口,offer 写 `a=setup:passive`,等平台连入。
+/// 与信令传输 [`Transport`] 相互独立:音频可以单独选择 UDP / TCP 主动 / TCP 被动。
+/// 语义对齐移动端模拟器的 `AudioTransportType`:
+/// - `TcpActive`(默认):设备是 TCP 客户端,offer 写 `a=setup:active`(NAT 后常用);
+/// - `TcpPassive`:设备监听端口,offer 写 `a=setup:passive`,等平台连入;
+/// - `Udp`:兼容性最好,但 NAT 后可能收不到平台下行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AudioTransport {
-    /// UDP —— 默认,兼容性最好。
-    #[default]
+    /// UDP(兼容性兜底)。
     Udp,
-    /// TCP 主动(设备连平台)。
+    /// TCP 主动(设备连平台)。默认项。
+    #[default]
     TcpActive,
     /// TCP 被动(设备监听,平台连入)。
     TcpPassive,
@@ -183,6 +184,14 @@ mod tests {
     fn transport_默认为_udp() {
         assert_eq!(Transport::default(), Transport::Udp);
         assert_eq!(Transport::Udp.to_string(), "UDP");
+    }
+
+    #[test]
+    fn 对讲流传输默认为_tcp主动() {
+        assert_eq!(AudioTransport::default(), AudioTransport::TcpActive);
+        assert_eq!(AudioTransport::default().as_str(), "TCP_ACTIVE");
+        assert!(AudioTransport::TcpActive.is_tcp());
+        assert!(!AudioTransport::Udp.is_tcp());
     }
 
     #[test]

@@ -188,8 +188,8 @@ function migrateLegacy(base: DesktopConfigV2): DesktopConfigV2 | null {
         server_domain: oldDomain.length === 10 ? oldDomain : serverId.slice(0, 10),
         password: typeof raw.password === "string" ? raw.password : "",
         transport: raw.transport === "TCP" || raw.transport === "Tcp" ? "TCP" : "UDP",
-        // 旧配置没有音频流传输字段:统一回退 UDP(兼容性最好)。
-        audio_transport: "UDP",
+        // 旧配置没有对讲流传输字段:与默认值保持一致(TCP 主动)。
+        audio_transport: "TCP_ACTIVE",
         gb_version: raw.gb_version === "2016" || raw.gb_version === "V2016" ? "V2016" : "V2022",
         signaling_encoding: raw.signaling_encoding === "UTF-8" || raw.signaling_encoding === "Utf8"
           ? "Utf8"

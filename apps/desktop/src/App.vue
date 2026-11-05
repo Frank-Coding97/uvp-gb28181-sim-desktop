@@ -99,7 +99,7 @@ async function addNew() {
     await addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
     server_id: "34020000002000000001", server_domain: "3402000000",
       password: "",
-      transport: "UDP", audio_transport: "UDP", gb_version: "V2022", signaling_encoding: "Gb18030" });
+      transport: "UDP", audio_transport: "TCP_ACTIVE", gb_version: "V2022", signaling_encoding: "Gb18030" });
     openEdit();
   } catch (cause) {
     lastError.value = { scope: "config", message: String(cause), ts_ms: Date.now() };

@@ -330,7 +330,7 @@ pub struct PlatformProfileConfig {
     /// 与设备数量解耦 —— 万级压测不需要万级连接。UDP 模式下该字段被忽略。
     #[serde(default = "default_signaling_tcp_connections")]
     pub signaling_tcp_connections: u16,
-    /// 音频流(语音广播/对讲下行)传输方式;老配置缺省 UDP。
+    /// 音频流(语音广播/对讲下行)传输方式;老配置缺省 TCP 主动。
     #[serde(default)]
     pub audio_transport: AudioTransport,
     pub gb_version: GbVersion,
@@ -448,7 +448,7 @@ impl Default for DesktopConfigV2 {
                 password: String::new(),
                 transport: Transport::Udp,
                 signaling_tcp_connections: default_signaling_tcp_connections(),
-                audio_transport: AudioTransport::Udp,
+                audio_transport: AudioTransport::TcpActive,
                 gb_version: GbVersion::V2022,
                 signaling_encoding: SignalingEncoding::Gb18030,
             }],

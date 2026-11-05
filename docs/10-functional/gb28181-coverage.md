@@ -87,7 +87,7 @@
 | 功能 | CmdType | 优先级 | 状态 |
 |---|---|---|---|
 | 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
-| 语音广播 | Broadcast | P2 | ✅ 平台下发 Broadcast Notify → 回 Broadcast Response(TargetID 属本设备 OK,否则 ERROR+Reason)→ 设备反向 INVITE(`s=Broadcast` / `a=recvonly` / PCMA+PCMU / `y=ssrc`)→ 200 OK 后 ACK → 按**音频流传输**(UDP / TCP 主动 / TCP 被动,`a=setup:active/passive`)收 RTP → G.711A/U 解码播放 → 平台 BYE 或本端停止时收尾。首页可配音频流传输;状态经 `broadcast_state` 推送(FR-36,握手/媒体链路集成测) |
+| 语音广播 | Broadcast | P2 | ✅ 平台下发 Broadcast Notify → 回 Broadcast Response(TargetID 属本设备 OK,否则 ERROR+Reason)→ 设备反向 INVITE(`s=Broadcast` / `a=recvonly` / PCMA+PCMU / `y=ssrc`)→ 200 OK 后 ACK → 按**对讲流传输模式**(UDP / TCP 主动 / TCP 被动,`a=setup:active/passive`)收 RTP → G.711A/U 解码播放 → 平台 BYE 或本端停止时收尾。首页可配对讲流传输模式;状态经 `broadcast_state` 推送(FR-36,握手/媒体链路集成测) |
 | 设备配置查询 | ConfigDownload / BasicParam + VideoParamOpt | P2 | 🟢 回 200 + ConfigDownload Response,支持 BasicParam(Name/Expiration/HeartBeat*)与 VideoParamOpt(DownloadSpeed/Resolution)按 ConfigType 组合输出(FR-17) |
 | 设备配置查询扩展 | ConfigDownload / 全 ConfigType | P2 | 🟢 GB28181-2022 A.2.4.7 全部 ConfigType:BasicParam/VideoParamOpt/VideoParamAttribute/VideoRecordPlan/VideoAlarmRecord/PictureMask/FrameMirror/AlarmReport/OSDConfig/SnapShotConfig 完整;SVACEncodeConfig/SVACDecodeConfig 最小合规占位(FR-37,单测) |
 | 设备配置修改 | DeviceConfig / 全配置项 | P2 | 🟢 A.2.3.2 全部配置命令接受回 DeviceConfig 应答(A.2.6.8);含 SVAC/VideoParamAttribute(FR-37) |
