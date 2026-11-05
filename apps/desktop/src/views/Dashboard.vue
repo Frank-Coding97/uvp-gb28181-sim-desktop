@@ -81,28 +81,6 @@ interface SubscriptionState {
   notify_count: number;
 }
 
-interface DeviceRuntimeState {
-  guarded: boolean;
-  alarming: boolean;
-  longitude: number;
-  latitude: number;
-  name: string;
-  expiration: number;
-  heartbeat_interval: number;
-  heartbeat_count: number;
-  video_record_plan_type: number | null;
-  alarm_record_duration: number | null;
-  picture_mask_enabled: number | null;
-  frame_mirror_mode: number | null;
-  alarm_report_enabled: number | null;
-  osd_time_show: number | null;
-  osd_show: number | null;
-  last_change: string;
-  updated_at_ms: number;
-}
-
-interface CmdEntry { kind: string; summary: string; ts_ms: number; }
-
 const message = useMessage();
 const router = useRouter();
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -146,9 +124,7 @@ const sourceProbe = ref("");
 let unlistenCaptureState: UnlistenFn | null = null;
 let unlistenDeviceError: UnlistenFn | null = null;
 let unlistenSub: UnlistenFn | null = null;
-let unlistenPlatformCommand: UnlistenFn | null = null;
 let unlistenMediaPreparation: UnlistenFn | null = null;
-let runtimeRefreshTimer: number | null = null;
 let recordingRefreshTimer: number | null = null;
 const recordingPhase = ref<"idle" | "starting" | "recording" | "finalizing" | "failed">("idle");
 const mediaPreparation = ref<{ phase: MediaPreparationPhase; message: string }>({ phase: "idle", message: "" });
@@ -176,51 +152,12 @@ const subscriptions = reactive<Record<SubscriptionKind, SubscriptionState>>({
   Alarm: { kind: "Alarm", active: false, notify_count: 0 },
   PTZPosition: { kind: "PTZPosition", active: false, notify_count: 0 },
 });
-const runtimeState = ref<DeviceRuntimeState | null>(null);
-const runtimeStateError = ref("无运行中设备");
-const runtimeUpdatedAt = computed(() => runtimeState.value?.updated_at_ms
-  ? new Date(runtimeState.value.updated_at_ms).toLocaleString("zh-CN", { hour12: false })
-  : "—");
 
 function resetSubscriptions() {
   for (const item of Object.values(subscriptions)) {
     item.active = false;
     item.notify_count = 0;
   }
-}
-
-function resetRuntimeUi() {
-  runtimeState.value = null;
-  runtimeStateError.value = "无运行中设备";
-  resetSubscriptions();
-  if (runtimeRefreshTimer) {
-    clearTimeout(runtimeRefreshTimer);
-    runtimeRefreshTimer = null;
-  }
-}
-
-async function refreshRuntimeState() {
-  if (!isTauri || !deviceLive.value) {
-    resetRuntimeUi();
-    return;
-  }
-  try {
-    runtimeState.value = await invoke<DeviceRuntimeState>("get_device_runtime_state");
-    runtimeStateError.value = "";
-  } catch (error) {
-    runtimeState.value = null;
-    runtimeStateError.value = String(error).includes("设备未启动") ? "无运行中设备" : `状态读取失败：${String(error)}`;
-  }
-}
-
-function scheduleRuntimeRefresh() {
-  void refreshRuntimeState();
-  if (runtimeRefreshTimer) clearTimeout(runtimeRefreshTimer);
-  // Tauri 事件与后续 invoke 处在不同调度队列，补一次短延迟对账，避免界面读到命令前快照。
-  runtimeRefreshTimer = window.setTimeout(() => {
-    runtimeRefreshTimer = null;
-    void refreshRuntimeState();
-  }, 80);
 }
 
 const draft = reactive({
@@ -745,9 +682,7 @@ watch(deviceLive, (running) => {
     hasFrame.value = false;
     previewState.value = "idle";
     clearPreviewStats();
-    resetRuntimeUi();
-  } else {
-    scheduleRuntimeRefresh();
+    resetSubscriptions();
   }
 });
 
@@ -779,15 +714,12 @@ onMounted(async () => {
     if (event.payload.kind in subscriptions) {
       subscriptions[event.payload.kind] = event.payload;
     }
-    void refreshRuntimeState();
   });
   unlistenMediaPreparation = await listen<MediaPreparationEvent>("media_preparation", (event) => {
     mediaPreparation.value = event.payload;
   });
-  unlistenPlatformCommand = await listen<CmdEntry>("platform_command", scheduleRuntimeRefresh);
   const [runtime] = await Promise.all([reconcile(), refreshSources(false)]);
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
-  await refreshRuntimeState();
   await refreshRecordingState();
   recordingRefreshTimer = window.setInterval(() => void refreshRecordingState(), 1000);
   await startPreview();
@@ -797,7 +729,6 @@ onActivated(async () => {
   previewPageActive = true;
   const runtime = await reconcile();
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
-  await refreshRuntimeState();
   await refreshRecordingState();
   await startPreview();
 });
@@ -814,8 +745,6 @@ onUnmounted(() => {
   unlistenDeviceError?.();
   unlistenSub?.();
   unlistenMediaPreparation?.();
-  unlistenPlatformCommand?.();
-  if (runtimeRefreshTimer) clearTimeout(runtimeRefreshTimer);
   if (recordingRefreshTimer) clearInterval(recordingRefreshTimer);
 });
 </script>
@@ -1101,26 +1030,6 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <section class="runtime-truth" aria-labelledby="runtime-truth-title">
-          <div class="runtime-head">
-            <div>
-              <span class="panel-kicker">DEVICE RUNTIME</span>
-              <h3 id="runtime-truth-title">设备状态真相</h3>
-            </div>
-            <small v-if="runtimeState">{{ runtimeUpdatedAt }}</small>
-          </div>
-          <div v-if="runtimeState" class="runtime-grid">
-            <div><span>布防状态</span><b :class="runtimeState.guarded ? 'on' : ''">{{ runtimeState.guarded ? "已布防" : "未布防" }}</b></div>
-            <div><span>报警状态</span><b :class="runtimeState.alarming ? 'alarm' : ''">{{ runtimeState.alarming ? "报警中" : "无报警" }}</b></div>
-            <div><span>报警订阅</span><b :class="subscriptions.Alarm.active ? 'on' : ''">{{ subscriptions.Alarm.active ? "平台已订阅" : "未订阅" }}</b></div>
-            <div><span>当前位置</span><b class="mono">{{ runtimeState.longitude.toFixed(4) }}, {{ runtimeState.latitude.toFixed(4) }}</b></div>
-            <div><span>最近变更</span><b class="mono">{{ runtimeState.last_change }}</b></div>
-            <div class="runtime-wide"><span>会话参数</span><b>{{ runtimeState.name || "未命名设备" }} · 注册 {{ runtimeState.expiration }}s · 心跳 {{ runtimeState.heartbeat_interval }}s × {{ runtimeState.heartbeat_count }}</b></div>
-            <div class="runtime-wide"><span>平台已应用配置</span><b>录像计划 {{ runtimeState.video_record_plan_type ?? "—" }} · 报警录像 {{ runtimeState.alarm_record_duration ?? "—" }}s · 遮挡 {{ runtimeState.picture_mask_enabled === 1 ? "开" : "关" }} · 镜像 {{ runtimeState.frame_mirror_mode ?? "—" }} · 报警上报 {{ runtimeState.alarm_report_enabled === 1 ? "开" : "关" }} · OSD {{ runtimeState.osd_show === 1 ? "开" : "关" }}</b></div>
-          </div>
-          <div v-else class="runtime-empty">{{ runtimeStateError || "无运行中设备" }}</div>
-        </section>
-
         <div class="config-foot">
           <n-icon :component="registerBlocker ? AlertCircleOutline : CheckmarkCircleOutline" />
           <span>{{ registerBlocker || (deviceLive ? "SIP 已注册，设备运行中" : "SIP 配置完整，可以启动模拟") }}</span>
@@ -1368,19 +1277,6 @@ onUnmounted(() => {
 .quick-card.action:disabled { cursor: not-allowed; color: var(--text-tertiary); }
 .quick-card.subscription.active { border-color: rgba(24, 160, 88, .38); color: var(--success); background: rgba(24, 160, 88, .07); }
 .subscription-dot { position: absolute; top: 7px; right: 7px; width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
-.runtime-truth { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-subtle); }
-.runtime-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-.runtime-head h3 { margin: 1px 0 0; color: var(--text-primary); font-size: 13px; }
-.runtime-head small { color: var(--text-tertiary); font-size: 9px; white-space: nowrap; }
-.runtime-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 7px; }
-.runtime-grid > div { min-width: 0; padding: 7px 8px; border: 1px solid var(--border-default); border-radius: 7px; background: rgba(255,255,255,.48); }
-.runtime-grid span { display: block; margin-bottom: 2px; color: var(--text-tertiary); font-size: 9px; }
-.runtime-grid b { display: block; overflow: hidden; color: var(--text-secondary); font-size: 10px; font-weight: 600; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
-.runtime-grid b.on { color: var(--success); }
-.runtime-grid b.alarm { color: var(--error); }
-.runtime-grid .runtime-wide { grid-column: 1 / -1; }
-.runtime-grid .runtime-wide b { white-space: normal; }
-.runtime-empty { margin-top: 7px; padding: 11px; border: 1px dashed var(--border-default); border-radius: 7px; color: var(--text-tertiary); text-align: center; font-size: 10px; }
 .config-foot { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--text-tertiary); font-size: 10px; }
 
 @media (max-width: 1080px) {
