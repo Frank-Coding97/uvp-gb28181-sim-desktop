@@ -674,6 +674,8 @@ pub struct LiveAvDevice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSourceCatalog {
     pub ffmpeg_available: bool,
+    /// 实际解析到的 FFmpeg 路径；未找到时为 `None`。用于诊断“设备列表为空”这类问题。
+    pub ffmpeg_path: Option<String>,
     pub aac_available: bool,
     pub opus_available: bool,
     pub screens: Vec<LiveScreenDevice>,
@@ -735,6 +737,7 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
         };
         Ok(LiveSourceCatalog {
             ffmpeg_available: ffmpeg.is_some(),
+            ffmpeg_path: ffmpeg.clone(),
             aac_available,
             opus_available,
             screens,
@@ -777,6 +780,7 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
         };
         Ok(LiveSourceCatalog {
             ffmpeg_available: ffmpeg.is_some(),
+            ffmpeg_path: ffmpeg.clone(),
             aac_available,
             opus_available,
             screens: Vec::new(),
@@ -790,6 +794,7 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
     {
         Ok(LiveSourceCatalog {
             ffmpeg_available: ffmpeg.is_some(),
+            ffmpeg_path: ffmpeg.clone(),
             aac_available,
             opus_available,
             screens: Vec::new(),

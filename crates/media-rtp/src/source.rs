@@ -91,6 +91,16 @@ pub fn ffmpeg_bin() -> Option<String> {
             return Some((*name).into());
         }
     }
+    // Windows 上 FFmpeg 通常装在 PATH 之外，或 PATH 是在应用进程启动之后才更新的。
+    // 装完 FFmpeg 后未重启编辑器，子进程继承的仍是旧环境，`Command::new("ffmpeg")`
+    // 就会失败——表现为摄像头列表为空且没有任何提示。这里显式枚举常见安装位置。
+    #[cfg(windows)]
+    for path in windows_ffmpeg_candidates() {
+        let s = path.to_string_lossy().into_owned();
+        if path.is_file() && probe(&s) {
+            return Some(s);
+        }
+    }
     // 开发环境常见绝对路径兜底；发布包不会依赖这些路径。
     for p in [
         "/opt/homebrew/bin/ffmpeg", // Apple Silicon Homebrew
@@ -103,6 +113,48 @@ pub fn ffmpeg_bin() -> Option<String> {
         }
     }
     None
+}
+
+/// Windows 下 FFmpeg 的常见安装位置（与 PATH 无关）。
+///
+/// 顺序按实际主流程度排列：WinGet 包目录 → Chocolatey → Program Files → 手工解压到 C:\ffmpeg。
+/// WinGet 的 `Links\ffmpeg.exe` 只是 0 字节别名，可能无法执行，所以真正的包目录也要列。
+#[cfg(windows)]
+fn windows_ffmpeg_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let base = PathBuf::from(local);
+        candidates.push(base.join("Microsoft/WinGet/Links/ffmpeg.exe"));
+        let packages = base.join("Microsoft/WinGet/Packages");
+        if let Ok(entries) = std::fs::read_dir(&packages) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                // 目前发布 FFmpeg 的清单有 Gyan.FFmpeg 与 Gyan.FFmpeg.Shared。
+                if !name.starts_with("gyan.ffmpeg") {
+                    continue;
+                }
+                let Ok(versions) = std::fs::read_dir(entry.path()) else {
+                    continue;
+                };
+                for version in versions.flatten() {
+                    candidates.push(version.path().join("bin").join("ffmpeg.exe"));
+                }
+            }
+        }
+    }
+    if let Some(program_data) = std::env::var_os("ProgramData") {
+        candidates.push(PathBuf::from(program_data).join("chocolatey/bin/ffmpeg.exe"));
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(dir) = std::env::var_os(key) {
+            candidates.push(PathBuf::from(dir).join("ffmpeg/bin/ffmpeg.exe"));
+        }
+    }
+    candidates.push(PathBuf::from(r"C:\ffmpeg\bin\ffmpeg.exe"));
+    candidates
 }
 
 /// 把容器视频文件(MP4/FLV/MKV/MOV 等)转封装为 H.264 Annex B 裸流,返回裸流文件路径。
