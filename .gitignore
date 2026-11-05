@@ -5,6 +5,7 @@
 
 # ---- Node / 前端 ----
 node_modules/
+node_modules.partial/
 apps/desktop/dist/
 apps/desktop/.vite/
 *.local
@@ -12,6 +13,9 @@ apps/desktop/.vite/
 # ---- Tauri ----
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
+
+# ---- 本地开发临时目录（cl.exe 临时目录 / WebView2 数据目录）----
+/.tmp
 
 # ---- 运行时数据 ----
 *.sqlite
