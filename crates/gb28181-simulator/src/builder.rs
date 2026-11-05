@@ -194,6 +194,179 @@ pub fn message_xml(
     }
 }
 
+/// 语音广播/对讲下行对话的标识(设备作为 UAC 主动发 INVITE)。
+///
+/// 与注册用的 [`DialogIds`] 分开:广播是一次独立对话,平台按 Call-ID 认领
+/// (`ClaimBroadcastDialog`),沿用注册的 Call-ID 会让平台的 Broadcast 会话匹配不上。
+#[derive(Debug, Clone)]
+pub struct BroadcastDialogIds {
+    /// 本端 From-tag(同时是 200 OK 后 ACK/BYE 的 From-tag)。
+    pub local_tag: String,
+    /// 本次 INVITE 的 Call-ID。
+    pub call_id: String,
+    /// 被广播的通道 ID(Subject 的 senderId,也决定平台按通道匹配会话)。
+    pub channel_id: String,
+    /// 平台侧音源 ID(Broadcast 通知的 SourceID,Subject 的 receiverId)。
+    pub source_id: String,
+    /// INVITE 的 CSeq 序号(ACK 沿用,BYE 用 +1)。
+    pub cseq: u32,
+    /// 设备侧 SSRC(写进 SDP `y=` 与 Subject)。
+    pub ssrc: u32,
+}
+
+impl BroadcastDialogIds {
+    /// 新建一组随机会话标识。
+    pub fn new(channel_id: &str, source_id: &str) -> Self {
+        BroadcastDialogIds {
+            local_tag: rand_token(""),
+            call_id: rand_token(""),
+            channel_id: channel_id.to_string(),
+            source_id: source_id.to_string(),
+            cseq: 1,
+            ssrc: rand::random::<u32>() & 0x7FFF_FFFF,
+        }
+    }
+}
+
+/// 构造设备发起的语音广播 INVITE(§9.8 / F.2.1)。
+///
+/// From/Contact 用**设备 ID**(平台据此反查设备),Subject 用
+/// `{通道ID}:{ssrc},{平台音源ID}:0`(平台据此匹配 Broadcast 会话)。
+pub fn invite_broadcast(
+    cfg: &DeviceConfig,
+    ids: &BroadcastDialogIds,
+    sdp: &str,
+    local_host: &str,
+    local_port: u16,
+) -> Request {
+    let mut headers = Headers::new();
+    headers.append(
+        "Via",
+        format!(
+            "SIP/2.0/{} {}:{};rport;branch={}",
+            cfg.transport,
+            local_host,
+            local_port,
+            rand_token("z9hG4bK")
+        ),
+    );
+    headers.append(
+        "From",
+        format!("<{}>;tag={}", device_aor(cfg), ids.local_tag),
+    );
+    headers.append("To", format!("<{}>", platform_uri(cfg)));
+    headers.append("Call-ID", ids.call_id.clone());
+    headers.append("CSeq", format!("{} INVITE", ids.cseq));
+    headers.append(
+        "Contact",
+        format!("<sip:{}@{}:{}>", cfg.device_id, local_host, local_port),
+    );
+    headers.append(
+        "Subject",
+        format!(
+            "{}:{},{}:0",
+            ids.channel_id, ids.ssrc, ids.source_id
+        ),
+    );
+    headers.append("Content-Type", "application/sdp");
+    headers.append("Max-Forwards", "70");
+    headers.append("User-Agent", "UVP-GB28181-Sim");
+    headers.append("X-GB-Ver", cfg.gb_version.x_gb_ver());
+    Request {
+        method: Method::Invite,
+        uri: platform_uri(cfg),
+        headers,
+        body: sdp.as_bytes().to_vec(),
+    }
+}
+
+/// 构造广播对话 2xx 的 ACK(RFC 3261 §13.2.2.4)。
+///
+/// `remote_target` 为平台 200 OK 的 Contact(可能带端口),缺省回退到平台 URI。
+pub fn ack_broadcast(
+    cfg: &DeviceConfig,
+    ids: &BroadcastDialogIds,
+    remote_tag: &str,
+    remote_target: Option<&str>,
+    local_host: &str,
+    local_port: u16,
+) -> Request {
+    let mut headers = Headers::new();
+    headers.append(
+        "Via",
+        format!(
+            "SIP/2.0/{} {}:{};rport;branch={}",
+            cfg.transport,
+            local_host,
+            local_port,
+            rand_token("z9hG4bK")
+        ),
+    );
+    headers.append(
+        "From",
+        format!("<{}>;tag={}", device_aor(cfg), ids.local_tag),
+    );
+    headers.append(
+        "To",
+        format!("<{}>;tag={remote_tag}", platform_uri(cfg)),
+    );
+    headers.append("Call-ID", ids.call_id.clone());
+    headers.append("CSeq", format!("{} ACK", ids.cseq));
+    headers.append("Max-Forwards", "70");
+    Request {
+        method: Method::Ack,
+        uri: remote_target
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| platform_uri(cfg)),
+        headers,
+        body: Vec::new(),
+    }
+}
+
+/// 构造设备侧结束广播的 BYE(对话内请求,CSeq = INVITE + 1)。
+pub fn bye_broadcast(
+    cfg: &DeviceConfig,
+    ids: &BroadcastDialogIds,
+    remote_tag: &str,
+    remote_target: Option<&str>,
+    local_host: &str,
+    local_port: u16,
+) -> Request {
+    let mut headers = Headers::new();
+    headers.append(
+        "Via",
+        format!(
+            "SIP/2.0/{} {}:{};rport;branch={}",
+            cfg.transport,
+            local_host,
+            local_port,
+            rand_token("z9hG4bK")
+        ),
+    );
+    headers.append(
+        "From",
+        format!("<{}>;tag={}", device_aor(cfg), ids.local_tag),
+    );
+    headers.append(
+        "To",
+        format!("<{}>;tag={remote_tag}", platform_uri(cfg)),
+    );
+    headers.append("Call-ID", ids.call_id.clone());
+    headers.append("CSeq", format!("{} BYE", ids.cseq + 1));
+    headers.append("Max-Forwards", "70");
+    headers.append("User-Agent", "UVP-GB28181-Sim");
+    Request {
+        method: Method::Bye,
+        uri: remote_target
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| platform_uri(cfg)),
+        headers,
+        body: Vec::new(),
+    }
+}
+
 /// 为入站请求构造 200 OK 响应。按 SIP 规则回显 Via/From/To/Call-ID/CSeq
 /// (若 To 无 tag 则补一个随机 tag),用于应答平台的 OPTIONS / 简单 MESSAGE。
 pub fn response_ok(request: &sip_core::Request) -> sip_core::Response {
@@ -332,6 +505,7 @@ mod tests {
             server_id: "34020000002000000001".into(),
             server_domain: "3402000000".into(),
             transport: Transport::Udp,
+            audio_transport: common::AudioTransport::Udp,
             register_expires_secs: 3_600,
             heartbeat_interval_secs: 60,
             heartbeat_fail_threshold: 3,
@@ -349,6 +523,60 @@ mod tests {
             gb_version: common::GbVersion::V2022,
             signaling_encoding: common::SignalingEncoding::Gb18030,
         }
+    }
+
+    #[test]
+    fn 反向广播invite_带subject与sdp() {
+        let ids = BroadcastDialogIds::new("34020000001320000001", "34020000002000000001");
+        let sdp = "v=0\r\ns=Broadcast\r\n";
+        let req = invite_broadcast(&cfg(), &ids, sdp, "5.6.7.8", 5070);
+        let text = String::from_utf8(req.to_bytes()).unwrap();
+        assert!(text.starts_with(
+            "INVITE sip:34020000002000000001@1.2.3.4:5060 SIP/2.0\r\n"
+        ));
+        assert!(text.contains("From: <sip:34020000001320000001@3402000000>"));
+        assert!(text.contains(";tag="));
+        assert!(text.contains(&format!(
+            "Subject: 34020000001320000001:{},34020000002000000001:0",
+            ids.ssrc
+        )));
+        assert!(text.contains("Contact: <sip:34020000001320000001@5.6.7.8:5070>"));
+        assert!(text.contains("CSeq: 1 INVITE"));
+        assert!(text.contains("Content-Type: application/sdp"));
+        assert!(text.ends_with(sdp));
+    }
+
+    #[test]
+    fn 广播ack与bye_沿用对话标识() {
+        let ids = BroadcastDialogIds::new("34020000001320000001", "34020000002000000001");
+        let ack = ack_broadcast(
+            &cfg(),
+            &ids,
+            "remotetag",
+            Some("sip:34020000002000000001@9.9.9.9:5099"),
+            "5.6.7.8",
+            5070,
+        );
+        let ack_text = String::from_utf8(ack.to_bytes()).unwrap();
+        assert!(ack_text.starts_with("ACK sip:34020000002000000001@9.9.9.9:5099 SIP/2.0"));
+        assert!(ack_text.contains("tag=remotetag"));
+        assert!(ack_text.contains("CSeq: 1 ACK"));
+
+        let bye = bye_broadcast(
+            &cfg(),
+            &ids,
+            "remotetag",
+            None,
+            "5.6.7.8",
+            5070,
+        );
+        let bye_text = String::from_utf8(bye.to_bytes()).unwrap();
+        assert!(bye_text.starts_with(
+            "BYE sip:34020000002000000001@1.2.3.4:5060 SIP/2.0"
+        ));
+        assert!(bye_text.contains("CSeq: 2 BYE"));
+        assert!(bye_text.contains("tag=remotetag"));
+        assert!(bye_text.contains(&format!("Call-ID: {}", ids.call_id)));
     }
 
     #[test]

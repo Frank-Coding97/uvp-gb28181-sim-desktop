@@ -79,8 +79,9 @@ Windows 已选为主要构建和验证环境；其余最低设备及量化品质
 - 多平台订阅测试用于确认资源增长边界；首版不承诺任意并发数量。
 - 候选设备覆盖：无独显的办公电脑、无可用硬件编码的回退环境、独显电脑、Mac。
 - 具体 CPU、内存、GPU、驱动、操作系统版本及首批优先平台待确定。
-- 当前 canonical 摄像头/屏幕采集实现限于 macOS；Windows 需要纳入能力建设范围，
-  不能把增加编码器选择误写为已经完成 Windows 实时采集支持。
+- 当前 canonical 摄像头/屏幕采集已覆盖 macOS 与 Windows（Windows 屏幕为 `ddagrab`
+  桌面复制，见 `90-process/windows-screen-implementation.md`）；GPU 自动选型仍未实现，
+  不能把增加编码器选择误写为已经完成硬件编码支持。
 
 ## 验收标准草案
 

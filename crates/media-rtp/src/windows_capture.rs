@@ -10,7 +10,6 @@ pub(super) fn command_args(
     input_size: (u32, u32),
     mode_args: &[String],
 ) -> Vec<String> {
-    use super::LiveVideoCodec;
     // Use the Windows capture graph clock. Redirected cameras can report a
     // device clock that lags the microphone clock; keep actual capture timing
     // instead of synthesizing timestamps from the configured frame rate.
@@ -47,13 +46,23 @@ pub(super) fn command_args(
     if input_size != (profile.width, profile.height) {
         args.extend([
             "-vf".into(),
-            format!(
-                "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
-                w = profile.width,
-                h = profile.height
-            ),
+            scale_pad_filter(profile.width, profile.height),
         ]);
     }
+    args.extend(encoder_args(profile));
+    args
+}
+
+/// 把任意输入尺寸等比缩放到输出档位并补黑边，保证推流尺寸与 profile 一致。
+pub(super) fn scale_pad_filter(width: u32, height: u32) -> String {
+    format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+    )
+}
+
+/// 摄像头和屏幕采集共用的软件编码参数，保证两条路径的编码规格不会漂移。
+pub(super) fn encoder_args(profile: &LiveCaptureProfile) -> Vec<String> {
+    use super::LiveVideoCodec;
     let gop = profile.keyframe_interval_frames();
     let codec_args: Vec<String> = match profile.video_codec {
         LiveVideoCodec::H264 => [
@@ -68,7 +77,7 @@ pub(super) fn command_args(
             format!("repeat-headers=1:keyint={gop}:min-keyint={gop}:scenecut=0:rc-lookahead=0:log-level=error"),
         ].into(),
     };
-    args.extend(codec_args);
+    let mut args = codec_args;
     args.extend([
         "-bf".into(),
         "0".into(),

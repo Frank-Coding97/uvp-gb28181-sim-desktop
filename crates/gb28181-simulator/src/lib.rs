@@ -3,11 +3,16 @@
 //! 一个 [`device::DeviceSimulator`] = 一台虚拟 IPC 的状态机。M1 实现注册(含 Digest)
 //! 与心跳保活;目录/点播/媒体在 M2 接入。压测调度器批量创建并驱动它们。
 
+pub mod broadcast;
 pub mod builder;
 pub mod device;
 pub(crate) mod firmware_upgrade;
 pub mod recording;
 
+pub use broadcast::{
+    decode_alaw, decode_ulaw, BroadcastAudioSink, BroadcastEndReason, BroadcastRunner,
+    BROADCAST_SAMPLE_RATE,
+};
 pub use device::{
     CatalogQueryActivity, ChannelConfig, DeviceConfig, DeviceInfo, DeviceRuntimeSnapshot,
     DeviceSimulator, DeviceState,

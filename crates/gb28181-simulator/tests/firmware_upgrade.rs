@@ -14,7 +14,7 @@ use common::{DeviceId, GbVersion, Transport};
 use gb28181_simulator::{builder, ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sip_core::{Headers, Incoming, Method, Request, SipMessage, UdpTransport};
+use sip_core::{Headers, Incoming, Method, Request, SipMessage, SipTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -34,6 +34,7 @@ fn test_cfg(platform_port: u16, version: GbVersion) -> DeviceConfig {
         server_id: SERVER_ID.into(),
         server_domain: SERVER_DOMAIN.into(),
         transport: Transport::Udp,
+        audio_transport: common::AudioTransport::Udp,
         register_expires_secs: 3_600,
         heartbeat_interval_secs: 60,
         heartbeat_fail_threshold: 3,
@@ -149,7 +150,7 @@ enum PlatformEvent {
 /// 交给测试断言。使用 AOR 入站队列而不是 Call-ID 响应队列，避免与设备业务
 /// Response 共用 Call-ID 时发生路由碰撞。
 fn spawn_upgrade_platform(
-    platform: Arc<UdpTransport>,
+    platform: Arc<SipTransport>,
     device_addr: SocketAddr,
     result_failures: u8,
 ) -> (
@@ -261,7 +262,7 @@ async fn next_register(events: &mut UnboundedReceiver<PlatformEvent>) -> u8 {
 /// 等待设备回给平台的业务/最终 MESSAGE。业务应答是 fire-and-forget，最终结果
 /// 是有事务的 MESSAGE，必须回 SIP 200 让设备任务完成。
 async fn receive_messages(
-    platform: Arc<UdpTransport>,
+    platform: Arc<SipTransport>,
     mut inbound: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
     want_result: bool,
 ) -> String {
@@ -298,8 +299,8 @@ async fn receive_messages(
 
 #[tokio::test]
 async fn success_download_apply_reregister_and_notify_current_version() {
-    let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let device = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let platform = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+    let device = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let platform_addr = platform.local_addr().unwrap();
     let device_addr = device.local_addr().unwrap();
     let (http_addr, http_task, http_requests) = serve_http(
@@ -353,8 +354,8 @@ async fn success_download_apply_reregister_and_notify_current_version() {
 
 #[tokio::test]
 async fn corrupt_package_not_applied_and_final_error_has_reason_02() {
-    let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let device = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let platform = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+    let device = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let platform_addr = platform.local_addr().unwrap();
     let device_addr = device.local_addr().unwrap();
     let (http_addr, http_task, _http_requests) = serve_http(
@@ -398,8 +399,8 @@ async fn corrupt_package_not_applied_and_final_error_has_reason_02() {
 
 #[tokio::test]
 async fn same_session_deduplicates_and_different_session_is_busy() {
-    let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let device = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let platform = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+    let device = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let platform_addr = platform.local_addr().unwrap();
     let device_addr = device.local_addr().unwrap();
     let (http_addr, http_task, _http_requests) = serve_http(
@@ -482,8 +483,8 @@ async fn same_session_deduplicates_and_different_session_is_busy() {
 
 #[tokio::test]
 async fn gb2016_is_rejected_without_download_or_final_notify() {
-    let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let device = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let platform = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+    let device = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let platform_addr = platform.local_addr().unwrap();
     let device_addr = device.local_addr().unwrap();
     let dir = state_dir("2016");

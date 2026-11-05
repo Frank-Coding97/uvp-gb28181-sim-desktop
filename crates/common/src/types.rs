@@ -12,7 +12,7 @@ pub enum Transport {
     /// UDP —— GB28181 最常用,压测默认。
     #[default]
     Udp,
-    /// TCP —— 预留枚举；当前 SIP 传输层尚未实现,上层会明确拒绝该配置。
+    /// TCP —— 与 UDP 共用上层接口,底层为共享连接池(`sip_core::TcpTransport`)。
     Tcp,
 }
 
@@ -22,6 +22,46 @@ impl fmt::Display for Transport {
             Transport::Udp => write!(f, "UDP"),
             Transport::Tcp => write!(f, "TCP"),
         }
+    }
+}
+
+/// 音频流(语音广播/对讲下行)的媒体传输方式。
+///
+/// 与信令传输 [`Transport`] 相互独立:信令固定走 UDP,音频可以单独选择
+/// UDP / TCP 主动 / TCP 被动。语义对齐移动端模拟器的 `AudioTransportType`:
+/// - `TcpActive`:设备是 TCP 客户端,offer 写 `a=setup:active`(NAT 后常用);
+/// - `TcpPassive`:设备监听端口,offer 写 `a=setup:passive`,等平台连入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AudioTransport {
+    /// UDP —— 默认,兼容性最好。
+    #[default]
+    Udp,
+    /// TCP 主动(设备连平台)。
+    TcpActive,
+    /// TCP 被动(设备监听,平台连入)。
+    TcpPassive,
+}
+
+impl AudioTransport {
+    /// 协议/日志用的稳定标识(`UDP` / `TCP_ACTIVE` / `TCP_PASSIVE`)。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AudioTransport::Udp => "UDP",
+            AudioTransport::TcpActive => "TCP_ACTIVE",
+            AudioTransport::TcpPassive => "TCP_PASSIVE",
+        }
+    }
+
+    /// 是否为 TCP 媒体传输(决定 SDP 的 `TCP/RTP/AVP` 与 `a=setup` 行)。
+    pub fn is_tcp(&self) -> bool {
+        !matches!(self, AudioTransport::Udp)
+    }
+}
+
+impl fmt::Display for AudioTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

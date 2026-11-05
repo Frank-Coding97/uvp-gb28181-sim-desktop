@@ -7,7 +7,11 @@ const builder = source.match(/function buildScenarioToml\(([\s\S]*?)\n\}/)?.[0] 
 
 assert.match(validator, /passwordFor\(p\.id\)/, "启动前必须检查当前会话密码");
 assert.match(validator, /请输入本次注册密码/, "空密码应给出明确提示");
-assert.match(validator, /transport\.toUpperCase\(\) !== "UDP"/, "TCP 档案必须 fail-closed");
+assert.doesNotMatch(
+  validator,
+  /transport\.toUpperCase\(\) !== "UDP"/,
+  "TCP 信令已支持,校验不得再按传输方式拒绝启动",
+);
 assert.match(builder, /server_id =/, "新 TOML 必须输出平台 ID");
 assert.match(builder, /profile\.server_id/, "平台 ID 应取活动档案原值");
 assert.match(builder, /server_domain =/, "新 TOML 必须独立输出平台域");

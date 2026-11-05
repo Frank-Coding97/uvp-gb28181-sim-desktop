@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use scenario::{DeviceInfoTemplate, LinearScenario, MediaProfile};
-use sip_core::{Headers, Response, SipMessage, UdpTransport};
+use sip_core::{Headers, Response, SipMessage, SipTransport};
 use stress_engine::Orchestrator;
 
 /// 起一个 mock 平台:对任意 REGISTER 直接回 200(简化,不走 401)。
 /// 返回已收到的不同设备数计数句柄。
-async fn spawn_mock_platform() -> (Arc<UdpTransport>, u16, Arc<AtomicU32>) {
-    let platform = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+async fn spawn_mock_platform() -> (Arc<SipTransport>, u16, Arc<AtomicU32>) {
+    let platform = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let port = platform.local_addr().unwrap().port();
     let counter = Arc::new(AtomicU32::new(0));
 

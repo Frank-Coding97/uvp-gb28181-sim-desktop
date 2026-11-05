@@ -132,6 +132,14 @@ P1 当时尚未实施 Windows 实时采集与 GPU 自动选型；代码保持未
 已补齐 DirectShow 设备枚举、精确规格探测、摄像头采集与真实 PTS 通道。
 RDP 摄像头的 H.264/H.265、G.711/AAC、720p 预览暂停恢复与重开已通过；
 C925e 已出现在软件目录，但实际打开仍被 DirectShow 拒绝，独立 FFmpeg 同样复现。
-Windows 屏幕采集与 GPU 自动选型仍不在本批范围。
+Windows 屏幕采集与 GPU 自动选型仍不在本批范围；屏幕采集随后补齐，见下节。
 
 详细规格、测试结果和设备边界见 [Windows 摄像头实施记录](windows-camera-implementation.md)。
+
+## Windows 屏幕采集（2026-11-05）
+
+已补齐 Win32 显示器枚举、FFmpeg `ddagrab` 桌面复制、H.264/H.265 软件编码与真实编码
+PTS；720p/1080p 实采、预览暂停恢复、停止后重开通过。音频、跨适配器多显示器、4K 与
+60 分钟稳定性尚未验证。
+
+详见 [Windows 屏幕采集实施记录](windows-screen-implementation.md)。

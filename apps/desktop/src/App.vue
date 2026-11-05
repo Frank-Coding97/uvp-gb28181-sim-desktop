@@ -99,15 +99,15 @@ async function addNew() {
     await addProfile({ name: "新平台", server_host: "127.0.0.1", server_port: 5060,
     server_id: "34020000002000000001", server_domain: "3402000000",
       password: "",
-      transport: "UDP", gb_version: "V2022", signaling_encoding: "Gb18030" });
+      transport: "UDP", audio_transport: "UDP", gb_version: "V2022", signaling_encoding: "Gb18030" });
     openEdit();
   } catch (cause) {
     lastError.value = { scope: "config", message: String(cause), ts_ms: Date.now() };
   }
 }
 const transportOptions = [
-  { label: "UDP（当前支持）", value: "UDP" },
-  { label: "TCP（信令层尚未实现）", value: "TCP" },
+  { label: "UDP（共享 socket）", value: "UDP" },
+  { label: "TCP（共享连接池）", value: "TCP" },
 ];
 const versionOptions = [
   { label: "GB/T 28181-2022", value: "V2022" },
@@ -316,7 +316,7 @@ const themeOverrides = {
                     </div>
                   </div>
                   <div class="reg-btns">
-                    <n-button size="small" :type="deviceLive ? 'error' : 'primary'" :loading="registrationBusy" :disabled="registrationBusy || (!deviceLive && active?.transport === 'TCP')" @click="toggleRegistration">
+                    <n-button size="small" :type="deviceLive ? 'error' : 'primary'" :loading="registrationBusy" :disabled="registrationBusy" @click="toggleRegistration">
                       {{ registrationActionLabel }}
                     </n-button>
                   </div>

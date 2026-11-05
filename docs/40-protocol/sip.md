@@ -23,8 +23,11 @@
 ## <a id="传输"></a>传输
 
 - **UDP**(默认):无连接,事务层负责超时重传(T1≈500ms 起指数退避)。
-- **TCP**:面向连接;RTP over TCP 用 RFC 4571 解帧(2 字节大端长度 + 包体)。
-- **压测共享 socket**:所有虚拟设备复用少量 socket,收到响应按 `Call-ID` + 事务 branch 路由到对应设备,避免每设备一 socket 导致端口/FD 耗尽。见 `10-functional/stress-testing.md#42`。
+- **TCP**:面向连接,重传由传输层负责,事务层只做一次发送 + 总预算等待。
+  信令流按 `Content-Length` 切报文(处理粘包/半包);响应必须沿收到请求的那条连接回发(RFC 3261 §18.2.2)。
+  注意 **RFC 4571**(2 字节大端长度 + 包体)是 RTP over TCP 的分帧规则,属于媒体面,与信令 TCP 无关。
+- **压测共享承载**:UDP 复用少量 socket,TCP 复用少量连接(默认 4 条,设备按 ID 哈希固定分配);
+  收到响应按 `Call-ID` + 事务 branch 路由到对应设备,避免每设备一承载导致端口/FD 耗尽。见 `10-functional/stress-testing.md#42`。
 
 ## 事务与对话
 

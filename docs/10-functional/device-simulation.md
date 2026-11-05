@@ -41,7 +41,10 @@
 - 收到 OPTIONS → 回 200 OK。
 
 ### 3.4 传输(FR-4)
-- UDP(默认)与 TCP。压测下**共享 socket**,靠 Call-ID/事务路由分发,不为每设备开独立 socket。见 `40-protocol/sip.md#传输`。
+- UDP(默认)与 TCP。压测下两种传输都**共享承载**:UDP 复用少量 socket,TCP 复用少量连接,
+  靠 Call-ID/事务路由分发,不为每设备开独立 socket/连接 —— FD 占用与设备数无关。
+  TCP 连接池默认 4 条(可配 1–64),设备按 ID 哈希固定落到某条连接,平台的"注册连接 → 下发连接"
+  绑定关系不会被打破。见 `40-protocol/sip.md#传输` 与 `30-crates/sip-core.md`。
 
 ### 3.5 目录查询(FR-5)
 - 收到 Catalog 查询(MESSAGE) → 回 200 OK + 异步 MESSAGE 携 Catalog 响应 XML,列出本设备的通道。
@@ -82,7 +85,19 @@
 
 ## 4. 单设备配置项
 
-见 `30-crates/gb28181-simulator.md` 的 `DeviceConfig`:device_id、username、password、server_host/port/domain、transport、heartbeat_interval_secs、channels(通道列表)、device_info、video_source、video_fps、light_bitrate_kbps(B 档伪流码率)、gb_version。
+见 `30-crates/gb28181-simulator.md` 的 `DeviceConfig`:device_id、username、password、server_host/port/domain、transport、**audio_transport**(语音广播/对讲下行的媒体传输:UDP / TCP 主动 / TCP 被动,与信令传输独立)、heartbeat_interval_secs、channels(通道列表)、device_info、video_source、video_fps、light_bitrate_kbps(B 档伪流码率)、gb_version。
+
+### 4.1 语音广播 / 对讲下行(平台 → 设备)
+
+平台下发 `Broadcast` 通知后,设备以 UAC 身份反向 INVITE,`s=Broadcast`、`a=recvonly`、PCMA/PCMU;平台 200 OK 给出媒体地址后回 ACK,并按 `audio_transport` 收流:
+
+| 音频流传输 | offer | 收流方式 |
+|---|---|---|
+| UDP | `m=audio <port> RTP/AVP 8 0` | 绑定 UDP 端口收 RTP |
+| TCP 主动 | `m=audio <port> TCP/RTP/AVP 8 0` + `a=setup:active` | 收到 answer 后由设备 connect 平台 |
+| TCP 被动 | 同上 + `a=setup:passive` | 设备监听,等平台连入 |
+
+RTP 按 RFC 4571 解帧(TCP),G.711A/U 解码为 8kHz 单声道 PCM;桌面端经 `broadcast_audio` 事件交给前端 Web Audio 播放,状态(通道/传输/包数)经 `broadcast_state` 显示在首页。平台 BYE 或设备下线时释放端口并尽力回 BYE。
 
 ## 5. 验收
 

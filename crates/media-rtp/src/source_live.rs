@@ -30,6 +30,10 @@ mod windows_capture;
 mod windows_camera;
 
 #[cfg(windows)]
+#[path = "windows_screen.rs"]
+mod windows_screen;
+
+#[cfg(windows)]
 #[path = "windows_timing.rs"]
 mod windows_timing;
 #[cfg(windows)]
@@ -788,6 +792,28 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
     }
     #[cfg(windows)]
     {
+        let (screens, screen_error) = match windows_screen::list_monitors() {
+            Ok(monitors) => (
+                monitors
+                    .into_iter()
+                    .map(|monitor| LiveScreenDevice {
+                        display_id: monitor.display_id,
+                        width: monitor.width,
+                        height: monitor.height,
+                        name: monitor.name,
+                        uri: LiveSourceSpec::Screen {
+                            display_id: monitor.display_id,
+                            audio: LiveAudioSource::None,
+                            audio_codec: LiveAudioCodec::default(),
+                            profile: LiveVideoProfile::default(),
+                        }
+                        .canonical_uri(),
+                    })
+                    .collect(),
+                None,
+            ),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         let (cameras, microphones, avfoundation_error) = match ffmpeg.as_deref() {
             Some(binary) => match windows_camera::list_devices(binary) {
                 Ok(devices) => (
@@ -822,10 +848,10 @@ pub fn list_live_sources() -> Result<LiveSourceCatalog> {
             ffmpeg_path: ffmpeg.clone(),
             aac_available,
             opus_available,
-            screens: Vec::new(),
+            screens,
             cameras,
             microphones,
-            screen_error: Some("Windows 屏幕采集尚未实现".into()),
+            screen_error,
             avfoundation_error,
         })
     }
@@ -1705,8 +1731,10 @@ impl LiveSource {
         {
             match spec {
                 #[cfg(windows)]
-                LiveSourceSpec::Screen { .. } => {
-                    Err(Error::Media("Windows 屏幕采集尚未实现".into()))
+                LiveSourceSpec::Screen {
+                    display_id, audio, ..
+                } => {
+                    Self::capture_screen_profile(display_id, audio, capture_profile, preview, true)
                 }
                 LiveSourceSpec::Camera {
                     video_index,
@@ -1749,9 +1777,12 @@ impl LiveSource {
         {
             match spec {
                 #[cfg(windows)]
-                LiveSourceSpec::Screen { .. } => {
-                    Err(Error::Media("Windows 屏幕采集尚未实现".into()))
-                }
+                LiveSourceSpec::Screen {
+                    display_id,
+                    audio,
+                    audio_codec,
+                    profile,
+                } => Self::capture_screen(display_id, audio, audio_codec, profile, fps),
                 LiveSourceSpec::Camera {
                     video_index,
                     audio_index,
@@ -1811,9 +1842,9 @@ impl LiveSource {
         let fps = profile.video_fps;
         #[cfg(target_os = "macos")]
         if macos_console_screen_locked() {
-            return Err(Error::Media(camera_startup_timeout_message(
+            return Err(Error::Media(startup_timeout_message(
                 "video",
-                CameraStartup {
+                CaptureStartup::Camera {
                     video_index,
                     audio_index,
                     input_fps: f64::from(camera_input_fps(fps)),
@@ -2297,7 +2328,7 @@ impl LiveSource {
             audio_ready.as_deref(),
             &video_tail,
             audio_tail.as_ref(),
-            CameraStartup {
+            CaptureStartup::Camera {
                 video_index,
                 audio_index,
                 input_fps,
@@ -3184,6 +3215,270 @@ impl LiveSource {
             needs_keyframe: false,
         })
     }
+
+    #[cfg(windows)]
+    fn capture_screen(
+        display_id: u32,
+        audio: LiveAudioSource,
+        audio_codec: LiveAudioCodec,
+        profile: LiveVideoProfile,
+        fps: u32,
+    ) -> Result<Self> {
+        Self::capture_screen_profile(
+            display_id,
+            audio,
+            LiveCaptureProfile::legacy_screen(profile, fps, audio_codec),
+            None,
+            false,
+        )
+    }
+
+    /// 启动唯一平台屏幕采集；预览只消费它产出的编码 AU 副本。
+    ///
+    /// Windows 用 FFmpeg 的 `ddagrab` 直接抓桌面并软件编码，因此时间戳、预览、
+    /// 事件队列与 DirectShow 摄像头共用同一套实现，不额外复制一条编码路径。
+    #[cfg(windows)]
+    fn capture_screen_profile(
+        display_id: u32,
+        audio: LiveAudioSource,
+        profile: LiveCaptureProfile,
+        preview: Option<Arc<dyn PreviewSink>>,
+        timed: bool,
+    ) -> Result<Self> {
+        if audio.is_enabled() {
+            return Err(Error::Media(format!(
+                "Windows 屏幕采集暂不支持音频（audio={}）；请改用 audio=none",
+                audio.as_uri_value()
+            )));
+        }
+        validate_screen_dimension(profile.width, "screen width")?;
+        validate_screen_dimension(profile.height, "screen height")?;
+        if !(MIN_SCREEN_BITRATE_KBPS..=MAX_SCREEN_BITRATE_KBPS).contains(&profile.bitrate_kbps) {
+            return Err(Error::Media(format!(
+                "screen bitrate must be between {MIN_SCREEN_BITRATE_KBPS} and {MAX_SCREEN_BITRATE_KBPS} kbps"
+            )));
+        }
+        let ffmpeg = ffmpeg_bin().ok_or_else(|| {
+            Error::Media("Windows 屏幕采集需要 FFmpeg；请安装 FFmpeg 或设置 UVP_FFMPEG_PATH".into())
+        })?;
+        let monitor = windows_screen::resolve(display_id)?;
+        let display_id = monitor.display_id;
+        let audio_codec = profile.audio_codec;
+        let fps = profile.video_fps;
+        let mut screen_args = windows_screen::command_args(&monitor, &profile);
+        tracing::info!(
+            display_id,
+            output_idx = display_id.saturating_sub(1),
+            monitor_width = monitor.width,
+            monitor_height = monitor.height,
+            output_width = profile.width,
+            output_height = profile.height,
+            output_fps = fps,
+            "starting Windows desktop duplication capture"
+        );
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut timing_video_stats_reader: Option<Box<dyn Read + Send>> = None;
+        if timed {
+            let reader = windows_timing::StatsReader::bind(Arc::clone(&stop_flag))
+                .map_err(|error| Error::Media(format!("创建视频时间戳通道失败: {error}")))?;
+            let position = screen_args
+                .iter()
+                .rposition(|arg| arg == "pipe:1")
+                .expect("screen video output");
+            screen_args.splice(
+                position..position,
+                [
+                    "-stats_enc_post:v".into(),
+                    reader.url(),
+                    "-stats_enc_post_fmt:v".into(),
+                    "{pts} {tb}".into(),
+                ],
+            );
+            timing_video_stats_reader = Some(Box::new(reader));
+        }
+        let video_label = format!("screen display {display_id} at {fps} fps");
+        let video = common::hidden_command(&ffmpeg)
+            .args(&screen_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Media(format!("failed to start {video_label}: {e}")))?;
+        let mut startup = StartupChildren::new(video);
+        startup.stop_flag = Some(Arc::clone(&stop_flag));
+        let (video_tail, join) = capture_stderr_tail(&mut startup.children[0], &video_label)?;
+        startup.track(join);
+        let video_ready = Arc::new(AtomicBool::new(false));
+        let producer_alive = Arc::new(AtomicBool::new(true));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let generation = crate::preview::next_capture_generation();
+        let (preview_input, preview_worker) = preview.map_or((None, None), |sink| {
+            let (input, worker) = spawn_preview_worker_with_codec(
+                ffmpeg.clone(),
+                fps,
+                generation,
+                profile.video_codec.ps_codec(),
+                sink,
+            );
+            (Some(input), Some(worker))
+        });
+        let preview_control = preview_worker.as_ref().map(PreviewWorkerHandle::control);
+        let tx = Arc::new(LatestFrameQueue::new(2));
+        let rx = Arc::clone(&tx);
+        let timed_events = timed.then(|| Arc::new(LiveEventQueue::new((fps * 8).max(64) as usize)));
+        let hub = Arc::new(EncodedFrameHub::new_with_timing(
+            Arc::clone(&tx),
+            preview_input,
+            generation,
+            timed_events.clone(),
+            fps,
+            profile.video_codec,
+        ));
+        let timing_video_pts = timed.then(|| Arc::new(Mutex::new(VecDeque::<Option<u64>>::new())));
+        let timing_clock = timed.then(|| Arc::new(CameraTimingClock::new(false)));
+        if let Some(reader) = timing_video_stats_reader {
+            let timing_pts = timing_video_pts
+                .as_ref()
+                .expect("timed screen stats must have a PTS queue")
+                .clone();
+            let timing_clock = timing_clock
+                .as_ref()
+                .expect("timed screen stats must have a clock")
+                .clone();
+            let timing_stop = Arc::clone(&stop_flag);
+            let timing_error = Arc::clone(&terminal_error);
+            startup.track(spawn_camera_timing_stats_reader(
+                reader,
+                timing_pts,
+                timing_clock,
+                CameraTimingStream::Video,
+                timing_stop,
+                timing_error,
+            ));
+        }
+        let mut stdout = startup.children[0]
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Media(format!("failed to open {video_label} stdout")))?;
+        let ready = Arc::clone(&video_ready);
+        let alive = Arc::clone(&producer_alive);
+        let video_stop = Arc::clone(&stop_flag);
+        let video_error = Arc::clone(&terminal_error);
+        let codec = profile.video_codec;
+        let video_reader = std::thread::spawn(move || {
+            let mut pending = Vec::with_capacity(256 * 1024);
+            let mut chunk = [0_u8; 32 * 1024];
+            let mut total_bytes = 0_u64;
+            let mut total_frames = 0_u64;
+            let timed_sender = timing_video_pts.as_ref().map(|pts| TimedFrameSender {
+                hub: hub.as_ref(),
+                pts: pts.as_ref(),
+                wait_for_pts: true,
+                strict_timing: true,
+                timing_error: Some(video_error.as_ref()),
+                timing_stop: Some(video_stop.as_ref()),
+                initial_timing_wait: AtomicBool::new(true),
+            });
+            tracing::info!(
+                generation,
+                codec = codec.as_str(),
+                "screen encoded stdout reader started"
+            );
+            loop {
+                if video_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        ready.store(true, Ordering::Release);
+                        total_bytes += n as u64;
+                        pending.extend_from_slice(&chunk[..n]);
+                        match codec {
+                            LiveVideoCodec::H264 => {
+                                if let Some(sender) = timed_sender.as_ref() {
+                                    drain_frames(&mut pending, sender);
+                                } else {
+                                    drain_frames(&mut pending, hub.as_ref());
+                                }
+                            }
+                            LiveVideoCodec::H265 => {
+                                if let Some(sender) = timed_sender.as_ref() {
+                                    drain_hevc_frames(&mut pending, sender);
+                                } else {
+                                    drain_hevc_frames(&mut pending, hub.as_ref());
+                                }
+                            }
+                        }
+                        if video_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let drained = hub.primary.pushed_total();
+                        if drained != total_frames && (drained <= 1 || drained % 150 == 0) {
+                            tracing::info!(
+                                total_bytes,
+                                total_frames = drained,
+                                pending_bytes = pending.len(),
+                                "screen encoded frames drained"
+                            );
+                        }
+                        total_frames = drained;
+                    }
+                }
+            }
+            tracing::warn!(
+                generation,
+                total_bytes,
+                total_frames,
+                "screen encoded reader stopped"
+            );
+            if !video_stop.load(Ordering::Acquire) {
+                if let Ok(mut error) = video_error.lock() {
+                    *error = Some(format!("screen {video_label} stopped unexpectedly"));
+                }
+            }
+            alive.store(false, Ordering::Release);
+        });
+        startup.track(video_reader);
+
+        wait_for_ffmpeg_startup(
+            &mut startup.children,
+            &video_ready,
+            None,
+            &video_tail,
+            None,
+            CaptureStartup::Screen {
+                display_id,
+                input_fps: f64::from(fps),
+            },
+        )?;
+        let (children, worker_threads) = startup.disarm();
+
+        Ok(Self {
+            rx,
+            buf: VecDeque::new(),
+            audio_rx: None,
+            audio_buf: VecDeque::new(),
+            audio_enabled: false,
+            audio_credit_90k: 0,
+            audio_codec,
+            audio_sample_rate_hz: profile.audio_sample_rate_hz,
+            fps,
+            codec: profile.video_codec,
+            timed_events,
+            children,
+            worker_threads,
+            stop_flag,
+            producer_alive,
+            terminal_error,
+            preview_worker,
+            preview_control,
+            #[cfg(target_os = "macos")]
+            screen_stream: None,
+            last_key: None,
+            consecutive_empty: 0,
+            needs_keyframe: false,
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3500,10 +3795,17 @@ fn screen_hevc_command_args(profile: &LiveCaptureProfile) -> Vec<String> {
 
 #[cfg(any(target_os = "macos", windows))]
 #[derive(Debug, Clone, Copy)]
-struct CameraStartup {
-    video_index: u32,
-    audio_index: Option<u32>,
-    input_fps: f64,
+enum CaptureStartup {
+    Camera {
+        video_index: u32,
+        audio_index: Option<u32>,
+        input_fps: f64,
+    },
+    #[cfg(windows)]
+    Screen {
+        display_id: u32,
+        input_fps: f64,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -3524,23 +3826,36 @@ fn macos_console_screen_locked() -> bool {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn camera_startup_timeout_message(
+fn startup_timeout_message(
     missing: &str,
-    camera: CameraStartup,
+    startup: CaptureStartup,
     video_stderr: &str,
     audio_stderr: &str,
     console_locked: bool,
 ) -> String {
-    if console_locked {
-        return format!(
-            "[camera_screen_locked] Mac 屏幕当前已锁定，AVFoundation 不会交付摄像头视频帧。请解锁 Mac 后重试；video index {} at input {} fps, audio index {:?}",
-            camera.video_index, camera.input_fps, camera.audio_index
-        );
+    match startup {
+        CaptureStartup::Camera {
+            video_index,
+            audio_index,
+            input_fps,
+        } => {
+            if console_locked {
+                return format!(
+                    "[camera_screen_locked] Mac 屏幕当前已锁定，AVFoundation 不会交付摄像头视频帧。请解锁 Mac 后重试；video index {video_index} at input {input_fps} fps, audio index {audio_index:?}"
+                );
+            }
+            format!(
+                "camera produced no {missing} data within 15 seconds; video index {video_index} at input {input_fps} fps, audio index {audio_index:?}; video stderr: {video_stderr}; audio stderr: {audio_stderr}"
+            )
+        }
+        #[cfg(windows)]
+        CaptureStartup::Screen {
+            display_id,
+            input_fps,
+        } => format!(
+            "screen produced no {missing} data within 15 seconds; display {display_id} at {input_fps} fps; video stderr: {video_stderr}; 可能原因：锁屏、桌面复制被其他程序占用、显示器已断开或 D3D11 桌面复制不可用"
+        ),
     }
-    format!(
-        "camera produced no {missing} data within 15 seconds; video index {} at input {} fps, audio index {:?}; video stderr: {video_stderr}; audio stderr: {audio_stderr}",
-        camera.video_index, camera.input_fps, camera.audio_index
-    )
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -3634,7 +3949,7 @@ fn wait_for_ffmpeg_startup(
     audio_ready: Option<&AtomicBool>,
     video_tail: &Arc<Mutex<VecDeque<String>>>,
     audio_tail: Option<&Arc<Mutex<VecDeque<String>>>>,
-    camera: CameraStartup,
+    startup: CaptureStartup,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -3653,14 +3968,26 @@ fn wait_for_ffmpeg_startup(
             {
                 kill_children(children);
                 let kind = if position == 0 { "video" } else { "audio" };
-                return Err(Error::Media(format!(
-                    "camera {kind} capture exited before startup ({status}); video index {} at input {} fps, audio index {:?}; video stderr: {}; audio stderr: {}",
-                    camera.video_index,
-                    camera.input_fps,
-                    camera.audio_index,
-                    locked_tail(video_tail),
-                    audio_tail.map_or_else(|| "n/a".into(), locked_tail)
-                )));
+                let detail = match startup {
+                    CaptureStartup::Camera {
+                        video_index,
+                        audio_index,
+                        input_fps,
+                    } => format!(
+                        "camera {kind} capture exited before startup ({status}); video index {video_index} at input {input_fps} fps, audio index {audio_index:?}; video stderr: {}; audio stderr: {}",
+                        locked_tail(video_tail),
+                        audio_tail.map_or_else(|| "n/a".into(), locked_tail)
+                    ),
+                    #[cfg(windows)]
+                    CaptureStartup::Screen {
+                        display_id,
+                        input_fps,
+                    } => format!(
+                        "screen {kind} capture exited before startup ({status}); display {display_id} at {input_fps} fps; video stderr: {}",
+                        locked_tail(video_tail)
+                    ),
+                };
+                return Err(Error::Media(detail));
             }
         }
         if Instant::now() >= deadline {
@@ -3671,9 +3998,9 @@ fn wait_for_ffmpeg_startup(
                 (true, false) => "requested audio",
                 (true, true) => unreachable!(),
             };
-            return Err(Error::Media(camera_startup_timeout_message(
+            return Err(Error::Media(startup_timeout_message(
                 missing,
-                camera,
+                startup,
                 &locked_tail(video_tail),
                 &audio_tail.map_or_else(|| "n/a".into(), locked_tail),
                 {
@@ -4487,9 +4814,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn 锁屏时摄像头启动失败必须给出可执行提示() {
-        let message = camera_startup_timeout_message(
+        let message = startup_timeout_message(
             "video",
-            CameraStartup {
+            CaptureStartup::Camera {
                 video_index: 0,
                 audio_index: None,
                 input_fps: 30.0,
@@ -4502,6 +4829,62 @@ mod tests {
         assert!(message.contains("[camera_screen_locked]"));
         assert!(message.contains("解锁 Mac"));
         assert!(!message.contains("produced no video data within 15 seconds"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn 屏幕启动超时必须提示桌面复制排查方向() {
+        let message = startup_timeout_message(
+            "video",
+            CaptureStartup::Screen {
+                display_id: 1,
+                input_fps: 25.0,
+            },
+            "Failed to enumerate DXGI output 0",
+            "n/a",
+            false,
+        );
+
+        assert!(message.contains("display 1 at 25 fps"), "{message}");
+        assert!(message.contains("桌面复制"), "{message}");
+        assert!(!message.contains("camera produced no"), "{message}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows屏幕采集拒绝音频而不是静默忽略() {
+        match LiveSource::capture_with_profile(
+            "live:screen:1?audio=system",
+            crate::profile::MediaProfile::default(),
+            None,
+        ) {
+            Ok(_) => panic!("screen audio must be rejected before capture starts"),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(text.contains("Windows 屏幕采集暂不支持音频"), "{text}");
+                assert!(text.contains("audio=system"), "{text}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn 实时目录把Windows显示器暴露为屏幕来源() {
+        let catalog = list_live_sources().expect("enumerate live sources");
+        assert!(
+            catalog.screen_error.is_none(),
+            "unexpected screen error: {:?}",
+            catalog.screen_error
+        );
+        let screen = catalog.screens.first().expect("at least one monitor");
+        assert!(screen.display_id > 0);
+        assert!(screen.uri.starts_with("live:screen:"));
+        assert!(screen.width > 0 && screen.height > 0);
+        assert!(catalog
+            .screens
+            .iter()
+            .any(|screen| screen.name.contains("显示器")));
     }
 
     #[cfg(target_os = "macos")]

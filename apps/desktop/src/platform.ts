@@ -10,6 +10,8 @@ import {
 } from "./media-profile.ts";
 
 export type SignalingTransport = "UDP" | "TCP";
+/** 音频流(语音广播/对讲下行)传输方式,与信令传输相互独立。 */
+export type AudioTransport = "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE";
 export type GbVersion = "V2016" | "V2022";
 export type SignalingEncoding = "Gb18030" | "Utf8";
 export type BindMode = "auto" | "specific";
@@ -23,6 +25,14 @@ export interface PlatformProfile {
   server_domain: string;
   password: string;
   transport: SignalingTransport;
+  /**
+   * TCP 信令连接池大小(缺省由后端给出)。
+   *
+   * 所有虚拟设备共享这若干条连接,FD 占用与设备数量解耦;
+   * UDP 模式下该字段被后端忽略。前端不暴露控件,仅在保存配置时原样透传。
+   */
+  signaling_tcp_connections?: number;
+  audio_transport: AudioTransport;
   gb_version: GbVersion;
   signaling_encoding: SignalingEncoding;
 }
@@ -178,6 +188,8 @@ function migrateLegacy(base: DesktopConfigV2): DesktopConfigV2 | null {
         server_domain: oldDomain.length === 10 ? oldDomain : serverId.slice(0, 10),
         password: typeof raw.password === "string" ? raw.password : "",
         transport: raw.transport === "TCP" || raw.transport === "Tcp" ? "TCP" : "UDP",
+        // 旧配置没有音频流传输字段:统一回退 UDP(兼容性最好)。
+        audio_transport: "UDP",
         gb_version: raw.gb_version === "2016" || raw.gb_version === "V2016" ? "V2016" : "V2022",
         signaling_encoding: raw.signaling_encoding === "UTF-8" || raw.signaling_encoding === "Utf8"
           ? "Utf8"

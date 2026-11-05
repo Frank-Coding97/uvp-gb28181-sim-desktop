@@ -128,11 +128,8 @@ impl Scenario for LinearScenario {
                 "平台地址必须是有效的 IP:端口（当前不支持域名）".into(),
             ));
         }
-        if self.transport != Transport::Udp {
-            return Err(common::Error::Config(
-                "当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into(),
-            ));
-        }
+        // 传输方式不在此处设限:UDP 与 TCP 都由 sip-core 的共享承载实现,
+        // 具体差异(FD 占用、重连)对场景层透明。
         if !self.server_id.trim().is_empty() {
             DeviceId::new(self.server_id.clone())
                 .map_err(|_| common::Error::Config("平台 ID 必须是 20 位数字".into()))?;
@@ -224,6 +221,7 @@ impl Scenario for LinearScenario {
                 },
                 server_domain: self.server_domain.clone(),
                 transport: self.transport,
+                audio_transport: common::AudioTransport::Udp,
                 register_expires_secs: 3_600,
                 heartbeat_interval_secs: self.heartbeat_interval_secs,
                 heartbeat_fail_threshold: 3,

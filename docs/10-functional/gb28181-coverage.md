@@ -2,7 +2,7 @@
 
 **状态:核心已实现并真机验证** · 本项目实现 GB/T 28181-2022 **下级设备(IPC)侧**协议。协议流程参考开源项目 uvp-gb28181-sim(Android 版),桌面端用 Rust 独立重写。
 
-> **对标 uvp-gb28181-sim 结论(2026-07-04 更新)**:上游 Android 版的核心能力(注册/心跳/目录/点播/PTZ 及设备控制/**预置位 CRUD**/**看守位**/GPS 上报/报警)本项目均已覆盖并真机验证,且**额外**具备上游没有的**万级压测引擎**(差异化核心)、**GB-2016/2022 双版本**、**订阅通知全套**(目录/报警对话内 NOTIFY + 位置周期)、**回放倍速/下载**、**音视频复合流(H.264+G.711A)**、**MP4/FLV/MKV 容器源**、**网络校时**、**SIP 信令实时追踪**。仍缺:**语音广播/对讲**(需反向 INVITE + 音频上行,本 WVP 环境无法触发验证)、巡航轨迹控制、摄像头实时采集;GB35114/上级侧为明确不做。
+> **对标 uvp-gb28181-sim 结论(2026-11-05 更新)**:上游 Android 版的核心能力(注册/心跳/目录/点播/PTZ 及设备控制/**预置位 CRUD**/**看守位**/GPS 上报/报警)本项目均已覆盖并真机验证,且**额外**具备上游没有的**万级压测引擎**(差异化核心)、**GB-2016/2022 双版本**、**订阅通知全套**(目录/报警对话内 NOTIFY + 位置周期)、**回放倍速/下载**、**音视频复合流(H.264+G.711A)**、**MP4/FLV/MKV 容器源**、**网络校时**、**SIP 信令实时追踪**。语音广播/对讲下行已补齐:反向 INVITE + UDP / TCP 主动 / TCP 被动收流 + G.711A/U 解码播放(FR-36)。仍缺:设备麦克风上行(真正的双向对讲)、巡航轨迹控制、摄像头实时采集;GB35114/上级侧为明确不做。
 
 图例:✅ 已实现并对真实 WVP 验证 · 🟢 已实现(单测,未逐一真机) · 🚧 部分 · ⬜ 规划 · 🚫 明确不做
 
@@ -19,7 +19,7 @@
 | OPTIONS 探活响应 | FR-3 | ✅ |
 | SUBSCRIBE 订阅应答(回 200) | FR-3 | ✅ 注册后 SUBSCRIBE 正常应答 |
 | SIP over UDP | FR-4 | ✅ |
-| SIP over TCP | FR-4 | 🟢 传输层已支持 |
+| SIP over TCP | FR-4 | ✅ 共享连接池(设备按 ID 哈希分配,FD 与设备数解耦) |
 
 ## 设备查询(平台 → 设备)
 
@@ -87,7 +87,7 @@
 | 功能 | CmdType | 优先级 | 状态 |
 |---|---|---|---|
 | 网络校时 | REGISTER 200 OK 的 Date 头 | P1 | ✅ 解析平台 Date 校准时钟偏移(实测 +28794s=UTC↔Beijing),心跳/报警/位置时间戳随之对齐(修复了原 1970 占位) |
-| 语音广播 | Broadcast | P2 | 🟡 握手已实现:解析 Broadcast Notify(SourceID/TargetID)→ 回 Broadcast Response(TargetID 属本设备 OK,否则 ERROR+Reason);接受后构造反向 INVITE 的 SDP offer(a=recvonly / PCMA+PCMU / y=ssrc)。**反向 INVITE 事务与音频 RTP 接收/ACK/BYE 链路本 WVP 环境无法触发验证,未实装收流**(FR-36,握手+SDP 单测) |
+| 语音广播 | Broadcast | P2 | ✅ 平台下发 Broadcast Notify → 回 Broadcast Response(TargetID 属本设备 OK,否则 ERROR+Reason)→ 设备反向 INVITE(`s=Broadcast` / `a=recvonly` / PCMA+PCMU / `y=ssrc`)→ 200 OK 后 ACK → 按**音频流传输**(UDP / TCP 主动 / TCP 被动,`a=setup:active/passive`)收 RTP → G.711A/U 解码播放 → 平台 BYE 或本端停止时收尾。首页可配音频流传输;状态经 `broadcast_state` 推送(FR-36,握手/媒体链路集成测) |
 | 设备配置查询 | ConfigDownload / BasicParam + VideoParamOpt | P2 | 🟢 回 200 + ConfigDownload Response,支持 BasicParam(Name/Expiration/HeartBeat*)与 VideoParamOpt(DownloadSpeed/Resolution)按 ConfigType 组合输出(FR-17) |
 | 设备配置查询扩展 | ConfigDownload / 全 ConfigType | P2 | 🟢 GB28181-2022 A.2.4.7 全部 ConfigType:BasicParam/VideoParamOpt/VideoParamAttribute/VideoRecordPlan/VideoAlarmRecord/PictureMask/FrameMirror/AlarmReport/OSDConfig/SnapShotConfig 完整;SVACEncodeConfig/SVACDecodeConfig 最小合规占位(FR-37,单测) |
 | 设备配置修改 | DeviceConfig / 全配置项 | P2 | 🟢 A.2.3.2 全部配置命令接受回 DeviceConfig 应答(A.2.6.8);含 SVAC/VideoParamAttribute(FR-37) |
@@ -134,7 +134,7 @@
 
 | 功能 | 说明 |
 |---|---|
-| 双向语音对讲 | 🚫 排期外 |
+| 双向语音对讲（设备麦克风上行） | 🚫 排期外（下行广播/对讲已支持，见上） |
 | GB35114 国密扩展 | 🚫 后续评估 |
 | 上级平台(SU)侧 | 🚫 本项目只做下级设备 |
 

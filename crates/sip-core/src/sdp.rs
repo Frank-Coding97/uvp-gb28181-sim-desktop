@@ -7,7 +7,7 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use common::{Error, Result};
+use common::{AudioTransport, Error, Result};
 
 /// 一个 SDP 会话描述(面向单路视频流)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,20 +253,132 @@ impl fmt::Display for SessionDescription {
     }
 }
 
+/// 语音广播/对讲下行应答里的媒体参数(平台 answer 的解析结果)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastAnswer {
+    /// 平台收流/发流地址(answer 的 `c=` 行)。
+    pub remote_ip: IpAddr,
+    /// 平台媒体端口(answer 的 `m=audio` 端口)。
+    pub remote_port: u16,
+    /// 是否 TCP 媒体(answer `m=` proto 含 TCP)。
+    pub tcp: bool,
+    /// 编码 payload type:8 = PCMA(G.711A),0 = PCMU(G.711U)。
+    pub payload_type: u8,
+}
+
+impl BroadcastAnswer {
+    /// 该应答是否声明确实能接收 PCMA/PCMU。
+    pub fn codec_name(&self) -> &'static str {
+        if self.payload_type == 8 {
+            "PCMA"
+        } else {
+            "PCMU"
+        }
+    }
+}
+
+/// 解析语音广播/对讲下行 INVITE 的 200 OK SDP(answer)。
+///
+/// 只做设备侧需要的宽松解析:定位 `m=audio`、端口、`c=` 地址、TCP 标记与
+/// payload type(8/0)。平台 answer 通常为 `s=Talk`、`a=sendonly`、
+/// `a=rtpmap:8 PCMA/8000`,不强制要求 `o=` 行(部分平台省略)。
+pub fn parse_broadcast_answer(raw: &str) -> Result<BroadcastAnswer> {
+    let mut session_ip: Option<IpAddr> = None;
+    let mut media_ip: Option<IpAddr> = None;
+    let mut port: u16 = 0;
+    let mut tcp = false;
+    let mut payload_type: Option<u8> = None;
+    let mut in_audio = false;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("m=") {
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            if fields.len() >= 4 && fields[0].eq_ignore_ascii_case("audio") {
+                in_audio = true;
+                port = fields[1]
+                    .parse()
+                    .map_err(|_| Error::Sip("广播应答 m= 端口非法".into()))?;
+                tcp = fields[2].to_ascii_uppercase().contains("TCP");
+                for field in &fields[3..] {
+                    match *field {
+                        "8" => {
+                            payload_type = Some(8);
+                            break;
+                        }
+                        "0" => payload_type = Some(0),
+                        _ => {}
+                    }
+                }
+            } else {
+                in_audio = false;
+            }
+        } else if let Some(rest) = line.strip_prefix("c=") {
+            if let Some(ip) = parse_connection_ip(rest) {
+                if in_audio {
+                    media_ip = Some(ip);
+                } else if session_ip.is_none() {
+                    session_ip = Some(ip);
+                }
+            }
+        } else if in_audio {
+            if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+                // 形如 `8 PCMA/8000` / `0 PCMU/8000`。
+                let mut parts = rest.split_whitespace();
+                if let Some(pt) = parts.next().and_then(|v| v.parse::<u8>().ok()) {
+                    let encoding = parts.next().unwrap_or("").to_ascii_uppercase();
+                    if (pt == 8 && encoding.starts_with("PCMA"))
+                        || (pt == 0 && encoding.starts_with("PCMU"))
+                    {
+                        payload_type.get_or_insert(pt);
+                    }
+                }
+            }
+        }
+    }
+
+    if port == 0 {
+        return Err(Error::Sip("广播应答缺少 m=audio 端口".into()));
+    }
+    let payload_type = payload_type.ok_or_else(|| Error::Sip("广播应答未提供 PCMA/PCMU".into()))?;
+    let ip = media_ip
+        .or(session_ip)
+        .ok_or_else(|| Error::Sip("广播应答缺少 c= 地址".into()))?;
+    Ok(BroadcastAnswer {
+        remote_ip: ip,
+        remote_port: port,
+        tcp,
+        payload_type,
+    })
+}
+
+/// 从 `IN IP4 1.2.3.4` / `IN IP6 ::1` 里取 IP。
+fn parse_connection_ip(rest: &str) -> Option<IpAddr> {
+    let mut parts = rest.split_whitespace();
+    let _net = parts.next();
+    let _addr_type = parts.next();
+    parts.next()?.parse().ok()
+}
+
 /// 构造语音广播的 SDP offer(设备作接收方,收平台下行 G.711A)。
 ///
-/// 设备为 UAC 主叫,`a=recvonly`,`m=audio {port} RTP/AVP 8 0`,
-/// 首选 PCMA(G.711A,pt=8),兼容 PCMU(pt=0);`y={ssrc}`。TCP 时用 `TCP/RTP/AVP`。
+/// 设备为 UAC 主叫,`a=recvonly`,`m=audio {port} RTP/AVP 8 0` 或
+/// `TCP/RTP/AVP 8 0`(按 [`AudioTransport`] 决定);首选 PCMA(G.711A,pt=8),
+/// 兼容 PCMU(pt=0);`y={ssrc}`。
 pub fn build_broadcast_offer(
     username: &str,
     local_ip: IpAddr,
     port: u16,
     ssrc: u32,
-    tcp: bool,
+    transport: AudioTransport,
 ) -> String {
     let ip = local_ip.to_string();
     let at = if local_ip.is_ipv4() { "IP4" } else { "IP6" };
-    let proto = if tcp { "TCP/RTP/AVP" } else { "RTP/AVP" };
+    let proto = if transport.is_tcp() {
+        "TCP/RTP/AVP"
+    } else {
+        "RTP/AVP"
+    };
     let mut sdp = String::new();
     sdp.push_str("v=0\r\n");
     sdp.push_str(&format!("o={username} 0 0 IN {at} {ip}\r\n"));
@@ -277,9 +389,16 @@ pub fn build_broadcast_offer(
     sdp.push_str("a=rtpmap:8 PCMA/8000\r\n");
     sdp.push_str("a=rtpmap:0 PCMU/8000\r\n");
     sdp.push_str("a=recvonly\r\n");
-    if tcp {
-        sdp.push_str("a=setup:active\r\n");
-        sdp.push_str("a=connection:new\r\n");
+    match transport {
+        AudioTransport::TcpActive => {
+            sdp.push_str("a=setup:active\r\n");
+            sdp.push_str("a=connection:new\r\n");
+        }
+        AudioTransport::TcpPassive => {
+            sdp.push_str("a=setup:passive\r\n");
+            sdp.push_str("a=connection:new\r\n");
+        }
+        AudioTransport::Udp => {}
     }
     sdp.push_str(&format!("y={ssrc}\r\n"));
     sdp
@@ -347,17 +466,80 @@ mod tests {
     #[test]
     fn 广播offer_recvonly与g711() {
         let ip: IpAddr = "192.168.1.50".parse().unwrap();
-        let sdp = build_broadcast_offer("34020000001320000001", ip, 30000, 0x1234, false);
+        let sdp = build_broadcast_offer(
+            "34020000001320000001",
+            ip,
+            30000,
+            0x1234,
+            AudioTransport::Udp,
+        );
         assert!(sdp.contains("s=Broadcast\r\n"));
         assert!(sdp.contains("m=audio 30000 RTP/AVP 8 0\r\n"));
         assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"));
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"));
         assert!(sdp.contains("a=recvonly\r\n"));
+        assert!(!sdp.contains("a=setup:"));
         assert!(sdp.contains("y=4660\r\n")); // 0x1234
-                                             // TCP 变体带 setup/connection + TCP/RTP/AVP。
-        let tcp = build_broadcast_offer("d", ip, 30000, 1, true);
-        assert!(tcp.contains("m=audio 30000 TCP/RTP/AVP 8 0\r\n"));
-        assert!(tcp.contains("a=setup:active\r\n"));
+    }
+
+    #[test]
+    fn 广播offer_tcp主动声明active() {
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        let sdp = build_broadcast_offer("d", ip, 30000, 1, AudioTransport::TcpActive);
+        assert!(sdp.contains("m=audio 30000 TCP/RTP/AVP 8 0\r\n"));
+        assert!(sdp.contains("a=setup:active\r\n"));
+        assert!(sdp.contains("a=connection:new\r\n"));
+    }
+
+    #[test]
+    fn 广播offer_tcp被动声明passive() {
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        let sdp = build_broadcast_offer("d", ip, 30000, 1, AudioTransport::TcpPassive);
+        assert!(sdp.contains("m=audio 30000 TCP/RTP/AVP 8 0\r\n"));
+        assert!(sdp.contains("a=setup:passive\r\n"));
+        assert!(sdp.contains("a=connection:new\r\n"));
+    }
+
+    #[test]
+    fn 解析广播应答_udp_pcma() {
+        let answer = "v=0\r\n\
+o=34020000002000000001 0 0 IN IP4 192.168.1.100\r\n\
+s=Talk\r\n\
+c=IN IP4 192.168.1.100\r\n\
+t=0 0\r\n\
+m=audio 30100 RTP/AVP 8\r\n\
+a=sendonly\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+y=1234\r\n";
+        let parsed = parse_broadcast_answer(answer).unwrap();
+        assert_eq!(parsed.remote_ip, "192.168.1.100".parse::<IpAddr>().unwrap());
+        assert_eq!(parsed.remote_port, 30100);
+        assert!(!parsed.tcp);
+        assert_eq!(parsed.payload_type, 8);
+        assert_eq!(parsed.codec_name(), "PCMA");
+    }
+
+    #[test]
+    fn 解析广播应答_tcp并识别pcmu() {
+        let answer = "v=0\r\n\
+c=IN IP4 10.0.0.5\r\n\
+m=audio 40000 TCP/RTP/AVP 0\r\n\
+a=setup:passive\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+        let parsed = parse_broadcast_answer(answer).unwrap();
+        assert_eq!(parsed.remote_port, 40000);
+        assert!(parsed.tcp);
+        assert_eq!(parsed.payload_type, 0);
+        assert_eq!(parsed.codec_name(), "PCMU");
+    }
+
+    #[test]
+    fn 解析广播应答_缺端口或编码报错() {
+        assert!(parse_broadcast_answer("v=0\r\nm=audio 0 RTP/AVP 8\r\n").is_err());
+        assert!(
+            parse_broadcast_answer("v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 9000 RTP/AVP 96\r\n")
+                .is_err()
+        );
     }
 
     const SAMPLE_SDP: &str = "v=0\r

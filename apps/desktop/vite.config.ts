@@ -35,6 +35,12 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 1420,
     strictPort: true,
+    watch: {
+      // 编辑器/工具做原子写时会创建 .xxx.tmpdir 临时目录；Windows 上这些目录
+      // 可能被锁住，Vite 的 chokidar 一 watch 就 EBUSY 把整个 dev server 打崩。
+      // 这些临时文件不参与构建，直接忽略。
+      ignored: ["**/.*.tmpdir/**", "**/*.tmp"],
+    },
   },
   // CSS 用 lightningcss 转换，不用默认的 postcss。
   //

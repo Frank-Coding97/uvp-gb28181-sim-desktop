@@ -10,7 +10,6 @@ import {
   shallowRef,
 } from "vue";
 import {
-  NAlert,
   NButton,
   NForm,
   NFormItem,
@@ -148,7 +147,6 @@ function tomlString(value: string): string {
 function validateForm(): string | null {
   const p = activePlatform.value;
   if (!p) return "请先在顶栏配置目标平台";
-  if (p.transport.toUpperCase() !== "UDP") return "当前 SIP 信令仅支持 UDP，请修改目标平台传输模式";
   if (!passwordFor(p.id).trim()) return "请输入本次注册密码";
   if (!/^\d{20}$/.test(form.value.base_device_id)) return "起始设备 ID 必须是 20 位数字";
   if (form.value.count < 1 || form.value.count > 10_000) return "设备数量必须在 1 到 10000 之间";
@@ -481,10 +479,6 @@ onUnmounted(() => {
         <n-button size="small" secondary :disabled="!hasReport" @click="exportReport">导出脱敏报告</n-button>
       </div>
     </header>
-
-    <n-alert v-if="activePlatform?.transport === 'TCP'" type="warning" :show-icon="false" class="notice">
-      当前 SIP 信令层仅支持 UDP。请在顶栏将目标平台传输模式改为 UDP 后再启动。
-    </n-alert>
 
     <section class="glass-card panel config-panel">
       <div class="panel-head">

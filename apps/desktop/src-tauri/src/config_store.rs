@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
 };
 
-use common::{DeviceId, GbVersion, SignalingEncoding, Transport};
+use common::{AudioTransport, DeviceId, GbVersion, SignalingEncoding, Transport};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
@@ -324,8 +324,22 @@ pub struct PlatformProfileConfig {
     #[serde(default)]
     pub password: String,
     pub transport: Transport,
+    /// TCP 信令连接池大小。
+    ///
+    /// 所有虚拟设备共享这 `n` 条连接(按设备 ID 哈希固定映射),因此 FD 占用恒等于该值,
+    /// 与设备数量解耦 —— 万级压测不需要万级连接。UDP 模式下该字段被忽略。
+    #[serde(default = "default_signaling_tcp_connections")]
+    pub signaling_tcp_connections: u16,
+    /// 音频流(语音广播/对讲下行)传输方式;老配置缺省 UDP。
+    #[serde(default)]
+    pub audio_transport: AudioTransport,
     pub gb_version: GbVersion,
     pub signaling_encoding: SignalingEncoding,
+}
+
+/// 缺省连接池大小,与 `sip_core::DEFAULT_CONNECTIONS` 保持一致。
+fn default_signaling_tcp_connections() -> u16 {
+    sip_core::DEFAULT_CONNECTIONS as u16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -398,7 +412,8 @@ impl Default for CapabilitySnapshot {
     fn default() -> Self {
         Self {
             signaling_udp: true,
-            signaling_tcp: false,
+            // TCP 信令已接入(共享连接池),不再是"可保存但不可用"的状态。
+            signaling_tcp: true,
         }
     }
 }
@@ -432,6 +447,8 @@ impl Default for DesktopConfigV2 {
                 server_domain: "3402000000".into(),
                 password: String::new(),
                 transport: Transport::Udp,
+                signaling_tcp_connections: default_signaling_tcp_connections(),
+                audio_transport: AudioTransport::Udp,
                 gb_version: GbVersion::V2022,
                 signaling_encoding: SignalingEncoding::Gb18030,
             }],
@@ -737,14 +754,38 @@ mod tests {
     }
 
     #[test]
-    fn tcp档案可保存但能力快照诚实() {
+    fn tcp档案可保存且能力快照声明支持() {
         let mut config = DesktopConfigV2::default();
         config.profiles[0].transport = Transport::Tcp;
         config.validate().unwrap();
 
         let capabilities = CapabilitySnapshot::default();
         assert!(capabilities.signaling_udp);
-        assert!(!capabilities.signaling_tcp);
+        assert!(
+            capabilities.signaling_tcp,
+            "TCP 信令已接入,能力快照不得继续声明不可用"
+        );
+    }
+
+    #[test]
+    fn tcp连接池大小可持久化且缺省为默认值() {
+        let config = DesktopConfigV2::default();
+        assert_eq!(
+            config.profiles[0].signaling_tcp_connections as usize,
+            sip_core::DEFAULT_CONNECTIONS
+        );
+
+        // 旧配置文件没有该字段时必须回落到默认值,不能读取失败。
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["profiles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("signaling_tcp_connections");
+        let restored: DesktopConfigV2 = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.profiles[0].signaling_tcp_connections as usize,
+            sip_core::DEFAULT_CONNECTIONS
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use common::{Error, Result};
 
 use crate::message::SipMessage;
+use crate::tcp::TcpTransport;
 
 /// 一条收到的消息 + 来源地址。
 #[derive(Debug)]
@@ -166,11 +167,13 @@ impl UdpTransport {
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((n, from)) => match SipMessage::parse(&buf[..n]) {
-                        Ok(message) => Self::dispatch(
+                        Ok(message) => dispatch(
                             &routes,
                             &aor_routes,
                             &tracer,
                             Incoming { message, from },
+                            None,
+                            None,
                         ),
                         Err(e) => tracing::warn!(%from, error=%e, "SIP 报文解析失败,丢弃"),
                     },
@@ -183,51 +186,65 @@ impl UdpTransport {
         })
     }
 
-    /// 分发:响应按 Call-ID 路由到事务队列;若 Call-ID 无匹配且是请求,
-    /// 则按 Request-URI 的 AOR(user 部分)路由到设备入站队列。
-    fn dispatch(
-        routes: &DashMap<String, mpsc::UnboundedSender<Incoming>>,
-        aor_routes: &DashMap<String, mpsc::UnboundedSender<Incoming>>,
-        tracer: &std::sync::RwLock<Option<Arc<dyn TraceObserver>>>,
-        incoming: Incoming,
-    ) {
-        if let Ok(guard) = tracer.read() {
-            if let Some(observer) = guard.as_ref() {
-                observer.on_trace(SipTrace {
-                    dir: TraceDir::In,
-                    message: &incoming.message,
-                    peer: incoming.from,
-                });
+}
+
+/// 共用分发逻辑(UDP / TCP 同一套路由规则)。
+///
+/// - `conn`:报文来自哪条 TCP 连接(None 表示 UDP)。收到**请求**时登记
+///   `Call-ID → 连接`,供设备回响应时沿原连接发出(RFC 3261 §18.2.2)。
+/// - `call_conn`:上述登记表,TCP 传输持有;UDP 传 None。
+pub(crate) fn dispatch(
+    routes: &DashMap<String, mpsc::UnboundedSender<Incoming>>,
+    aor_routes: &DashMap<String, mpsc::UnboundedSender<Incoming>>,
+    tracer: &std::sync::RwLock<Option<Arc<dyn TraceObserver>>>,
+    incoming: Incoming,
+    conn: Option<usize>,
+    call_conn: Option<&DashMap<String, usize>>,
+) {
+    if let Ok(guard) = tracer.read() {
+        if let Some(observer) = guard.as_ref() {
+            observer.on_trace(SipTrace {
+                dir: TraceDir::In,
+                message: &incoming.message,
+                peer: incoming.from,
+            });
+        }
+    }
+    // 先按 Call-ID 尝试(响应、以及在对话内的请求)。
+    let call_id = match &incoming.message {
+        SipMessage::Request(r) => r.headers.call_id(),
+        SipMessage::Response(r) => r.headers.call_id(),
+    };
+    // 入站请求的 Call-ID 绑定到来源连接,回响应时才能沿原连接发回。
+    if let Some(conn) = conn {
+        if let (Some(table), Some(id)) = (call_conn, call_id) {
+            if matches!(incoming.message, SipMessage::Request(_)) {
+                table.insert(id.to_string(), conn);
             }
         }
-        // 先按 Call-ID 尝试(响应、以及在对话内的请求)。
-        let call_id = match &incoming.message {
-            SipMessage::Request(r) => r.headers.call_id(),
-            SipMessage::Response(r) => r.headers.call_id(),
-        };
-        if let Some(id) = call_id {
-            if let Some(tx) = routes.get(id) {
+    }
+    if let Some(id) = call_id {
+        if let Some(tx) = routes.get(id) {
+            let _ = tx.send(incoming);
+            return;
+        }
+    }
+    // 未匹配 Call-ID:入站请求按 AOR 路由。
+    if let SipMessage::Request(req) = &incoming.message {
+        if let Some(aor) = uri_user(&req.uri) {
+            if let Some(tx) = aor_routes.get(aor) {
                 let _ = tx.send(incoming);
                 return;
             }
+            let method = match &incoming.message {
+                SipMessage::Request(r) => r.method.as_str(),
+                _ => "?",
+            };
+            tracing::warn!(aor=%aor, method=%method, "无匹配 AOR 入站路由,丢弃请求");
+            return;
         }
-        // 未匹配 Call-ID:入站请求按 AOR 路由。
-        if let SipMessage::Request(req) = &incoming.message {
-            if let Some(aor) = uri_user(&req.uri) {
-                if let Some(tx) = aor_routes.get(aor) {
-                    let _ = tx.send(incoming);
-                    return;
-                }
-                let method = match &incoming.message {
-                    SipMessage::Request(r) => r.method.as_str(),
-                    _ => "?",
-                };
-                tracing::warn!(aor=%aor, method=%method, "无匹配 AOR 入站路由,丢弃请求");
-                return;
-            }
-        }
-        tracing::debug!("消息无匹配路由,丢弃");
     }
+    tracing::debug!("消息无匹配路由,丢弃");
 }
 
 impl Drop for UdpTransport {
@@ -245,6 +262,121 @@ fn uri_user(uri: &str) -> Option<&str> {
     let after_scheme = uri.strip_prefix("sip:").unwrap_or(uri);
     after_scheme.split('@').next().filter(|s| !s.is_empty())
 }
+
+/// 统一的 SIP 传输句柄:同一套设备逻辑可跑在 UDP 或 TCP 之上。
+///
+/// 上层(`gb28181-simulator` / `stress-engine`)只依赖这一层,因此切换信令传输
+/// 不需要改动任何设备业务代码。两种传输的对外语义一致:
+///
+/// - 共享承载:UDP 一个 socket、TCP 一个连接池,都按 Call-ID / AOR 路由;
+/// - 由设备数量决定的资源消耗为 0 —— 承载数与设备数解耦,这是万级压测的前提。
+pub enum SipTransport {
+    /// UDP 共享 socket。
+    Udp(Arc<UdpTransport>),
+    /// TCP 共享连接池。
+    Tcp(Arc<TcpTransport>),
+}
+
+impl SipTransport {
+    /// 绑定 UDP 并启动接收循环。
+    pub async fn bind_udp(local: &str) -> Result<Arc<Self>> {
+        Ok(Arc::new(SipTransport::Udp(
+            UdpTransport::bind(local).await?,
+        )))
+    }
+
+    /// 以共享连接池方式连接平台 TCP 信令端口。
+    ///
+    /// `connections` 为连接池大小(1..=[`crate::tcp::MAX_CONNECTIONS`])。
+    pub async fn connect_tcp(peer: &str, connections: usize) -> Result<Arc<Self>> {
+        Ok(Arc::new(SipTransport::Tcp(TcpTransport::connect(
+            peer,
+            connections,
+        )
+        .await?)))
+    }
+
+    /// 是否可靠传输。TCP 下事务层不再做应用层重传(重传语义归 TCP)。
+    pub fn is_reliable(&self) -> bool {
+        matches!(self, SipTransport::Tcp(_))
+    }
+
+    /// 传输名称,用于日志与 UI。
+    pub fn name(&self) -> &'static str {
+        match self {
+            SipTransport::Udp(_) => "UDP",
+            SipTransport::Tcp(_) => "TCP",
+        }
+    }
+
+    /// 挂载 SIP 追踪观察者(FR-43)。传 None 关闭。
+    pub fn set_tracer(&self, tracer: Option<Arc<dyn TraceObserver>>) {
+        match self {
+            SipTransport::Udp(t) => t.set_tracer(tracer),
+            SipTransport::Tcp(t) => t.set_tracer(tracer),
+        }
+    }
+
+    /// 本地本端地址(用于回填 Via/Contact)。
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        match self {
+            SipTransport::Udp(t) => t.local_addr(),
+            SipTransport::Tcp(t) => t.local_addr(),
+        }
+    }
+
+    /// 为某 Call-ID 注册响应接收队列。
+    pub fn register(&self, call_id: impl Into<String>) -> mpsc::UnboundedReceiver<Incoming> {
+        match self {
+            SipTransport::Udp(t) => t.register(call_id),
+            SipTransport::Tcp(t) => t.register(call_id),
+        }
+    }
+
+    /// 为某设备 AOR 注册入站请求队列。
+    pub fn register_inbound(&self, aor: impl Into<String>) -> mpsc::UnboundedReceiver<Incoming> {
+        match self {
+            SipTransport::Udp(t) => t.register_inbound(aor),
+            SipTransport::Tcp(t) => t.register_inbound(aor),
+        }
+    }
+
+    /// 为多个 AOR(设备 ID + 各通道 ID)注册到同一入站队列。
+    pub fn register_inbound_many(
+        &self,
+        aors: impl IntoIterator<Item = String>,
+    ) -> mpsc::UnboundedReceiver<Incoming> {
+        match self {
+            SipTransport::Udp(t) => t.register_inbound_many(aors),
+            SipTransport::Tcp(t) => t.register_inbound_many(aors),
+        }
+    }
+
+    /// 注销某 Call-ID 的响应路由。
+    pub fn unregister(&self, call_id: &str) {
+        match self {
+            SipTransport::Udp(t) => t.unregister(call_id),
+            SipTransport::Tcp(t) => t.unregister(call_id),
+        }
+    }
+
+    /// 注销某设备 AOR 的入站路由。
+    pub fn unregister_inbound(&self, aor: &str) {
+        match self {
+            SipTransport::Udp(t) => t.unregister_inbound(aor),
+            SipTransport::Tcp(t) => t.unregister_inbound(aor),
+        }
+    }
+
+    /// 发送一条 SIP 消息。`dst` 仅 UDP 使用;TCP 沿已建立连接发出。
+    pub async fn send_to(&self, msg: &SipMessage, dst: SocketAddr) -> Result<()> {
+        match self {
+            SipTransport::Udp(t) => t.send_to(msg, dst).await,
+            SipTransport::Tcp(t) => t.send_to(msg, dst).await,
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

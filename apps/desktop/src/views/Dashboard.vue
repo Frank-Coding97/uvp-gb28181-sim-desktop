@@ -21,10 +21,11 @@ import {
   SaveOutline,
   TrashOutline,
   VideocamOutline,
+  VolumeHighOutline,
   WarningOutline,
 } from "@vicons/ionicons5";
 import { persistForm, useDevice } from "../device";
-import { usePlatform } from "../platform";
+import { usePlatform, type AudioTransport } from "../platform";
 import { buildLiveSourceUri, liveSourceAudio } from "../media-profile";
 import {
   describeParseFailure,
@@ -35,6 +36,7 @@ import {
   type ProvisionPayload,
 } from "../provision-link";
 import { usePreviewSession } from "../composables/preview/session";
+import { useBroadcastAudio } from "../composables/broadcastAudio";
 
 type MediaMode = "camera" | "screen" | "file";
 type PreviewState = "idle" | "starting" | "playing" | "stopped" | "error";
@@ -100,6 +102,14 @@ const {
   stopDevice,
   reconcile,
 } = useDevice();
+
+const {
+  state: broadcastState,
+  packets: broadcastPackets,
+  muted: broadcastMuted,
+  unlock: unlockBroadcastAudio,
+  start: startBroadcastAudio,
+} = useBroadcastAudio();
 
 const editing = ref(false);
 const saving = ref(false);
@@ -169,6 +179,7 @@ const draft = reactive({
   password: "",
   device_id: "",
   transport: "UDP" as "UDP" | "TCP",
+  audio_transport: "UDP" as AudioTransport,
 });
 const serverDomainManuallyEdited = ref(false);
 
@@ -198,8 +209,14 @@ const mediaModes = [
   { value: "file", label: "视频文件", icon: DocumentOutline },
 ] as const;
 const signalingTransportOptions = [
-  { label: "UDP（当前支持）", value: "UDP" },
-  { label: "TCP（信令层尚未实现）", value: "TCP" },
+  { label: "UDP（共享 socket）", value: "UDP" },
+  { label: "TCP（共享连接池）", value: "TCP" },
+];
+// 音频流传输独立于信令:语音广播/对讲下行的 RTP 走哪条路。
+const audioTransportOptions = [
+  { label: "UDP（兼容性最好）", value: "UDP" },
+  { label: "TCP 主动（设备连平台）", value: "TCP_ACTIVE" },
+  { label: "TCP 被动（设备监听，平台连入）", value: "TCP_PASSIVE" },
 ];
 const sipProfileOptions = computed(() =>
   profiles.value.map((profile) => ({ label: profile.name, value: profile.id })),
@@ -281,7 +298,6 @@ const registerBlocker = computed(() => {
   if (editing.value) return "正在编辑配置，点「完成」保存后再操作";
   if (!deviceLive.value) {
     if (!mediaSourceReady.value) return "先在左侧选择采集来源（摄像头 / 屏幕 / 视频文件）";
-    if (active.value?.transport === "TCP") return "信令 TCP 尚未接入，请把信令传输改成 UDP";
     if (!deviceIdValid.value || !platformValid.value) return "服务器、服务器 ID、设备 ID 不能为空";
   }
   return "";
@@ -298,6 +314,7 @@ function resetDraft() {
     draft.server_domain = active.value.server_domain;
     draft.password = active.value.password;
     draft.transport = active.value.transport;
+    draft.audio_transport = active.value.audio_transport ?? "UDP";
   }
   draft.device_id = config.value?.device.device_id ?? form.value.device_id;
   serverDomainManuallyEdited.value = false;
@@ -341,6 +358,7 @@ async function addSipProfile() {
       server_domain: source?.server_domain ?? "3402000000",
       password: "",
       transport: source?.transport ?? "UDP",
+      audio_transport: source?.audio_transport ?? "UDP",
       gb_version: source?.gb_version ?? "V2022",
       signaling_encoding: source?.signaling_encoding ?? "Gb18030",
     });
@@ -457,6 +475,7 @@ async function applyProvision(allowInsecure: boolean) {
       name,
       gb_version: active.value?.gb_version ?? "V2022",
       signaling_encoding: active.value?.signaling_encoding ?? "Gb18030",
+      audio_transport: "UDP",
       ...patch,
     });
     // 落盘后 active 已切到新配置,再进编辑态让用户核对/微调。
@@ -499,6 +518,7 @@ async function saveConfig() {
         server_domain: draft.server_domain.trim(),
         password: draft.password,
         transport: draft.transport,
+        audio_transport: draft.audio_transport,
       } : profile),
       device: { ...config.value.device, device_id: draft.device_id.trim() },
     });
@@ -611,11 +631,9 @@ async function registerDevice() {
 
 async function toggleRegistration() {
   if (registrationBusy.value || editing.value) return;
+  // 用户手势里解锁 Web Audio:平台发起广播时才能直接出声。
+  void unlockBroadcastAudio();
   if (!deviceLive.value && !mediaSourceReady.value) return;
-  if (!deviceLive.value && active.value?.transport === "TCP") {
-    message.error("信令 TCP 尚未实现，请改用 UDP");
-    return;
-  }
   registrationBusy.value = true;
   try {
     if (!deviceLive.value) {
@@ -693,6 +711,7 @@ watch(active, () => {
 onMounted(async () => {
   resetDraft();
   if (!isTauri) return;
+  void startBroadcastAudio();
   unlistenCaptureState = await listen<string>("capture_state", (event) => {
     captureState.value = event.payload as CaptureState;
     if (event.payload === "ready" && previewPageActive) void startPreview();
@@ -985,13 +1004,32 @@ onUnmounted(() => {
             <span>注册密码</span>
             <n-input v-model:value="draft.password" size="medium" :disabled="!editing" type="password" show-password-on="click" placeholder="上级平台配置的 SIP 密码" />
           </label>
-          <div class="field wide capability-note">对讲传输将在后续阶段接入；当前不保存伪配置。</div>
+          <label class="field wide">
+            <span>音频流传输（语音广播 / 对讲下行）</span>
+            <n-select v-model:value="draft.audio_transport" size="medium" :disabled="!editing" :options="audioTransportOptions" />
+          </label>
         </div>
 
         <div class="primary-actions">
           <n-button :type="deviceLive ? 'error' : 'primary'" size="large" :loading="registrationBusy" :disabled="registrationBusy || !!registerBlocker" :title="registerBlocker || undefined" @click="toggleRegistration">
             <template #icon><n-icon><RadioOutline /></n-icon></template>
             {{ registrationActionLabel }}
+          </n-button>
+        </div>
+
+        <div v-if="broadcastState.active" class="broadcast-indicator" role="status">
+          <n-icon class="broadcast-icon"><VolumeHighOutline /></n-icon>
+          <div class="broadcast-text">
+            <strong>对讲中</strong>
+            <span>
+              通道 {{ broadcastState.channel_id?.slice(-6) || "----" }}
+              · {{ broadcastState.transport }}
+              · 本地 {{ broadcastState.local_port }}
+              · {{ broadcastPackets }} 包
+            </span>
+          </div>
+          <n-button size="tiny" secondary @click="broadcastMuted = !broadcastMuted">
+            {{ broadcastMuted ? "恢复声音" : "静音" }}
           </n-button>
         </div>
 
@@ -1240,6 +1278,20 @@ onUnmounted(() => {
 .field > span { color: var(--text-tertiary); font-size: 10px; }
 .host-port { display: grid; grid-template-columns: minmax(0, 1fr) 78px; gap: 6px; }
 .primary-actions { display: grid; grid-template-columns: minmax(0, 1fr); margin-top: 10px; }
+.broadcast-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+  padding: 6px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary, #2f7cf6) 45%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-primary, #2f7cf6) 10%, transparent);
+}
+.broadcast-icon { flex: 0 0 auto; color: var(--accent-primary, #2f7cf6); }
+.broadcast-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.broadcast-text strong { font-size: 12px; }
+.broadcast-text span { font-size: 11px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .quick-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; margin-top: 7px; }
 .quick-card {
   position: relative;

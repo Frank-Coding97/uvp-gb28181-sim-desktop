@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use common::Result;
+use common::{Result, Transport};
 use gb28181_simulator::DeviceSimulator;
 use scenario::Scenario;
 
@@ -18,6 +18,8 @@ pub struct Orchestrator {
     /// 用于探测本机对平台可达地址的目标端点。
     server_host: String,
     server_port: u16,
+    /// 信令传输方式,取自场景配置。
+    transport: Transport,
 }
 
 impl Orchestrator {
@@ -40,6 +42,7 @@ impl Orchestrator {
             .ok_or_else(|| common::Error::Config("场景未生成任何设备".into()))?;
         let server_host = first.server_host.clone();
         let server_port = first.server_port;
+        let transport = first.transport;
         let ramp_per_second = scenario.ramp_per_second();
         let metrics = Arc::new(Metrics::default());
         let devices: Vec<Arc<DeviceSimulator>> = configs
@@ -60,6 +63,7 @@ impl Orchestrator {
             ramp_per_second,
             server_host,
             server_port,
+            transport,
         })
     }
 
@@ -90,8 +94,20 @@ impl Orchestrator {
         position_secs: u64,
         alarm_secs: u64,
     ) -> Result<()> {
-        // 单个共享 transport(所有设备复用一个 UDP socket)。
-        let transport = sip_core::UdpTransport::bind("0.0.0.0:0").await?;
+        // 单个共享 transport(所有设备复用一个 sip 承载:UDP socket 或 TCP 连接池)。
+        //
+        // TCP 走共享连接池:设备按 ID 哈希固定分配到池内某条连接,FD 占用等于池大小,
+        // 因此万级设备不会把句柄打满 —— 与 UDP 的共享 socket 模型同构。
+        let transport = match self.transport {
+            Transport::Udp => sip_core::SipTransport::bind_udp("0.0.0.0:0").await?,
+            Transport::Tcp => {
+                sip_core::SipTransport::connect_tcp(
+                    &format!("{}:{}", self.server_host, self.server_port),
+                    sip_core::DEFAULT_CONNECTIONS,
+                )
+                .await?
+            }
+        };
         let local_port = transport.local_addr()?.port();
 
         // 不能把 bind 得到的 0.0.0.0 写进 Via/Contact。通过连接目标平台探测
@@ -182,7 +198,7 @@ impl Orchestrator {
     #[allow(clippy::too_many_arguments)]
     async fn report_loop(
         dev: Arc<DeviceSimulator>,
-        transport: Arc<sip_core::UdpTransport>,
+        transport: Arc<sip_core::SipTransport>,
         local_host: String,
         local_port: u16,
         position_secs: u64,

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use common::{DeviceId, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
-use sip_core::UdpTransport;
+use sip_core::SipTransport;
 
 /// 读环境变量,缺省用给定默认值。
 fn env_or(key: &str, default: &str) -> String {
@@ -67,6 +67,7 @@ async fn main() {
         server_id,
         server_domain,
         transport: Transport::Udp,
+        audio_transport: common::AudioTransport::Udp,
         register_expires_secs: 3_600,
         heartbeat_interval_secs: 60,
         heartbeat_fail_threshold: 3,
@@ -96,7 +97,7 @@ async fn main() {
 
     // 本端地址:发现对外 IP + 绑定随机端口的共享传输。
     let local_ip = discover_local_ip(&format!("{server_host}:{server_port}"));
-    let transport = UdpTransport::bind("0.0.0.0:0")
+    let transport = SipTransport::bind_udp("0.0.0.0:0")
         .await
         .expect("绑定 UDP 失败");
     let local_port = transport.local_addr().expect("取本地端口失败").port();

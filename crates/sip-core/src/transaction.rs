@@ -1,7 +1,12 @@
 //! SIP 事务层。
 //!
-//! 实现 docs/30-crates/sip-core.md §transaction。M1 提供**客户端事务**:发送请求后
-//! 等待响应,UDP 下按 T1 指数退避重传,直到收到最终响应或达到重传上限。
+//! 实现 docs/30-crates/sip-core.md §transaction。提供**客户端事务**:发送请求后
+//! 等待响应。传输语义按承载区分:
+//!
+//! - UDP(不可靠):按 T1 指数退避重传,直到收到最终响应或达到重传上限;
+//! - TCP(可靠):重传由传输层负责,这里只做**一次**发送 + 总预算等待,避免在
+//!   可靠连接上重复投递 REGISTER / INVITE 造成平台侧重复会话。
+//!
 //! 响应与请求按 CSeq 序号匹配(同一 Call-ID 队列内)。
 
 use std::net::SocketAddr;
@@ -13,7 +18,7 @@ use tokio::time::timeout;
 use common::{Error, Result};
 
 use crate::message::{Request, Response, SipMessage};
-use crate::transport::{Incoming, UdpTransport};
+use crate::transport::{Incoming, SipTransport};
 
 /// 事务定时参数。默认贴近 RFC 3261(T1=500ms),测试可调小。
 #[derive(Debug, Clone, Copy)]
@@ -40,12 +45,16 @@ impl Default for Timing {
 pub type TxResult = Result<Response>;
 
 /// 执行一次客户端事务:发送 `request` 到 `dst`,在 `rx`(该 Call-ID 的接收队列)
-/// 上等待匹配响应。UDP 下超时按 t1→2×…(上限 t2)退避重传,超过上限返回超时错误
-/// (对应压测失败归因的 `timeout`)。
+/// 上等待匹配响应。
+///
+/// - 不可靠传输(UDP):超时按 t1→2×…(上限 t2)退避重传,超过上限返回超时错误
+///   (对应压测失败归因的 `timeout`)。
+/// - 可靠传输(TCP):只发一次,等待总预算(等价于 UDP 重传间隔之和)后超时,
+///   避免在可靠连接上重复投递请求。
 ///
 /// 匹配规则:响应 CSeq 序号与请求一致。临时响应(1xx)不结束事务,继续等最终响应。
 pub async fn client_transact(
-    transport: &UdpTransport,
+    transport: &SipTransport,
     dst: SocketAddr,
     request: &Request,
     rx: &mut mpsc::UnboundedReceiver<Incoming>,
@@ -56,6 +65,20 @@ pub async fn client_transact(
 
     // 首发。
     transport.send_to(&msg, dst).await?;
+
+    // 可靠传输:不做应用层重传。
+    if transport.is_reliable() {
+        let budget = transact_budget(timing);
+        return match timeout(budget, wait_matching(rx, cseq)).await {
+            Ok(Some(resp)) => Ok(resp),
+            Ok(None) => Err(Error::Sip("事务接收队列已关闭".into())),
+            Err(_) => Err(Error::Sip(format!(
+                "事务超时:{} 无最终响应(TCP,等待 {:.1}s)",
+                request.method,
+                budget.as_secs_f32()
+            ))),
+        };
+    }
 
     let mut interval = timing.t1;
     let mut retransmits = 0u32;
@@ -80,6 +103,19 @@ pub async fn client_transact(
     }
 }
 
+/// 事务总预算:UDP 各次重传等待间隔之和。
+///
+/// 让 TCP 与 UDP 在相同 [`Timing`] 下拥有可比的失败时延,便于压测归因对齐。
+fn transact_budget(timing: Timing) -> Duration {
+    let mut total = Duration::ZERO;
+    let mut interval = timing.t1;
+    for _ in 0..=timing.max_retransmits {
+        total += interval;
+        interval = (interval * 2).min(timing.t2);
+    }
+    total.max(Duration::from_millis(1))
+}
+
 /// 从队列取消息,返回首个 CSeq 匹配的**最终**响应(跳过 1xx 与请求)。
 async fn wait_matching(
     rx: &mut mpsc::UnboundedReceiver<Incoming>,
@@ -102,6 +138,7 @@ async fn wait_matching(
 mod tests {
     use super::*;
     use crate::message::{Headers, Method};
+    use crate::transport::UdpTransport;
 
     fn make_request(call_id: &str, cseq: u32) -> Request {
         let mut headers = Headers::new();
@@ -145,7 +182,8 @@ mod tests {
         });
 
         let req = make_request("call-1", 1);
-        let resp = client_transact(&device, dst, &req, &mut rx, Timing::default())
+        let tp = SipTransport::Udp(device.clone());
+        let resp = client_transact(&tp, dst, &req, &mut rx, Timing::default())
             .await
             .unwrap();
         assert_eq!(resp.status, 200);
@@ -164,7 +202,8 @@ mod tests {
             t2: Duration::from_millis(10),
             max_retransmits: 2,
         };
-        let r = client_transact(&device, dst, &req, &mut rx, timing).await;
+        let tp = SipTransport::Udp(device.clone());
+        let r = client_transact(&tp, dst, &req, &mut rx, timing).await;
         assert!(r.is_err());
     }
 }

@@ -31,10 +31,18 @@ assert.match(
   "没有实际视频源时只应拒绝注册，不能阻止已运行设备注销",
 );
 assert.ok(registrationButton, "应存在首页注册/注销按钮");
+// 按钮禁用条件已收敛到 registerBlocker(单一真相),这里改断言其内部判定,
+// 语义不变:没有实际视频源只应挡住注册,不影响注销。
+const registerBlocker = source.match(/const registerBlocker = computed\(\(\) => \{([\s\S]*?)\n\}\);/)?.[1] ?? "";
+assert.match(
+  registerBlocker,
+  /if \(!mediaSourceReady\.value\) return/,
+  "没有实际视频源时应作为注册禁用原因",
+);
 assert.match(
   registrationButton,
-  /\(!deviceLive && !mediaSourceReady\)/,
-  "没有实际视频源时只应禁用注册按钮，不能禁用注销按钮",
+  /!!registerBlocker/,
+  "注册按钮禁用必须走统一判定,不能另拼条件",
 );
 assert.doesNotMatch(
   source,

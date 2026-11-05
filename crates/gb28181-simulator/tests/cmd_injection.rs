@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use common::{DeviceId, GbVersion, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo, DeviceSimulator};
-use sip_core::{Headers, Incoming, Method, Request, SipMessage, UdpTransport};
+use sip_core::{Headers, Incoming, Method, Request, SipMessage, SipTransport};
 
 fn cfg() -> DeviceConfig {
     DeviceConfig {
@@ -17,6 +17,7 @@ fn cfg() -> DeviceConfig {
         server_id: "34020000002000000001".into(),
         server_domain: "3402000000".into(),
         transport: Transport::Udp,
+        audio_transport: common::AudioTransport::Udp,
         gb_version: GbVersion::V2022,
         signaling_encoding: common::SignalingEncoding::Gb18030,
         register_expires_secs: 3_600,
@@ -62,8 +63,8 @@ fn message(from_tag: &str, call_id: &str, body: &str) -> SipMessage {
 /// 注入一条命令,收集平台侧收到的应答 MESSAGE 体(独立 MESSAGE 路径)。
 async fn inject_and_collect(
     sim: &Arc<DeviceSimulator>,
-    device_tp: &Arc<UdpTransport>,
-    platform_tp: &Arc<UdpTransport>,
+    device_tp: &Arc<SipTransport>,
+    platform_tp: &Arc<SipTransport>,
     platform_addr: std::net::SocketAddr,
     call_id: &str,
     body: &str,
@@ -97,8 +98,8 @@ async fn inject_and_collect(
 #[tokio::test]
 async fn 全部查询命令注入应答() {
     let sim = Arc::new(DeviceSimulator::new(cfg()));
-    let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+    let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let platform_addr = platform_tp.local_addr().unwrap();
     // 让设备知道本端地址(应答 From 填充用)。
     sim.set_local_addr_for_test("127.0.0.1", device_tp.local_addr().unwrap().port());
@@ -140,8 +141,8 @@ async fn 全部查询命令注入应答() {
 #[tokio::test]
 async fn 设备配置控制注入应答() {
     let sim = Arc::new(DeviceSimulator::new(cfg()));
-    let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+    let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let platform_addr = platform_tp.local_addr().unwrap();
     sim.set_local_addr_for_test("127.0.0.1", device_tp.local_addr().unwrap().port());
     let dev = "34020000001110000001";
@@ -192,8 +193,8 @@ async fn 多通道子通道点播建立会话() {
     c.light_bitrate_kbps = Some(256); // B 档伪流,任意通道可推
     let sim = Arc::new(DeviceSimulator::new(c));
     sim.load_catalog_template("nvr-8ch");
-    let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-    let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+    let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+    let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
     let platform_addr = platform_tp.local_addr().unwrap();
     sim.set_local_addr_for_test("127.0.0.1", device_tp.local_addr().unwrap().port());
 

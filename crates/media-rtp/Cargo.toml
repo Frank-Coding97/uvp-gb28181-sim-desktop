@@ -26,6 +26,8 @@ objc2-core-foundation = { version = "=0.3.2", default-features = false, features
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGSession"] }
 
 [target.'cfg(windows)'.dependencies]
+# 显示器枚举只需要 user32 的 EnumDisplayMonitors/GetMonitorInfoW。
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
 # Media Foundation device and sample APIs for cameras that DirectShow cannot open.
 # 注：`windows` 0.61 没有 `Media_MediaFoundation` 这个 feature（WinRT 命名空间下不存在，
 # 会被 cargo 在**依赖解析阶段**拒绝：failed to select a version for `windows`）。

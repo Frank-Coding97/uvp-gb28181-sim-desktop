@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use common::{DeviceId, Error, Result, Transport};
 use gb28181_protocol::manscdp::Keepalive;
-use sip_core::{authorization, Challenge, UdpTransport};
+use sip_core::{authorization, Challenge, SipTransport};
 
 use crate::builder::{self, DialogIds};
 use crate::firmware_upgrade::{
@@ -144,6 +144,8 @@ pub struct DeviceConfig {
     pub server_domain: String,
     /// 信令传输方式。
     pub transport: Transport,
+    /// 音频流(语音广播/对讲下行)的媒体传输方式。
+    pub audio_transport: common::AudioTransport,
     /// 注册有效期(秒)，不得短于 3600。
     pub register_expires_secs: u32,
     /// 心跳间隔(秒)。
@@ -303,6 +305,8 @@ pub struct DeviceSimulator {
     upgrade_store: Arc<UpgradeStore>,
     /// 同一设备同时只允许一个新的升级会话执行。
     active_upgrade: tokio::sync::Mutex<Option<String>>,
+    /// 语音广播/对讲下行会话(平台 → 设备)。
+    broadcast: Arc<crate::broadcast::BroadcastRunner>,
 }
 
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
@@ -467,6 +471,10 @@ impl DeviceSimulator {
         state_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let runtime_config = initial_runtime_config(&config);
+        let broadcast = Arc::new(crate::broadcast::BroadcastRunner::new(
+            config.clone(),
+            Arc::clone(&observer),
+        ));
         let upgrade_store = Arc::new(UpgradeStore::open(
             state_dir,
             config.device_id.as_str(),
@@ -503,7 +511,16 @@ impl DeviceSimulator {
             catalog_activity: std::sync::Mutex::new(None),
             upgrade_store,
             active_upgrade: tokio::sync::Mutex::new(None),
+            broadcast,
         }
+    }
+
+    /// 注入语音广播的音频输出(桌面端在启动设备前注入;不注入则只统计不播放)。
+    pub fn set_broadcast_audio_sink(
+        &self,
+        sink: Arc<dyn crate::broadcast::BroadcastAudioSink>,
+    ) {
+        self.broadcast.set_audio_sink(sink);
     }
 
     /// 本端信令 host(run 启动后有效,未设时回退 0.0.0.0)。
@@ -1041,7 +1058,7 @@ impl DeviceSimulator {
     /// 成功返回 [`DeviceState::Registered`],鉴权/拒绝失败返回 [`DeviceState::Failed`] 对应错误。
     pub async fn register(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<DeviceState> {
@@ -1087,7 +1104,7 @@ impl DeviceSimulator {
     /// 注册核心逻辑(不含事件上报)。
     async fn register_inner(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<DeviceState> {
@@ -1168,7 +1185,7 @@ impl DeviceSimulator {
     /// 尽力而为:失败仅记录警告(下线流程不因注销失败而阻塞)。
     pub async fn unregister(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<()> {
@@ -1234,7 +1251,7 @@ impl DeviceSimulator {
     /// 事务结束即注销路由。
     async fn send_message_xml(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
         xml: &str,
@@ -1259,7 +1276,7 @@ impl DeviceSimulator {
     /// 不支持该 CmdType 直接丢弃)。发出即返回,不因平台不响应而阻塞重传。
     async fn send_message_xml_oneshot(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
         xml: &str,
@@ -1278,7 +1295,7 @@ impl DeviceSimulator {
     /// 发送一次心跳(MESSAGE + Keepalive XML)。返回平台响应状态码。
     pub async fn send_keepalive(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<u16> {
@@ -1301,7 +1318,7 @@ impl DeviceSimulator {
     /// `description` 为报警描述;返回平台响应状态码。
     pub async fn report_alarm(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
         description: &str,
@@ -1356,7 +1373,7 @@ impl DeviceSimulator {
     /// 直接丢弃不回 200,故不等待响应,发出即返回,避免无谓的事务重传阻塞。
     pub async fn report_video_upload(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
     ) -> Result<()> {
@@ -1378,7 +1395,7 @@ impl DeviceSimulator {
     /// 位置订阅场景下由周期任务调用;也可手动触发。返回平台响应状态码。
     pub async fn report_position(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         local_host: &str,
         local_port: u16,
         longitude: f64,
@@ -1411,7 +1428,7 @@ impl DeviceSimulator {
     /// Event/Subscription-State 头),`dst` 为平台来源地址。
     async fn notify_catalog(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         dst: SocketAddr,
         dialog: &builder::NotifyDialog,
         sn: u32,
@@ -1450,7 +1467,7 @@ impl DeviceSimulator {
     /// 计算当前目录相对上次快照的 diff(ADD/DEL/UPDATE/ON/OFF),若有变更且存在活跃目录订阅,
     /// 在订阅对话内发一条只含变更项的 Catalog NOTIFY,并刷新快照基线。无订阅/无变更时不发。
     /// CRUD(upsert_channel/remove_channel)或状态切换后调用。
-    pub async fn notify_catalog_changed(&self, transport: &Arc<UdpTransport>) -> Result<()> {
+    pub async fn notify_catalog_changed(&self, transport: &Arc<SipTransport>) -> Result<()> {
         use gb28181_protocol::manscdp::CatalogSnapshot;
         let next = CatalogSnapshot::from_nodes(self.catalog_publishable());
         let changes = {
@@ -1483,7 +1500,7 @@ impl DeviceSimulator {
     /// 串行发送目录 NOTIFY 分片；每片等待事务确认，失败时记录并继续剩余分片。
     async fn send_catalog_notify_pages(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         dst: SocketAddr,
         dialog: &builder::NotifyDialog,
         pages: Vec<gb28181_protocol::manscdp::CatalogNotify>,
@@ -1533,7 +1550,7 @@ impl DeviceSimulator {
     /// `interval` 缺省/为 0 时取 5 秒兜底。同一 CmdType 再次订阅会替换旧任务。
     async fn start_position_subscription(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         interval: Option<u64>,
     ) {
         let secs = interval.filter(|s| *s > 0).unwrap_or(5);
@@ -1581,7 +1598,7 @@ impl DeviceSimulator {
     /// 后续变化时上报;订阅建立后补推一条当前姿态,给平台一个基线读数。
     async fn register_ptz_position_subscription(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         dialog: builder::NotifyDialog,
         dst: SocketAddr,
     ) {
@@ -1620,7 +1637,7 @@ impl DeviceSimulator {
     /// 无条件周期上报)。无订阅时静默返回,平台会在下次订阅或查询时同步。
     async fn notify_ptz_if_pose_changed(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         before: (f32, f32, f32),
     ) {
         if self.precise_pose() == before {
@@ -1647,7 +1664,7 @@ impl DeviceSimulator {
     /// 关联不上就丢弃。
     pub async fn notify_ptz_position(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         dst: SocketAddr,
         dialog: &builder::NotifyDialog,
     ) -> Result<u16> {
@@ -1715,7 +1732,7 @@ impl DeviceSimulator {
     /// 周期上报任务,任务生命周期独立于单次入站处理。
     pub async fn answer_inbound(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         incoming: &sip_core::Incoming,
     ) -> Result<bool> {
         if let sip_core::SipMessage::Request(req) = &incoming.message {
@@ -1830,6 +1847,12 @@ impl DeviceSimulator {
                     self.handle_invite(transport, req, incoming.from).await
                 }
                 sip_core::Method::Bye => {
+                    // 语音广播对话的 BYE:结束广播并回 200 OK。
+                    if self.broadcast.handle_bye(req).await {
+                        let resp = sip_core::SipMessage::Response(builder::response_ok(req));
+                        transport.send_to(&resp, incoming.from).await?;
+                        return Ok(true);
+                    }
                     // 停止推流,回 200 OK。
                     self.handle_bye(transport, req, incoming.from).await
                 }
@@ -1935,7 +1958,7 @@ impl DeviceSimulator {
     /// 无活跃会话时也回 200(避免平台重传)。
     async fn handle_info(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
     ) -> Result<bool> {
@@ -2016,7 +2039,7 @@ impl DeviceSimulator {
         Some(permille.min(1000))
     }
 
-    async fn notify_media_finished(&self, transport: &Arc<UdpTransport>) {
+    async fn notify_media_finished(&self, transport: &Arc<SipTransport>) {
         let (host, port) = (self.local_host(), self.local_port());
         let sn = self.next_cseq();
         if let Ok(xml) = gb28181_protocol::manscdp::MediaStatusNotify::finished(
@@ -2972,12 +2995,11 @@ impl DeviceSimulator {
 
     /// 处理语音广播(FR-36):校验 TargetID,回 Broadcast Response,接受则反向发 INVITE。
     ///
-    /// 设备为**主叫 UAC**:向平台发 `m=audio ... a=recvonly` 的 INVITE 收 G.711A 下行。
-    /// ⚠️ 反向 INVITE 的完整音频接收/ACK/BYE 链路本 WVP 环境无法触发验证,当前实现
-    /// 到"发出带正确 SDP 的 INVITE"为止(记忆:不盲写无法验证的部分),已足以让平台侧建流。
+    /// 设备为**主叫 UAC**:向平台发 `m=audio ... a=recvonly` 的 INVITE 收 G.711A 下行,
+    /// 收到 200 OK 后回 ACK,并按配置的音频流传输方式(UDP / TCP 主动 / TCP 被动)收流播放。
     async fn handle_broadcast(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         bc: &gb28181_protocol::manscdp::BroadcastNotify,
         from: SocketAddr,
     ) -> Result<()> {
@@ -2988,38 +3010,41 @@ impl DeviceSimulator {
                 .channels
                 .iter()
                 .any(|c| c.channel_id.as_str() == bc.target_id);
-        let resp = if owned {
-            gb28181_protocol::manscdp::BroadcastResponse::ok(&bc.target_id, bc.sn)
-        } else {
+        let busy = owned && self.broadcast.is_active();
+        let resp = if !owned {
             gb28181_protocol::manscdp::BroadcastResponse::error(
                 self.config.device_id.as_str(),
                 bc.sn,
                 "target mismatch",
             )
+        } else if busy {
+            gb28181_protocol::manscdp::BroadcastResponse::error(
+                self.config.device_id.as_str(),
+                bc.sn,
+                "busy",
+            )
+        } else {
+            gb28181_protocol::manscdp::BroadcastResponse::ok(&bc.target_id, bc.sn)
         };
-        // 先回 200 OK(入站已回),再以独立 MESSAGE 发 Broadcast Response。
+        // 协议顺序:先以独立 MESSAGE 回 Broadcast Response,再发起反向 INVITE。
         let xml = resp.to_xml()?;
         self.send_reply_message(transport, from, &xml).await?;
 
-        if owned {
-            // 构造反向 INVITE 的 SDP offer(设备收流)。真正的 client INVITE 事务
-            // 需音频 RTP 接收端,本环境无法验证,故此处仅生成 offer 并记录。
-            let local_ip = transport
-                .local_addr()
-                .map(|a| a.ip())
-                .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
-            let offer = sip_core::build_broadcast_offer(
-                &bc.target_id,
-                local_ip,
-                0, // 端口 0:占位(未实际开收流 socket)
-                rand::random::<u32>() & 0x00FF_FFFF,
-                false,
-            );
-            tracing::info!(source = %bc.source_id, target = %bc.target_id,
-                "语音广播接受,反向 INVITE offer 已构造(音频接收链路待真机验证)");
-            tracing::debug!(sdp = %offer, "广播 SDP offer");
-        } else {
+        if !owned {
             tracing::warn!(target = %bc.target_id, "语音广播 TargetID 不属本设备,拒绝");
+            return Ok(());
+        }
+        if busy {
+            tracing::warn!(target = %bc.target_id, "语音广播忙,拒绝新的广播会话");
+            return Ok(());
+        }
+        if !self.broadcast.start(
+            Arc::clone(transport),
+            self.local_host(),
+            self.local_port(),
+            bc.clone(),
+        ) {
+            tracing::warn!(target = %bc.target_id, "语音广播会话启动失败");
         }
         Ok(())
     }
@@ -3028,7 +3053,7 @@ impl DeviceSimulator {
     /// 已在入站循环里回过 200/结果,这里异步执行不阻塞应答。
     fn spawn_control_side_effects(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         ctrl: &gb28181_protocol::manscdp::Control,
         upgrade_dispatch: Option<UpgradeDispatch>,
     ) {
@@ -3069,7 +3094,7 @@ impl DeviceSimulator {
     /// 执行已登记的升级会话，成功路径重新注册并持久化版本后发送最终 Notify。
     async fn run_upgrade_dispatch(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         dispatch: UpgradeDispatch,
     ) {
         let clear_active = matches!(&dispatch, UpgradeDispatch::Start(_));
@@ -3174,7 +3199,7 @@ impl DeviceSimulator {
 
     async fn send_upgrade_result(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         result: &UpgradeResult,
         session_id: &str,
     ) {
@@ -3259,7 +3284,7 @@ impl DeviceSimulator {
     /// 抓拍上传(GB-2022):串行拍 N 张，从共享采集流的最近可解码关键帧生成 JPEG。
     async fn run_snapshot_upload(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         cfg: &gb28181_protocol::manscdp::SnapShotConfig,
     ) {
         let (h, p) = (self.local_host(), self.local_port());
@@ -3331,7 +3356,7 @@ impl DeviceSimulator {
     /// 向平台发送一条应答/通知 MESSAGE(查询应答、控制应答、位置通知等复用)。
     async fn send_reply_message(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         to: SocketAddr,
         xml: &str,
     ) -> Result<()> {
@@ -3355,7 +3380,7 @@ impl DeviceSimulator {
     /// 返回顺序发送下一片，并在单片失败时继续 best-effort 发送剩余片。
     async fn send_query_response_message(
         &self,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         to: SocketAddr,
         xml: &str,
     ) -> Result<u16> {
@@ -3380,7 +3405,7 @@ impl DeviceSimulator {
     /// 处理 INVITE:解析平台 SDP,启动推流,回 200 OK(带本端 SDP)。
     async fn handle_invite(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
     ) -> Result<bool> {
@@ -3623,7 +3648,7 @@ impl DeviceSimulator {
     /// 处理 BYE:停止推流,回 200 OK。回放/下载会话结束后补发 MediaStatus 121。
     async fn handle_bye(
         self: &Arc<Self>,
-        transport: &Arc<UdpTransport>,
+        transport: &Arc<SipTransport>,
         req: &sip_core::Request,
         from: SocketAddr,
     ) -> Result<bool> {
@@ -3656,7 +3681,7 @@ impl DeviceSimulator {
     /// 这是设备"保持在线"的主循环(docs/10-functional/device-simulation.md §3.2/§3.3)。
     pub async fn run(
         self: Arc<Self>,
-        transport: Arc<UdpTransport>,
+        transport: Arc<SipTransport>,
         local_host: String,
         local_port: u16,
         shutdown: impl std::future::Future<Output = ()>,
@@ -3754,6 +3779,14 @@ impl DeviceSimulator {
         }
         inbound_task.abort();
         self.stop_subscriptions().await;
+        // 先结束语音广播(尽力向平台发 BYE),再注销设备。
+        if let Ok(dst) = format!("{}:{}", self.config.server_host, self.config.server_port)
+            .parse::<SocketAddr>()
+        {
+            self.broadcast
+                .stop(Arc::clone(&transport), dst, local_host.clone(), local_port)
+                .await;
+        }
         if let Some(service) = self.recording_service() {
             if let Err(error) = service.stop().await {
                 tracing::warn!(%error, "设备下线时录像收尾失败");
@@ -3819,6 +3852,7 @@ mod tests {
             server_id: "34020000002000000001".into(),
             server_domain: "3402000000".into(),
             transport: Transport::Udp,
+            audio_transport: common::AudioTransport::Udp,
             register_expires_secs: 3_600,
             heartbeat_interval_secs: 60,
             heartbeat_fail_threshold: 3,
@@ -3840,7 +3874,7 @@ mod tests {
 
     /// mock 平台:收到首个 REGISTER 回 401(带挑战),第二个回 200。
     async fn mock_platform_register(
-        platform: Arc<UdpTransport>,
+        platform: Arc<SipTransport>,
         device_addr: SocketAddr,
         call_id: String,
         expected_expires: u32,
@@ -3917,8 +3951,8 @@ mod tests {
 
     #[tokio::test]
     async fn 注册闭环_401后带鉴权成功() {
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
         let device_addr = device_tp.local_addr().unwrap();
 
@@ -3941,8 +3975,8 @@ mod tests {
 
     #[tokio::test]
     async fn 注册使用配置有效期() {
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
         let device_addr = device_tp.local_addr().unwrap();
 
@@ -3989,8 +4023,8 @@ mod tests {
 
     #[tokio::test]
     async fn 注册失败后的重试等待可被立即停止() {
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
         let device_addr = device_tp.local_addr().unwrap();
         let sim = Arc::new(DeviceSimulator::new(test_cfg(
@@ -4057,8 +4091,8 @@ mod tests {
             }
         }
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
         let device_addr = device_tp.local_addr().unwrap();
         let mut cfg = test_cfg("127.0.0.1", platform_addr.port());
@@ -4091,8 +4125,8 @@ mod tests {
     async fn options_回_200() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
         let sim = Arc::new(DeviceSimulator::new(test_cfg(
@@ -4141,8 +4175,8 @@ mod tests {
     async fn 目录查询应答含通道() {
         use sip_core::Method;
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
         let mut cfg = test_cfg("127.0.0.1", platform_addr.port());
@@ -4216,8 +4250,8 @@ mod tests {
     async fn catalog分片等待每片确认后串行发送() {
         use sip_core::Method;
 
-        let device_tp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
-        let platform_tp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let device_tp = Arc::new(SipTransport::bind_udp("127.0.0.1:0").await.unwrap());
+        let platform_tp = Arc::new(SipTransport::bind_udp("127.0.0.1:0").await.unwrap());
         let platform_addr = platform_tp.local_addr().unwrap();
         let sim = Arc::new(DeviceSimulator::new(test_cfg(
             "127.0.0.1",
@@ -4764,8 +4798,8 @@ mod tests {
     #[tokio::test]
     async fn 语音广播_目标匹配回ok() {
         use sip_core::{Headers, Method, Request, SipMessage};
-        let device_tp = std::sync::Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = std::sync::Arc::new(SipTransport::bind_udp("127.0.0.1:0").await.unwrap());
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
         let sim = std::sync::Arc::new(DeviceSimulator::new(test_cfg(
             "127.0.0.1",
@@ -4864,8 +4898,8 @@ mod tests {
     async fn 移动位置订阅_回200并周期上报位置notify() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
         // 设备平台地址指向 mock 平台;server_domain 为平台 AOR。
@@ -4939,8 +4973,8 @@ mod tests {
     async fn 报警订阅_回200并记录对话供对话内notify() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
         let sim = Arc::new(DeviceSimulator::new(test_cfg(
@@ -5002,7 +5036,7 @@ mod tests {
     }
 
     /// 平台侧对设备发来的请求回 200,结束设备的事务并抑制重传。
-    async fn ack_platform_request(platform: &Arc<UdpTransport>, incoming: &sip_core::Incoming) {
+    async fn ack_platform_request(platform: &Arc<SipTransport>, incoming: &sip_core::Incoming) {
         let SipMessage::Request(req) = &incoming.message else {
             return;
         };
@@ -5021,7 +5055,7 @@ mod tests {
     /// 平台下发 PTZPosition 事件订阅(GB-2022 事件型语义,**不带 Interval**)。
     async fn subscribe_ptz_position(
         sim: &Arc<DeviceSimulator>,
-        device_tp: &Arc<UdpTransport>,
+        device_tp: &Arc<SipTransport>,
         platform_addr: SocketAddr,
         call_id: &str,
     ) {
@@ -5056,8 +5090,8 @@ mod tests {
     async fn ptz位置订阅_回200记录对话且不启动周期上报() {
         use sip_core::Method;
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
         let sim = Arc::new(DeviceSimulator::new(test_cfg(
@@ -5126,8 +5160,8 @@ mod tests {
     async fn ptz姿态变化_发对话内notify_未变化不发() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
         let sim = Arc::new(DeviceSimulator::new(test_cfg(
@@ -5213,8 +5247,8 @@ mod tests {
     async fn info回放控制_调速与暂停恢复并回200() {
         use sip_core::{Method, Request};
 
-        let device_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        let platform_tp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
         let sim = Arc::new(DeviceSimulator::new(test_cfg(

@@ -15,7 +15,7 @@ use gb28181_simulator::{
     RecordingPhase, RecordingSource, RecordingState, RecordingStore,
 };
 use serde::Serialize;
-use sip_core::UdpTransport;
+use sip_core::SipTransport;
 use stress_engine::{Metrics, Orchestrator};
 use tauri::{
     ipc::{Channel, InvokeResponseBody},
@@ -76,7 +76,7 @@ struct StressHandle {
 /// 单设备运行句柄。
 struct DeviceHandle {
     sim: Arc<DeviceSimulator>,
-    transport: Arc<UdpTransport>,
+    transport: Arc<SipTransport>,
     local_host: String,
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
@@ -325,6 +325,23 @@ fn camera_capture_guidance(message: &str) -> String {
     message.to_string()
 }
 
+/// 语音广播/对讲下行的 PCM 输出。
+///
+/// 设备侧收流解码得到 8kHz 单声道 PCM,这里原样转成 `broadcast_audio` 事件;
+/// 前端用 Web Audio 建一个 8kHz AudioContext 排程播放(不引入原生音频依赖)。
+struct BroadcastAudioEmitter {
+    app: AppHandle,
+}
+
+impl gb28181_simulator::BroadcastAudioSink for BroadcastAudioEmitter {
+    fn on_pcm(&self, pcm: &[i16], sample_rate: u32) {
+        let _ = self.app.emit(
+            "broadcast_audio",
+            serde_json::json!({ "sample_rate": sample_rate, "pcm": pcm }),
+        );
+    }
+}
+
 impl DeviceObserver for StateEmitter {
     fn on_event(&self, event: DeviceEvent) {
         let state = match event {
@@ -433,6 +450,48 @@ impl DeviceObserver for StateEmitter {
                 let _ = self.app.emit(
                     "subscription_state",
                     serde_json::json!({ "kind": kind, "active": active, "notify_count": notify_count }),
+                );
+                return;
+            }
+            // 语音广播(对讲下行)→ 前端状态指示 + 音频播放。
+            DeviceEvent::BroadcastStarted {
+                channel_id,
+                source_id,
+                transport,
+                local_port,
+            } => {
+                let _ = self.app.emit(
+                    "broadcast_state",
+                    serde_json::json!({
+                        "active": true,
+                        "channel_id": channel_id,
+                        "source_id": source_id,
+                        "transport": transport,
+                        "local_port": local_port,
+                    }),
+                );
+                return;
+            }
+            DeviceEvent::BroadcastProgress { packets, bytes } => {
+                let _ = self.app.emit(
+                    "broadcast_progress",
+                    serde_json::json!({ "packets": packets, "bytes": bytes }),
+                );
+                return;
+            }
+            DeviceEvent::BroadcastEnded {
+                reason,
+                packets,
+                bytes,
+            } => {
+                let _ = self.app.emit(
+                    "broadcast_state",
+                    serde_json::json!({
+                        "active": false,
+                        "reason": reason,
+                        "packets": packets,
+                        "bytes": bytes,
+                    }),
                 );
                 return;
             }
@@ -1155,6 +1214,7 @@ async fn probe_live_source(
 ) -> Result<LiveProbeDto, String> {
     let spec = media_rtp::LiveSourceSpec::parse(uri.trim()).map_err(|error| error.to_string())?;
     let canonical_uri = uri.trim().to_string();
+    let is_screen = matches!(&spec, media_rtp::LiveSourceSpec::Screen { .. });
     let audio_requested = match spec {
         media_rtp::LiveSourceSpec::Camera { audio_index, .. } => audio_index.is_some(),
         media_rtp::LiveSourceSpec::Screen { audio, .. } => audio.is_enabled(),
@@ -1195,6 +1255,8 @@ async fn probe_live_source(
             "视频与请求的音频采集正常".to_string()
         } else if video_ready && audio_requested {
             "视频采集正常，但未检测到音频；请播放系统声音或对麦克风说话后重试".to_string()
+        } else if is_screen {
+            "未检测到屏幕画面，请检查是否有其他程序占用桌面复制，或显示器是否已断开".to_string()
         } else {
             "未检测到视频帧，请检查设备占用和系统摄像头权限".to_string()
         };
@@ -1331,9 +1393,8 @@ async fn start_device(
             .map_err(|error| format!("读取配置任务异常: {error}"))??
     };
     let mut resolved = persisted.resolve_start(input)?;
-    if resolved.profile.transport == Transport::Tcp {
-        return Err("当前 SIP 信令仅支持 UDP；TCP 传输尚未实现,请改用 UDP".into());
-    }
+    // 信令传输由 profile.transport 决定:UDP 走共享 socket,TCP 走共享连接池。
+    // 两者都在下面按模式创建,不再在此处拦截 TCP。
     if let Some(source) = resolved.video_source.take() {
         if source.starts_with("live:") {
             let spec = media_rtp::LiveSourceSpec::parse(&source)
@@ -1405,7 +1466,7 @@ async fn start_device(
                             .any(|screen| screen.display_id == display_id) =>
                 {
                     return Err(catalog.screen_error.unwrap_or_else(|| {
-                        format!("未找到 ScreenCaptureKit 显示器 {display_id}")
+                        format!("未找到显示器 {display_id}")
                     }));
                 }
                 _ => {}
@@ -1428,6 +1489,7 @@ async fn start_device(
         server_id: resolved.profile.server_id.clone(),
         server_domain: resolved.profile.server_domain.clone(),
         transport: resolved.profile.transport,
+        audio_transport: resolved.profile.audio_transport,
         register_expires_secs: resolved.device.register_expires_secs,
         heartbeat_interval_secs: resolved.device.heartbeat_interval_secs,
         heartbeat_fail_threshold: resolved.device.heartbeat_fail_threshold,
@@ -1526,15 +1588,12 @@ async fn start_device(
     if state.shutting_down.load(Ordering::Acquire) {
         return Err("应用正在退出".into());
     }
-    // 共享 UDP 传输 + 本端地址发现。
-    let bind_host = match resolved.network.bind_mode {
-        BindMode::Auto => "0.0.0.0".to_string(),
-        BindMode::Specific => resolved.network.bind_address.clone(),
-    };
-    let udp = UdpTransport::bind(&format!("{bind_host}:0"))
-        .await
-        .map_err(|e| e.to_string())?;
-    let local_port = udp.local_addr().map_err(|e| e.to_string())?.port();
+    // 共享信令承载 + 本端地址发现。
+    //
+    // 两种传输都是"一套承载带全部虚拟设备":
+    // - UDP:一个 socket,按 Call-ID/AOR 路由;
+    // - TCP:一个连接池,设备按 ID 哈希固定分配到某条连接。
+    // 因此 FD 占用与设备数量无关,这是万级压测能跑起来的前提。
     let local_host = match resolved.network.bind_mode {
         BindMode::Auto => discover_local_ip(&format!(
             "{}:{}",
@@ -1542,9 +1601,28 @@ async fn start_device(
         )),
         BindMode::Specific => resolved.network.bind_address.clone(),
     };
+    let transport = match resolved.profile.transport {
+        Transport::Udp => {
+            let bind_host = match resolved.network.bind_mode {
+                BindMode::Auto => "0.0.0.0".to_string(),
+                BindMode::Specific => resolved.network.bind_address.clone(),
+            };
+            SipTransport::bind_udp(&format!("{bind_host}:0")).await
+        }
+        Transport::Tcp => {
+            let peer = format!(
+                "{}:{}",
+                resolved.profile.server_host, resolved.profile.server_port
+            );
+            let connections = resolved.profile.signaling_tcp_connections.max(1) as usize;
+            SipTransport::connect_tcp(&peer, connections).await
+        }
+    }
+    .map_err(|e| e.to_string())?;
+    let local_port = transport.local_addr().map_err(|e| e.to_string())?.port();
 
     if resolved.network.sip_trace {
-        udp.set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
+        transport.set_tracer(Some(Arc::new(TraceEmitter { app: app.clone() })));
     }
 
     // 带状态观察者的设备实例。
@@ -1562,6 +1640,8 @@ async fn start_device(
     sim.set_preview_sink(Some(
         state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
     ));
+    // 语音广播/对讲下行的 PCM 输出:转成 Tauri 事件,由前端 Web Audio 播放。
+    sim.set_broadcast_audio_sink(Arc::new(BroadcastAudioEmitter { app: app.clone() }));
 
     // 持久化目录树优先；首次使用时才回退到启动表单指定模板。
     // 平台注册后可能立即查询目录，必须在 run() 前准备好。
@@ -1590,7 +1670,7 @@ async fn start_device(
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let sim_run = sim.clone();
-    let tp_run = udp.clone();
+    let tp_run = transport.clone();
     let host_run = local_host.clone();
     startup.commit(|| {
         tokio::spawn(async move {
@@ -1603,7 +1683,7 @@ async fn start_device(
 
         *guard = Some(DeviceHandle {
             sim,
-            transport: udp,
+            transport,
             local_host,
             local_port,
             stop_tx,

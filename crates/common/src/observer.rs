@@ -60,6 +60,33 @@ pub enum DeviceEvent {
         /// 人类可读摘要(如"查询目录 → 回 8 通道"、"PTZ 左转")。
         summary: String,
     },
+    /// 平台下发语音广播(对讲下行)并已建立媒体接收。
+    BroadcastStarted {
+        /// 被广播的通道 ID。
+        channel_id: String,
+        /// 平台侧音源 ID。
+        source_id: String,
+        /// 音频流传输方式(UDP / TCP_ACTIVE / TCP_PASSIVE)。
+        transport: String,
+        /// 本端媒体端口。
+        local_port: u16,
+    },
+    /// 语音广播接收进度(约每秒一次;没有新包时不发)。
+    BroadcastProgress {
+        /// 已接收 RTP 包数。
+        packets: u64,
+        /// 已接收音频字节数。
+        bytes: u64,
+    },
+    /// 语音广播结束。
+    BroadcastEnded {
+        /// 结束原因(remote_bye / local_stop / invite_timeout / ...)。
+        reason: String,
+        /// 本次会话共接收的 RTP 包数。
+        packets: u64,
+        /// 本次会话共接收的音频字节数。
+        bytes: u64,
+    },
     /// 订阅状态变化(供 UI"活跃订阅面板"):建立/清理/收到 NOTIFY 计数。
     SubscriptionChanged {
         /// 订阅类别(Catalog/Alarm/MobilePosition/PTZPosition)。

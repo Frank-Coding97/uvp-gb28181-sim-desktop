@@ -168,6 +168,9 @@ impl DeviceObserver for Metrics {
             | DeviceEvent::PlatformCommand { .. }
             | DeviceEvent::SubscriptionChanged { .. }
             | DeviceEvent::Progress { .. }
+            | DeviceEvent::BroadcastStarted { .. }
+            | DeviceEvent::BroadcastProgress { .. }
+            | DeviceEvent::BroadcastEnded { .. }
             | DeviceEvent::RuntimeError { .. } => {}
         }
     }
