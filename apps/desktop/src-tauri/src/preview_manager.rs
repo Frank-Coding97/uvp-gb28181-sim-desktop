@@ -72,9 +72,11 @@ struct EncodedTask {
 }
 
 impl EncodedTask {
+    /// 任务会在 await 点被直接 abort,循环末尾的日志走不到,退订日志记在这里。
     fn cancel(self) {
         self.stop.store(true, Ordering::Release);
         self.join.abort();
+        tracing::info!(token = self.token, "本地预览订阅结束");
     }
 }
 
@@ -269,7 +271,7 @@ async fn forward_encoded(
         ));
         tokio::time::sleep(RESUBSCRIBE_INTERVAL).await;
     }
-    tracing::info!(token = active.token, "本地预览订阅结束");
+    tracing::info!(token = active.token, "本地预览订阅结束(页面通道已关闭)");
 }
 
 #[derive(Debug, PartialEq, Eq)]
