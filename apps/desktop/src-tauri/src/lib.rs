@@ -24,6 +24,7 @@ use tauri::{
 use tokio::sync::{broadcast, Mutex};
 
 mod config_store;
+mod log_export;
 mod preview_channel;
 mod preview_manager;
 use config_store::{
@@ -42,6 +43,8 @@ struct AppState {
     data_root: OnceLock<(std::path::PathBuf, String)>,
     /// 录像索引真相，设备停止后仍可查看历史文件。
     recording_store: OnceLock<Arc<RecordingStore>>,
+    /// 本地抓拍图库（预览帧旁路落盘）。
+    snapshot_store: OnceLock<Arc<media_rtp::snapshot::SnapshotStore>>,
     /// 配置文件读写串行化，避免并发保存与读取看到半次操作。
     config_io: Mutex<()>,
     /// Independent cancellation path: preparation holds the device startup lock.
@@ -223,6 +226,7 @@ impl AppState {
             config_store: OnceLock::new(),
             data_root: OnceLock::new(),
             recording_store: OnceLock::new(),
+            snapshot_store: OnceLock::new(),
             config_io: Mutex::new(()),
             media_preparation: std::sync::Mutex::new(None),
             shutting_down: AtomicBool::new(false),
@@ -312,6 +316,136 @@ fn app_recording_store(state: &AppState, app: &AppHandle) -> Result<Arc<Recordin
             .get()
             .expect("RecordingStore 初始化后必须存在"),
     ))
+}
+
+fn app_snapshot_store(
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<Arc<media_rtp::snapshot::SnapshotStore>, String> {
+    if let Some(store) = state.snapshot_store.get() {
+        return Ok(Arc::clone(store));
+    }
+    let directory = app_data_root(state, app)?.join("snapshots");
+    let store = Arc::new(
+        media_rtp::snapshot::SnapshotStore::open(&directory)
+            .map_err(|error| format!("打开抓拍目录 {} 失败: {error}", directory.display()))?,
+    );
+    let _ = state.snapshot_store.set(store);
+    Ok(Arc::clone(
+        state
+            .snapshot_store
+            .get()
+            .expect("SnapshotStore 初始化后必须存在"),
+    ))
+}
+
+/// 抓拍当前预览帧。
+///
+/// 取的是预览总线上的最新帧，与播放中的画面同源：既不会打断推流，也不会出现
+/// 「抓拍和预览不是同一帧」的争议。预览未出帧时明确报错，而不是落一张黑图。
+#[tauri::command]
+async fn take_snapshot(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<media_rtp::snapshot::SnapshotMeta, String> {
+    let frame = state
+        .preview_bus
+        .latest_frame()
+        .ok_or_else(|| "预览尚未出帧，请先订阅预览或确认设备已推流".to_string())?;
+    let store = app_snapshot_store(&state, &app)?;
+    let captured_at_ms = frame.captured_at_ms as i64;
+    tokio::task::spawn_blocking(move || store.save(&frame.data, captured_at_ms))
+        .await
+        .map_err(|error| format!("抓拍任务异常: {error}"))?
+}
+
+#[tauri::command]
+async fn list_snapshots(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    limit: Option<usize>,
+) -> Result<Vec<media_rtp::snapshot::SnapshotMeta>, String> {
+    let store = app_snapshot_store(&state, &app)?;
+    let limit = limit.unwrap_or(60).clamp(1, 500);
+    tokio::task::spawn_blocking(move || store.list(limit))
+        .await
+        .map_err(|error| format!("读取抓拍列表任务异常: {error}"))?
+}
+
+/// 读取抓拍并转成 data URL。
+///
+/// 不走自定义协议的原因：数据根目录可能回落到 `exe_dir/data`，而 assetProtocol
+/// 的 scope 只能写死 `$APPDATA`；用 data URL 就不依赖实际落盘路径。
+#[tauri::command]
+async fn read_snapshot(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let store = app_snapshot_store(&state, &app)?;
+    let bytes = tokio::task::spawn_blocking(move || store.read(&id))
+        .await
+        .map_err(|error| format!("读取抓拍任务异常: {error}"))??;
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+#[tauri::command]
+async fn delete_snapshot(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    let store = app_snapshot_store(&state, &app)?;
+    tokio::task::spawn_blocking(move || store.delete(&id))
+        .await
+        .map_err(|error| format!("删除抓拍任务异常: {error}"))?
+}
+
+#[tauri::command]
+async fn export_snapshot(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+    target_path: String,
+) -> Result<String, String> {
+    let store = app_snapshot_store(&state, &app)?;
+    let target = std::path::PathBuf::from(target_path);
+    tokio::task::spawn_blocking(move || store.export_copy(&id, &target))
+        .await
+        .map_err(|error| format!("导出抓拍任务异常: {error}"))??;
+    Ok("抓拍已另存".into())
+}
+
+/// 导出当前页签日志（敏感字段已脱敏）。
+#[tauri::command]
+async fn export_logs(
+    tab: String,
+    blocks: Vec<String>,
+    target_path: String,
+) -> Result<log_export::LogExportResult, String> {
+    if blocks.is_empty() {
+        return Err("当前页签没有可导出的内容".into());
+    }
+    if blocks.len() > 20_000 {
+        return Err("单次导出条目过多，请先筛选后再导出".into());
+    }
+    let label = match tab.as_str() {
+        "sip" => "SIP 报文",
+        "system" => "系统日志",
+        "commands" => "平台命令",
+        other => return Err(format!("未知日志页签: {other}")),
+    };
+    let target = std::path::PathBuf::from(target_path);
+    let exported_at = common::clock::epoch_to_iso8601(common::clock::local_epoch_ms() / 1_000);
+    tokio::task::spawn_blocking(move || {
+        log_export::write_export(label, &exported_at, &blocks, &target)
+    })
+    .await
+    .map_err(|error| format!("导出日志任务异常: {error}"))?
 }
 
 /// 依次探测候选目录，返回第一个**真的能写入**的目录。
@@ -2910,6 +3044,12 @@ pub fn run() {
             get_clock_state,
             save_time_sync,
             sync_ntp_now,
+            take_snapshot,
+            list_snapshots,
+            read_snapshot,
+            delete_snapshot,
+            export_snapshot,
+            export_logs,
             reset_desktop_config,
             exchange_sip_provision,
             validate_scenario,

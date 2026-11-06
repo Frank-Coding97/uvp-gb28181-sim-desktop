@@ -1,9 +1,14 @@
 <script setup lang="ts">
 import { computed, onActivated, onDeactivated, onUnmounted, ref } from "vue";
-import { NButton } from "naive-ui";
+import { NButton, useMessage } from "naive-ui";
+import { useRouter } from "vue-router";
 import { useDevice } from "../device";
+import { takeSnapshot } from "../platform";
 import { usePreviewSession } from "../composables/preview/session";
 
+const message = useMessage();
+const router = useRouter();
+const capturing = ref(false);
 const { form, deviceState } = useDevice();
 const previewLatency = ref<number | null>(null);
 const previewFps = ref(0);
@@ -56,6 +61,25 @@ async function retry() {
   }
 }
 
+/**
+ * 抓拍当前预览帧。
+ *
+ * 后端取预览总线上的最新帧，所以这里不需要暂停/重启采集；未出帧时后端会
+ * 明确报错，前端只需把原因原样透出。
+ */
+async function capture() {
+  capturing.value = true;
+  try {
+    const meta = await takeSnapshot();
+    const size = meta.width && meta.height ? `${meta.width}×${meta.height}` : "尺寸未知";
+    message.success(`已抓拍 ${size}（${meta.file_name}）`);
+  } catch (reason) {
+    message.error(`抓拍失败：${String(reason)}`);
+  } finally {
+    capturing.value = false;
+  }
+}
+
 onActivated(() => { void start(); });
 onDeactivated(() => { void stop(); });
 onUnmounted(() => { void stop(); });
@@ -92,8 +116,10 @@ onUnmounted(() => { void stop(); });
         <div class="actions">
           <n-button type="primary" :disabled="!canStart" @click="start">订阅预览</n-button>
           <n-button v-if="state === 'error'" type="warning" secondary @click="retry">重试 worker</n-button>
+          <n-button :disabled="!hasFrame || capturing" :loading="capturing" @click="capture">抓拍</n-button>
           <n-button :disabled="state === 'idle' || state === 'stopped'" @click="stop">停止预览</n-button>
         </div>
+        <button class="link" @click="router.push('/snapshots')">查看抓拍图库 →</button>
         <div v-if="error" class="error-box">{{ error }}</div>
       </aside>
     </div>
@@ -126,6 +152,8 @@ onUnmounted(() => { void stop(); });
 .info-row b, .info-row code { overflow-wrap: anywhere; color: var(--text-secondary); font-size: 12px; }
 .hint { margin: 20px 0; padding: 11px 12px; border-radius: 9px; background: var(--accent-dim); color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
 .actions { display: flex; gap: 8px; }
+.link { margin-top: 12px; padding: 0; border: 0; background: none; color: var(--accent); font-size: 12px; text-align: left; cursor: pointer; }
+.link:hover { text-decoration: underline; }
 .error-box { margin-top: 14px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--error) 35%, transparent); border-radius: 9px; background: color-mix(in srgb, var(--error) 10%, transparent); color: var(--error); font-size: 11px; line-height: 1.5; }
 @media (max-width: 900px) { .preview-grid { grid-template-columns: 1fr; } .preview-stage { min-height: 420px; } .video-wrap, .empty-stage { height: 350px; } }
 </style>

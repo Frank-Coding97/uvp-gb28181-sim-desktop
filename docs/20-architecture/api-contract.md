@@ -73,6 +73,41 @@ interface ClockSnapshot {
 
 > 语义约束:NTP 生效期间 `sync_from_date_header` 只更新 `sip_offset_secs`,不覆盖 `offset_secs`;NTP 失败时回退到 `sip_offset_secs`,无可回退值时保持原偏移。
 
+### 抓拍与日志导出命令(FR-47 / FR-44)
+
+| 命令 | 入参 | 返回 | 说明 |
+|---|---|---|---|
+| `take_snapshot` | — | `SnapshotMeta` | 取预览总线**最新一帧** JPEG 落盘;未出帧时返回「预览尚未出帧」错误,不写黑图 |
+| `list_snapshots` | `{ limit?: number }` | `SnapshotMeta[]` | 按 `captured_at_ms` 倒序,`limit` 默认 60、上限 500 |
+| `read_snapshot` | `{ id: string }` | `string` | 返回 `data:image/jpeg;base64,…`,不依赖 assetProtocol scope |
+| `delete_snapshot` | `{ id: string }` | `void` | 删除单张 |
+| `export_snapshot` | `{ id: string, targetPath: string }` | `string` | 原文件复制到用户选定路径,不重新编码 |
+| `export_logs` | `{ tab: "sip" \| "system" \| "commands", blocks: string[], targetPath: string }` | `LogExportResult` | 渲染 + 脱敏 + 写文件;`blocks` 为空直接拒绝 |
+
+```ts
+interface SnapshotMeta {
+  id: string;            // 文件名去扩展名,同时是 ID 白名单校验对象
+  file_name: string;
+  path: string;
+  byte_len: number;
+  captured_at_ms: number; // 帧被切出的时刻
+  saved_at_ms: number;    // 落盘时刻(可能晚于抓拍时刻)
+  width: number | null;   // 来自 JPEG SOF 解析,解析失败为 null
+  height: number | null;
+}
+
+interface LogExportResult {
+  path: string;
+  byte_len: number;
+  redacted: number;   // 实际替换的敏感字段数
+  line_count: number; // 导出条目数
+}
+```
+
+> 脱敏约束:脱敏在 Rust 侧 `common::log_redact` 完成,前端只递原始文本块。覆盖 `Authorization` / `Proxy-Authorization` 头、`<Password>` 标签、`password=` 键值与 `"password"` JSON 字段;`DeviceID`、`Call-ID`、`CSeq` 等排障主键**不脱敏**。导出文件头固定写明「已脱敏、不可恢复」。
+>
+> 抓拍 ID 只接受 `[A-Za-z0-9_-]`,用于阻断 `../` 越界读取;同毫秒重复抓拍自动追加序号,不覆盖。
+
 `DeviceCfg` JSON 字段:`server_host`/`server_port`/`server_domain`/`device_id`/`password`/`transport`("UDP"/"TCP")/`gb_version`("2016"/"2022")/`channel_name`/`video_source`(可空,C 档文件路径)。
 
 命令失败统一返回错误对象 `{ code: string, message: string }`(code 对应 `common::Error` 变体)。

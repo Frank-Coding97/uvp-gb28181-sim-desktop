@@ -22,6 +22,7 @@ pub use preview_worker::{
 pub mod ps;
 pub mod pusher;
 pub mod rtp;
+pub mod snapshot;
 pub mod source;
 
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};

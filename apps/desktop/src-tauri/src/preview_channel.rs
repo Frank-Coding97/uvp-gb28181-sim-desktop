@@ -77,6 +77,14 @@ impl DesktopPreviewBus {
         self.statuses.borrow().clone()
     }
 
+    /// 取最近一帧预览 JPEG（抓拍用）。
+    ///
+    /// 这里刻意用借用而不是 `send_replace(None)` 之类会改动总线状态的方式：
+    /// 抓拍是只读旁路，不能让一次点击影响正在播放的预览或平台点播。
+    pub fn latest_frame(&self) -> Option<PreviewJpeg> {
+        self.frames.borrow().clone()
+    }
+
     pub fn set_active(&self, active: bool) {
         let Ok(_order) = self.order.lock() else {
             return;

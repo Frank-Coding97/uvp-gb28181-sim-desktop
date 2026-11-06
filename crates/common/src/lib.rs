@@ -5,6 +5,7 @@
 
 pub mod clock;
 pub mod error;
+pub mod log_redact;
 pub mod logging;
 pub mod ntp;
 pub mod observer;

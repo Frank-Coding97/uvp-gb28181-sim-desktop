@@ -2,6 +2,9 @@
 import { computed, nextTick, onActivated, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { useMessage } from "naive-ui";
+import { exportLogs } from "../platform";
 
 interface LogLine { ts_ms: number; level: string; target: string; message: string; }
 interface TraceEntry {
@@ -105,6 +108,64 @@ function toggleTraceRow(index: number) {
   expandedTrace.value = expandedTrace.value === index ? null : index;
 }
 
+const message = useMessage();
+const exporting = ref(false);
+
+/**
+ * 把当前页签的**可见内容**整理成待导出文本块。
+ *
+ * 只导出已渲染的内容（也就是用户筛选后看到的内容）：这样"导出"和"我看到什么"
+ * 一致，不会出现导出一份几万行、实际没人看过的日志。
+ */
+function collectExportBlocks(): string[] {
+  if (activeTab.value === "sip") {
+    const blocks = filteredTraces.value.map((item) => {
+      const head = `[${fmtTs(item.ts_ms)}] ${item.direction === "in" ? "◀ 收" : "▶ 发"} ${item.method} ${item.peer}${item.cseq ? ` ${item.cseq}` : ""}`;
+      return item.raw ? `${head}\n${item.raw}` : head;
+    });
+    for (const item of historicalSipLogs.value) {
+      blocks.push(`[${fmtTs(item.ts_ms)}] 历史 SIP 报文\n${item.message}`);
+    }
+    return blocks;
+  }
+  if (activeTab.value === "commands") {
+    return filteredCommands.value.map(
+      (item) => `[${fmtTs(item.ts_ms)}] ${commandLabel(item.kind)} ${item.summary}`,
+    );
+  }
+  return filteredLogs.value.map(
+    (item) => `[${fmtTs(item.ts_ms)}] ${item.level.toUpperCase()} ${item.target}: ${item.message}`,
+  );
+}
+
+async function exportCurrent() {
+  const blocks = collectExportBlocks();
+  if (!blocks.length) {
+    message.warning("当前页签没有可导出的内容");
+    return;
+  }
+  const suffix = activeTab.value === "sip" ? "sip" : activeTab.value === "commands" ? "commands" : "system";
+  const stamp = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const defaultName = `uvp-logs-${suffix}-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.txt`;
+  exporting.value = true;
+  try {
+    const target = await saveDialog({
+      defaultPath: defaultName,
+      filters: [{ name: "文本日志", extensions: ["txt", "log"] }],
+    });
+    if (typeof target !== "string") return;
+    const result = await exportLogs(activeTab.value, blocks, target);
+    message.success(
+      `已导出 ${result.line_count} 条，脱敏 ${result.redacted} 处 → ${result.path}`,
+    );
+  } catch (error) {
+    message.error(`导出失败：${String(error)}`);
+  } finally {
+    exporting.value = false;
+  }
+}
+
 onMounted(async () => {
   if (!isTauri) return;
   try { level.value = await invoke<string>("get_log_level"); } catch { /* 使用默认 */ }
@@ -162,6 +223,12 @@ onUnmounted(() => { unlistenLog?.(); unlistenTrace?.(); unlistenCommand?.(); });
           <label class="check"><input v-model="paused" type="checkbox" /> 暂停</label>
           <label v-if="activeTab === 'system'" class="check"><input v-model="autoScroll" type="checkbox" /> 自动滚动</label>
           <button v-if="activeTab === 'system'" class="mini-btn" @click="refreshHistory">刷新历史</button>
+          <button
+            class="mini-btn"
+            :disabled="exporting"
+            title="导出当前页签的可见内容；Authorization / Password 等敏感字段会在后端脱敏，不可恢复"
+            @click="exportCurrent"
+          >{{ exporting ? "导出中…" : "导出" }}</button>
           <button class="mini-btn danger" @click="clearCurrent">清空视图</button>
         </div>
       </div>

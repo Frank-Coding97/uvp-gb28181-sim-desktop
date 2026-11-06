@@ -474,6 +474,68 @@ export async function syncNtpNow(): Promise<NtpProbeResult> {
   return invoke<NtpProbeResult>("sync_ntp_now");
 }
 
+/** 本地抓拍元数据（后端 media-rtp::snapshot::SnapshotMeta）。 */
+export interface SnapshotMeta {
+  id: string;
+  file_name: string;
+  path: string;
+  byte_len: number;
+  /** 帧被切出的时刻（毫秒纪元），不是落盘时刻。 */
+  captured_at_ms: number;
+  saved_at_ms: number;
+  width: number | null;
+  height: number | null;
+}
+
+/**
+ * 抓拍当前预览帧。
+ *
+ * 后端取的是预览总线上的最新帧，与画面同源；预览未出帧时会直接报错，
+ * 不会给出一张黑图。因此这个调用必须在预览播放中使用。
+ */
+export async function takeSnapshot(): Promise<SnapshotMeta> {
+  return invoke<SnapshotMeta>("take_snapshot");
+}
+
+export async function listSnapshots(limit = 60): Promise<SnapshotMeta[]> {
+  return invoke<SnapshotMeta[]>("list_snapshots", { limit });
+}
+
+/** 读取抓拍为 data URL（后端按实际落盘目录读，不依赖资源协议 scope）。 */
+export async function readSnapshot(id: string): Promise<string> {
+  return invoke<string>("read_snapshot", { id });
+}
+
+export async function deleteSnapshot(id: string): Promise<void> {
+  await invoke("delete_snapshot", { id });
+}
+
+export async function exportSnapshot(id: string, targetPath: string): Promise<string> {
+  return invoke<string>("export_snapshot", { id, targetPath });
+}
+
+/** 日志导出结果；`redacted` 是真实替换掉的敏感字段数量。 */
+export interface LogExportResult {
+  path: string;
+  byte_len: number;
+  redacted: number;
+  line_count: number;
+}
+
+/**
+ * 导出当前页签日志。
+ *
+ * `blocks` 是已经格式化好的文本块，脱敏在 Rust 侧完成 —— 前端不参与判定，
+ * 也就不存在「某条路径忘了脱敏」的可能。
+ */
+export async function exportLogs(
+  tab: string,
+  blocks: string[],
+  targetPath: string,
+): Promise<LogExportResult> {
+  return invoke<LogExportResult>("export_logs", { tab, blocks, targetPath });
+}
+
 export async function resetDesktopConfig(): Promise<DesktopConfigV2> {
   try {
     const reset = await invoke<DesktopConfigV2>("reset_desktop_config");
