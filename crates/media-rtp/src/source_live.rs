@@ -1076,6 +1076,8 @@ struct LatestFrameQueue {
 /// media producer can consume it without synthesizing a second FPS clock.
 struct LiveEventQueue {
     events: Mutex<VecDeque<crate::source::MediaEvent>>,
+    /// 有新事件或间断时唤醒阻塞等待的消费者(SharedMedia 采集线程)。
+    ready: std::sync::Condvar,
     capacity: usize,
     dropped: AtomicBool,
     dropped_pts_90k: std::sync::atomic::AtomicU64,
@@ -1299,6 +1301,7 @@ impl LiveEventQueue {
     fn new(capacity: usize) -> Self {
         Self {
             events: Mutex::new(VecDeque::with_capacity(capacity.max(1))),
+            ready: std::sync::Condvar::new(),
             capacity: capacity.max(1),
             dropped: AtomicBool::new(false),
             dropped_pts_90k: std::sync::atomic::AtomicU64::new(0),
@@ -1316,6 +1319,24 @@ impl LiveEventQueue {
             self.dropped.store(true, Ordering::Release);
         }
         events.push_back(event);
+        drop(events);
+        self.ready.notify_one();
+    }
+
+    /// 阻塞等待一个事件,最长 `timeout`。间断标记优先于普通事件。
+    fn wait_pop(&self, timeout: Duration) -> Option<crate::source::MediaEvent> {
+        let deadline = Instant::now() + timeout;
+        let mut events = self.events.lock().ok()?;
+        loop {
+            if let Some(pts_90k) = self.take_dropped_pts() {
+                return Some(crate::source::MediaEvent::Discontinuity { pts_90k });
+            }
+            if let Some(event) = events.pop_front() {
+                return Some(event);
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            events = self.ready.wait_timeout(events, remaining).ok()?.0;
+        }
     }
 
     fn pop(&self) -> Option<crate::source::MediaEvent> {
@@ -4549,6 +4570,16 @@ impl VideoSource for LiveSource {
         events.pop()
     }
 
+    fn wait_event_blocking(&mut self, timeout: Duration) -> Option<crate::source::MediaEvent> {
+        match self.timed_events.as_ref() {
+            Some(events) => events.wait_pop(timeout),
+            None => {
+                std::thread::sleep(timeout.min(Duration::from_millis(1)));
+                None
+            }
+        }
+    }
+
     fn audio_sample_rate_hz(&self) -> u32 {
         self.audio_sample_rate_hz
     }
@@ -5449,6 +5480,43 @@ mod tests {
         ));
         assert_eq!(overflow.take_dropped_pts(), Some(12_000));
         assert_eq!(overflow.pop().map(|event| event.pts_90k()), Some(12_000));
+    }
+
+    #[test]
+    fn live_event_queue阻塞等待被推入唤醒_溢出先返回间断() {
+        let queue = Arc::new(LiveEventQueue::new(1));
+        let producer = Arc::clone(&queue);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            producer.push(crate::source::MediaEvent::Discontinuity { pts_90k: 7 });
+        });
+        let event = queue.wait_pop(Duration::from_secs(2));
+        handle.join().unwrap();
+        assert_eq!(event.map(|event| event.pts_90k()), Some(7));
+        assert!(started.elapsed() < Duration::from_secs(1), "应被推入唤醒");
+
+        assert!(queue.wait_pop(Duration::from_millis(20)).is_none());
+
+        let au = |pts| {
+            crate::source::MediaEvent::Video(crate::source::TimedVideoAu::new(
+                vec![1],
+                crate::ps::VideoCodec::H264,
+                false,
+                pts,
+                3_600,
+            ))
+        };
+        queue.push(au(100));
+        queue.push(au(200));
+        assert!(matches!(
+            queue.wait_pop(Duration::from_millis(20)),
+            Some(crate::source::MediaEvent::Discontinuity { pts_90k: 200 })
+        ));
+        assert_eq!(
+            queue.wait_pop(Duration::from_millis(20)).map(|e| e.pts_90k()),
+            Some(200)
+        );
     }
 
     fn frame(id: u8) -> Frame {

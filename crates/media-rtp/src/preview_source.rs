@@ -105,6 +105,14 @@ impl VideoSource for PreviewingSource {
         Some(event)
     }
 
+    fn wait_event_blocking(&mut self, timeout: std::time::Duration) -> Option<MediaEvent> {
+        let event = self.source.wait_event_blocking(timeout)?;
+        if let MediaEvent::Video(video) = &event {
+            self.dispatch_video(&video.data, video.codec, video.key_frame);
+        }
+        Some(event)
+    }
+
     fn audio_sample_rate_hz(&self) -> u32 {
         self.source.audio_sample_rate_hz()
     }

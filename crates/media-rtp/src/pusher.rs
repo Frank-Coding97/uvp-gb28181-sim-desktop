@@ -418,6 +418,7 @@ async fn push_timed_events(
 ) -> Result<()> {
     let live = source.is_live();
     let paced_by_source = source.timed_events_are_paced();
+    let async_events = source.has_async_events();
     let mut first_pts: Option<u64> = None;
     let mut last_sent_pts: Option<u64> = None;
     let mut wall_anchor = std::time::Instant::now();
@@ -457,9 +458,19 @@ async fn push_timed_events(
             was_paused = false;
         }
 
-        let event = if let Some(event) = pending_event.take() {
-            event
-        } else if let Some(event) = source.next_media_event() {
+        let next = if pending_event.is_some() {
+            pending_event.take()
+        } else if async_events {
+            // 订阅端直接 await 总线,没有事件时不再空转。超时返回 None 后
+            // 走下面的存活/错误检查,再回到循环顶部处理暂停与 seek。
+            tokio::select! {
+                _ = &mut stop => return Ok(()),
+                event = source.recv_event() => event,
+            }
+        } else {
+            source.next_media_event()
+        };
+        let event = if let Some(event) = next {
             event
         } else {
             // 有限源可能在最后一次读取时才把异步错误写入自身状态，
@@ -468,9 +479,11 @@ async fn push_timed_events(
                 return Err(Error::Media(error));
             }
             if source.is_live() {
-                tokio::select! {
-                    _ = &mut stop => return Ok(()),
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                if !async_events {
+                    tokio::select! {
+                        _ = &mut stop => return Ok(()),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
                 }
                 continue;
             }
