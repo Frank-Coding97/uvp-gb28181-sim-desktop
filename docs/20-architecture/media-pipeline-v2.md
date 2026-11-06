@@ -315,6 +315,19 @@ P3 原生采集之前没有 GPU 显存帧,原生编码器无从接入。P2a 先�
 - 预览只传视频,不传音频。
 - 预览帧协议沿用 v1 头部格式(`UVPJ` magic),版本号升到 2,载荷类型增加 `annexb-h264` / `annexb-h265`。
 
+**P4 落地(已实现,媒体引擎子进程未做前在主程序内)**
+
+- 后端 `PreviewManager`(`apps/desktop/src-tauri/src/preview_manager.rs`):页面 attach 才 `SharedMedia::subscribe()`,detach 即退订。**预览关闭时没有订阅者、没有 FFmpeg 预览进程**。
+- 起播:订阅自带的缓存关键帧先发出(立即有画面);它与之后的直播帧之间有时间轴缺口,缺口/`Discontinuity` 之后丢 delta,等下一个带参数集的关键帧。
+- 帧头 `UVPJ` v2 = 36 字节:`kind`(0 jpeg / 1 h264 / 2 h265)、关键帧标志、关键帧附带 codec 字符串(Rust 解析 SPS 生成 `avc1.PPCCLL` / `hvc1.…`,`media_rtp::codec_string`)。
+- 前端 `manager.ts`:编码帧按序送 `VideoDecoder`(不走 latest-wins);首个关键帧检测通过后立即解码;解码队列 > 3 丢 delta 等关键帧;解码器出错重建;代际变化(设备重启)关闭旧解码器。
+- 回退:前端 `isConfigSupported` 失败(先试 `prefer-hardware` 再试 `no-preference`)→ `set_preview_fallback(true)` → 同一订阅改喂现有 FFmpeg preview worker 出 JPEG。**实际回退实现沿用 FFmpeg worker,不是上面写的 MF/VideoToolbox 原生解码**,原生解码留给 P5 媒体引擎。
+- 抓拍改为取共享媒体当前关键帧转 JPEG,不依赖预览开启(此前取预览总线最新 JPEG,预览默认关闭后会失效)。
+- 首页与推流预览页默认关闭,点"开启预览"才订阅;选择只在本次运行内保持,重启恢复关闭。
+- 已知遗留:采集源内部的旧预览旁路(`LiveSource` 的 `preview` 参数与 `EncodedFrameHub.preview`)已不再接线(恒为 `None`),代码随 P3 替换 `source_live.rs` 时删除。
+
+**实测**(本机 WebView2 同内核 Edge 156,headless):NVENC 输出的 H.264 Annex B(`avc1.64001E`)不带 description 直接解码 25/25 帧;NVENC H.265(`hvc1.1.6.L90.90`)`isConfigSupported` 返回不支持(本机未装 HEVC 扩展),按设计走 JPEG 回退。
+
 ---
 
 ## 10. 按需采集
@@ -388,7 +401,7 @@ P3 原生采集之前没有 GPU 显存帧,原生编码器无从接入。P2a 先�
 | P2a 硬件编码器(FFmpeg) ✅ | 现有 FFmpeg 采集换硬件编码器 + 试编探测 + 运行期失败回退 + 前端 GPU/CPU 标识(§5.5) | Windows 实测选中 NVENC,1080p 屏幕采集 H.264/H.265 验收通过;macOS 待真机验收 |
 | P2b 原生编码器 | 编码器 trait;NVENC / oneVPL / AMF SDK、MF MFT、VideoToolbox 直接吃 GPU 显存帧。**与 P3 合并实施**(没有原生采集就没有显存帧) | 各编码器出流都能在平台起播,每个 IDR 都带参数集 |
 | P3 采集层 | 双平台三类源原生采集;统一时钟;GPU 缩放和 OSD;删除 `VideoSource` 旧接口(`next_frame`/`next_audio`/`LegacyMediaClock`)与 pusher 按帧率打拍的旧主循环 | 连续运行 24 小时,音画偏差 < 40ms |
-| P4 预览 | 预览按钮 + WebCodecs 播放 + 不支持时的回退 | 点击后 0.5 秒内出画面;关闭后预览相关 CPU 归零 |
+| P4 预览 ✅(代码) | 预览按钮 + WebCodecs 播放 + 不支持时的回退(§9.3 P4 落地) | 点击后 0.5 秒内出画面;关闭后预览相关 CPU 归零 —— 单测与 Edge 解码验证已过,应用内真机观感待验收 |
 | P5 按需采集 + 子进程 | 状态机、空闲保持;媒体引擎独立进程、崩溃拉起 | 杀掉子进程后自动恢复推流,SIP 注册不掉 |
 | P6 文件源 | 索引、直通、一次性转码缓存;FFmpeg 精简为导入专用 | 直通 CPU ≈ 0;循环播放时间戳连续 |
 

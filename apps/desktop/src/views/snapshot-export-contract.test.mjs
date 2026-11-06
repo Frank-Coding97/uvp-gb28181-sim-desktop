@@ -39,12 +39,15 @@ test("脱敏在 Rust 侧完成，前端不自行拼接抹除逻辑", () => {
   assert.doesNotMatch(logs, /replace\([^)]*Authorization/);
 });
 
-test("抓拍取自预览总线最新帧，未出帧时明确报错", () => {
-  assert.match(backend, /latest_frame\(\)/);
-  assert.match(backend, /预览尚未出帧/);
+test("抓拍取自共享媒体当前关键帧，不依赖本地预览开启", () => {
+  // 预览默认关闭(media-pipeline-v2 P4),抓拍不能再从预览总线取帧。
+  assert.match(backend, /current_keyframe_jpeg\(\)/);
+  assert.doesNotMatch(backend, /preview_bus\s*\.latest_frame\(\)/);
+  assert.match(backend, /设备尚未启动，无法抓拍/);
   assert.match(store, /pub fn save\(&self, jpeg: &\[u8\]/);
   assert.match(preview, /takeSnapshot/);
-  assert.match(preview, /:disabled="!hasFrame \|\| capturing"/);
+  assert.match(preview, /:disabled="capturing"/);
+  assert.doesNotMatch(preview, /:disabled="!hasFrame \|\| capturing"/);
 });
 
 test("抓拍 ID 只允许单段文件名字符，拒绝路径穿越", () => {

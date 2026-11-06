@@ -5,6 +5,7 @@ import { useRouter } from "vue-router";
 import { useDevice } from "../device";
 import { takeSnapshot } from "../platform";
 import { usePreviewSession } from "../composables/preview/session";
+import { previewEnabled } from "../composables/preview/optIn";
 
 const message = useMessage();
 const router = useRouter();
@@ -30,6 +31,7 @@ const sourceType = computed(() => {
 });
 
 async function start() {
+  previewEnabled.value = true;
   error.value = "";
   state.value = "starting";
   if (!session) session = usePreviewSession(canvasRef.value, {
@@ -46,6 +48,12 @@ async function start() {
 }
 
 async function stop() {
+  previewEnabled.value = false;
+  await pause();
+}
+
+/** 页面切走只暂停,不改变用户的开启选择。 */
+async function pause() {
   await session?.stop();
   hasFrame.value = false;
   previewLatency.value = null;
@@ -62,10 +70,10 @@ async function retry() {
 }
 
 /**
- * 抓拍当前预览帧。
+ * 抓拍当前采集画面。
  *
- * 后端取预览总线上的最新帧，所以这里不需要暂停/重启采集；未出帧时后端会
- * 明确报错，前端只需把原因原样透出。
+ * 后端取共享媒体缓存的最近关键帧转 JPEG，不要求预览开启，也不会打断推流；
+ * 设备未采集时后端会明确报错，前端只需把原因原样透出。
  */
 async function capture() {
   capturing.value = true;
@@ -80,9 +88,10 @@ async function capture() {
   }
 }
 
-onActivated(() => { void start(); });
-onDeactivated(() => { void stop(); });
-onUnmounted(() => { void stop(); });
+// 默认不预览;只恢复用户在本次运行中已开启的预览。
+onActivated(() => { if (previewEnabled.value) void start(); });
+onDeactivated(() => { void pause(); });
+onUnmounted(() => { void pause(); });
 </script>
 
 <template>
@@ -90,7 +99,7 @@ onUnmounted(() => { void stop(); });
     <div class="page-header">
       <div>
         <div class="page-title">推流预览</div>
-        <div class="page-sub">设备注册成功后自动预览，平台点播时复用同一批编码帧</div>
+        <div class="page-sub">点击"开启预览"查看画面，与平台点播使用同一批编码帧；关闭预览不影响推流</div>
       </div>
       <div class="status-pill" :class="state"><i />{{ stateText }}</div>
     </div>
@@ -103,7 +112,7 @@ onUnmounted(() => { void stop(); });
         <div v-if="!hasFrame" class="empty-stage">
           <div class="empty-icon">◉</div>
           <strong>{{ state === 'error' ? '预览无法启动' : '等待预览画面' }}</strong>
-          <span>{{ error || '选择媒体源后点击“开始预览”' }}</span>
+          <span>{{ error || '注册设备后点击"开启预览"' }}</span>
         </div>
         <div class="stage-foot"><span>{{ sourceType }}</span><span>状态：{{ stateText }}<template v-if="previewLatency !== null"> · {{ previewFps }} FPS · {{ previewLatency }} ms · 跳 {{ previewSkipped }}</template></span></div>
       </section>
@@ -112,12 +121,12 @@ onUnmounted(() => { void stop(); });
         <div class="panel-title">预览控制</div>
         <div class="info-row"><span>媒体源</span><code>{{ source || '未配置' }}</code></div>
         <div class="info-row"><span>设备状态</span><b>{{ deviceState === 'InCall' ? '平台推流中' : deviceState }}</b></div>
-        <div class="hint">预览复用唯一 H.264 采集流，由不打开摄像头的隔离 worker 转成 MJPEG。页面切换只更换 Canvas，不会重启摄像头或平台推流。</div>
+        <div class="hint">预览直接解码与平台点播相同的 H.264/H.265 码流（WebCodecs 硬件解码；不支持时自动回退 JPEG）。关闭或切走页面即退订，不再占用资源，也不会重启摄像头或平台推流。</div>
         <div class="actions">
-          <n-button type="primary" :disabled="!canStart" @click="start">订阅预览</n-button>
-          <n-button v-if="state === 'error'" type="warning" secondary @click="retry">重试 worker</n-button>
-          <n-button :disabled="!hasFrame || capturing" :loading="capturing" @click="capture">抓拍</n-button>
-          <n-button :disabled="state === 'idle' || state === 'stopped'" @click="stop">停止预览</n-button>
+          <n-button type="primary" :disabled="!canStart" @click="start">开启预览</n-button>
+          <n-button v-if="state === 'error'" type="warning" secondary @click="retry">重试预览</n-button>
+          <n-button :disabled="capturing" :loading="capturing" @click="capture">抓拍</n-button>
+          <n-button :disabled="state === 'idle' || state === 'stopped'" @click="stop">关闭预览</n-button>
         </div>
         <button class="link" @click="router.push('/snapshots')">查看抓拍图库 →</button>
         <div v-if="error" class="error-box">{{ error }}</div>

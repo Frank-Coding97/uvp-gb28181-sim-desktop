@@ -36,6 +36,7 @@ import {
   type ProvisionPayload,
 } from "../provision-link";
 import { usePreviewSession } from "../composables/preview/session";
+import { previewEnabled } from "../composables/preview/optIn";
 import { useBroadcastAudio } from "../composables/broadcastAudio";
 
 type MediaMode = "camera" | "screen" | "file";
@@ -130,6 +131,7 @@ const previewFps = ref(0);
 const previewSkipped = ref(0);
 const previewWidth = ref<number | null>(null);
 const previewHeight = ref<number | null>(null);
+const previewDecode = ref("");
 const sourceProbe = ref("");
 let unlistenCaptureState: UnlistenFn | null = null;
 let unlistenDeviceError: UnlistenFn | null = null;
@@ -260,23 +262,33 @@ const sourceHint = computed(() => {
   return "";
 });
 const mediaSourceReady = computed(() => form.value.video_source.trim().length > 0);
-const previewStateText = computed(() => ({
+const previewStateText = computed(() => (previewEnabled.value ? {
   idle: "等待启动",
   starting: "等待画面",
   playing: "采集中",
   stopped: "已停止",
   error: "采集异常",
-}[previewState.value]));
+}[previewState.value] : "预览已关闭"));
+const previewBlockedReason = computed(() => {
+  if (!isTauri) return "仅桌面端可预览";
+  if (!deviceLive.value) return "注册设备后可开启预览";
+  if (captureState.value !== "ready") return "等待采集就绪";
+  return "";
+});
 const previewEmptyTitle = computed(() => {
+  if (!previewEnabled.value) return "本地预览已关闭";
   if (!deviceLive.value) return "虚拟摄像机未启动";
   if (captureState.value === "stopped") return "尚未配置视频源";
   if (captureState.value === "error") return "视频采集启动失败";
   return "等待采集画面";
 });
 const previewEmptyHint = computed(() => {
+  if (!previewEnabled.value) {
+    return previewBlockedReason.value || "关闭预览不影响采集与平台推流；需要查看画面时再开启";
+  }
   if (!deviceLive.value) return "选择采集来源并注册设备后显示同帧预览";
   if (captureState.value === "stopped") return "请选择摄像头、屏幕或视频文件后重新注册设备";
-  return previewError.value || "采集源就绪后会自动订阅并显示首帧";
+  return previewError.value || "正在等待首个关键帧";
 });
 const sourceSummary = computed(() => {
   const source = form.value.video_source.trim();
@@ -669,7 +681,7 @@ async function fireAlarm() {
 }
 
 async function startPreview() {
-  if (!previewPageActive || !isTauri || !deviceLive.value || captureState.value !== "ready" || previewState.value === "playing" || previewState.value === "starting") return;
+  if (!previewEnabled.value || !previewPageActive || !isTauri || !deviceLive.value || captureState.value !== "ready" || previewState.value === "playing" || previewState.value === "starting") return;
   previewError.value = "";
   previewState.value = "starting";
   if (!session) session = usePreviewSession(canvasRef.value, {
@@ -682,9 +694,31 @@ async function startPreview() {
       previewSkipped.value = stats.skipped;
       previewWidth.value = canvasRef.value?.width ?? null;
       previewHeight.value = canvasRef.value?.height ?? null;
+      previewDecode.value = stats.mode === "webcodecs" ? `${codecLabel(stats.codec)} · 硬件解码` : "JPEG 回退";
     },
   });
   await session.start();
+}
+
+function codecLabel(codec: string) {
+  if (codec.startsWith("avc1")) return "H.264";
+  if (codec.startsWith("hvc1") || codec.startsWith("hev1")) return "H.265";
+  return codec || "视频";
+}
+
+/** 用户主动开启预览。只在本次应用运行期间记住,重启后恢复为关闭。 */
+async function enablePreview() {
+  if (previewBlockedReason.value) return;
+  previewEnabled.value = true;
+  await startPreview();
+}
+
+async function disablePreview() {
+  previewEnabled.value = false;
+  await session?.stop();
+  hasFrame.value = false;
+  previewState.value = "idle";
+  clearPreviewStats();
 }
 
 async function retryPreview() {
@@ -704,6 +738,7 @@ function clearPreviewStats() {
   previewSkipped.value = 0;
   previewWidth.value = null;
   previewHeight.value = null;
+  previewDecode.value = "";
 }
 
 watch(deviceLive, (running) => {
@@ -728,7 +763,8 @@ onMounted(async () => {
   void startBroadcastAudio();
   unlistenCaptureState = await listen<string>("capture_state", (event) => {
     captureState.value = event.payload as CaptureState;
-    if (event.payload === "ready" && previewPageActive) void startPreview();
+    // 只恢复用户已开启的预览;默认不自动预览。
+    if (event.payload === "ready" && previewPageActive && previewEnabled.value) void startPreview();
     if (event.payload === "stopped" || event.payload === "error") {
       hasFrame.value = false;
       clearPreviewStats();
@@ -756,7 +792,7 @@ onMounted(async () => {
   await refreshSubscriptions();
   await refreshRecordingState();
   recordingRefreshTimer = window.setInterval(() => void refreshRecordingState(), 1000);
-  await startPreview();
+  if (previewEnabled.value) await startPreview();
 });
 
 onActivated(async () => {
@@ -765,7 +801,7 @@ onActivated(async () => {
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
   await refreshSubscriptions();
   await refreshRecordingState();
-  await startPreview();
+  if (previewEnabled.value) await startPreview();
 });
 
 onDeactivated(() => {
@@ -804,7 +840,10 @@ onUnmounted(() => {
             <span class="panel-kicker">VIDEO CAPTURE</span>
             <h2>视频采集预览</h2>
           </div>
-          <div class="preview-status" :class="previewState"><i />{{ previewStateText }}</div>
+          <div class="preview-head-actions">
+            <div class="preview-status" :class="previewEnabled ? previewState : 'off'"><i />{{ previewStateText }}</div>
+            <n-button v-if="previewEnabled" size="tiny" quaternary @click="disablePreview">关闭预览</n-button>
+          </div>
         </div>
 
         <div class="preview-slot">
@@ -814,7 +853,18 @@ onUnmounted(() => {
               <div class="cover-mark"><n-icon :size="42"><VideocamOutline /></n-icon></div>
               <strong>{{ previewEmptyTitle }}</strong>
               <span>{{ previewEmptyHint }}</span>
-              <n-button v-if="previewState === 'error' && captureState === 'ready'" size="small" type="primary" secondary @click="retryPreview">
+              <n-button
+                v-if="!previewEnabled"
+                class="preview-enable"
+                size="small"
+                type="primary"
+                :disabled="!!previewBlockedReason"
+                :title="previewBlockedReason"
+                @click="enablePreview"
+              >
+                开启预览
+              </n-button>
+              <n-button v-else-if="previewState === 'error' && captureState === 'ready'" size="small" type="primary" secondary @click="retryPreview">
                 重试预览
               </n-button>
             </div>
@@ -822,9 +872,9 @@ onUnmounted(() => {
             <div class="preview-overlay bottom-row">
               <span>{{ sourceSummary }}</span>
               <span v-if="previewWidth !== null && previewHeight !== null">
-                本地预览 {{ previewWidth }}×{{ previewHeight }} · {{ previewFps }} FPS · {{ previewLatency }} ms · 跳 {{ previewSkipped }}
+                本地预览 {{ previewWidth }}×{{ previewHeight }} · {{ previewDecode }} · {{ previewFps }} FPS · {{ previewLatency }} ms · 跳 {{ previewSkipped }}
               </span>
-              <span v-else>本地预览待启动</span>
+              <span v-else>{{ previewEnabled ? "本地预览待启动" : "本地预览已关闭" }}</span>
             </div>
           </div>
         </div>
@@ -1277,6 +1327,9 @@ onUnmounted(() => {
 .panel-kicker { display: block; color: var(--accent); font-size: 9px; font-weight: 750; }
 .panel-head h2 { margin: 1px 0 0; color: var(--text-primary); font-size: 16px; font-weight: 720; }
 .preview-status { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 11px; }
+.preview-head-actions { display: inline-flex; align-items: center; gap: 8px; }
+.preview-status.off i { background: var(--text-secondary); opacity: .5; }
+.preview-enable { position: relative; margin-top: 4px; }
 .preview-status.playing i { background: var(--success); }
 .preview-status.starting i { background: var(--warning); }
 .preview-status.error i { background: var(--error); }

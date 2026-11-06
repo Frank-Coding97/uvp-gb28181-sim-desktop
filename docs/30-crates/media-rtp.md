@@ -25,6 +25,13 @@
 - Tauri 命令 `get_encoder_status` 返回两种编码的选择结果,供设置页显示。
 - 设计与实测数据见 [`media-pipeline-v2.md` §5.5](../20-architecture/media-pipeline-v2.md)。
 
+## v2 P4:本地预览改为总线订阅
+
+- 删除 `preview_source::PreviewingSource`;`DeviceSimulator` 不再持有预览 sink,采集源启动时 `preview` 参数恒为 `None`。
+- 本地预览由桌面端 `PreviewManager` 订阅 `SharedMedia`,编码帧直送前端 WebCodecs;`preview_worker` 只作为 JPEG 回退被调用。
+- 新增 `codec_string` 模块:由 SPS 生成 WebCodecs codec 字符串。
+- `DeviceSimulator::current_keyframe_jpeg()`:平台抓拍与本地抓拍共用,取共享媒体当前关键帧转 JPEG。
+
 ## 容器格式支持(FileSource)
 
 引擎推流只吃 **H.264/H.265 Annex B 裸流**(按起始码切帧)。为支持常见容器(MP4/FLV/MKV/MOV):

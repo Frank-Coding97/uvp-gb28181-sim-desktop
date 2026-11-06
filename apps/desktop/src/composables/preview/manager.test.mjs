@@ -1,4 +1,5 @@
 import { createPreviewManager } from "./manager.ts";
+import { envelopeV2, jpegEnvelope } from "./envelope.fixture.mjs";
 
 function equal(actual, expected) {
   if (actual !== expected) throw new Error(`expected ${String(expected)}, got ${String(actual)}`);
@@ -13,17 +14,7 @@ function flush() {
 }
 
 function envelope(generation, sequence, capturedAtMs = Date.now()) {
-  const jpeg = [0xff, 0xd8, 0xff, sequence & 0xff, 0xff, 0xd9];
-  const bytes = new Uint8Array(32 + jpeg.length);
-  bytes.set([0x55, 0x56, 0x50, 0x4a], 0);
-  const view = new DataView(bytes.buffer);
-  view.setUint16(4, 1, true);
-  view.setUint16(6, 32, true);
-  view.setBigUint64(8, BigInt(generation), true);
-  view.setBigUint64(16, BigInt(sequence), true);
-  view.setBigUint64(24, BigInt(capturedAtMs), true);
-  bytes.set(jpeg, 32);
-  return bytes.buffer;
+  return jpegEnvelope(generation, sequence, capturedAtMs);
 }
 
 function status(generation = 1, previewGeneration = 1, phase = "preview_starting", reason = null) {
@@ -103,6 +94,9 @@ class FakeTransport {
   }
 
   async retry() {}
+
+  fallbackCalls = [];
+  async setFallback(value) { this.fallbackCalls.push(value); }
 }
 
 function canvas() {

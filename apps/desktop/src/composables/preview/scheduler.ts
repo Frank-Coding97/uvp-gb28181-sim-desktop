@@ -5,44 +5,82 @@
  */
 
 /** envelope 头长度，与 Rust 侧 `PREVIEW_HEADER_LEN` 对应。 */
-export const PREVIEW_HEADER_LEN = 32;
-export const PREVIEW_ENVELOPE_VERSION = 1;
+export const PREVIEW_HEADER_LEN = 36;
+export const PREVIEW_ENVELOPE_VERSION = 2;
 const PREVIEW_MAGIC = [0x55, 0x56, 0x50, 0x4a] as const; // UVPJ
 
+/** 载荷类型，与 Rust `PreviewPayloadKind` 对应。 */
+export type PreviewPayloadKind = "jpeg" | "h264" | "h265";
+const PAYLOAD_KINDS: readonly PreviewPayloadKind[] = ["jpeg", "h264", "h265"];
+
 export interface PreviewFrame {
-  /** 完整 JPEG 字节，与原 buffer 共享内存，不复制。 */
+  kind: PreviewPayloadKind;
+  /** 编码帧是否关键帧；JPEG 恒为 true。 */
+  keyFrame: boolean;
+  /** 关键帧携带的 WebCodecs codec 字符串（如 `avc1.64001F`），其余为空串。 */
+  codec: string;
+  /** 载荷字节（JPEG 或 Annex B 访问单元），与原 buffer 共享内存，不复制。 */
+  payload: Uint8Array;
+  /** 兼容旧调用方：等同于 payload。 */
   jpeg: Uint8Array;
-  /** 采集侧读到这一帧的时刻，用于算端到端延迟。 */
+  /** 后端发出这一帧的时刻，用于算端到端延迟。 */
   capturedAtMs: number;
   generation: number;
   sequence: number;
 }
 
-/** 解析后端 versioned envelope；不接受旧版或字段超出 JS 安全整数的帧。 */
+/**
+ * 解析后端 v2 envelope：
+ * `magic(4) version(2) header_len(2) kind(1) flags(1) codec_len(2)
+ *  generation(8) sequence(8) captured_at_ms(8)` + codec(codec_len) + payload。
+ * 不接受旧版或字段超出 JS 安全整数的帧。
+ */
 export function parsePreviewFrame(raw: ArrayBuffer): PreviewFrame | null {
   if (raw.byteLength <= PREVIEW_HEADER_LEN) return null;
   const view = new DataView(raw);
   if (PREVIEW_MAGIC.some((byte, index) => view.getUint8(index) !== byte)) return null;
   if (view.getUint16(4, true) !== PREVIEW_ENVELOPE_VERSION) return null;
   const headerLength = view.getUint16(6, true);
-  if (headerLength !== PREVIEW_HEADER_LEN || raw.byteLength <= headerLength) return null;
-  const generation = view.getBigUint64(8, true);
-  const sequence = view.getBigUint64(16, true);
-  const capturedAtMs = view.getBigUint64(24, true);
+  if (headerLength !== PREVIEW_HEADER_LEN) return null;
+  const kind = PAYLOAD_KINDS[view.getUint8(8)];
+  if (!kind) return null;
+  const keyFrame = (view.getUint8(9) & 0x01) !== 0;
+  const codecLength = view.getUint16(10, true);
+  const generation = view.getBigUint64(12, true);
+  const sequence = view.getBigUint64(20, true);
+  const capturedAtMs = view.getBigUint64(28, true);
   if (
     generation > BigInt(Number.MAX_SAFE_INTEGER)
     || sequence > BigInt(Number.MAX_SAFE_INTEGER)
     || capturedAtMs > BigInt(Number.MAX_SAFE_INTEGER)
   ) return null;
-  const jpeg = new Uint8Array(raw, headerLength);
-  // JPEG 必须以 SOI(FF D8 FF) 开头，否则说明流对齐出了问题。
-  if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8 || jpeg[2] !== 0xff) return null;
+  const payloadOffset = headerLength + codecLength;
+  if (raw.byteLength <= payloadOffset) return null;
+  const codec = codecLength
+    ? String.fromCharCode(...new Uint8Array(raw, headerLength, codecLength))
+    : "";
+  const payload = new Uint8Array(raw, payloadOffset);
+  if (kind === "jpeg") {
+    // JPEG 必须以 SOI(FF D8 FF) 开头，否则说明流对齐出了问题。
+    if (payload[0] !== 0xff || payload[1] !== 0xd8 || payload[2] !== 0xff) return null;
+  } else if (!startsWithAnnexB(payload)) {
+    return null;
+  }
   return {
-    jpeg,
+    kind,
+    keyFrame: kind === "jpeg" ? true : keyFrame,
+    codec,
+    payload,
+    jpeg: payload,
     capturedAtMs: Number(capturedAtMs),
     generation: Number(generation),
     sequence: Number(sequence),
   };
+}
+
+function startsWithAnnexB(bytes: Uint8Array): boolean {
+  return (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1)
+    || (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 0 && bytes[3] === 1);
 }
 
 export interface LatestFrameScheduler {
