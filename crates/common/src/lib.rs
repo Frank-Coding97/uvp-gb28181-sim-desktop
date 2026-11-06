@@ -6,11 +6,12 @@
 pub mod clock;
 pub mod error;
 pub mod logging;
+pub mod ntp;
 pub mod observer;
 pub mod process;
 pub mod types;
 
 pub use error::{Error, Result};
-pub use process::hidden_command;
 pub use observer::{DeviceEvent, DeviceObserver, FailureKind, NoopObserver};
+pub use process::hidden_command;
 pub use types::{AudioTransport, DeviceId, GbVersion, SignalingEncoding, Transport};

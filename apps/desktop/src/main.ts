@@ -14,6 +14,7 @@ import System from "./views/System.vue";
 import Preview from "./views/Preview.vue";
 import Settings from "./views/Settings.vue";
 import Recordings from "./views/Recordings.vue";
+import Clock from "./views/Clock.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -33,6 +34,7 @@ const router = createRouter({
     { path: "/media-settings",   component: Settings, props: { section: "media" } },
     { path: "/osd-settings",     component: Settings, props: { section: "osd" } },
     { path: "/network-settings", component: Settings, props: { section: "network" } },
+    { path: "/clock",            component: Clock },
     { path: "/about",            component: Settings, props: { section: "about" } },
     { path: "/logs",      component: System },
     { path: "/settings",  redirect: "/device-settings" }, // 旧设置入口兼容

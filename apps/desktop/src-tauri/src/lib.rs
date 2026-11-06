@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, OnceLock,
 };
-use std::{collections::HashSet, net::IpAddr};
+use std::{collections::HashSet, net::IpAddr, time::Duration};
 
 use common::{DeviceEvent, DeviceId, DeviceObserver, Transport};
 use gb28181_simulator::{
@@ -28,7 +28,7 @@ mod preview_channel;
 mod preview_manager;
 use config_store::{
     BindMode, CatalogNodeConfig, ConfigStore, DesktopConfigV2, EffectiveDeviceConfig,
-    StartDeviceInput,
+    StartDeviceInput, TimeSyncSettings,
 };
 use preview_channel::DesktopPreviewBus;
 use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
@@ -63,6 +63,26 @@ struct AppState {
     preview_bus: Arc<DesktopPreviewBus>,
     /// 应用级唯一预览 Channel 管理器；页面只 attach/detach。
     preview_manager: Arc<PreviewManager>,
+    /// NTP 周期刷新任务（设备运行期才启动）。
+    ntp: Mutex<NtpRuntime>,
+}
+
+/// NTP 刷新任务的运行态。
+///
+/// `running` 用 `Arc<AtomicBool>` 而不是普通 bool：任务自己退出（例如取消后
+/// 跑完最后一轮）也要能把状态置回 false，否则界面会一直显示"刷新中"。
+struct NtpRuntime {
+    cancel: Option<Arc<AtomicBool>>,
+    running: Arc<AtomicBool>,
+}
+
+impl NtpRuntime {
+    fn new() -> Self {
+        Self {
+            cancel: None,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// 压测运行句柄。收到停止请求后仅标记 `stopping`，由后台任务退出时释放。
@@ -126,6 +146,35 @@ impl Drop for DeviceStartup<'_> {
 }
 
 impl AppState {
+    /// 启动（或重启）NTP 周期刷新任务。
+    ///
+    /// 每次重启都换一个新的 `running` 标志：旧任务退出时只会把自己那份置 false，
+    /// 不会把新任务的状态误标成"未运行"。
+    async fn restart_ntp_refresh(&self, settings: TimeSyncSettings) {
+        let mut runtime = self.ntp.lock().await;
+        if let Some(cancel) = runtime.cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        runtime.cancel = Some(Arc::clone(&cancel));
+        runtime.running = Arc::clone(&running);
+        drop(runtime);
+        tokio::spawn(ntp_refresh_loop(settings, cancel, running));
+    }
+
+    async fn stop_ntp_refresh(&self) {
+        let mut runtime = self.ntp.lock().await;
+        if let Some(cancel) = runtime.cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        runtime.running.store(false, Ordering::Release);
+    }
+
+    async fn ntp_running(&self) -> bool {
+        self.ntp.lock().await.running.load(Ordering::Acquire)
+    }
+
     fn begin_device_start(&self) -> Result<DeviceStartup<'_>, String> {
         let mut pending = self
             .media_preparation
@@ -185,8 +234,65 @@ impl AppState {
             device: Mutex::new(None),
             preview_bus,
             preview_manager,
+            ntp: Mutex::new(NtpRuntime::new()),
         }
     }
+}
+
+/// NTP 周期刷新。首次查询立即执行，之后按 `refresh_interval_secs` 循环。
+///
+/// 失败不终止循环：NTP 服务器通常是内网地址，偶发超时不该让校时永久停摆；
+/// 每次失败都会回退到 SIP Date 并把原因写进 [`common::clock`]，界面可查。
+async fn ntp_refresh_loop(
+    settings: TimeSyncSettings,
+    cancel: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+) {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        let server = settings.ntp_server.clone();
+        let port = settings.ntp_port;
+        let outcome = tokio::task::spawn_blocking(move || {
+            common::ntp::query(&server, port, Duration::from_millis(1_500))
+        })
+        .await;
+        match outcome {
+            Ok(Ok(sample)) => {
+                common::clock::apply_ntp(
+                    sample.offset_secs(),
+                    &sample.server,
+                    sample.round_trip_ms,
+                );
+                tracing::info!(
+                    server = %sample.server,
+                    offset_secs = sample.offset_secs(),
+                    rtt_ms = sample.round_trip_ms,
+                    stratum = sample.stratum,
+                    "NTP 校时完成"
+                );
+            }
+            Ok(Err(error)) => {
+                common::clock::ntp_failed(&error);
+                tracing::warn!(error = %error, "NTP 校时失败，已回退 SIP Date");
+            }
+            Err(error) => {
+                common::clock::ntp_failed(&format!("NTP 查询任务异常: {error}"));
+                tracing::warn!(error = %error, "NTP 查询任务异常");
+            }
+        }
+
+        let interval = Duration::from_secs(settings.refresh_interval_secs.max(1));
+        let deadline = tokio::time::Instant::now() + interval;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if cancel.load(Ordering::Acquire) {
+                break;
+            }
+        }
+    }
+    running.store(false, Ordering::Release);
 }
 
 fn app_recording_store(state: &AppState, app: &AppHandle) -> Result<Arc<RecordingStore>, String> {
@@ -299,11 +405,7 @@ fn control_state_file(state: &AppState, app: &AppHandle) -> Result<std::path::Pa
     Ok(app_data_root(state, app)?.join("device-control-state-v1.json"))
 }
 
-fn load_control_state(
-    sim: &gb28181_simulator::DeviceSimulator,
-    state: &AppState,
-    app: &AppHandle,
-) {
+fn load_control_state(sim: &gb28181_simulator::DeviceSimulator, state: &AppState, app: &AppHandle) {
     let Ok(path) = control_state_file(state, app) else {
         return;
     };
@@ -321,11 +423,7 @@ fn load_control_state(
     }
 }
 
-fn save_control_state(
-    sim: &gb28181_simulator::DeviceSimulator,
-    state: &AppState,
-    app: &AppHandle,
-) {
+fn save_control_state(sim: &gb28181_simulator::DeviceSimulator, state: &AppState, app: &AppHandle) {
     let Ok(path) = control_state_file(state, app) else {
         return;
     };
@@ -749,6 +847,124 @@ async fn save_osd_config(
     tokio::task::spawn_blocking(move || store.save_osd(osd, expected_revision))
         .await
         .map_err(|error| format!("保存 OSD 配置任务异常: {error}"))?
+}
+
+/// 校时页要的全部信息:生效偏移、来源、SIP 回退值与 NTP 配置。
+#[derive(Debug, Serialize)]
+struct ClockStateDto {
+    /// 当前生效偏移/来源/凭证明细。
+    clock: common::clock::ClockSnapshot,
+    /// 持久化的 NTP 配置。
+    time_sync: TimeSyncSettings,
+    /// NTP 周期刷新任务是否在跑(设备未运行或未启用时为 false)。
+    ntp_running: bool,
+    /// 本机当前时间(毫秒),由前端做本地时区格式化。
+    local_epoch_ms: i64,
+    /// 校时后的设备对外时间(毫秒)= 本地 + 偏移。
+    platform_epoch_ms: i64,
+    /// 读取时的配置版本，保存 NTP 配置时原样带回，避免覆盖并发修改。
+    config_revision: u64,
+}
+
+/// 一次手动 NTP 校时的结果。
+#[derive(Debug, Serialize)]
+struct NtpProbeDto {
+    offset_secs: i64,
+    round_trip_ms: i64,
+    stratum: u8,
+    server: String,
+    clock: common::clock::ClockSnapshot,
+}
+
+/// 读取当前校时状态与 NTP 配置。
+#[tauri::command]
+async fn get_clock_state(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<ClockStateDto, String> {
+    let store = app_config_store(&state, &app)?;
+    let (time_sync, config_revision) = {
+        let _io = state.config_io.lock().await;
+        tokio::task::spawn_blocking(move || {
+            store
+                .load()
+                .map(|config| (config.time_sync, config.config_revision))
+        })
+        .await
+        .map_err(|error| format!("读取配置任务异常: {error}"))??
+    };
+    let clock = common::clock::snapshot();
+    let local_epoch_ms = common::clock::local_epoch_ms();
+    Ok(ClockStateDto {
+        platform_epoch_ms: local_epoch_ms + clock.offset_secs.saturating_mul(1_000),
+        clock,
+        ntp_running: state.ntp_running().await,
+        time_sync,
+        local_epoch_ms,
+        config_revision,
+    })
+}
+
+/// 保存 NTP 配置。
+///
+/// 与其它配置不同,这里**不要求设备已停止**:校时是运行态能力,内网 NTP 地址经常
+/// 要边跑边试。保存后在跑的设备会立刻按新配置重启刷新任务,不需要重新注册。
+#[tauri::command]
+async fn save_time_sync(
+    time_sync: TimeSyncSettings,
+    expected_revision: u64,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopConfigV2, String> {
+    let store = app_config_store(&state, &app)?;
+    let saved = {
+        let _io = state.config_io.lock().await;
+        tokio::task::spawn_blocking(move || store.save_time_sync(time_sync, expected_revision))
+            .await
+            .map_err(|error| format!("保存校时配置任务异常: {error}"))??
+    };
+    let device_running = state.device.lock().await.is_some();
+    if !saved.time_sync.ntp_enabled {
+        state.stop_ntp_refresh().await;
+        common::clock::clear_ntp();
+    } else if device_running {
+        state.restart_ntp_refresh(saved.time_sync.clone()).await;
+    }
+    Ok(saved)
+}
+
+/// 手动触发一次 NTP 校时(不依赖设备是否在运行)。
+#[tauri::command]
+async fn sync_ntp_now(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<NtpProbeDto, String> {
+    let store = app_config_store(&state, &app)?;
+    let settings = {
+        let _io = state.config_io.lock().await;
+        tokio::task::spawn_blocking(move || store.load().map(|config| config.time_sync))
+            .await
+            .map_err(|error| format!("读取配置任务异常: {error}"))??
+    };
+    let server = settings.ntp_server.clone();
+    let port = settings.ntp_port;
+    let sample = tokio::task::spawn_blocking(move || {
+        common::ntp::query(&server, port, Duration::from_millis(1_500))
+    })
+    .await
+    .map_err(|error| format!("NTP 查询任务异常: {error}"))?
+    .map_err(|error| {
+        common::clock::ntp_failed(&error);
+        error
+    })?;
+    common::clock::apply_ntp(sample.offset_secs(), &sample.server, sample.round_trip_ms);
+    Ok(NtpProbeDto {
+        offset_secs: sample.offset_secs(),
+        round_trip_ms: sample.round_trip_ms,
+        stratum: sample.stratum,
+        server: sample.server,
+        clock: common::clock::snapshot(),
+    })
 }
 
 /// OSD 能否烧进码流：FFmpeg 带 drawtext/drawbox，且有中文字体。
@@ -1594,9 +1810,9 @@ async fn start_device(
                             .iter()
                             .any(|screen| screen.display_id == display_id) =>
                 {
-                    return Err(catalog.screen_error.unwrap_or_else(|| {
-                        format!("未找到显示器 {display_id}")
-                    }));
+                    return Err(catalog
+                        .screen_error
+                        .unwrap_or_else(|| format!("未找到显示器 {display_id}")));
                 }
                 _ => {}
             }
@@ -1822,6 +2038,9 @@ async fn start_device(
             effective_config,
         });
     })?;
+    if persisted.time_sync.ntp_enabled {
+        state.restart_ntp_refresh(persisted.time_sync.clone()).await;
+    }
     Ok("设备已启动".into())
 }
 
@@ -1941,6 +2160,9 @@ async fn delete_recording(
 #[tauri::command]
 async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
     let mut guard = state.device.lock().await;
+    // 设备停止后不再有"设备时间"的维护者，先停 NTP 周期任务；偏移保留，
+    // 这样平台侧看到的最后一次时间不会突然跳回本机时钟。
+    state.stop_ntp_refresh().await;
     match guard.take() {
         Some(h) => {
             save_control_state(h.sim.as_ref(), &state, &app);
@@ -2685,6 +2907,9 @@ pub fn run() {
             save_media_config,
             save_osd_config,
             get_osd_capability,
+            get_clock_state,
+            save_time_sync,
+            sync_ntp_now,
             reset_desktop_config,
             exchange_sip_provision,
             validate_scenario,

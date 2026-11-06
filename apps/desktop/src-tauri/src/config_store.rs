@@ -124,6 +124,21 @@ impl ConfigStore {
         self.save(&current)
     }
 
+    /// 保存 NTP 校时配置。与 OSD 一致：只改自己那一段，其余字段以磁盘为准。
+    pub fn save_time_sync(
+        &self,
+        time_sync: TimeSyncSettings,
+        expected_revision: u64,
+    ) -> Result<DesktopConfigV2, String> {
+        time_sync.validate()?;
+        let mut current = self.load()?;
+        if current.config_revision != expected_revision {
+            return Err("配置版本冲突，请重新读取后保存".into());
+        }
+        current.time_sync = time_sync;
+        self.save(&current)
+    }
+
     fn write_config(&self, config: &DesktopConfigV2) -> Result<(), String> {
         config.validate()?;
         let bytes = serde_json::to_vec_pretty(config)
@@ -249,6 +264,66 @@ pub struct DesktopConfigV2 {
     /// 本地 OSD 水印样式；旧配置文件缺省时取移动端一致的默认值。
     #[serde(default)]
     pub osd: OsdSettings,
+    /// 逻辑协议时钟的 NTP 校时配置；默认关闭，按 JSON 缺失字段补默认值。
+    #[serde(default)]
+    pub time_sync: TimeSyncSettings,
+}
+
+/// 逻辑协议时钟的 NTP 配置。
+///
+/// 与移动端 `SimConfig.timeSync` 同语义：**默认关闭**，关闭或查询失败时使用
+/// 注册 200 OK 的 SIP Date。`refresh_interval_secs` 是两次查询之间的间隔。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimeSyncSettings {
+    #[serde(default)]
+    pub ntp_enabled: bool,
+    #[serde(default = "default_ntp_server")]
+    pub ntp_server: String,
+    #[serde(default = "default_ntp_port")]
+    pub ntp_port: u16,
+    #[serde(default = "default_ntp_refresh_secs")]
+    pub refresh_interval_secs: u64,
+}
+
+fn default_ntp_server() -> String {
+    "ntp.aliyun.com".into()
+}
+
+fn default_ntp_port() -> u16 {
+    123
+}
+
+fn default_ntp_refresh_secs() -> u64 {
+    600
+}
+
+impl Default for TimeSyncSettings {
+    fn default() -> Self {
+        Self {
+            ntp_enabled: false,
+            ntp_server: default_ntp_server(),
+            ntp_port: default_ntp_port(),
+            refresh_interval_secs: default_ntp_refresh_secs(),
+        }
+    }
+}
+
+impl TimeSyncSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ntp_server.trim().is_empty() {
+            return Err("NTP 服务器地址不能为空".into());
+        }
+        if self.ntp_server.chars().any(char::is_whitespace) {
+            return Err("NTP 服务器地址不能包含空白字符".into());
+        }
+        if self.ntp_port == 0 {
+            return Err("NTP 端口必须在 1~65535".into());
+        }
+        if !(1..=86_400).contains(&self.refresh_interval_secs) {
+            return Err("NTP 刷新间隔必须在 1~86400 秒".into());
+        }
+        Ok(())
+    }
 }
 
 /// Kept private: only schema 1 on-disk input uses the legacy FPS location.
@@ -284,6 +359,7 @@ impl DesktopConfigV1 {
             network: self.network,
             catalog_tree: self.catalog_tree,
             osd: OsdSettings::default(),
+            time_sync: TimeSyncSettings::default(),
         }
     }
 }
@@ -490,6 +566,7 @@ impl Default for DesktopConfigV2 {
             },
             catalog_tree: Vec::new(),
             osd: OsdSettings::default(),
+            time_sync: TimeSyncSettings::default(),
         }
     }
 }
@@ -558,6 +635,7 @@ impl DesktopConfigV2 {
         }
         self.media.validate()?;
         self.osd.validate()?;
+        self.time_sync.validate()?;
         if self.network.bind_mode == BindMode::Specific
             && self.network.bind_address.parse::<IpAddr>().is_err()
         {

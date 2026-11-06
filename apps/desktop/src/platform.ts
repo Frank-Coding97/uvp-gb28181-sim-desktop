@@ -83,6 +83,81 @@ export interface DesktopConfigV2 {
   catalog_tree: CatalogNodeConfig[];
   /** 本地 OSD 水印样式；旧后端缺省时由 normalizeOsdSettings 补齐。 */
   osd?: OsdSettings;
+  /** NTP 校时配置；旧后端缺省时按默认值（关闭）展示。 */
+  time_sync?: TimeSyncSettings;
+}
+
+/** 逻辑协议时钟的 NTP 配置，与 Rust 侧 `TimeSyncSettings` 一一对应。 */
+export interface TimeSyncSettings {
+  ntp_enabled: boolean;
+  ntp_server: string;
+  ntp_port: number;
+  refresh_interval_secs: number;
+}
+
+export type TimeSyncSource = "none" | "sip_date" | "ntp";
+
+/** Rust `common::clock::ClockSnapshot` 的投影。 */
+export interface ClockSnapshot {
+  offset_secs: number;
+  source: TimeSyncSource;
+  detail: string;
+  synced_at_ms: number;
+  sip_offset_secs: number;
+  sip_synced: boolean;
+  ntp_active: boolean;
+  last_error: string | null;
+}
+
+export interface ClockState {
+  clock: ClockSnapshot;
+  time_sync: TimeSyncSettings;
+  ntp_running: boolean;
+  local_epoch_ms: number;
+  platform_epoch_ms: number;
+  config_revision: number;
+}
+
+export interface NtpProbeResult {
+  offset_secs: number;
+  round_trip_ms: number;
+  stratum: number;
+  server: string;
+  clock: ClockSnapshot;
+}
+
+/** 默认值与 Rust `TimeSyncSettings::default()` 保持一致：关闭、阿里云 NTP、10 分钟刷新。 */
+export function defaultTimeSyncSettings(): TimeSyncSettings {
+  return {
+    ntp_enabled: false,
+    ntp_server: "ntp.aliyun.com",
+    ntp_port: 123,
+    refresh_interval_secs: 600,
+  };
+}
+
+export function normalizeTimeSyncSettings(value: Partial<TimeSyncSettings> | undefined | null): TimeSyncSettings {
+  const base = defaultTimeSyncSettings();
+  return {
+    ntp_enabled: typeof value?.ntp_enabled === "boolean" ? value.ntp_enabled : base.ntp_enabled,
+    ntp_server: typeof value?.ntp_server === "string" && value.ntp_server.trim() ? value.ntp_server : base.ntp_server,
+    ntp_port: Number.isInteger(value?.ntp_port) && (value!.ntp_port as number) > 0 ? value!.ntp_port as number : base.ntp_port,
+    refresh_interval_secs: Number.isInteger(value?.refresh_interval_secs) && (value!.refresh_interval_secs as number) > 0
+      ? value!.refresh_interval_secs as number
+      : base.refresh_interval_secs,
+  };
+}
+
+/** 返回第一条错误；合法时返回 null。与 Rust 侧校验口径一致。 */
+export function validateTimeSyncSettings(value: TimeSyncSettings): string | null {
+  const server = value.ntp_server.trim();
+  if (!server) return "NTP 服务器地址不能为空";
+  if (/\s/.test(server)) return "NTP 服务器地址不能包含空白字符";
+  if (!Number.isInteger(value.ntp_port) || value.ntp_port < 1 || value.ntp_port > 65535) return "NTP 端口必须在 1~65535";
+  if (!Number.isInteger(value.refresh_interval_secs) || value.refresh_interval_secs < 1 || value.refresh_interval_secs > 86400) {
+    return "NTP 刷新间隔必须在 1~86400 秒";
+  }
+  return null;
 }
 
 export type OsdSize = "small" | "medium" | "large";
@@ -363,6 +438,40 @@ export async function saveOsdConfig(osd: OsdSettings, expectedRevision?: number)
 
 export async function getOsdCapability(): Promise<OsdCapability> {
   return invoke<OsdCapability>("get_osd_capability");
+}
+
+/**
+ * 保存 NTP 校时配置。
+ *
+ * 与其它配置不同：设备运行中**允许**修改（校时是运行态能力，内网 NTP 地址
+ * 经常要边跑边试），保存后后端会按新配置重启刷新任务。
+ */
+export async function saveTimeSync(
+  timeSync: TimeSyncSettings,
+  expectedRevision?: number,
+): Promise<DesktopConfigV2> {
+  if (!config.value) throw new Error("桌面端配置尚未加载");
+  try {
+    const saved = await invoke<DesktopConfigV2>("save_time_sync", {
+      timeSync,
+      expectedRevision: expectedRevision ?? config.value.config_revision,
+    });
+    return applyConfig(saved);
+  } catch (cause) {
+    error.value = String(cause);
+    await refreshAfterRevisionConflict(cause);
+    throw cause;
+  }
+}
+
+/** 读取当前校时状态（偏移、来源、SIP 回退值、NTP 任务运行态）。 */
+export async function getClockState(): Promise<ClockState> {
+  return invoke<ClockState>("get_clock_state");
+}
+
+/** 手动执行一次 NTP 校时，成功后立即生效。 */
+export async function syncNtpNow(): Promise<NtpProbeResult> {
+  return invoke<NtpProbeResult>("sync_ntp_now");
 }
 
 export async function resetDesktopConfig(): Promise<DesktopConfigV2> {

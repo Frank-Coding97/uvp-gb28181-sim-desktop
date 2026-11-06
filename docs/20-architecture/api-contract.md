@@ -43,6 +43,36 @@
 
 > 当前设备状态**只经 `device_state` 事件**推送(见 §3),没有同名查询命令。
 
+### 设备校时命令(FR-46)
+
+| 命令 | 入参 | 返回 | 说明 |
+|---|---|---|---|
+| `get_clock_state` | — | `ClockStateDto` | 生效偏移/来源/凭证/SIP 回退值 + NTP 配置 + 任务运行态 + `config_revision` |
+| `save_time_sync` | `{ time_sync: TimeSyncSettings, expectedRevision: number }` | `DesktopConfigV2` | 保存 NTP 配置;设备运行中允许修改,后端立即重启刷新任务;关闭时回退 SIP Date |
+| `sync_ntp_now` | — | `NtpProbeDto` | 手动执行一次 SNTP 查询并立即生效,不依赖设备是否在运行 |
+
+```ts
+interface TimeSyncSettings {
+  ntp_enabled: boolean;          // 默认 false
+  ntp_server: string;            // 默认 ntp.aliyun.com
+  ntp_port: number;              // 默认 123
+  refresh_interval_secs: number; // 默认 600
+}
+
+interface ClockSnapshot {
+  offset_secs: number;        // 平台时间 − 本地时间
+  source: "none" | "sip_date" | "ntp";
+  detail: string;             // 原始 Date 头 或 "NTP host:port · RTT nms"
+  synced_at_ms: number;
+  sip_offset_secs: number;    // 最近一次 SIP Date 偏移(回退值)
+  sip_synced: boolean;
+  ntp_active: boolean;
+  last_error: string | null;
+}
+```
+
+> 语义约束:NTP 生效期间 `sync_from_date_header` 只更新 `sip_offset_secs`,不覆盖 `offset_secs`;NTP 失败时回退到 `sip_offset_secs`,无可回退值时保持原偏移。
+
 `DeviceCfg` JSON 字段:`server_host`/`server_port`/`server_domain`/`device_id`/`password`/`transport`("UDP"/"TCP")/`gb_version`("2016"/"2022")/`channel_name`/`video_source`(可空,C 档文件路径)。
 
 命令失败统一返回错误对象 `{ code: string, message: string }`(code 对应 `common::Error` 变体)。

@@ -20,6 +20,7 @@ import VideocamOutline from "@vicons/ionicons5/es/VideocamOutline.js";
 import TextOutline from "@vicons/ionicons5/es/TextOutline.js";
 import FilmOutline from "@vicons/ionicons5/es/FilmOutline.js";
 import WifiOutline from "@vicons/ionicons5/es/WifiOutline.js";
+import TimeOutline from "@vicons/ionicons5/es/TimeOutline.js";
 import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
@@ -43,6 +44,7 @@ const menuOptions: MenuOption[] = [
   { label: "音视频配置", key: "/media-settings",   icon: icon(VideocamOutline) },
   { label: "OSD 水印",   key: "/osd-settings",     icon: icon(TextOutline) },
   { label: "网络配置",   key: "/network-settings", icon: icon(WifiOutline) },
+  { label: "设备校时",   key: "/clock",            icon: icon(TimeOutline) },
   { label: "日志",       key: "/logs",             icon: icon(TerminalOutline) },
   { label: "关于",       key: "/about",            icon: icon(InformationCircleOutline) },
 ];
