@@ -27,6 +27,8 @@ import CalendarOutline from "@vicons/ionicons5/es/CalendarOutline.js";
 import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
+import type { GbVersion, SignalingEncoding } from "./platform";
+import { effective, normalizeForVersion, optionsFor, parseEncoding } from "./signaling-charset.mjs";
 import { useDevice } from "./device";
 import NotificationBell from "./components/NotificationBell.vue";
 import { startNotificationCenter, stopNotificationCenter } from "./notification-center";
@@ -77,13 +79,18 @@ const editForm = ref({
   server_domain: "",
   password: "",
   transport: "UDP" as "UDP" | "TCP",
-  gb_version: "V2022" as "V2016" | "V2022",
-  signaling_encoding: "Gb18030" as "Gb18030" | "Utf8",
+  gb_version: "V2022" as GbVersion,
+  signaling_encoding: "Gb18030" as SignalingEncoding,
 });
 function openEdit() {
   if (active.value) {
     Object.assign(editForm.value, active.value);
     editForm.value.password = passwordFor(active.value.id);
+    // 存量配置可能存着与版本不匹配的编码：编辑框里显示实际会出站的那个值。
+    editForm.value.signaling_encoding = effective(
+      parseEncoding(active.value.signaling_encoding),
+      active.value.gb_version,
+    );
   }
 }
 async function saveEdit() {
@@ -125,10 +132,16 @@ const versionOptions = [
   { label: "GB/T 28181-2022", value: "V2022" },
   { label: "GB/T 28181-2016", value: "V2016" },
 ];
-const encodingOptions = [
-  { label: "GB18030(国标默认)", value: "Gb18030" },
-  { label: "UTF-8", value: "Utf8" },
-];
+const encodingOptions = computed(() => optionsFor(editForm.value.gb_version).map((item) => ({
+  label: item.label,
+  value: item.value,
+  disabled: item.disabled,
+})));
+/** 切版本时把不适用的编码纠到新版本默认，避免把必定被兜底的值存进档案。 */
+function pickEditVersion(version: GbVersion) {
+  editForm.value.gb_version = version;
+  editForm.value.signaling_encoding = normalizeForVersion(editForm.value.signaling_encoding, version);
+}
 
 const activeKey = computed(() => route.path);
 const showTopbar = computed(() => route.path !== "/dashboard");
@@ -310,7 +323,7 @@ const themeOverrides = {
                       <n-input v-model:value="editForm.server_domain" size="small" maxlength="10" placeholder="服务器域（10 位）" />
                       <n-input v-model:value="editForm.password" size="small" type="password" show-password-on="click" placeholder="SIP 密码" />
                       <n-select v-model:value="editForm.transport" size="small" :options="transportOptions" />
-                      <n-select v-model:value="editForm.gb_version" size="small" :options="versionOptions" />
+                      <n-select :value="editForm.gb_version" size="small" :options="versionOptions" @update:value="pickEditVersion" />
                       <n-select v-model:value="editForm.signaling_encoding" size="small" :options="encodingOptions" />
                       <div class="pe-actions">
                         <n-button size="small" type="primary" :disabled="deviceLive" @click="saveEdit">保存</n-button>

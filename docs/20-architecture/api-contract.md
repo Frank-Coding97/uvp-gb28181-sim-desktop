@@ -291,6 +291,17 @@ interface SipTraceEntry {
   peer: string;               // 对端地址 host:port
   summary: string;            // 首行摘要(请求行 / 状态行)
 }
+
+// 信令字符集(FR-53,GB/T 28181 §6.10)。每个平台档案一个,随 gb_version 收窄。
+// 2022 §6.10「应 GB18030」;2016 §6.10「宜 GB2312」;UTF-8 非国标,仅作联调逃逸口。
+type SignalingEncoding = "Gb2312" | "Gb18030" | "Utf8";
+
+// 版本 → 可选值(不可用项在 UI 上禁用,不隐藏):
+//   V2016: Gb2312(默认) / Utf8   — Gb18030 在 2016 下是不认得的声明名
+//   V2022: Gb18030(默认) / Utf8  — Gb2312 由超集 GB18030 取代
+// 实际出站 = effective(保存值, 版本):不匹配时按版本默认兜底,不带着对端不认的声明出站。
+// GB2312 声明配 GBK 字节(兼容超集),声明与字节必须同源;入站按报文自身声明解码。
+// 细节见 10-functional/signaling-charset.md。
 ```
 
 ### 单设备信令追踪命令

@@ -2227,7 +2227,12 @@ async fn start_device(
         media_profile: Some(resolved.media.clone()),
         light_bitrate_kbps: None,
         gb_version: resolved.profile.gb_version,
-        signaling_encoding: resolved.profile.signaling_encoding,
+        // 出站字符集必须与国标版本相容:切到 2016 后仍存着 GB18030 时兜底成 GB2312,
+        // 否则会带着 2016 平台不认的声明名出站(现场表现是"收到了但解析不出")。
+        signaling_encoding: resolved
+            .profile
+            .signaling_encoding
+            .effective(resolved.profile.gb_version),
     };
 
     // Prepare the immutable output before REGISTER; INVITE only subscribes to it.

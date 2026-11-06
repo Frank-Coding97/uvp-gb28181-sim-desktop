@@ -35,6 +35,7 @@ import {
   type OsdCapability,
   type OsdLayer,
   type OsdSettings,
+  type SignalingEncoding,
   getOsdCapability,
 } from "../platform";
 import {
@@ -47,6 +48,14 @@ import {
   osdSettingsEqual,
   validateOsdSettings,
 } from "../osd-settings";
+import {
+  defaultFor,
+  effective,
+  effectiveSummary,
+  normalizeForVersion,
+  optionsFor,
+  parseEncoding,
+} from "../signaling-charset.mjs";
 
 type SettingKey = "device" | "media" | "osd" | "network" | "about";
 
@@ -61,6 +70,9 @@ const settings = [
 ];
 
 const activeKey = computed(() => props.section);
+const charsetOptions = computed(() => optionsFor(profileVersion.value));
+/** 「实际出站」回显：保存值与版本不符时会点明兜底原因，避免以为保存没生效。 */
+const charsetSummary = computed(() => effectiveSummary(profileEncoding.value, profileVersion.value));
 const saving = ref(false);
 const feedback = ref<{ ok: boolean; text: string } | null>(null);
 const { deviceLive, deviceState, effectiveConfig, form } = useDevice();
@@ -91,6 +103,8 @@ const osdCapability = ref<OsdCapability | null>(null);
 const osdNow = ref(new Date());
 let osdClock: ReturnType<typeof setInterval> | null = null;
 const profileVersion = ref<GbVersion>("V2022");
+// 信令字符集(§6.10)。与协议版本绑定：2016 只有 GB2312，2022 只有 GB18030，UTF-8 两版都能选。
+const profileEncoding = ref<SignalingEncoding>(defaultFor("V2022"));
 const mediaAdvancedOpen = ref(false);
 const localIpOptions = ref<LocalIpOption[]>([]);
 const localIpLoading = ref(false);
@@ -122,6 +136,11 @@ function replaceDrafts(force = false) {
   const preserveVersion = !force
     && activePlatform.value
     && profileVersion.value !== activePlatform.value.gb_version;
+  // 字符集与版本同源：版本被改过（未保存）时不能单独把字符集拉回后端值，
+  // 否则用户刚切的版本会配上旧版本的编码。后端值一律先按版本归一再回填。
+  const backendVersion = activePlatform.value?.gb_version ?? "V2022";
+  const backendEncoding = effective(parseEncoding(activePlatform.value?.signaling_encoding), backendVersion);
+  const preserveEncoding = !force && (preserveVersion || profileEncoding.value !== backendEncoding);
   if (!preserveDevice) deviceDraft.value = { ...config.value.device };
   if (force || !mediaDraft.value || !mediaDraftBase.value
     || mediaProfileEqual(mediaDraft.value, mediaDraftBase.value)) {
@@ -137,6 +156,13 @@ function replaceDrafts(force = false) {
     osdDraftRevision.value = config.value.config_revision;
   }
   if (!preserveVersion) profileVersion.value = activePlatform.value?.gb_version ?? "V2022";
+  if (!preserveEncoding) profileEncoding.value = backendEncoding;
+}
+
+/** 切版本时把不适用的字符集纠到新版本默认，避免界面选中项与实际出站不一致。 */
+function pickVersion(version: GbVersion) {
+  profileVersion.value = version;
+  profileEncoding.value = normalizeForVersion(profileEncoding.value, version);
 }
 
 watch(config, () => replaceDrafts(), { immediate: true });
@@ -398,7 +424,12 @@ async function saveCurrent() {
     await saveDesktopConfig({
       ...config.value,
       profiles: config.value.profiles.map((profile) => profile.id === activeId
-        ? { ...profile, gb_version: profileVersion.value }
+        ? {
+            ...profile,
+            gb_version: profileVersion.value,
+            // 写回归一后的值：切过版本后配置里不留"与版本不匹配"的无效字符集。
+            signaling_encoding: normalizeForVersion(profileEncoding.value, profileVersion.value),
+          }
         : profile),
       device: { ...deviceDraft.value },
       network: { ...networkDraft.value },
@@ -471,9 +502,23 @@ function setBindMode(mode: BindMode) {
         <section v-if="activeKey === 'device' && deviceDraft" class="settings-section">
           <div class="section-label">协议版本</div>
           <div class="segmented wide">
-            <button type="button" :class="{ on: profileVersion === 'V2016' }" :disabled="locked" @click="profileVersion = 'V2016'">GB/T 28181-2016</button>
-            <button type="button" :class="{ on: profileVersion === 'V2022' }" :disabled="locked" @click="profileVersion = 'V2022'">GB/T 28181-2022</button>
+            <button type="button" :class="{ on: profileVersion === 'V2016' }" :disabled="locked" @click="pickVersion('V2016')">GB/T 28181-2016</button>
+            <button type="button" :class="{ on: profileVersion === 'V2022' }" :disabled="locked" @click="pickVersion('V2022')">GB/T 28181-2022</button>
           </div>
+
+          <div class="section-label">信令字符集（§6.10）</div>
+          <div class="segmented wide">
+            <button
+              v-for="item in charsetOptions"
+              :key="item.value"
+              type="button"
+              :class="{ on: profileEncoding === item.value }"
+              :title="item.hint"
+              :disabled="locked || item.disabled"
+              @click="profileEncoding = item.value"
+            >{{ item.label }}</button>
+          </div>
+          <p class="charset-hint">{{ charsetSummary }}</p>
 
           <div class="section-label">设备与注册</div>
           <div class="field-grid two">
@@ -724,6 +769,10 @@ function setBindMode(mode: BindMode) {
 .segmented { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--border-default); border-radius: 9px; background: rgba(255,255,255,.42); }
 .segmented button { flex: 1; padding: 8px 12px; border: 0; border-radius: 7px; background: transparent; color: var(--text-secondary); cursor: pointer; }
 .segmented button.on { background: var(--accent); color: #fff; }
+/* 字符集按版本禁用不可选项：灰掉但保留可见，让「这版没有这个编码」这层约束看得见。 */
+.segmented button:disabled { cursor: not-allowed; opacity: .42; }
+.segmented button.on:disabled { opacity: .55; }
+.charset-hint { margin: 8px 0 0; padding: 0 2px; color: var(--text-tertiary); font-size: 11px; line-height: 1.5; }
 .field-grid { display: grid; gap: 10px; }
 .field-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .field { display: flex; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 12px; }

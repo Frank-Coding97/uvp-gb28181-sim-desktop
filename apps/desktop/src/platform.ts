@@ -9,12 +9,13 @@ import {
   type MediaProfile,
 } from "./media-profile.ts";
 import type { RecordPlanSettings } from "./record-plan.mjs";
+import { effective, parseEncoding } from "./signaling-charset.mjs";
 
 export type SignalingTransport = "UDP" | "TCP";
 /** 音频流(语音广播/对讲下行)传输方式,与信令传输相互独立。 */
 export type AudioTransport = "UDP" | "TCP_ACTIVE" | "TCP_PASSIVE";
 export type GbVersion = "V2016" | "V2022";
-export type SignalingEncoding = "Gb18030" | "Utf8";
+export type SignalingEncoding = "Gb2312" | "Gb18030" | "Utf8";
 export type BindMode = "auto" | "specific";
 
 export interface PlatformProfile {
@@ -283,6 +284,8 @@ function migrateLegacy(base: DesktopConfigV2): DesktopConfigV2 | null {
         ? oldDomain
         : base.profiles[0].server_id);
       const id = stringValue(raw.id, `profile-${index + 1}`);
+      const version: GbVersion =
+        raw.gb_version === "2016" || raw.gb_version === "V2016" ? "V2016" : "V2022";
       return {
         id,
         name: stringValue(raw.name, `平台 ${index + 1}`),
@@ -294,10 +297,10 @@ function migrateLegacy(base: DesktopConfigV2): DesktopConfigV2 | null {
         transport: raw.transport === "TCP" || raw.transport === "Tcp" ? "TCP" : "UDP",
         // 旧配置没有对讲流传输字段:与默认值保持一致(TCP 主动)。
         audio_transport: "TCP_ACTIVE",
-        gb_version: raw.gb_version === "2016" || raw.gb_version === "V2016" ? "V2016" : "V2022",
-        signaling_encoding: raw.signaling_encoding === "UTF-8" || raw.signaling_encoding === "Utf8"
-          ? "Utf8"
-          : "Gb18030",
+        gb_version: version,
+        // 字符集按版本归一:旧配置缺该字段、或存了与版本不符的值(如 2016 档配 GB18030)
+        // 一律落到版本默认,避免迁移后带着对端不认的声明名出站。
+        signaling_encoding: effective(parseEncoding(raw.signaling_encoding), version),
       };
     })
     : base.profiles;

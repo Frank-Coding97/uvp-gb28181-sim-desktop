@@ -10,3 +10,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+# 仅测试用:校验枚举落盘的变体名与前端约定一致。
+serde_json.workspace = true

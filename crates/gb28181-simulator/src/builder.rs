@@ -17,12 +17,21 @@ pub fn rand_token(prefix: &str) -> String {
 ///
 /// 同时把 `<?xml ... encoding="..."?>` 声明改写为实际编码,保证声明与字节一致
 /// (原代码声明固定 GB2312 但字节是 UTF-8,导致平台解码中文乱码)。
+///
+/// GB2312 实际用 **GBK** 编码:GB2312 是 EUC-CN 严格子集,编不出「镕」这类字,
+/// 而平台侧对 `GB2312` 声明也是取 GBK 解码器(`encodingForLabel` 注释:
+/// "GBK is the compatible superset used by deployed devices")。声明仍写 GB2312 ——
+/// 2016 平台不一定认 GBK 这个名字,但认 GB2312;字节用超集,对常用字完全一致。
 pub fn encode_xml_body(xml: &str, encoding: common::SignalingEncoding) -> Vec<u8> {
     // 1) 改写 XML 声明里的 encoding 值以匹配实际编码。
     let fixed = rewrite_xml_encoding(xml, encoding.xml_name());
     // 2) 按目标字符集编码字节。
     match encoding {
         common::SignalingEncoding::Utf8 => fixed.into_bytes(),
+        common::SignalingEncoding::Gb2312 => {
+            let (bytes, _, _) = encoding_rs::GBK.encode(&fixed);
+            bytes.into_owned()
+        }
         common::SignalingEncoding::Gb18030 => {
             let (bytes, _, _) = encoding_rs::GB18030.encode(&fixed);
             bytes.into_owned()
@@ -30,32 +39,96 @@ pub fn encode_xml_body(xml: &str, encoding: common::SignalingEncoding) -> Vec<u8
     }
 }
 
-/// 把 XML 声明的 `encoding="XXX"` 改成给定值;无声明则原样返回。
+/// 把 XML **声明**里的 `encoding="XXX"` 改成给定值;无声明则原样返回。
+///
+/// 只动 prolog(`<?xml ... ?>`)内的那一处。不能用「全局首个 `encoding="` 」定位:
+/// 正文里完全可能出现同名属性(描述字段里嵌一段 XML、或带 CDATA 的配置回显),
+/// 那样会把正文内容改坏,而声明反而没变 —— 声明与字节再次不一致。
 fn rewrite_xml_encoding(xml: &str, enc_name: &str) -> String {
-    if let Some(start) = xml.find("encoding=\"") {
-        let val_start = start + "encoding=\"".len();
-        if let Some(rel_end) = xml[val_start..].find('"') {
-            let val_end = val_start + rel_end;
-            let mut out = String::with_capacity(xml.len());
-            out.push_str(&xml[..val_start]);
-            out.push_str(enc_name);
-            out.push_str(&xml[val_end..]);
-            return out;
-        }
+    let Some(start) = xml.find("<?xml") else {
+        return xml.to_string();
+    };
+    let Some(rel_end) = xml[start..].find("?>") else {
+        return xml.to_string();
+    };
+    let end = start + rel_end;
+    let prolog = &xml[start..end];
+    let Some(at) = prolog.find("encoding") else {
+        return xml.to_string();
+    };
+    let rest = &prolog[at..];
+    let Some(eq) = rest.find('=') else {
+        return xml.to_string();
+    };
+    let after_quote = &rest[eq + 1..];
+    let trimmed = after_quote.trim_start();
+    let Some(quote) = trimmed.chars().next() else {
+        return xml.to_string();
+    };
+    if quote != '"' && quote != '\'' {
+        return xml.to_string();
     }
-    xml.to_string()
+    let Some(value_len) = trimmed[1..].find(quote) else {
+        return xml.to_string();
+    };
+    let value_start = at + eq + 1 + (after_quote.len() - trimmed.len()) + 1;
+    let mut patched = String::with_capacity(prolog.len() + enc_name.len());
+    patched.push_str(&prolog[..value_start]);
+    patched.push_str(enc_name);
+    patched.push_str(&prolog[value_start + value_len..]);
+    format!("{}{}{}", &xml[..start], patched, &xml[end..])
 }
 
 /// 把入站报文体字节按信令编码解码为 UTF-8 String(供解析)。
-/// 先按声明/配置编码尝试;GB18030 解码兼容 GB2312/ASCII。
+///
+/// 优先按报文**自己声明的**编码解码,只有拿不到声明时才回退到配置值。
+/// 理由:配置只描述本端出站意图,描述不了对端实际发了什么 —— 本端配 UTF-8、
+/// 平台按 2022 发 GB18030 时,死死按配置解会把中文解成乱码,而报文里明明写着编码名。
 pub fn decode_xml_body(bytes: &[u8], encoding: common::SignalingEncoding) -> String {
+    decode_with(declared_xml_encoding(bytes).unwrap_or(encoding), bytes)
+}
+
+fn decode_with(encoding: common::SignalingEncoding, bytes: &[u8]) -> String {
     match encoding {
         common::SignalingEncoding::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+        // GB2312 声明按 GBK 解(超集,兼容严格子集字节)。
+        common::SignalingEncoding::Gb2312 => {
+            let (text, _, _) = encoding_rs::GBK.decode(bytes);
+            text.into_owned()
+        }
         common::SignalingEncoding::Gb18030 => {
             let (text, _, _) = encoding_rs::GB18030.decode(bytes);
             text.into_owned()
         }
     }
+}
+
+/// 从报文**字节**里读 XML 声明中的编码名。
+///
+/// 只看前 1KB,并把非 ASCII 字节当空格 —— 三种候选编码的声明部分都是纯 ASCII,
+/// 所以这段不需要先知道编码就能读出来,这正是「按声明解码」能自举的原因。
+/// 只在 prolog(`<?xml ... ?>`)范围内找 `encoding=`,避免正文里恰好的
+/// `encoding="..."`(如带 CDATA 的描述字段)被误认。
+fn declared_xml_encoding(bytes: &[u8]) -> Option<common::SignalingEncoding> {
+    const WINDOW: usize = 1024;
+    let head: String = bytes
+        .iter()
+        .take(WINDOW)
+        .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { ' ' })
+        .collect();
+    let start = head.find("<?xml")?;
+    let end = start + head[start..].find("?>")?;
+    let prolog = &head[start..end];
+    let at = prolog.find("encoding")? + "encoding".len();
+    let rest = &prolog[at..];
+    let after_eq = rest.get(rest.find('=')? + 1..)?.trim_start();
+    let quote = after_eq.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value = &after_eq[1..];
+    let close = value.find(quote)?;
+    Some(common::SignalingEncoding::from_str_lenient(&value[..close]))
 }
 
 /// 构造一次注册会话所需的标识(同一会话内 from-tag/call-id 保持一致)。
@@ -637,6 +710,78 @@ mod tests {
         let u = encode_xml_body(xml, common::SignalingEncoding::Utf8);
         assert!(u.windows(5).any(|w| w == b"UTF-8"));
         assert!(decode_xml_body(&u, common::SignalingEncoding::Utf8).contains("前门相机"));
+    }
+
+    #[test]
+    fn 中文编码_gb2312声明配_gbk_字节() {
+        let xml =
+            "<?xml version=\"1.0\" encoding=\"GB18030\"?>\n<Notify><Name>前门相机</Name></Notify>";
+        let bytes = encode_xml_body(xml, common::SignalingEncoding::Gb2312);
+        // 声明必须跟着编码走:2016 平台不认 GB18030 这个名字。
+        assert!(
+            bytes.windows(6).any(|w| w == b"GB2312"),
+            "GB2312 出站声明应写 GB2312"
+        );
+        assert!(!bytes.windows(7).any(|w| w == b"GB18030"));
+        // 字节不是 UTF-8:否则等于声明与字节不一致,平台按 GBK 解会乱码。
+        assert_ne!(bytes, xml.replace("GB18030", "GB2312").into_bytes());
+        assert!(
+            !bytes.windows(3).any(|w| w == "前".as_bytes()),
+            "中文不应以 UTF-8 三字节形式出现"
+        );
+        // 常用字下 GBK 与 GB18030 字节一致,故按任一解码都能还原。
+        assert!(decode_xml_body(&bytes, common::SignalingEncoding::Gb2312).contains("前门相机"));
+        assert!(decode_xml_body(&bytes, common::SignalingEncoding::Gb18030).contains("前门相机"));
+    }
+
+    #[test]
+    fn 入站按报文自身声明解码而非配置() {
+        // 本端配 UTF-8,平台按 2022 发 GB18030:必须按声明解,否则整段乱码。
+        let xml = "<?xml version=\"1.0\" encoding=\"GB18030\"?>\n<Notify><Name>前门相机</Name></Notify>";
+        let bytes = encode_xml_body(xml, common::SignalingEncoding::Gb18030);
+        let text = decode_xml_body(&bytes, common::SignalingEncoding::Utf8);
+        assert!(text.contains("前门相机"), "应按报文声明解码,实际:{text}");
+
+        // 反向:本端配 GB2312,平台发 UTF-8。
+        let utf = encode_xml_body(xml, common::SignalingEncoding::Utf8);
+        let text = decode_xml_body(&utf, common::SignalingEncoding::Gb2312);
+        assert!(text.contains("前门相机"), "应按 UTF-8 声明解码,实际:{text}");
+    }
+
+    #[test]
+    fn 无声明时回退配置编码() {
+        let xml = "<Notify><Name>前门相机</Name></Notify>";
+        let bytes = encode_xml_body(xml, common::SignalingEncoding::Gb18030);
+        let text = decode_xml_body(&bytes, common::SignalingEncoding::Gb18030);
+        assert!(text.contains("前门相机"));
+    }
+
+    #[test]
+    fn 正文里的_encoding_字样不被误认为声明() {
+        // 无 prolog,正文里恰好带 encoding="UTF-8":不能被当成声明去按 UTF-8 解 GBK 字节,
+        // 也不能被声明改写逻辑改掉(它只是描述字段里的一个属性)。
+        let xml = "<Notify><Desc encoding=\"UTF-8\">前门相机</Desc></Notify>";
+        let bytes = encode_xml_body(xml, common::SignalingEncoding::Gb2312);
+        let text = decode_xml_body(&bytes, common::SignalingEncoding::Gb2312);
+        assert!(text.contains("前门相机"), "实际:{text}");
+        assert!(
+            text.contains("encoding=\"UTF-8\""),
+            "正文属性不应被声明改写波及,实际:{text}"
+        );
+    }
+
+    #[test]
+    fn 声明改写只落在_prolog() {
+        // 有声明且正文也带同名属性:声明的值要改,正文的值不能动。
+        let xml = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<Notify><Desc encoding=\"UTF-8\">前门相机</Desc></Notify>"
+        );
+        let fixed = super::rewrite_xml_encoding(xml, "GB2312");
+        assert!(fixed.starts_with("<?xml version=\"1.0\" encoding=\"GB2312\"?>"));
+        assert!(fixed.contains("<Desc encoding=\"UTF-8\">"));
+        // 只有 base 一处被换掉:UTF-8 应当还剩一处(正文属性)。
+        assert_eq!(fixed.matches("UTF-8").count(), 1);
     }
 
     #[test]
