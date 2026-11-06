@@ -69,33 +69,17 @@ pub(super) fn scale_pad_filter(width: u32, height: u32) -> String {
     )
 }
 
-/// 摄像头和屏幕采集共用的软件编码参数，保证两条路径的编码规格不会漂移。
+/// 摄像头和屏幕采集共用的编码参数，保证两条路径的编码规格不会漂移。
+///
+/// 编码器由 `profile.encoder` 决定(硬件优先,见 [`crate::encoder`]);
+/// 这里只追加输出节奏与输出目标。
 pub(super) fn encoder_args(profile: &LiveCaptureProfile) -> Vec<String> {
-    use super::LiveVideoCodec;
-    let gop = profile.keyframe_interval_frames();
-    let codec_args: Vec<String> = match profile.video_codec {
-        LiveVideoCodec::H264 => [
-            "-c:v".into(), "libx264".into(), "-preset".into(), "ultrafast".into(),
-            "-tune".into(), "zerolatency".into(), "-x264-params".into(),
-            format!("slices=1:sliced-threads=0:repeat-headers=1:keyint={gop}:min-keyint={gop}:scenecut=0:rc-lookahead=0"),
-            "-refs".into(), "1".into(),
-        ].into(),
-        LiveVideoCodec::H265 => [
-            "-c:v".into(), "libx265".into(), "-preset".into(), "ultrafast".into(),
-            "-tune".into(), "zerolatency".into(), "-x265-params".into(),
-            format!("repeat-headers=1:keyint={gop}:min-keyint={gop}:scenecut=0:rc-lookahead=0:log-level=error"),
-        ].into(),
-    };
-    let mut args = codec_args;
+    let mut args = crate::encoder::encoder_args(
+        profile.encoder,
+        profile.video_codec.ps_codec(),
+        profile.encode_params(),
+    );
     args.extend([
-        "-bf".into(),
-        "0".into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-        "-b:v".into(),
-        format!("{}k", profile.bitrate_kbps),
-        "-g".into(),
-        gop.to_string(),
         "-fps_mode".into(),
         "cfr".into(),
         "-r".into(),
@@ -124,6 +108,7 @@ mod tests {
             video_codec: codec,
             audio_codec: LiveAudioCodec::Aac,
             audio_sample_rate_hz: 48000,
+            encoder: crate::encoder::EncoderBackend::Software,
         }
     }
 
@@ -190,6 +175,24 @@ mod tests {
             .any(|pair| pair == ["-audio_buffer_size", "100"]));
         // 输入尺寸已等于输出尺寸，不该再挂缩放滤镜。
         assert!(!args.iter().any(|arg| arg == "-vf"));
+    }
+
+    #[test]
+    fn 选中硬件编码器时替换编码参数且输出尾部不变() {
+        let mut nvenc = profile(LiveVideoCodec::H264);
+        nvenc.encoder = crate::encoder::EncoderBackend::Nvenc;
+        let args = command_args("camera", None, &nvenc, (1920, 1080), &[], None);
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "nv12"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-bsf:v", "dump_extra=freq=keyframe"]));
+        assert!(!args.iter().any(|arg| arg.contains("x264")));
+        let tail: Vec<&str> = args[args.len() - 9..].iter().map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            ["-fps_mode", "cfr", "-r", "30", "-f", "h264", "-flush_packets", "1", "pipe:1"]
+        );
     }
 
     #[test]

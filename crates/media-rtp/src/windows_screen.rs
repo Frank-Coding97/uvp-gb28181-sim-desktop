@@ -232,6 +232,7 @@ mod tests {
             video_codec: codec,
             audio_codec: LiveAudioCodec::Aac,
             audio_sample_rate_hz: 48000,
+            encoder: crate::encoder::EncoderBackend::Software,
         }
     }
 

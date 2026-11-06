@@ -16,6 +16,15 @@
 - **LightSource**:关键帧前置伪 SPS/PPS,否则共享总线订阅者等不到起播点。
 - 旧接口 `next_frame` / `next_audio` 仍在,P3 替换采集层时删除。
 
+## v2 P2a:硬件编码器选择(`encoder` 模块)
+
+- `encoder::select(ffmpeg, codec) -> SelectedEncoder`:按平台候选顺序试编探测,结果进程内缓存;`mark_failed` 标记运行期失败的后端。
+- `encoder::encoder_args(backend, codec, EncodeParams)`:纯函数,生成 `-c:v` 起的全部编码参数(无 B 帧、固定 GOP、CBR、`dump_extra`),Windows 摄像头/屏幕与 macOS 摄像头/屏幕共用。
+- `LiveCaptureProfile.encoder`:构造时为软编,`capture_*_profile` 启动 FFmpeg 前填入探测结果。
+- 环境变量 `UVP_VIDEO_ENCODER=nvenc|qsv|amf|mf|videotoolbox|software` 强制指定后端。
+- Tauri 命令 `get_encoder_status` 返回两种编码的选择结果,供设置页显示。
+- 设计与实测数据见 [`media-pipeline-v2.md` §5.5](../20-architecture/media-pipeline-v2.md)。
+
 ## 容器格式支持(FileSource)
 
 引擎推流只吃 **H.264/H.265 Annex B 裸流**(按起始码切帧)。为支持常见容器(MP4/FLV/MKV/MOV):

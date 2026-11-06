@@ -1649,6 +1649,18 @@ struct LiveProbeDto {
     message: String,
 }
 
+/// 本机 H.264 / H.265 实际使用的视频编码后端(硬件优先,首次调用会试编探测约 1~3 秒)。
+#[tauri::command]
+async fn get_encoder_status() -> Result<Vec<media_rtp::encoder::SelectedEncoder>, String> {
+    tokio::task::spawn_blocking(|| {
+        let ffmpeg =
+            media_rtp::ffmpeg_bin().ok_or_else(|| "未找到 FFmpeg，无法探测编码器".to_string())?;
+        Ok(media_rtp::encoder::status(&ffmpeg))
+    })
+    .await
+    .map_err(|error| format!("编码器探测任务异常: {error}"))?
+}
+
 /// 枚举可用于规范实时源 URI 的摄像头、麦克风和显示器。
 #[tauri::command]
 async fn list_live_sources() -> Result<LiveSourceCatalogDto, String> {
@@ -3058,6 +3070,7 @@ pub fn run() {
             get_metrics,
             export_report,
             list_live_sources,
+            get_encoder_status,
             list_camera_modes,
             probe_live_source,
             is_preview_window_visible,

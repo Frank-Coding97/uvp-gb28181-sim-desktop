@@ -150,9 +150,25 @@ struct LiveCaptureProfile {
     video_codec: LiveVideoCodec,
     audio_codec: LiveAudioCodec,
     audio_sample_rate_hz: u32,
+    /// 视频编码后端。构造时为软编,启动采集前由 [`Self::with_selected_encoder`] 探测填入。
+    encoder: crate::encoder::EncoderBackend,
 }
 
 impl LiveCaptureProfile {
+    /// 按本机能力选择编码后端(首次调用会试编探测)。
+    fn with_selected_encoder(mut self, ffmpeg: &str) -> Self {
+        self.encoder = crate::encoder::select(ffmpeg, self.video_codec.ps_codec()).backend;
+        self
+    }
+
+    /// 本 profile 对应的统一编码参数。
+    fn encode_params(self) -> crate::encoder::EncodeParams {
+        crate::encoder::EncodeParams {
+            bitrate_kbps: self.bitrate_kbps,
+            gop: self.keyframe_interval_frames(),
+        }
+    }
+
     fn from_media(profile: &MediaProfile) -> Result<Self> {
         profile.validate().map_err(Error::Media)?;
         let video_codec = match profile.video_codec {
@@ -173,6 +189,7 @@ impl LiveCaptureProfile {
             video_codec,
             audio_codec,
             audio_sample_rate_hz: profile.effective_audio_sample_rate_hz(),
+            encoder: crate::encoder::EncoderBackend::Software,
         })
     }
 
@@ -186,6 +203,7 @@ impl LiveCaptureProfile {
             video_codec: LiveVideoCodec::H264,
             audio_codec,
             audio_sample_rate_hz: audio_codec.sample_rate() as u32,
+            encoder: crate::encoder::EncoderBackend::Software,
         }
     }
 
@@ -199,6 +217,7 @@ impl LiveCaptureProfile {
             video_codec: profile.codec,
             audio_codec,
             audio_sample_rate_hz: audio_codec.sample_rate() as u32,
+            encoder: crate::encoder::EncoderBackend::Software,
         }
     }
 
@@ -1904,6 +1923,12 @@ impl LiveSource {
         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
             Error::Media("camera capture requires an available FFmpeg platform backend".into())
         })?;
+        let profile = profile.with_selected_encoder(&ffmpeg);
+        tracing::info!(
+            encoder = profile.encoder.ffmpeg_encoder(profile.video_codec.ps_codec()),
+            hardware = profile.encoder.is_hardware(),
+            "摄像头采集视频编码器"
+        );
         if audio_index.is_some() {
             ensure_audio_encoder(&ffmpeg, audio_codec)?;
         }
@@ -2387,7 +2412,8 @@ impl LiveSource {
                 audio_index,
                 input_fps,
             },
-        )?;
+        )
+        .inspect_err(|error| note_encoder_failure(&profile, error))?;
         let (children, worker_threads) = startup.disarm();
 
         Ok(Self {
@@ -2587,8 +2613,20 @@ impl LiveSource {
             fps,
             profile.video_codec,
         ));
-        match profile.video_codec {
-            LiveVideoCodec::H264 => {
+        // 有 FFmpeg 时先探测编码器:H.264 有 VideoToolbox 就不用进程内 openh264。
+        let profile = match ffmpeg_bin() {
+            Some(ffmpeg) => profile.with_selected_encoder(&ffmpeg),
+            None => profile,
+        };
+        tracing::info!(
+            encoder = profile.encoder.ffmpeg_encoder(profile.video_codec.ps_codec()),
+            hardware = profile.encoder.is_hardware(),
+            "屏幕采集视频编码器"
+        );
+        let use_openh264 =
+            profile.video_codec == LiveVideoCodec::H264 && !profile.encoder.is_hardware();
+        match use_openh264 {
+            true => {
                 let keyframe_interval_frames = profile.keyframe_interval_frames();
                 let encoder_config = EncoderConfig::new()
                     .set_bitrate_bps(profile.bitrate_kbps * 1000)
@@ -2655,14 +2693,15 @@ impl LiveSource {
                 });
                 screen_startup.track(encoder_thread);
             }
-            LiveVideoCodec::H265 => {
+            false => {
                 let ffmpeg = ffmpeg_bin().ok_or_else(|| {
                     Error::Media(
-                        "H.265 screen encoding requires the bundled FFmpeg executable".into(),
+                        "screen encoding requires the bundled FFmpeg executable".into(),
                     )
                 })?;
+                let screen_codec = profile.video_codec;
                 let mut child = common::hidden_command(&ffmpeg)
-                    .args(screen_hevc_command_args(&profile))
+                    .args(screen_ffmpeg_command_args(&profile))
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -2740,7 +2779,14 @@ impl LiveSource {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 pending.extend_from_slice(&chunk[..n]);
-                                drain_hevc_frames(&mut pending, &timed_sender);
+                                match screen_codec {
+                                    LiveVideoCodec::H265 => {
+                                        drain_hevc_frames(&mut pending, &timed_sender)
+                                    }
+                                    LiveVideoCodec::H264 => {
+                                        drain_frames(&mut pending, &timed_sender)
+                                    }
+                                }
                                 if reader_stop.load(Ordering::Acquire) {
                                     break;
                                 }
@@ -3323,6 +3369,12 @@ impl LiveSource {
         let ffmpeg = ffmpeg_bin().ok_or_else(|| {
             Error::Media("Windows 屏幕采集需要 FFmpeg；请安装 FFmpeg 或设置 UVP_FFMPEG_PATH".into())
         })?;
+        let profile = profile.with_selected_encoder(&ffmpeg);
+        tracing::info!(
+            encoder = profile.encoder.ffmpeg_encoder(profile.video_codec.ps_codec()),
+            hardware = profile.encoder.is_hardware(),
+            "屏幕采集视频编码器"
+        );
         let monitor = windows_screen::resolve(display_id)?;
         let display_id = monitor.display_id;
         let audio_codec = profile.audio_codec;
@@ -3514,7 +3566,8 @@ impl LiveSource {
                 display_id,
                 input_fps: f64::from(fps),
             },
-        )?;
+        )
+        .inspect_err(|error| note_encoder_failure(&profile, error))?;
         let (children, worker_threads) = startup.disarm();
 
         Ok(Self {
@@ -3589,8 +3642,6 @@ fn camera_command_args_for_profile(
     let output_fps = profile.video_fps.max(1).to_string();
     let cfr_args = cfr_output_args(&output_fps);
     let input_fps = input_fps.to_string();
-    let keyframe_interval = profile.keyframe_interval_frames().to_string();
-    let bitrate = format!("{}k", profile.bitrate_kbps);
     let output_size = format!(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
         profile.width, profile.height, profile.width, profile.height
@@ -3632,10 +3683,6 @@ fn camera_command_args_for_profile(
         "0:v:0".into(),
         "-vf".into(),
         output_size,
-        "-b:v".into(),
-        bitrate,
-        "-g".into(),
-        keyframe_interval,
         cfr_args[0].into(),
         cfr_args[1].into(),
         cfr_args[2].into(),
@@ -3646,43 +3693,17 @@ fn camera_command_args_for_profile(
         "1".into(),
         "pipe:1".into(),
     ];
-    let encoder_args = match profile.video_codec {
-        LiveVideoCodec::H264 => vec![
-            "-c:v".into(),
-            "libx264".into(),
-            "-preset".into(),
-            "ultrafast".into(),
-            "-tune".into(),
-            "zerolatency".into(),
-            "-x264-params".into(),
-            format!(
-                "slices=1:sliced-threads=0:repeat-headers=1:keyint={}:min-keyint={}:scenecut=0:rc-lookahead=0",
-                profile.keyframe_interval_frames(),
-                profile.keyframe_interval_frames()
-            ),
-            "-bf".into(),
-            "0".into(),
-            "-refs".into(),
-            "1".into(),
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-        ],
-        LiveVideoCodec::H265 => vec![
-            "-c:v".into(),
-            "hevc_videotoolbox".into(),
-            "-allow_sw".into(),
-            "1".into(),
-            "-realtime".into(),
-            "1".into(),
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-        ],
-    };
-    let bitrate_position = args
+    // 编码器(硬件优先)插在输出节奏参数之前,见 crate::encoder。
+    let encoder_args = crate::encoder::encoder_args(
+        profile.encoder,
+        profile.video_codec.ps_codec(),
+        profile.encode_params(),
+    );
+    let cfr_position = args
         .iter()
-        .position(|arg| arg == "-b:v")
-        .expect("camera output must include a video bitrate");
-    args.splice(bitrate_position..bitrate_position, encoder_args);
+        .position(|arg| arg.as_str() == cfr_args[0])
+        .expect("camera output must include the CFR arguments");
+    args.splice(cfr_position..cfr_position, encoder_args);
     args
 }
 
@@ -3815,13 +3836,15 @@ fn parse_ffmpeg_timing_stats_line(line: &str) -> Option<i128> {
         .checked_div(denominator)
 }
 
+/// macOS 屏幕采集:ScreenCaptureKit 的 BGRA 原始帧经 stdin 交给 FFmpeg 编码。
+///
+/// H.265 与硬件 H.264(VideoToolbox)都走这里;只有探测后只能软编 H.264 时
+/// 才回退到进程内 openh264。编码器参数统一由 [`crate::encoder`] 生成。
 #[cfg(target_os = "macos")]
-fn screen_hevc_command_args(profile: &LiveCaptureProfile) -> Vec<String> {
+fn screen_ffmpeg_command_args(profile: &LiveCaptureProfile) -> Vec<String> {
     let size = format!("{}x{}", profile.width, profile.height);
     let fps = profile.video_fps.to_string();
-    let bitrate = format!("{}k", profile.bitrate_kbps);
-    let keyframe_interval = profile.keyframe_interval_frames().to_string();
-    vec![
+    let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
         "-f".into(),
@@ -3835,26 +3858,22 @@ fn screen_hevc_command_args(profile: &LiveCaptureProfile) -> Vec<String> {
         "-i".into(),
         "pipe:0".into(),
         "-an".into(),
-        "-c:v".into(),
-        "hevc_videotoolbox".into(),
-        "-allow_sw".into(),
-        "1".into(),
-        "-realtime".into(),
-        "1".into(),
-        "-b:v".into(),
-        bitrate,
-        "-g".into(),
-        keyframe_interval.clone(),
-        "-keyint_min".into(),
-        keyframe_interval,
+    ];
+    args.extend(crate::encoder::encoder_args(
+        profile.encoder,
+        profile.video_codec.ps_codec(),
+        profile.encode_params(),
+    ));
+    args.extend([
         "-r".into(),
         fps,
         "-fps_mode".into(),
         "cfr".into(),
         "-f".into(),
-        "hevc".into(),
+        profile.video_codec.ffmpeg_format().into(),
         "pipe:1".into(),
-    ]
+    ]);
+    args
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -4004,6 +4023,27 @@ fn capture_stderr_tail(child: &mut Child, label: &str) -> Result<StderrCapture> 
         }
     });
     Ok((tail, join))
+}
+
+/// 采集启动失败且 stderr 指向编码器时,标记该硬件后端失败,下次启动换下一个候选。
+///
+/// 只认编码器相关的报错,避免把摄像头被占用等设备问题误判成编码器问题。
+#[cfg(any(target_os = "macos", windows))]
+fn note_encoder_failure(profile: &LiveCaptureProfile, error: &Error) {
+    if !profile.encoder.is_hardware() {
+        return;
+    }
+    let codec = profile.video_codec.ps_codec();
+    if encoder_error_in(&error.to_string(), profile.encoder.ffmpeg_encoder(codec)) {
+        crate::encoder::mark_failed(codec, profile.encoder);
+    }
+}
+
+fn encoder_error_in(message: &str, encoder_name: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains(encoder_name)
+        || lower.contains("error while opening encoder")
+        || lower.contains("could not open encoder")
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -5021,6 +5061,7 @@ mod tests {
             video_codec: LiveVideoCodec::H265,
             audio_codec: LiveAudioCodec::Aac,
             audio_sample_rate_hz: 8_000,
+            encoder: crate::encoder::EncoderBackend::VideoToolbox,
         };
         let args = camera_command_args_for_profile(
             0,
@@ -5060,13 +5101,16 @@ mod tests {
             video_codec: LiveVideoCodec::H265,
             audio_codec: LiveAudioCodec::G711A,
             audio_sample_rate_hz: 8_000,
+            encoder: crate::encoder::EncoderBackend::VideoToolbox,
         };
-        let command = screen_hevc_command_args(&profile).join(" ");
+        let command = screen_ffmpeg_command_args(&profile).join(" ");
 
         assert!(command.contains("-video_size 1920x1080"));
         assert!(command.contains("-framerate 25"));
         assert!(command.contains("-b:v 4000k"));
-        assert!(command.contains("-g 50 -keyint_min 50"));
+        assert!(command.contains("-g 50"));
+        assert!(command.contains("-c:v hevc_videotoolbox"));
+        assert!(command.contains("-bsf:v dump_extra=freq=keyframe"));
         assert!(command.contains("-r 25 -fps_mode cfr"));
         assert!(command.ends_with("-f hevc pipe:1"));
     }
@@ -5480,6 +5524,13 @@ mod tests {
         ));
         assert_eq!(overflow.take_dropped_pts(), Some(12_000));
         assert_eq!(overflow.pop().map(|event| event.pts_90k()), Some(12_000));
+    }
+
+    #[test]
+    fn 只有编码器相关的启动错误才判定为编码器失败() {
+        assert!(encoder_error_in("... Error while opening encoder for output stream #0:0 ...", "h264_nvenc"));
+        assert!(encoder_error_in("[h264_nvenc @ 0x1] OpenEncodeSessionEx failed", "h264_nvenc"));
+        assert!(!encoder_error_in("Could not run graph (sometimes caused by a device already in use)", "h264_nvenc"));
     }
 
     #[test]

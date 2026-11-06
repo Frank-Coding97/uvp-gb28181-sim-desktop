@@ -153,6 +153,27 @@ pub struct EncoderCapability {
 - 当前路径为软编时,前端在设备卡片上标注"CPU 编码"。
 - 只能软编 H.265 时(x265 1080p30 约 2~4 核),提示推荐 H.264 或 720p。**只提示,不自动修改配置**。
 
+### 5.5 P2a 落地:FFmpeg 硬件编码器(已实现)
+
+P3 原生采集之前没有 GPU 显存帧,原生编码器无从接入。P2a 先在现有 FFmpeg 采集管线里换编码器,`crates/media-rtp/src/encoder.rs`:
+
+- 候选:Windows `h264/hevc_nvenc → _qsv → _amf → _mf → libx264/libx265`;macOS `h264/hevc_videotoolbox → libx264/libx265`。
+- 首次使用时用 `testsrc2` 试编 12 帧(GOP=5),要求有输出、≥2 个 IDR、每个 IDR 前带参数集,首个通过者胜出,进程内缓存。启动失败且 stderr 指向编码器时 `mark_failed`,下次换下一个候选。
+- 统一参数:`-bf 0`、`-g` + `-force_key_frames`(**AMF H.264 不认 `-g`**,实测 12 帧只出 1 个 IDR)、CBR(`-maxrate`/`-bufsize` = 码率)、`-bsf:v dump_extra=freq=keyframe`。
+- macOS 屏幕 H.264 有 VideoToolbox 时改走 FFmpeg 管道,不再用 openh264 + 逐像素 BGRA→RGB;只能软编时仍回退 openh264。
+- 调试:`UVP_VIDEO_ENCODER=nvenc|qsv|amf|mf|videotoolbox|software` 强制指定。
+- 前端:设置页"视频编码"旁显示 `GPU 编码（NVENC）` / `CPU 编码`,软编给出降级建议。
+
+**实测**(本机 Ryzen 7 5800H + NVIDIA T600,FFmpeg 9.0.2,单位为单核百分比):
+
+| 场景 | libx264 / libx265 | NVENC |
+|---|---|---|
+| 1080p25 合成高动态画面,纯编码 H.264 | 55% | 4% |
+| 1080p25 合成高动态画面,纯编码 H.265 | 136% | 3% |
+| 1080p25 屏幕采集整条管线(桌面基本静止) | 51~59% | 38~45% |
+
+屏幕采集收益小,原因是剩下的开销主要在 `hwdownload` + CPU 缩放/色彩转换(约 40% 单核),不在编码;静止桌面 x264 本身也很便宜。这部分要靠 P3 的 GPU 缩放(D3D11 VideoProcessor)消除。QSV 在本机(无 Intel GPU)探测失败被正确跳过。**macOS 部分只做了参数单测,未在真机验证。**
+
 ---
 
 ## 6. 采集层(R5)
@@ -364,7 +385,8 @@ pub struct EncoderCapability {
 | 阶段 | 内容 | 验收标准 |
 |---|---|---|
 | P1 总线与协议 ✅(代码) | `Bytes` + async 订阅;PS 音视频交织;视频 TCP 被动;按订阅者封装。**删除旧接口推迟到 P3**(旧采集路径随 `source_live.rs` 一起替换) | 现有源跑通,真实平台(如 WVP)点播音视频同步 —— 单测已过,WVP 联调待做 |
-| P2 编码层 | 编码器 trait + 能力探测;VideoToolbox、NVENC、oneVPL、AMF、MF、x264/x265 | 各编码器出流都能在平台起播,每个 IDR 都带参数集 |
+| P2a 硬件编码器(FFmpeg) ✅ | 现有 FFmpeg 采集换硬件编码器 + 试编探测 + 运行期失败回退 + 前端 GPU/CPU 标识(§5.5) | Windows 实测选中 NVENC,1080p 屏幕采集 H.264/H.265 验收通过;macOS 待真机验收 |
+| P2b 原生编码器 | 编码器 trait;NVENC / oneVPL / AMF SDK、MF MFT、VideoToolbox 直接吃 GPU 显存帧。**与 P3 合并实施**(没有原生采集就没有显存帧) | 各编码器出流都能在平台起播,每个 IDR 都带参数集 |
 | P3 采集层 | 双平台三类源原生采集;统一时钟;GPU 缩放和 OSD;删除 `VideoSource` 旧接口(`next_frame`/`next_audio`/`LegacyMediaClock`)与 pusher 按帧率打拍的旧主循环 | 连续运行 24 小时,音画偏差 < 40ms |
 | P4 预览 | 预览按钮 + WebCodecs 播放 + 不支持时的回退 | 点击后 0.5 秒内出画面;关闭后预览相关 CPU 归零 |
 | P5 按需采集 + 子进程 | 状态机、空闲保持;媒体引擎独立进程、崩溃拉起 | 杀掉子进程后自动恢复推流,SIP 注册不掉 |

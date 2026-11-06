@@ -8,6 +8,7 @@
 //! - `source`:视频源抽象(空媒体 / 真实文件循环)
 //! - `pusher`:把视频源→PS→RTP 按帧率推流的驱动
 
+pub mod encoder;
 pub mod file_profile;
 pub mod interleave;
 pub mod osd;
