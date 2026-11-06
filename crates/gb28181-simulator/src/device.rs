@@ -201,6 +201,8 @@ const CATALOG_UDP_BODY_MAX_BYTES: usize = 1000;
 /// 1232B，也兼容部分对较大 UDP SIP 报文处理不完整的平台。
 const CATALOG_UDP_PAYLOAD_MAX_BYTES: usize = 1200;
 const RECORD_INFO_PAGE_SIZE: usize = 5;
+/// TCP 被动推流:200 OK 发出后等待平台连入的上限。
+const TCP_PASSIVE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn register_retry_base() -> std::time::Duration {
     std::time::Duration::from_secs(REGISTER_RETRY_MIN_SECS)
@@ -4365,8 +4367,9 @@ impl DeviceSimulator {
         let trying = sip_core::SipMessage::Response(builder::response_status(req, 100, "Trying"));
         transport.send_to(&trying, from).await?;
 
-        // 传输模式:平台 SDP 的 m= proto 含 "TCP" 则走 TCP-ACTIVE(RFC 4571)。
-        let use_tcp = platform_sdp.media.proto.to_uppercase().contains("TCP");
+        // 传输角色:UDP / 设备主动连平台 / 设备被动等平台连入(由 offer 的 a=setup 推导)。
+        let media_transport = platform_sdp.device_media_transport();
+        tracing::info!(?media_transport, setup = ?platform_sdp.setup, "INVITE:媒体传输角色");
 
         // o= 用户名/索引通道均取 INVITE Request-URI 的 user 部分。
         let channel = req
@@ -4449,9 +4452,41 @@ impl DeviceSimulator {
             .local_host()
             .parse()
             .unwrap_or_else(|_| transport.local_addr().map(|a| a.ip()).unwrap_or(rtp_host));
-        // RFC 4145:TCP passive offer 的 active answer 使用 discard port 9，
-        // 实际媒体目标仍为平台 offer 中的 c=/m= 地址。
-        let answer_port = if use_tcp { 9 } else { 0 };
+        // 设备被动:先绑定监听端口,answer 里写真实端口,平台收到 200 OK 后连入。
+        // 只有确实要推流时才绑定,避免无源会话白占端口。
+        let passive_listener = if media_transport == sip_core::MediaTransport::TcpPassive
+            && source.is_some()
+        {
+            // 绑定通配地址:local_host 可能是 NAT 外部地址,不一定在本机网卡上。
+            let bind_ip: IpAddr = if local_ip.is_ipv4() {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv6Addr::UNSPECIFIED.into()
+            };
+            match tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, 0)).await {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    tracing::warn!(%error, %local_ip, "TCP 被动推流监听端口绑定失败");
+                    let unavailable = sip_core::SipMessage::Response(
+                        builder::response_status(req, 488, "Not Acceptable Here"),
+                    );
+                    transport.send_to(&unavailable, from).await?;
+                    return Ok(true);
+                }
+            }
+        } else {
+            None
+        };
+        // RFC 4145:设备主动时 answer 使用 discard port 9,实际媒体目标仍为
+        // 平台 offer 中的 c=/m= 地址;设备被动时写真实监听端口。
+        let answer_port = match media_transport {
+            sip_core::MediaTransport::Udp => 0,
+            sip_core::MediaTransport::TcpActive => 9,
+            sip_core::MediaTransport::TcpPassive => passive_listener
+                .as_ref()
+                .and_then(|listener| listener.local_addr().ok())
+                .map_or(9, |addr| addr.port()),
+        };
         let local_sdp = sip_core::SessionDescription::new_device_answer(
             channel,
             local_ip,
@@ -4491,15 +4526,31 @@ impl DeviceSimulator {
                 if start_rx.await.is_err() {
                     return;
                 }
-                if use_tcp {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
-                let result = media_rtp::push_stream_controlled(
+                let target = match (media_transport, passive_listener) {
+                    (sip_core::MediaTransport::TcpPassive, Some(listener)) => {
+                        media_rtp::RtpTarget::TcpPassive {
+                            listener,
+                            accept_timeout: TCP_PASSIVE_ACCEPT_TIMEOUT,
+                        }
+                    }
+                    (sip_core::MediaTransport::TcpActive, _)
+                    | (sip_core::MediaTransport::TcpPassive, None) => {
+                        // 主动模式给平台一点时间建监听并收 ACK。
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        media_rtp::RtpTarget::TcpActive(rtp_dst)
+                    }
+                    (sip_core::MediaTransport::Udp, _) => media_rtp::RtpTarget::Udp(rtp_dst),
+                };
+                // GB28181 的音频复用在 PS 内部,SDP 没有可靠的"不要音频"信号,
+                // 直播与回放都按源能力带音频;PushOptions 保留按会话关闭的能力。
+                let result = media_rtp::push_stream_to(
                     source,
-                    rtp_dst,
-                    ssrc,
-                    fps,
-                    use_tcp,
+                    target,
+                    media_rtp::PushOptions {
+                        ssrc,
+                        fps,
+                        with_audio: true,
+                    },
                     control_task,
                     async {
                         let _ = stop_rx.await;
@@ -5144,6 +5195,101 @@ mod tests {
         );
         sim.stop_shared_media().await;
         platform_task.await.unwrap();
+    }
+
+    /// 平台 offer `a=setup:active`:设备在 200 OK 里写真实监听端口 + `setup:passive`,
+    /// 平台连入后收到 RFC 4571 分帧的 RTP。
+    #[tokio::test]
+    async fn invite_tcp_被动_answer回填监听端口且平台连入后收到rtp() {
+        use sip_core::{Method, Request};
+        use tokio::io::AsyncReadExt;
+
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+        let mut cfg = test_cfg("127.0.0.1", platform_addr.port());
+        cfg.light_bitrate_kbps = Some(128);
+        let sim = Arc::new(DeviceSimulator::with_observer(
+            cfg,
+            Arc::new(common::NoopObserver),
+        ));
+        let platform_task = tokio::spawn(mock_platform_register(
+            platform_tp.clone(),
+            device_addr,
+            sim.call_id().to_string(),
+            3_600,
+        ));
+        sim.register(&device_tp, "127.0.0.1", device_addr.port())
+            .await
+            .unwrap();
+        platform_task.await.unwrap();
+
+        let sdp = "v=0\r\n\
+o=34020000002000000001 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 40000 TCP/RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+a=recvonly\r\n\
+a=setup:active\r\n\
+a=connection:new\r\n\
+y=0100000099\r\n";
+        let mut h = Headers::new();
+        h.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKinvp");
+        h.set("From", "<sip:34020000002000000001@3402>;tag=p1");
+        h.set("To", "<sip:34020000001320000001@3402>");
+        h.set("Call-ID", "inv-passive-1");
+        h.set("CSeq", "1 INVITE");
+        h.set("Content-Type", "application/sdp");
+        let invite = Request {
+            method: Method::Invite,
+            uri: "sip:34020000001320000001@127.0.0.1".into(),
+            headers: h,
+            body: sdp.as_bytes().to_vec(),
+        };
+        let mut presp = platform_tp.register("inv-passive-1");
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(invite),
+            from: platform_addr,
+        };
+        assert!(sim.answer_inbound(&device_tp, &incoming).await.unwrap());
+
+        // 跳过 100 Trying,取 200 OK 的 SDP。
+        let answer = loop {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(2), presp.recv())
+                .await
+                .expect("超时未收到 INVITE 应答")
+                .expect("应答通道关闭");
+            if let SipMessage::Response(resp) = got.message {
+                if resp.status == 200 {
+                    break String::from_utf8(resp.body).unwrap();
+                }
+            }
+        };
+        assert!(answer.contains("a=setup:passive\r\n"), "answer: {answer}");
+        let answer_sdp = sip_core::SessionDescription::parse(&answer).unwrap();
+        let port = answer_sdp.media.port;
+        assert_ne!(port, 9, "设备被动时必须写真实监听端口");
+
+        let mut platform_media = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("平台连入设备监听端口失败");
+        let mut len = [0u8; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            platform_media.read_exact(&mut len),
+        )
+        .await
+        .expect("超时未收到 RTP")
+        .unwrap();
+        let mut pkt = vec![0u8; u16::from_be_bytes(len) as usize];
+        platform_media.read_exact(&mut pkt).await.unwrap();
+        assert_eq!(pkt[0], 0x80);
+        assert_eq!(&pkt[8..12], &100_000_099u32.to_be_bytes());
+
+        sim.stop_shared_media().await;
     }
 
     #[tokio::test]

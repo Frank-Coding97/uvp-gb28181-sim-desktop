@@ -814,10 +814,17 @@ impl VideoSource for LightSource {
         let key_frame = self.counter % self.keyframe_interval == 0;
         self.counter = self.counter.wrapping_add(1);
         // 伪 NAL:Annex B 起始码 + NAL 头(IDR type5 / slice type1)+ 填充占位。
+        // 关键帧前置伪 SPS/PPS:共享总线与订阅者只从"带参数集的关键帧"起播,
+        // 缺参数集会导致 B 档设备点播后永远等不到起播点。参数集计入帧长之外。
+        const FAKE_PARAM_SETS: [u8; 12] = [0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xCE];
         let nal_type: u8 = if key_frame { 0x65 } else { 0x61 };
-        let mut data = Vec::with_capacity(self.frame_bytes + 5);
+        let prefix = if key_frame { FAKE_PARAM_SETS.len() } else { 0 };
+        let mut data = Vec::with_capacity(prefix + self.frame_bytes + 5);
+        if key_frame {
+            data.extend_from_slice(&FAKE_PARAM_SETS);
+        }
         data.extend_from_slice(&[0, 0, 0, 1, nal_type]);
-        data.resize(self.frame_bytes + 5, 0xAB);
+        data.resize(prefix + self.frame_bytes + 5, 0xAB);
         Some(Frame { data, key_frame })
     }
 }
@@ -2598,8 +2605,13 @@ mod tests {
         let mut s = LightSource::new(200, 25);
         let f0 = s.next_frame().unwrap();
         assert!(f0.key_frame); // 首帧为关键帧
-        assert_eq!(f0.data.len(), 1000 + 5); // 起始码+NAL头+填充
-        assert_eq!(&f0.data[..5], &[0, 0, 0, 1, 0x65]); // IDR
+        // 关键帧 = 伪 SPS/PPS(12B) + 起始码+NAL头+填充。
+        assert_eq!(f0.data.len(), 12 + 1000 + 5);
+        assert!(crate::pusher::contains_codec_config(
+            &f0.data,
+            crate::ps::VideoCodec::H264
+        ));
+        assert_eq!(&f0.data[12..17], &[0, 0, 0, 1, 0x65]); // IDR
         let f1 = s.next_frame().unwrap();
         assert!(!f1.key_frame); // 第二帧非关键帧
         assert_eq!(&f1.data[..5], &[0, 0, 0, 1, 0x61]); // slice
@@ -2608,6 +2620,8 @@ mod tests {
     #[test]
     fn 轻量源最小帧下限() {
         let mut s = LightSource::new(1, 25); // 极低码率 → 命中 64 字节下限
+        let f = s.next_frame().unwrap();
+        assert_eq!(f.data.len(), 12 + 64 + 5); // 首帧为带参数集的关键帧
         let f = s.next_frame().unwrap();
         assert_eq!(f.data.len(), 64 + 5);
     }
