@@ -1,29 +1,87 @@
 //! 预览帧通道。
 //!
-//! 预览走的是采集侧 FFmpeg 旁路出来的 MJPEG：**每帧自包含，没有帧间依赖**。
-//! 这一条性质消掉了此前整套复杂度——不需要保序、不需要重同步、不需要参数集
-//! 关键帧、不需要逐帧 ACK、不需要消费进度反馈。丢中间帧的代价就是丢一帧。
+//! v2(media-pipeline-v2 P4)起有两种载荷:
+//! - **编码帧**(主路):共享媒体总线上的 H.264/H.265 Annex B 访问单元,前端用
+//!   WebCodecs `VideoDecoder` 硬件解码。必须保序;关键帧额外携带 codec 字符串。
+//! - **JPEG**(回退):前端不支持该编码时,由 FFmpeg preview worker 转出的 MJPEG,
+//!   每帧自包含,只保留最新帧。
 //!
-//! 因此这里只保留最新帧：它同时是最低延迟和最简单的策略。
+//! 帧头(小端):
+//! `magic "UVPJ"(4) version=2(2) header_len(2) kind(1) flags(1) codec_len(2)
+//!  generation(8) sequence(8) captured_at_ms(8)` = 36 字节,之后是 `codec_len`
+//! 字节的 ASCII codec 字符串(仅关键帧),再之后是载荷。
 
 use media_rtp::{PreviewJpeg, PreviewPhase, PreviewSink, PreviewStatus};
 
 pub const PREVIEW_MAGIC: [u8; 4] = *b"UVPJ";
-pub const PREVIEW_VERSION: u16 = 1;
-/// `magic(4) + version(2) + header_len(2) + generation(8) + sequence(8) + captured_at_ms(8)`。
-pub const PREVIEW_HEADER_LEN: usize = 32;
+pub const PREVIEW_VERSION: u16 = 2;
+pub const PREVIEW_HEADER_LEN: usize = 36;
+
+/// 载荷类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PreviewPayloadKind {
+    Jpeg = 0,
+    H264 = 1,
+    H265 = 2,
+}
+
+impl PreviewPayloadKind {
+    pub fn from_codec(codec: media_rtp::VideoCodec) -> Self {
+        match codec {
+            media_rtp::VideoCodec::H264 => Self::H264,
+            media_rtp::VideoCodec::H265 => Self::H265,
+        }
+    }
+}
+
+/// flags bit0:关键帧(编码帧);JPEG 恒为 1。
+pub const PREVIEW_FLAG_KEY: u8 = 0x01;
+
+/// 一帧的元数据。
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewEnvelope<'a> {
+    pub kind: PreviewPayloadKind,
+    pub key_frame: bool,
+    pub generation: u64,
+    pub sequence: u64,
+    pub captured_at_ms: u64,
+    /// 关键帧携带的 WebCodecs codec 字符串,如 `avc1.64001F`。
+    pub codec: Option<&'a str>,
+}
 
 /// 把一帧打包成前端可直接解析的字节。
-pub fn encode_preview_frame(frame: &PreviewJpeg) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PREVIEW_HEADER_LEN + frame.data.len());
+pub fn encode_envelope(meta: PreviewEnvelope<'_>, payload: &[u8]) -> Vec<u8> {
+    let codec = meta.codec.unwrap_or("").as_bytes();
+    let codec_len = codec.len().min(u16::MAX as usize);
+    let mut out = Vec::with_capacity(PREVIEW_HEADER_LEN + codec_len + payload.len());
     out.extend_from_slice(&PREVIEW_MAGIC);
     out.extend_from_slice(&PREVIEW_VERSION.to_le_bytes());
     out.extend_from_slice(&(PREVIEW_HEADER_LEN as u16).to_le_bytes());
-    out.extend_from_slice(&frame.generation.to_le_bytes());
-    out.extend_from_slice(&frame.sequence.to_le_bytes());
-    out.extend_from_slice(&frame.captured_at_ms.to_le_bytes());
-    out.extend_from_slice(&frame.data);
+    out.push(meta.kind as u8);
+    out.push(if meta.key_frame { PREVIEW_FLAG_KEY } else { 0 });
+    out.extend_from_slice(&(codec_len as u16).to_le_bytes());
+    out.extend_from_slice(&meta.generation.to_le_bytes());
+    out.extend_from_slice(&meta.sequence.to_le_bytes());
+    out.extend_from_slice(&meta.captured_at_ms.to_le_bytes());
+    out.extend_from_slice(&codec[..codec_len]);
+    out.extend_from_slice(payload);
     out
+}
+
+/// JPEG 回退帧。
+pub fn encode_preview_frame(frame: &PreviewJpeg) -> Vec<u8> {
+    encode_envelope(
+        PreviewEnvelope {
+            kind: PreviewPayloadKind::Jpeg,
+            key_frame: true,
+            generation: frame.generation,
+            sequence: frame.sequence,
+            captured_at_ms: frame.captured_at_ms,
+            codec: None,
+        },
+        &frame.data,
+    )
 }
 
 #[derive(Debug)]
@@ -77,12 +135,9 @@ impl DesktopPreviewBus {
         self.statuses.borrow().clone()
     }
 
-    /// 取最近一帧预览 JPEG（抓拍用）。
-    ///
-    /// 这里刻意用借用而不是 `send_replace(None)` 之类会改动总线状态的方式：
-    /// 抓拍是只读旁路，不能让一次点击影响正在播放的预览或平台点播。
-    pub fn latest_frame(&self) -> Option<PreviewJpeg> {
-        self.frames.borrow().clone()
+    /// 编码帧主路自己发布状态(不经过 JPEG worker)。与 worker 状态共用代际排序。
+    pub fn publish_status(&self, status: PreviewStatus) {
+        PreviewSink::status(self, status);
     }
 
     pub fn set_active(&self, active: bool) {
@@ -208,14 +263,53 @@ mod tests {
     }
 
     #[test]
-    fn envelope_头部是小端采集时刻_其后原样是jpeg字节() {
+    fn envelope_v2_jpeg头部与载荷() {
         let encoded = encode_preview_frame(&frame(7, 11, 0x0102));
         let expected_header = [
-            b'U', b'V', b'P', b'J', 1, 0, 32, 0, 7, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0,
-            2, 1, 0, 0, 0, 0, 0, 0,
+            b'U', b'V', b'P', b'J', 2, 0, 36, 0, // magic version header_len
+            0, PREVIEW_FLAG_KEY, 0, 0, // kind=jpeg flags=key codec_len=0
+            7, 0, 0, 0, 0, 0, 0, 0, // generation
+            11, 0, 0, 0, 0, 0, 0, 0, // sequence
+            2, 1, 0, 0, 0, 0, 0, 0, // captured_at_ms
         ];
         assert_eq!(&encoded[..PREVIEW_HEADER_LEN], &expected_header);
         assert_eq!(&encoded[PREVIEW_HEADER_LEN..], &frame(7, 11, 0x0102).data);
+    }
+
+    #[test]
+    fn envelope_v2_编码帧关键帧带codec字符串() {
+        let au = [0, 0, 0, 1, 0x65, 0x88];
+        let encoded = encode_envelope(
+            PreviewEnvelope {
+                kind: PreviewPayloadKind::H265,
+                key_frame: true,
+                generation: 3,
+                sequence: 1,
+                captured_at_ms: 9,
+                codec: Some("hvc1.1.6.L120.90"),
+            },
+            &au,
+        );
+        assert_eq!(encoded[8], PreviewPayloadKind::H265 as u8);
+        assert_eq!(encoded[9], PREVIEW_FLAG_KEY);
+        assert_eq!(u16::from_le_bytes([encoded[10], encoded[11]]), 16);
+        assert_eq!(&encoded[36..52], b"hvc1.1.6.L120.90");
+        assert_eq!(&encoded[52..], &au);
+
+        let delta = encode_envelope(
+            PreviewEnvelope {
+                kind: PreviewPayloadKind::H264,
+                key_frame: false,
+                generation: 3,
+                sequence: 2,
+                captured_at_ms: 10,
+                codec: None,
+            },
+            &au,
+        );
+        assert_eq!(delta[9], 0);
+        assert_eq!(&delta[10..12], &[0, 0]);
+        assert_eq!(&delta[36..], &au);
     }
 
     #[test]

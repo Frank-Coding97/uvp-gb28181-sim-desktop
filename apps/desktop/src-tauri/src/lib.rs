@@ -32,7 +32,9 @@ use config_store::{
     StartDeviceInput, TimeSyncSettings,
 };
 use preview_channel::DesktopPreviewBus;
-use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
+use preview_manager::{
+    PreviewEventSink, PreviewForwardTarget, PreviewManager, PreviewMediaSource, PreviewSubscription,
+};
 
 /// 应用全局状态（托管在 Tauri managed state）。
 struct AppState {
@@ -339,22 +341,32 @@ fn app_snapshot_store(
     ))
 }
 
-/// 抓拍当前预览帧。
+/// 抓拍当前采集画面。
 ///
-/// 取的是预览总线上的最新帧，与播放中的画面同源：既不会打断推流，也不会出现
-/// 「抓拍和预览不是同一帧」的争议。预览未出帧时明确报错，而不是落一张黑图。
+/// 取共享媒体缓存的最近一个可独立解码的关键帧转 JPEG,与平台点播同源;
+/// 不要求本地预览开启,也不会打断推流。设备未采集时明确报错。
 #[tauri::command]
 async fn take_snapshot(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<media_rtp::snapshot::SnapshotMeta, String> {
-    let frame = state
-        .preview_bus
-        .latest_frame()
-        .ok_or_else(|| "预览尚未出帧，请先订阅预览或确认设备已推流".to_string())?;
+    let sim = state
+        .device
+        .lock()
+        .await
+        .as_ref()
+        .map(|device| device.sim.clone())
+        .ok_or_else(|| "设备尚未启动，无法抓拍".to_string())?;
+    let jpeg = sim
+        .current_keyframe_jpeg()
+        .await
+        .map_err(|error| error.to_string())?;
     let store = app_snapshot_store(&state, &app)?;
-    let captured_at_ms = frame.captured_at_ms as i64;
-    tokio::task::spawn_blocking(move || store.save(&frame.data, captured_at_ms))
+    let captured_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    tokio::task::spawn_blocking(move || store.save(&jpeg, captured_at_ms))
         .await
         .map_err(|error| format!("抓拍任务异常: {error}"))?
 }
@@ -1763,6 +1775,24 @@ async fn probe_live_source(
     .map_err(|error| format!("实时采集探测任务异常: {error}"))?
 }
 
+/// 预览订阅入口:从当前运行的设备取共享媒体。
+struct DevicePreviewMedia(AppHandle);
+
+impl PreviewMediaSource for DevicePreviewMedia {
+    fn subscribe(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PreviewSubscription>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let state = self.0.state::<AppState>();
+            let sim = state.device.lock().await.as_ref()?.sim.clone();
+            let fps = sim.config().video_fps;
+            let source = sim.subscribe_shared_media().await?;
+            Some(PreviewSubscription { source, fps })
+        })
+    }
+}
+
 struct TauriPreviewTarget(Channel<InvokeResponseBody>);
 
 impl PreviewForwardTarget for TauriPreviewTarget {
@@ -1834,15 +1864,21 @@ async fn stop_binary_preview(
 
 #[tauri::command]
 async fn retry_binary_preview(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let guard = state.device.lock().await;
-    let Some(device) = guard.as_ref() else {
-        return Err("设备尚未启动".into());
-    };
-    if device.sim.retry_preview().await {
-        Ok("正在重建本地预览，摄像头采集保持运行".into())
+    if state.preview_manager.restart() {
+        Ok("正在重建本地预览，采集与推流保持运行".into())
     } else {
-        Err("当前媒体源没有可重试的摄像头预览".into())
+        Err("当前没有打开的本地预览".into())
     }
+}
+
+/// 前端不支持当前编码的 WebCodecs 解码时切到 JPEG 回退(或切回)。
+#[tauri::command]
+async fn set_preview_fallback(
+    fallback: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state.preview_manager.set_fallback(fallback);
+    Ok(())
 }
 
 /// 通过"向平台发起 UDP connect"发现本机对外 IP(不真正发包)。
@@ -2129,9 +2165,6 @@ async fn start_device(
     }
     load_control_state(sim.as_ref(), &state, &app);
     sim.install_recording_store(app_recording_store(&state, &app)?);
-    sim.set_preview_sink(Some(
-        state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
-    ));
     // 单设备实时采集时把 OSD 烧进码流；文件源在模拟器内部自动跳过。
     sim.set_osd_settings(Some(resolved.osd.clone()));
     // 语音广播/对讲下行的 PCM 输出:转成 Tauri 事件,由前端 Web Audio 播放。
@@ -2941,6 +2974,10 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // 本地预览按需订阅当前设备的共享媒体总线。
+            app.state::<AppState>()
+                .preview_manager
+                .set_media_source(Arc::new(DevicePreviewMedia(app.handle().clone())));
             // 日志落盘。内存环形缓冲只够 UI 翻看，排查采集/预览这类"跑一次才复现"
             // 的问题时拿不出来——落到文件才能事后直接读。
             // 日志目录同样要走可写探测：受限环境里 AppData 能建目录但建不了文件，
@@ -3077,6 +3114,7 @@ pub fn run() {
             start_binary_preview,
             stop_binary_preview,
             retry_binary_preview,
+            set_preview_fallback,
             start_device,
             cancel_media_preparation,
             stop_device,

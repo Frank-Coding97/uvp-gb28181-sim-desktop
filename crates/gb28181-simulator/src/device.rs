@@ -257,8 +257,6 @@ pub struct CatalogQueryActivity {
 /// 设备仿真运行时状态机。持有配置 + 会话标识 + CSeq 计数 + 会话状态 + 事件观察者。
 pub struct DeviceSimulator {
     config: DeviceConfig,
-    /// 桌面端可选的同帧预览接收器。
-    preview_sink: std::sync::Mutex<Option<Arc<dyn media_rtp::PreviewSink>>>,
     /// 桌面端本地 OSD 样式；None 表示不烧录 OSD(CLI/压测)。
     osd_settings: std::sync::Mutex<Option<media_rtp::osd::OsdSettings>>,
     /// 平台经 DeviceConfig 下发的 OSDConfig。runtime_config 里的 osd_config
@@ -831,7 +829,6 @@ impl DeviceSimulator {
         ));
         Self {
             config,
-            preview_sink: std::sync::Mutex::new(None),
             osd_settings: std::sync::Mutex::new(None),
             platform_osd: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
@@ -1406,11 +1403,6 @@ impl DeviceSimulator {
         Ok(changed)
     }
 
-    /// 设置桌面端预览接收器。必须在启动设备前调用。
-    pub fn set_preview_sink(&self, sink: Option<Arc<dyn media_rtp::PreviewSink>>) {
-        *self.preview_sink.lock().unwrap() = sink;
-    }
-
     /// 设置本地 OSD 样式。必须在启动设备前调用；None 表示不烧录 OSD。
     pub fn set_osd_settings(&self, settings: Option<media_rtp::osd::OsdSettings>) {
         *self.osd_settings.lock().unwrap() = settings;
@@ -1489,16 +1481,16 @@ impl DeviceSimulator {
             .lock()
             .map_err(|_| Error::Media("文件准备状态锁异常".into()))?
             .clone();
-        let preview = self.preview_sink.lock().unwrap().clone();
+        // 本地预览不再由采集源内部旁路,改为桌面端订阅共享媒体总线(media-pipeline-v2 P4)。
         // OSD 只烧进实时采集；文件循环不重新编码。
         let osd = path.starts_with("live:").then(|| self.osd_overlay()).flatten();
         let source = tokio::task::spawn_blocking(move || {
             if path.starts_with("live:") {
                 let capture = match profile {
                     Some(profile) => {
-                        media_rtp::LiveSource::capture_with_profile_osd(&path, profile, preview, osd)
+                        media_rtp::LiveSource::capture_with_profile_osd(&path, profile, None, osd)
                     }
-                    None => media_rtp::LiveSource::capture(&path, fps, preview),
+                    None => media_rtp::LiveSource::capture(&path, fps, None),
                 };
                 capture
                     .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
@@ -1508,14 +1500,7 @@ impl DeviceSimulator {
                     .ok_or_else(|| Error::Media("文件尚未按媒体配置准备，请重新启动设备".into()))?
                     .open_source(true)
                     .map_err(Error::Media)?;
-                let source: Box<dyn media_rtp::VideoSource> = Box::new(source);
-                match preview {
-                    Some(sink) => {
-                        media_rtp::preview_source::PreviewingSource::new(source, fps, sink)
-                            .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
-                    }
-                    None => Ok(source),
-                }
+                Ok(Box::new(source) as Box<dyn media_rtp::VideoSource>)
             } else {
                 media_rtp::FileSource::from_path_av(&path, fps)
                     .map(|source| Box::new(source) as Box<dyn media_rtp::VideoSource>)
@@ -1568,6 +1553,34 @@ impl DeviceSimulator {
     }
 
     /// 只重建本地预览 worker；注册、主采集与平台推流保持不动。
+    /// 订阅当前共享媒体(本地预览用)。采集未启动或已停止时返回 `None`。
+    pub async fn subscribe_shared_media(&self) -> Option<media_rtp::SharedVideoSource> {
+        self.shared_media
+            .lock()
+            .await
+            .as_ref()
+            .filter(|media| media.is_alive())
+            .map(|media| media.subscribe())
+    }
+
+    /// 当前采集画面的 JPEG:取共享媒体缓存的最近一个带参数集关键帧解码。
+    ///
+    /// 平台 SnapShotConfig 抓拍与桌面端本地抓拍共用,不依赖本地预览是否开启。
+    pub async fn current_keyframe_jpeg(&self) -> Result<Vec<u8>> {
+        let current = self
+            .shared_media
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|media| media.latest_config_frame());
+        let Some((frame, codec)) = current else {
+            return Err(Error::Media("尚无可解码的当前关键帧，请确认设备已启动采集".into()));
+        };
+        tokio::task::spawn_blocking(move || media_rtp::frame_to_jpeg(&frame, codec))
+            .await
+            .map_err(|error| Error::Media(format!("抓拍转码任务异常: {error}")))?
+    }
+
     pub async fn retry_preview(&self) -> bool {
         self.shared_media
             .lock()
@@ -4214,29 +4227,12 @@ impl DeviceSimulator {
             } else {
                 cfg.upload_url.clone()
             };
-            let current = self
-                .shared_media
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|media| media.latest_config_frame());
-            let jpeg = if let Some((frame, codec)) = current {
-                match tokio::task::spawn_blocking(move || media_rtp::frame_to_jpeg(&frame, codec))
-                    .await
-                {
-                    Ok(Ok(jpeg)) => Some(jpeg),
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "当前帧转 JPEG 失败");
-                        None
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "抓拍转码任务回收失败");
-                        None
-                    }
+            let jpeg = match self.current_keyframe_jpeg().await {
+                Ok(jpeg) => Some(jpeg),
+                Err(error) => {
+                    tracing::warn!(%error, "当前帧转 JPEG 失败，本张抓拍跳过");
+                    None
                 }
-            } else {
-                tracing::warn!("尚无可解码当前关键帧，本张抓拍跳过");
-                None
             };
             if let Some(jpeg) = jpeg {
                 match http_put_jpeg(&url, &jpeg).await {
