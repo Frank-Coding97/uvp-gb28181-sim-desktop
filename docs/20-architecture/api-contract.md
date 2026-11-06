@@ -205,6 +205,24 @@ interface LogExportResult {
 
 `DeviceCfg` JSON 字段:`server_host`/`server_port`/`server_domain`/`device_id`/`password`/`transport`("UDP"/"TCP")/`gb_version`("2016"/"2022")/`channel_name`/`video_source`(可空,C 档文件路径)。
 
+### 录像中心命令(FR-51)
+
+| 命令 | 入参 | 返回 | 说明 |
+|---|---|---|---|
+| `get_recordings` | — | `RecordingEntryDto[]` | 已完成录像索引(按开始时间倒序由前端排) |
+| `get_recording_state` | — | `{ phase, active_id, error }` | 当前录像阶段 |
+| `start_recording` / `stop_recording` | — | `RecordingState` | 手动起停 |
+| `delete_recording` | `{ id: string }` | `boolean` | 删除文件与索引 |
+| `get_recording_thumbnail` | `{ id: string }` | `string` | 首帧缩略图的 `data:image/jpeg;base64,...` |
+
+> 缩略图**不随录像落盘**，而是首次请求时用外部 `ffmpeg` 抽一帧（`-ss` 置于 `-i` 之前做关键帧级定位，只取 1 帧，缩到 320 宽），
+> 结果缓存在数据目录的 `recording-thumbs/<id>.jpg`。缓存 mtime 早于源文件时重新抽。
+> 返回 data URL 而不是本地路径：数据根目录可能被 `UVP_CONFIG_DIR` 挪到 asset 协议作用域之外，
+> 走 `convertFileSrc` 会在那些环境里全部加载失败。ID 只接受 `[A-Za-z0-9_-]`，与抓拍同一套规则。
+
+时间范围筛选（全部/今天/近 7 天/近 30 天/自定义）完全在前端完成，语义是**时间窗重叠**：
+一段 20:00→次日 02:00 的录像在「今天」筛选中必须出现。按开始时间判定会把跨夜录像藏起来。
+
 命令失败统一返回错误对象 `{ code: string, message: string }`(code 对应 `common::Error` 变体)。
 
 ---

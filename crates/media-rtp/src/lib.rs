@@ -24,6 +24,7 @@ pub mod pusher;
 pub mod rtp;
 pub mod snapshot;
 pub mod source;
+pub mod thumbnail;
 
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};
 pub use pusher::{contains_codec_config, push_stream, push_stream_controlled, PlaybackControl};

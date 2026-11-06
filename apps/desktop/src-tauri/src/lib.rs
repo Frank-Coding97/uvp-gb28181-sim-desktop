@@ -2477,6 +2477,61 @@ async fn get_recordings(
         .collect())
 }
 
+/// 取某段录像的首帧缩略图，返回可直接放进 `<img src>` 的 data URL。
+///
+/// 抽帧走外部 ffmpeg，抽到的 JPEG 缓存在数据目录下按 ID 命名：同一段录像只抽一次。
+/// 找不到 ffmpeg / 文件损坏时返回错误，前端退化为占位图 —— 缩略图是增强项，
+/// 不该因为它不可用就让整个录像列表报错。
+#[tauri::command]
+async fn get_recording_thumbnail(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    if !media_rtp::thumbnail::is_valid_id(&id) {
+        return Err("录像 ID 只允许字母、数字、- 与 _".into());
+    }
+    let store = app_recording_store(&state, &app)?;
+    let entry = store
+        .list()
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| format!("录像不存在: {id}"))?;
+    let source = std::path::PathBuf::from(&entry.path);
+    let cache_dir = app_data_root(&state, &app)?.join(media_rtp::thumbnail::THUMB_DIR);
+    let cache = media_rtp::thumbnail::cache_path(&cache_dir, &id)
+        .ok_or_else(|| "缩略图路径非法".to_string())?;
+
+    // 缓存比源文件新才复用：录像被覆盖/重写时要重新抽，不能拿旧图糊弄。
+    let reusable = std::fs::metadata(&cache)
+        .and_then(|cached| {
+            std::fs::metadata(&source)
+                .and_then(|origin| Ok(cached.modified()? >= origin.modified()?))
+        })
+        .unwrap_or(false);
+    if !reusable {
+        let duration_secs = (entry.end_time_ms.saturating_sub(entry.start_time_ms)) as f64 / 1000.0;
+        let seek = media_rtp::thumbnail::seek_secs_for(duration_secs);
+        let ffmpeg = media_rtp::ffmpeg_bin()
+            .ok_or_else(|| "未找到 ffmpeg，无法生成录像缩略图".to_string())?;
+        let input = source.clone();
+        let output = cache.clone();
+        tokio::task::spawn_blocking(move || {
+            media_rtp::thumbnail::extract(&input, &output, seek, &ffmpeg)
+        })
+        .await
+        .map_err(|error| format!("缩略图任务异常: {error}"))??;
+    }
+
+    let bytes = std::fs::read(&cache)
+        .map_err(|error| format!("读取缩略图 {} 失败: {error}", cache.display()))?;
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
 #[tauri::command]
 async fn get_recording_state(state: tauri::State<'_, AppState>) -> Result<RecordingState, String> {
     let device = state.device.lock().await;
@@ -3438,6 +3493,7 @@ pub fn run() {
             cancel_media_preparation,
             stop_device,
             get_recordings,
+            get_recording_thumbnail,
             get_recording_state,
             start_recording,
             stop_recording,

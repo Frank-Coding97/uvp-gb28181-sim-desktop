@@ -1,9 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { NButton, NEmpty, NIcon, NInput, NPopconfirm, NSelect, NTag, useMessage } from "naive-ui";
-import { PlayCircleOutline, RefreshOutline, StopCircleOutline, TrashOutline, VideocamOutline } from "@vicons/ionicons5";
+import { CalendarOutline, PlayCircleOutline, RefreshOutline, StopCircleOutline, TrashOutline, VideocamOutline } from "@vicons/ionicons5";
 import { useDevice } from "../device";
+import {
+  QUICK_RANGES,
+  customRange,
+  durationSeconds,
+  filterRecordings,
+  formatDuration,
+  formatLocalInput,
+  quickRange,
+} from "../recording-filter.mjs";
 
 type RecordingPhase = "idle" | "starting" | "recording" | "finalizing" | "failed";
 type RecordingKind = "time" | "alarm" | "manual";
@@ -36,7 +45,15 @@ const loading = ref(false);
 const actionBusy = ref(false);
 const keyword = ref("");
 const kind = ref<RecordingKind | "all">("all");
+const rangeKey = ref("all");
+const customFrom = ref("");
+const customTo = ref("");
+const rangeNow = ref(Date.now());
 const selected = ref<RecordingEntry | null>(null);
+/** 缩略图 data URL；null 表示还在抽帧，失败时记录到 thumbErrors。 */
+const thumbs = reactive<Record<string, string | null>>({});
+const thumbErrors = reactive<Record<string, string>>({});
+const requestedThumbs = new Set<string>();
 let timer: number | null = null;
 
 const phaseText: Record<RecordingPhase, string> = {
@@ -55,19 +72,53 @@ const kindOptions = [
 ];
 const isActive = computed(() => ["starting", "recording", "finalizing"].includes(state.value.phase));
 const canStart = computed(() => deviceLive.value && !isActive.value);
-const filtered = computed(() => {
-  const query = keyword.value.trim().toLowerCase();
-  return recordings.value.filter((entry) =>
-    (kind.value === "all" || entry.kind === kind.value)
-    && (!query || `${entry.id} ${entry.channel_id} ${entry.path}`.toLowerCase().includes(query)),
-  );
+const rangeOptions = QUICK_RANGES.map((item) => ({ label: item.label, value: item.value }));
+
+/** 当前生效的时间窗：快速范围换算，自定义走两个输入框。 */
+const activeRange = computed(() => {
+  if (rangeKey.value === "custom") return customRange(customFrom.value, customTo.value);
+  return quickRange(rangeKey.value, rangeNow.value);
 });
+const filtered = computed(() => filterRecordings(recordings.value, {
+  keyword: keyword.value,
+  kind: kind.value,
+  from: activeRange.value?.from ?? null,
+  to: activeRange.value?.to ?? null,
+}));
 const selectedUrl = computed(() => selected.value && isTauri ? convertFileSrc(selected.value.path) : "");
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** 一次最多为多少段录像抽缩略图。抽帧要起 ffmpeg 子进程，无上限会在长列表上打满 CPU。 */
+const THUMB_LIMIT = 80;
+/** 抽帧串行队列：并发跑 ffmpeg 只会互相抢 CPU，反而更慢。 */
+let thumbQueue: Promise<void> = Promise.resolve();
+
+/**
+ * 按需抽帧。每段录像只请求一次：成功留下 data URL，失败记原因并停止重试 ——
+ * 录像文件损坏时反复抽帧没有任何意义，只会每刷新一次就卡一下。
+ */
+function requestThumbnails(entries: RecordingEntry[]) {
+  let queued = 0;
+  for (const entry of entries) {
+    if (!isTauri || requestedThumbs.has(entry.id)) continue;
+    if (queued >= THUMB_LIMIT) break;
+    requestedThumbs.add(entry.id);
+    queued += 1;
+    thumbs[entry.id] = null;
+    thumbQueue = thumbQueue.then(async () => {
+      try {
+        thumbs[entry.id] = await invoke<string>("get_recording_thumbnail", { id: entry.id });
+      } catch (error) {
+        delete thumbs[entry.id];
+        thumbErrors[entry.id] = String(error);
+      }
+    });
+  }
 }
 
 async function refresh(silent = false) {
@@ -81,6 +132,8 @@ async function refresh(silent = false) {
     recordings.value = items.slice().sort((a, b) => b.start_time_ms - a.start_time_ms);
     state.value = current;
     if (selected.value) selected.value = items.find((item) => item.id === selected.value?.id) ?? null;
+    // 只给当前筛选结果抽帧：列表滚动/筛选变化时按需补，不做全库预抽。
+    requestThumbnails(recordings.value);
   } catch (error) {
     if (!silent) message.error(String(error));
   } finally {
@@ -112,6 +165,10 @@ async function remove(entry: RecordingEntry) {
   try {
     await invoke("delete_recording", { id: entry.id });
     if (selected.value?.id === entry.id) selected.value = null;
+    // 连带清掉缩略图缓存状态：文件没了，留着 data URL 会指向一段不存在的录像。
+    delete thumbs[entry.id];
+    delete thumbErrors[entry.id];
+    requestedThumbs.delete(entry.id);
     message.success("录像已删除");
     await refresh(true);
   } catch (error) {
@@ -121,7 +178,19 @@ async function remove(entry: RecordingEntry) {
 
 onMounted(() => {
   void refresh();
-  timer = window.setInterval(() => void refresh(true), 1000);
+  timer = window.setInterval(() => {
+    rangeNow.value = Date.now();
+    void refresh(true);
+  }, 1000);
+});
+
+// 切到自定义时用「今天」预填，避免两个空输入框让人以为筛不出东西是坏了。
+watch(rangeKey, (value) => {
+  if (value !== "custom" || customFrom.value || customTo.value) return;
+  const today = quickRange("today", Date.now());
+  if (!today) return;
+  customFrom.value = formatLocalInput(today.from);
+  customTo.value = formatLocalInput(today.to - 60_000);
 });
 onUnmounted(() => { if (timer) clearInterval(timer); });
 </script>
@@ -146,7 +215,7 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
     <section class="status-strip">
       <div><small>录像状态</small><strong :class="`phase-${state.phase}`"><i />{{ phaseText[state.phase] }}</strong></div>
       <div><small>设备采集</small><strong>{{ deviceLive ? "设备运行中" : "设备未启动" }}</strong></div>
-      <div><small>已完成录像</small><strong>{{ recordings.length }} 段</strong></div>
+      <div><small>已完成录像</small><strong>{{ filtered.length === recordings.length ? `${recordings.length} 段` : `${filtered.length} / ${recordings.length} 段` }}</strong></div>
       <div class="status-error"><small>最近错误</small><strong>{{ state.error || "无" }}</strong></div>
     </section>
 
@@ -155,15 +224,25 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
         <div class="toolbar">
           <n-input v-model:value="keyword" clearable placeholder="搜索通道、文件或 ID" />
           <n-select v-model:value="kind" :options="kindOptions" />
+          <n-select v-model:value="rangeKey" :options="rangeOptions" />
+        </div>
+        <div v-if="rangeKey === 'custom'" class="custom-range">
+          <label><span>开始</span><input v-model="customFrom" type="datetime-local" /></label>
+          <label><span>结束</span><input v-model="customTo" type="datetime-local" /></label>
+          <small>按时间窗重叠筛选：跨夜录像会在覆盖到的每一天都出现。</small>
         </div>
         <div v-if="filtered.length" class="recording-list">
           <article v-for="entry in filtered" :key="entry.id" class="recording-row" :class="{ selected: selected?.id === entry.id }" @click="selected = entry">
+            <div class="recording-thumb" :title="thumbErrors[entry.id] || entry.path">
+              <img v-if="thumbs[entry.id]" :src="thumbs[entry.id]!" :alt="`录像 ${entry.start_time} 缩略图`" loading="lazy" />
+              <n-icon v-else :size="16" :class="{ failed: !!thumbErrors[entry.id] }"><CalendarOutline v-if="thumbErrors[entry.id]" /><VideocamOutline v-else /></n-icon>
+            </div>
             <button class="play-button" type="button" title="本地播放" @click.stop="selected = entry"><n-icon><PlayCircleOutline /></n-icon></button>
             <div class="recording-main">
               <div><strong>{{ entry.start_time }}</strong><n-tag size="small" :bordered="false">{{ kindText[entry.kind] }}</n-tag><n-tag size="small" :bordered="false" type="info">{{ entry.source === "platform" ? "平台触发" : "本地触发" }}</n-tag></div>
               <small>{{ entry.channel_id }} · {{ entry.path }}</small>
             </div>
-            <div class="recording-meta"><strong>{{ formatBytes(entry.size_bytes) }}</strong><small>{{ entry.end_time }}</small></div>
+            <div class="recording-meta"><strong>{{ formatBytes(entry.size_bytes) }}</strong><small>{{ formatDuration(durationSeconds(entry)) }} · 至 {{ entry.end_time }}</small></div>
             <n-popconfirm positive-text="删除" negative-text="取消" @positive-click="remove(entry)">
               <template #trigger><n-button quaternary circle type="error" @click.stop><template #icon><n-icon><TrashOutline /></n-icon></template></n-button></template>
               确定删除该录像文件与索引吗？
@@ -177,7 +256,7 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
         <template v-if="selected">
           <div class="player-title"><div><small>LOCAL PLAYBACK</small><h2>{{ selected.start_time }}</h2></div><n-tag>{{ kindText[selected.kind] }}</n-tag></div>
           <video :key="selected.id" controls preload="metadata" :src="selectedUrl" />
-          <dl><dt>通道</dt><dd>{{ selected.channel_id }}</dd><dt>时间范围</dt><dd>{{ selected.start_time }} — {{ selected.end_time }}</dd><dt>文件</dt><dd>{{ selected.path }}</dd></dl>
+          <dl><dt>通道</dt><dd>{{ selected.channel_id }}</dd><dt>时间范围</dt><dd>{{ selected.start_time }} — {{ selected.end_time }}</dd><dt>时长</dt><dd>{{ formatDuration(durationSeconds(selected)) }}</dd><dt>文件</dt><dd>{{ selected.path }}</dd></dl>
         </template>
         <n-empty v-else class="player-empty" description="选择一段录像进行本地播放" />
       </aside>
@@ -197,8 +276,15 @@ h1 { margin: 4px 0 2px; color: var(--text-primary); font-size: 25px; } h2 { marg
 .status-strip i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); } .phase-recording i { background: var(--error); box-shadow: 0 0 0 4px rgba(208,48,80,.1); } .phase-failed { color: var(--error); }
 .workspace { min-height: 0; display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(340px, .75fr); gap: 12px; }
 .library-panel, .player-panel { min-height: 0; overflow: hidden; border: 1px solid var(--border-default); border-radius: 14px; background: rgba(255,255,255,.58); }
-.library-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); } .toolbar { display: grid; grid-template-columns: 1fr 160px; gap: 8px; padding: 12px; border-bottom: 1px solid var(--border-subtle); }
-.recording-list { overflow: auto; padding: 6px; } .recording-row { display: grid; grid-template-columns: 38px minmax(0,1fr) auto 34px; align-items: center; gap: 10px; margin-bottom: 4px; padding: 10px; border: 1px solid transparent; border-radius: 10px; cursor: pointer; }
+.library-panel { display: flex; flex-direction: column; } .toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 130px 130px; gap: 8px; padding: 12px; border-bottom: 1px solid var(--border-subtle); }
+.custom-range { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border-subtle); background: rgba(56,132,255,.04); }
+.custom-range label { display: grid; gap: 3px; font-size: 10px; color: var(--text-tertiary); }
+.custom-range input { padding: 5px 8px; border: 1px solid var(--border-default); border-radius: 7px; background: white; color: var(--text-primary); font: inherit; font-size: 11px; }
+.custom-range small { flex: 1 1 100%; color: var(--text-tertiary); font-size: 10px; }
+.recording-list { flex: 1; min-height: 0; overflow: auto; padding: 6px; } .recording-row { display: grid; grid-template-columns: 64px 38px minmax(0,1fr) auto 34px; align-items: center; gap: 10px; margin-bottom: 4px; padding: 10px; border: 1px solid transparent; border-radius: 10px; cursor: pointer; }
+.recording-thumb { display: grid; place-items: center; width: 64px; height: 40px; overflow: hidden; border-radius: 6px; background: #0b1626; color: rgba(255,255,255,.42); }
+.recording-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.recording-thumb .failed { color: var(--warning, #d07818); }
 .recording-row:hover, .recording-row.selected { border-color: rgba(56,132,255,.3); background: var(--accent-soft); } .play-button { display: grid; place-items: center; width: 34px; height: 34px; border: 0; border-radius: 50%; color: var(--accent); background: white; font-size: 23px; cursor: pointer; }
 .recording-main { min-width: 0; } .recording-main > div { display: flex; align-items: center; gap: 6px; } .recording-main small { display: block; margin-top: 5px; overflow: hidden; color: var(--text-tertiary); text-overflow: ellipsis; white-space: nowrap; }
 .recording-meta { text-align: right; } .recording-meta small { display: block; margin-top: 4px; color: var(--text-tertiary); font-size: 10px; }

@@ -28,6 +28,8 @@ import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutl
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
 import { useDevice } from "./device";
+import NotificationBell from "./components/NotificationBell.vue";
+import { startNotificationCenter, stopNotificationCenter } from "./notification-center";
 
 const route = useRoute();
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -229,10 +231,16 @@ onMounted(async () => {
     lastError.value = e.payload;
   });
   uptimeTimer = window.setInterval(tickUptime, 1000);
+  // 通知中心自带事件订阅：与当前停在哪个页面无关，切页不丢历史。
+  await startNotificationCenter();
   // app 启动/刷新后与引擎对账,反映后台是否已有设备在跑。
   reconcile();
 });
-onUnmounted(() => { unlisten?.(); unlistenErr?.(); if (uptimeTimer) clearInterval(uptimeTimer); });
+onUnmounted(() => {
+  unlisten?.(); unlistenErr?.();
+  if (uptimeTimer) clearInterval(uptimeTimer);
+  stopNotificationCenter();
+});
 
 const themeOverrides = {
   common: {
@@ -326,6 +334,7 @@ const themeOverrides = {
                     </div>
                   </div>
                   <div class="reg-btns">
+                    <NotificationBell />
                     <n-button size="small" :type="deviceLive ? 'error' : 'primary'" :loading="registrationBusy" :disabled="registrationBusy" @click="toggleRegistration">
                       {{ registrationActionLabel }}
                     </n-button>
