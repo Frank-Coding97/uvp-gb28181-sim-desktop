@@ -14,6 +14,8 @@
 //! 前补参数集。调试时可用环境变量 `UVP_VIDEO_ENCODER` 强制指定后端。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
@@ -266,6 +268,82 @@ pub fn status(ffmpeg: &str) -> Vec<SelectedEncoder> {
         .into_iter()
         .map(|codec| select(ffmpeg, codec))
         .collect()
+}
+
+/// 源文件的视频流信息,用于判断能否直通。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceVideoStream {
+    pub codec: VideoCodec,
+    pub width: u32,
+    pub height: u32,
+    /// 帧率分子/分母,如 (30, 1) 或 (30000, 1001)。
+    pub fps_num: u32,
+    pub fps_den: u32,
+}
+
+impl SourceVideoStream {
+    /// 源帧率是否接近目标帧率(误差 < 1%)。
+    pub fn fps_matches(&self, target_fps: u32) -> bool {
+        let source_fps = (self.fps_num as f64) / (self.fps_den as f64);
+        let delta = (source_fps - target_fps as f64).abs();
+        delta < 0.01 * target_fps as f64
+    }
+}
+
+/// 探测源文件的第一条视频流参数。用于文件准备时判断能否直通。
+/// 探测失败返回 `Err`,调用方可忽略并走转码。
+pub fn probe_source_video(ffprobe: &str, source: &Path) -> Result<SourceVideoStream, String> {
+    let output = Command::new(ffprobe)
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=codec_name,width,height,r_frame_rate", "-of", "json",
+        ])
+        .arg(source)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffprobe 启动失败: {e}"))?;
+    if !output.status.success() {
+        return Err("ffprobe 返回失败状态".into());
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("ffprobe JSON 解析失败: {e}"))?;
+    let stream = json
+        .get("streams")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| "源文件没有视频流".to_string())?;
+    let codec_name = stream
+        .get("codec_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "ffprobe 未返回 codec_name".to_string())?;
+    let codec = match codec_name {
+        "h264" => VideoCodec::H264,
+        "hevc" => VideoCodec::H265,
+        _ => return Err(format!("源视频编码 {codec_name} 不支持直通")),
+    };
+    let width = stream
+        .get("width")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "ffprobe 未返回 width".to_string())? as u32;
+    let height = stream
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "ffprobe 未返回 height".to_string())? as u32;
+    let fps_str = stream
+        .get("r_frame_rate")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "ffprobe 未返回 r_frame_rate".to_string())?;
+    let (num_str, den_str) = fps_str
+        .split_once('/')
+        .ok_or_else(|| format!("帧率格式非法: {fps_str}"))?;
+    let fps_num = num_str
+        .parse::<u32>()
+        .map_err(|_| format!("帧率分子非法: {num_str}"))?;
+    let fps_den = den_str
+        .parse::<u32>()
+        .map_err(|_| format!("帧率分母非法: {den_str}"))?;
+    Ok(SourceVideoStream { codec, width, height, fps_num, fps_den })
 }
 
 /// 探测用的 GOP:12 帧里应出现 3 个 IDR(第 0、5、10 帧)。
