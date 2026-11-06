@@ -14,8 +14,10 @@ pub use broadcast::{
     BROADCAST_SAMPLE_RATE,
 };
 pub use device::{
-    CatalogQueryActivity, ChannelConfig, DeviceConfig, DeviceInfo, DeviceRuntimeSnapshot,
-    DeviceSimulator, DeviceState,
+    CatalogQueryActivity, ChannelConfig, ControlSnapshot, CruiseSnapshot, DeviceConfig,
+    DeviceInfo, DeviceRuntimeSnapshot, DeviceSimulator, DeviceState, MaskRegionSnapshot,
+    OsdItemSnapshot, PersistedControlState, PersistedCruise, PersistedPreset, PersistedScan,
+    PresetSnapshot, ScanSnapshot, StorageCardSnapshot,
 };
 pub use recording::{
     RecordingEntry, RecordingKind, RecordingPhase, RecordingQuery, RecordingService,

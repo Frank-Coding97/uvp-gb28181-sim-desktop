@@ -34,7 +34,7 @@ function icon(comp: any) {
 
 const menuOptions: MenuOption[] = [
   { label: "首页",       key: "/dashboard",        icon: icon(HomeOutline) },
-  { label: "云台控制",   key: "/ptz",              icon: icon(HardwareChipOutline) },
+  { label: "模拟器中心", key: "/simulator",        icon: icon(HardwareChipOutline) },
   { label: "目录管理",   key: "/channels",         icon: icon(GitNetworkOutline) },
   { label: "录像中心",   key: "/recordings",       icon: icon(FilmOutline) },
   { label: "压力测试",   key: "/scenario",         icon: icon(PulseOutline) },

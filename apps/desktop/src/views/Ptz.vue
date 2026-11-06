@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import ThreePtzCamera from "../components/ThreePtzCamera.vue";
+import PtzCamera3D from "../components/PtzCamera3D.vue";
 import { useDevice } from "../device";
 
 interface PtzAction {
@@ -39,6 +39,11 @@ const lastActionAt = ref("尚未收到平台 PTZ 命令");
 const subscriptions = ref<Record<string, SubscriptionState>>({});
 
 const PRESET_IDS = [1, 2, 3, 4, 5] as const;
+const ZOOM_MAX = 20;
+// GB28181 速度 0..255 映射为角速度（°/s），变倍速度 0..15 映射为倍率/秒的对数速率。
+const PAN_RATE_MIN = 8, PAN_RATE_MAX = 120;
+const TILT_RATE_MIN = 6, TILT_RATE_MAX = 80;
+const showFov = ref(true);
 const presetNames = ref<Record<number, string>>({
   1: "大门入口", 2: "停车场", 3: "接待大厅", 4: "东侧通道", 5: "西侧通道",
 });
@@ -120,12 +125,17 @@ let unlistenPtz: UnlistenFn | null = null;
 let unlistenPreset: UnlistenFn | null = null;
 let unlistenSubscription: UnlistenFn | null = null;
 
+let lastTickAt = 0;
 function poseTick() {
+  const now = performance.now();
+  const dt = lastTickAt === 0 ? 0.06 : Math.min(0.2, (now - lastTickAt) / 1000);
+  lastTickAt = now;
   if (seeking.value && target.value) {
     const next = target.value;
-    pan.value += (next.pan - pan.value) * 0.08;
-    tilt.value += (next.tilt - tilt.value) * 0.08;
-    zoom.value += (next.zoom - zoom.value) * 0.08;
+    const k = 1 - Math.exp(-dt * 2.2);
+    pan.value += (next.pan - pan.value) * k;
+    tilt.value += (next.tilt - tilt.value) * k;
+    zoom.value += (next.zoom - zoom.value) * k;
     if (Math.abs(next.pan - pan.value) < 0.5 && Math.abs(next.tilt - tilt.value) < 0.5 && Math.abs(next.zoom - zoom.value) < 0.02) {
       pan.value = next.pan;
       tilt.value = next.tilt;
@@ -136,14 +146,16 @@ function poseTick() {
     return;
   }
   const action = ptz.value;
-  const panStep = (action.pan_speed / 255) * 4 + 1.5;
-  const tiltStep = (action.tilt_speed / 255) * 4 + 1.5;
+  const panStep = (PAN_RATE_MIN + (action.pan_speed / 255) * (PAN_RATE_MAX - PAN_RATE_MIN)) * dt;
+  const tiltStep = (TILT_RATE_MIN + (action.tilt_speed / 255) * (TILT_RATE_MAX - TILT_RATE_MIN)) * dt;
+  // 变倍按对数速率：最快约 1.5s 从 1× 拉到 20×，最慢约 12s。
+  const zoomRate = (0.25 + (action.zoom_speed / 15) * 1.75) * dt;
   if (action.left) pan.value -= panStep;
   if (action.right) pan.value += panStep;
   if (action.up) tilt.value = Math.min(90, tilt.value + tiltStep);
   if (action.down) tilt.value = Math.max(-90, tilt.value - tiltStep);
-  if (action.zoom_in) zoom.value = Math.min(4, zoom.value + 0.03);
-  if (action.zoom_out) zoom.value = Math.max(1, zoom.value - 0.03);
+  if (action.zoom_in) zoom.value = Math.min(ZOOM_MAX, zoom.value * Math.exp(zoomRate));
+  if (action.zoom_out) zoom.value = Math.max(1, zoom.value * Math.exp(-zoomRate));
 }
 
 watch(deviceLive, (running) => {
@@ -151,7 +163,7 @@ watch(deviceLive, (running) => {
 });
 
 onMounted(async () => {
-  poseTimer = window.setInterval(poseTick, 60);
+  poseTimer = window.setInterval(poseTick, 33);
   if (!isTauri) return;
   unlistenPtz = await listen<PtzAction>("ptz_action", (event) => {
     seeking.value = false;
@@ -218,7 +230,11 @@ onUnmounted(() => {
             <div class="dial" :style="compassDialStyle"><span>N</span><span>E</span><span>S</span><span>W</span></div>
             <b>{{ normalizedPan.toFixed(0).padStart(3, "0") }}°</b>
           </div>
-          <ThreePtzCamera :pan="pan" :tilt="tilt" :zoom="zoom" :active="ptzActive" :seeking="seeking" />
+          <PtzCamera3D
+            :pan="pan" :tilt="tilt" :zoom="zoom" :zoom-max="ZOOM_MAX"
+            :active="ptzActive" :seeking="seeking" :online="deviceLive" :show-fov="showFov"
+          />
+          <button class="fov-toggle" :class="{ on: showFov }" @click="showFov = !showFov">视场</button>
           <div v-if="!deviceLive" class="offline-cover"><b>等待设备注册</b><span>注册后平台 PTZ 命令会在这里实时驱动球机</span></div>
         </div>
       </section>
@@ -276,6 +292,8 @@ onUnmounted(() => {
 .dial span:nth-child(3) { bottom: 0; left: 50%; transform: translateX(-50%); }
 .dial span:nth-child(4) { top: 50%; left: 0; transform: translateY(-50%); }
 .compass > b { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font: 700 17px "SF Mono", monospace; }
+.fov-toggle { position: absolute; z-index: 5; right: 20px; bottom: 16px; padding: 5px 10px; border: 1px solid rgba(163,196,235,.24); border-radius: 7px; color: rgba(212,230,251,.6); background: rgba(5,16,29,.35); font-size: 11px; cursor: pointer; }
+.fov-toggle.on { border-color: rgba(90,160,255,.55); color: #dcecff; background: rgba(56,132,255,.18); }
 .offline-cover { position: absolute; z-index: 6; inset: 0; display: grid; place-content: center; gap: 8px; text-align: center; color: rgba(223,234,249,.72); background: rgba(5,16,29,.42); backdrop-filter: blur(2px); }
 .offline-cover b { color: #fff; font-size: 18px; }
 .offline-cover span { font-size: 12px; }

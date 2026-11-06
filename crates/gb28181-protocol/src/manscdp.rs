@@ -599,14 +599,36 @@ impl Control {
         }
     }
 
-    /// 解析辅助控制(PTZCmd byte3 = 0x89 开 / 0x8A 关,b4=辅助号)。
+    /// 解析自动扫描控制(PTZCmd byte3 = 0x89 设置/启动 / 0x8A 速度,b4=扫描组号)。
+    ///
+    /// 0x89: b5 子动作 0=启动, 1=设左边界, 2=设右边界；
+    /// 0x8A: b5 低 8 位 + b6 高 4 位组成 12 位速度。
+    pub fn scan_op(&self) -> Option<ScanOp> {
+        let b = self.ptz_bytes()?;
+        let group = b[4] as u32;
+        match b[3] {
+            0x89 => match b[5] {
+                0 => Some(ScanOp::Start { group }),
+                1 => Some(ScanOp::SetLeft { group }),
+                2 => Some(ScanOp::SetRight { group }),
+                _ => None,
+            },
+            0x8A => Some(ScanOp::SetSpeed {
+                group,
+                speed: (b[5] as u32) | (((b[6] & 0xF0) as u32 >> 4) << 8),
+            }),
+            _ => None,
+        }
+    }
+
+    /// 解析辅助控制(PTZCmd byte3 = 0x8C 开 / 0x8D 关,b4=辅助号)。
     ///
     /// 辅助号:1=雨刷 2=红外灯 3=加热 4=除雾 5=制冷(海康/大华事实标准)。
     pub fn aux_op(&self) -> Option<AuxOp> {
         let b = self.ptz_bytes()?;
         let on = match b[3] {
-            0x89 => true,
-            0x8A => false,
+            0x8C => true,
+            0x8D => false,
             _ => return None,
         };
         Some(AuxOp {
@@ -701,6 +723,19 @@ pub enum CruiseOp {
     Start { track: u32 },
 }
 
+/// 自动扫描控制操作(PTZCmd 0x89/0x8A 解析结果,GB/T 28181 表 A.10)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanOp {
+    /// 启动扫描(group=0 时标准没有定义"停止"，停止走全零云台帧)。
+    Start { group: u32 },
+    /// 把设备当前姿态设为左边界。
+    SetLeft { group: u32 },
+    /// 把设备当前姿态设为右边界。
+    SetRight { group: u32 },
+    /// 设置扫描速度(12 位原值)。
+    SetSpeed { group: u32, speed: u32 },
+}
+
 /// 辅助控制功能(海康/大华事实标准索引)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuxFunction {
@@ -744,7 +779,7 @@ impl AuxFunction {
     }
 }
 
-/// 辅助控制操作(PTZCmd 0x89/0x8A 解析结果)。
+/// 辅助控制操作(PTZCmd 0x8C/0x8D 解析结果)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuxOp {
     /// true=开,false=关。
@@ -1725,13 +1760,39 @@ pub struct VideoAlarmRecord {
     pub duration: u32,
 }
 
-/// 视频画面遮挡(ConfigDownload/PictureMask,GB-2022 A.2.3.2.8)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 视频画面遮挡(ConfigDownload/PictureMask,GB-2022 A.2.1.17)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename = "PictureMask")]
 pub struct PictureMask {
-    /// 是否启用画面遮挡:0=关闭,1=开启。
-    #[serde(rename = "Enabled")]
-    pub enabled: u32,
+    /// 遮挡开关:0=关闭,1=开启。兼容旧平台的 `Enabled` 写法。
+    #[serde(rename = "On", alias = "Enabled", default)]
+    pub on: u32,
+    /// 区域总数(标准必选;只回读，不独立落库)。
+    #[serde(rename = "SumNum", default)]
+    pub sum_num: u32,
+    /// 遮挡区域列表(可选)。
+    #[serde(rename = "RegionList", default, skip_serializing_if = "Option::is_none")]
+    pub region_list: Option<PictureMaskRegionList>,
+}
+
+/// `PictureMask/RegionList`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename = "RegionList")]
+pub struct PictureMaskRegionList {
+    #[serde(rename = "@Num", default)]
+    pub num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<PictureMaskRegion>,
+}
+
+/// `PictureMask/RegionList/Item`。`Point` 是「左上角 + 右下角」四个像素值。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename = "Item")]
+pub struct PictureMaskRegion {
+    #[serde(rename = "Seq", default)]
+    pub seq: u32,
+    #[serde(rename = "Point", default)]
+    pub point: String,
 }
 
 /// 画面翻转(ConfigDownload/FrameMirror,GB-2022 A.2.1.23)。
@@ -1752,16 +1813,63 @@ pub struct AlarmReport {
     pub enabled: u32,
 }
 
-/// 前端OSD配置(ConfigDownload/OSDConfig,GB-2022 A.2.3.2.11)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 前端OSD配置(ConfigDownload/OSDConfig,GB-2022 A.2.1.12)。
+///
+/// 同时兼容桌面旧版的 `TimeShowFlag/OSDShowFlag` 写法与标准
+/// `TimeEnable/TextEnable/Item` 写法；标准字段存在时优先。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename = "OSDConfig")]
 pub struct OSDConfig {
-    /// 绝对时间信息显示开关:0=关闭,1=开启。
-    #[serde(rename = "TimeShowFlag")]
+    /// 绝对时间信息显示开关(旧版):0=关闭,1=开启。
+    #[serde(rename = "TimeShowFlag", default)]
     pub time_show_flag: u32,
-    /// OSD信息显示开关:0=关闭,1=开启。
-    #[serde(rename = "OSDShowFlag")]
+    /// OSD信息显示开关(旧版):0=关闭,1=开启。
+    #[serde(rename = "OSDShowFlag", default)]
     pub osd_show_flag: u32,
+    /// 配置窗口长度像素值(标准=视频水平像素)。
+    #[serde(rename = "Length", default)]
+    pub length: u32,
+    /// 配置窗口宽度像素值(标准=视频垂直像素)。
+    #[serde(rename = "Width", default)]
+    pub width: u32,
+    #[serde(rename = "TimeX", default)]
+    pub time_x: u32,
+    #[serde(rename = "TimeY", default)]
+    pub time_y: u32,
+    #[serde(rename = "TimeEnable", default)]
+    pub time_enable: Option<u32>,
+    #[serde(rename = "TimeType", default)]
+    pub time_type: Option<u32>,
+    #[serde(rename = "TextEnable", default)]
+    pub text_enable: Option<u32>,
+    #[serde(rename = "SumNum", default)]
+    pub sum_num: u32,
+    #[serde(rename = "Item", default)]
+    pub items: Vec<OsdTextItem>,
+}
+
+/// `OSDConfig/Item` 的一行自由文本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename = "Item")]
+pub struct OsdTextItem {
+    #[serde(rename = "Text", default)]
+    pub text: String,
+    #[serde(rename = "X", default)]
+    pub x: u32,
+    #[serde(rename = "Y", default)]
+    pub y: u32,
+}
+
+impl OSDConfig {
+    /// 标准字段优先；缺席时回落到旧版开关。
+    pub fn time_visible(&self) -> bool {
+        self.time_enable.map(|value| value == 1).unwrap_or(self.time_show_flag == 1)
+    }
+
+    /// 标准字段优先；缺席时回落到旧版开关。
+    pub fn text_visible(&self) -> bool {
+        self.text_enable.map(|value| value == 1).unwrap_or(self.osd_show_flag == 1)
+    }
 }
 
 /// 图像抓拍配置(ConfigDownload/SnapShotConfig,GB-2022 A.2.1.24)。
@@ -1858,12 +1966,13 @@ impl ConfigDownloadResponse {
                 record_plan_type: 0,
             }),
             video_alarm_record: want_alarm_record.then_some(VideoAlarmRecord { duration: 30 }),
-            picture_mask: want_picture_mask.then_some(PictureMask { enabled: 0 }),
+            picture_mask: want_picture_mask.then_some(PictureMask::default()),
             frame_mirror: want_frame_mirror.then_some(FrameMirror { mode: 0 }),
             alarm_report: want_alarm_report.then_some(AlarmReport { enabled: 1 }),
             osd_config: want_osd.then_some(OSDConfig {
                 time_show_flag: 1,
                 osd_show_flag: 1,
+                ..Default::default()
             }),
             snap_shot_config: want_snapshot.then_some(SnapShotCfg {
                 snap_num: 1,
@@ -2446,12 +2555,24 @@ pub struct CruiseTrackQueryResponse {
 impl CruiseTrackQueryResponse {
     /// 用轨迹号与该轨迹的预置点列表构造(Speed/DwellTime 固定 5/3)。
     pub fn new(device_id: impl Into<String>, sn: u32, group_id: u32, preset_ids: &[u32]) -> Self {
+        Self::new_with_params(device_id, sn, group_id, preset_ids, 5, 3)
+    }
+
+    /// 带组级速度/停留时间构造；平台下发过就回真实值。
+    pub fn new_with_params(
+        device_id: impl Into<String>,
+        sn: u32,
+        group_id: u32,
+        preset_ids: &[u32],
+        speed: u32,
+        dwell_time: u32,
+    ) -> Self {
         let items: Vec<CruisePresetItem> = preset_ids
             .iter()
             .map(|&p| CruisePresetItem {
                 preset_id: p,
-                speed: 5,
-                dwell_time: 3,
+                speed,
+                dwell_time,
             })
             .collect();
         let num = items.len() as u32;
@@ -3004,11 +3125,24 @@ mod tests {
             mk("A50F0188020000").cruise_op(),
             Some(CruiseOp::Start { track: 2 })
         );
-        // 辅助控制开:byte3=0x89, aux=1(雨刷)
-        let aux = mk("A50F0189010000").aux_op().unwrap();
+        // 扫描启动:byte3=0x89, 组=1, 子动作=0
+        assert_eq!(
+            mk("A50F0189010000").scan_op(),
+            Some(ScanOp::Start { group: 1 })
+        );
+        // 扫描设速度:byte3=0x8A, 组=2, 12 位速度 0x01FF = 511
+        assert_eq!(
+            mk("A50F018A02FF10").scan_op(),
+            Some(ScanOp::SetSpeed {
+                group: 2,
+                speed: 511
+            })
+        );
+        // 辅助控制开:byte3=0x8C, aux=1(雨刷)
+        let aux = mk("A50F018C010000").aux_op().unwrap();
         assert!(aux.on && aux.function == AuxFunction::Wiper);
-        // 辅助控制关:byte3=0x8A, aux=2(红外灯)
-        let aux2 = mk("A50F018A020000").aux_op().unwrap();
+        // 辅助控制关:byte3=0x8D, aux=2(红外灯)
+        let aux2 = mk("A50F018D020000").aux_op().unwrap();
         assert!(!aux2.on && aux2.function == AuxFunction::InfraredLight);
         // FI 指令(表 A.6):0x42 聚焦近、0x41 聚焦远、0x48 光圈缩小、0x44 光圈放大。
         let near = mk("A50F0142000000").fi_op().unwrap();

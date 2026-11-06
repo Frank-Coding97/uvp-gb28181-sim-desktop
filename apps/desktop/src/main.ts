@@ -6,7 +6,7 @@ import { createRouter, createWebHashHistory } from "vue-router";
 import "./theme.css";
 import App from "./App.vue";
 import Dashboard from "./views/Dashboard.vue";
-import Ptz from "./views/Ptz.vue";
+import SimulatorCenter from "./views/SimulatorCenter.vue";
 import PtzLab from "./views/PtzLab.vue";
 import Channels from "./views/Channels.vue";
 import Scenario from "./views/Scenario.vue";
@@ -20,7 +20,8 @@ const router = createRouter({
   routes: [
     { path: "/", redirect: "/dashboard" },
     { path: "/dashboard", component: Dashboard },
-    { path: "/ptz",       component: Ptz },
+    { path: "/simulator", component: SimulatorCenter },
+    { path: "/ptz",       redirect: "/simulator" }, // 旧入口兼容
     // 仅开发预览：3D 相机重画对比，不在导航中暴露。
     { path: "/ptz-lab",   component: PtzLab },
     { path: "/preview",   component: Preview },

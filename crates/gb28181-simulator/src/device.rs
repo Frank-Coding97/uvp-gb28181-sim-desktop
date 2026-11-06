@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use common::{DeviceId, Error, Result, Transport};
 use gb28181_protocol::manscdp::Keepalive;
+use serde::{Deserialize, Serialize};
 use sip_core::{authorization, Challenge, SipTransport};
 
 use crate::builder::{self, DialogIds};
@@ -288,6 +289,8 @@ pub struct DeviceSimulator {
     ptz_notify_count: std::sync::atomic::AtomicU32,
     /// 预置位表(编号 → 名称)。PTZ 预置位设置/删除命令更新,PresetQuery 返回。
     presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
+    /// 预置位姿态表。与名称表分开保存，PresetQuery 协议只回名称，UI 快照需要姿态。
+    preset_poses: std::sync::Mutex<std::collections::BTreeMap<u8, (f32, f32, f32)>>,
     /// 设备控制态(布防/看守位/巡航/精准姿态)。扩展查询与控制命令共同维护(FR-17/18)。
     control_state: std::sync::Mutex<ControlState>,
     /// 平台下发后已应用的会话级设备配置。ConfigDownload 从这里回读，不再返回固定值。
@@ -309,6 +312,14 @@ pub struct DeviceSimulator {
     broadcast: Arc<crate::broadcast::BroadcastRunner>,
 }
 
+/// 自动扫描组(GB/T 28181 表 A.10)。边界是设备当时姿态的快照。
+#[derive(Debug, Clone, Default)]
+pub struct ScanGroupState {
+    pub left: Option<(f32, f32, f32)>,
+    pub right: Option<(f32, f32, f32)>,
+    pub speed: Option<u32>,
+}
+
 /// 设备控制态。由扩展控制命令(布防/看守位/巡航/精准云台)更新,
 /// 供扩展查询(AlarmStatus/HomePositionQuery/CruiseTrack*/PTZPosition)读回。
 #[derive(Debug, Clone)]
@@ -321,10 +332,38 @@ pub struct ControlState {
     pub home_enabled: bool,
     /// 是否已设看守位(HomePositionQuery 的 PresetIndex 标志)。
     pub home_set: bool,
+    /// 看守位指向的预置位号。
+    pub home_preset_index: Option<u32>,
+    /// 看守位自动归位时间(秒)。
+    pub home_reset_time: Option<u32>,
     /// 巡航轨迹:轨迹号 → 该轨迹的预置位号列表(增点/删点维护)。
     pub cruise_tracks: std::collections::BTreeMap<u32, Vec<u32>>,
+    /// 巡航组级速度(12 位原值)。
+    pub cruise_speed: std::collections::BTreeMap<u32, u32>,
+    /// 巡航组级每点停留秒数。
+    pub cruise_dwell: std::collections::BTreeMap<u32, u32>,
+    /// 当前正在执行的巡航轨迹。
+    pub active_cruise: Option<u32>,
+    /// 平台设过边界的自动扫描组。
+    pub scan_groups: std::collections::BTreeMap<u32, ScanGroupState>,
+    /// 当前正在执行的扫描组。
+    pub active_scan: Option<u32>,
     /// 最近一次精准云台姿态(pan 度, tilt 度, zoom 倍)。
     pub precise_pose: (f32, f32, f32),
+    /// 当前姿态(前端积分后回写,作为预置位/扫描边界的真值)。
+    pub pose: (f32, f32, f32),
+    /// 当前聚焦行程(0~1)。
+    pub focus: f32,
+    /// 当前光圈行程(0~1)。
+    pub iris: f32,
+    /// 平台是否查询过存储卡。
+    pub storage_queried: bool,
+    /// 目标跟踪模式(Auto/Manual;None=未跟踪)。
+    pub target_mode: Option<String>,
+    /// 目标跟踪框（归一化 left/top/width/height，原点=画面左上角）。
+    pub target_box: Option<(f32, f32, f32, f32)>,
+    /// 最近一次拉框联动框（归一化 left/top/width/height）。
+    pub drag_zoom_box: Option<(f32, f32, f32, f32)>,
 }
 
 impl Default for ControlState {
@@ -334,10 +373,152 @@ impl Default for ControlState {
             alarming: false,
             home_enabled: true,
             home_set: false,
+            home_preset_index: None,
+            home_reset_time: None,
             cruise_tracks: std::collections::BTreeMap::new(),
+            cruise_speed: std::collections::BTreeMap::new(),
+            cruise_dwell: std::collections::BTreeMap::new(),
+            active_cruise: None,
+            scan_groups: std::collections::BTreeMap::new(),
+            active_scan: None,
             precise_pose: (0.0, 0.0, 1.0),
+            pose: (0.0, 0.0, 1.0),
+            focus: 0.5,
+            iris: 0.5,
+            storage_queried: false,
+            target_mode: None,
+            target_box: None,
+            drag_zoom_box: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PresetSnapshot {
+    pub id: u8,
+    pub name: String,
+    pub pan: f32,
+    pub tilt: f32,
+    pub zoom: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CruiseSnapshot {
+    pub id: u32,
+    pub points: Vec<u32>,
+    pub speed: Option<u32>,
+    pub dwell: Option<u32>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanSnapshot {
+    pub id: u32,
+    pub left: Option<(f32, f32, f32)>,
+    pub right: Option<(f32, f32, f32)>,
+    pub speed: Option<u32>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageCardSnapshot {
+    pub id: u32,
+    pub name: String,
+    pub capacity_mb: u32,
+    pub free_mb: u32,
+    pub status: String,
+    pub progress: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MaskRegionSnapshot {
+    pub seq: u32,
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedPreset {
+    pub id: u8,
+    pub name: String,
+    pub pan: f32,
+    pub tilt: f32,
+    pub zoom: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedCruise {
+    pub id: u32,
+    pub points: Vec<u32>,
+    pub speed: Option<u32>,
+    pub dwell: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedScan {
+    pub id: u32,
+    pub left: Option<(f32, f32, f32)>,
+    pub right: Option<(f32, f32, f32)>,
+    pub speed: Option<u32>,
+}
+
+/// 跨进程重启持久化的设备控制配置（不含瞬态目标/存储查询/运行态）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedControlState {
+    pub presets: Vec<PersistedPreset>,
+    pub home_enabled: bool,
+    pub home_preset_index: Option<u32>,
+    pub home_reset_time: Option<u32>,
+    pub cruise: Vec<PersistedCruise>,
+    pub scan: Vec<PersistedScan>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OsdItemSnapshot {
+    pub text: String,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// 模拟器中心需要的设备控制快照。只读，不持锁执行 I/O。
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlSnapshot {
+    pub pan: f32,
+    pub tilt: f32,
+    pub zoom: f32,
+    pub focus: f32,
+    pub iris: f32,
+    pub presets: Vec<PresetSnapshot>,
+    pub home_enabled: bool,
+    pub home_preset_index: Option<u32>,
+    pub home_reset_time: Option<u32>,
+    pub cruise: Vec<CruiseSnapshot>,
+    pub scan: Vec<ScanSnapshot>,
+    pub storage_queried: bool,
+    pub storage_cards: Vec<StorageCardSnapshot>,
+    pub mask_configured: bool,
+    pub mask_on: bool,
+    pub mask_regions: Vec<MaskRegionSnapshot>,
+    pub osd_length: u32,
+    pub osd_width: u32,
+    pub osd_time_x: u32,
+    pub osd_time_y: u32,
+    pub osd_time_visible: bool,
+    pub osd_text_visible: bool,
+    pub osd_time_type: Option<u32>,
+    pub osd_items: Vec<OsdItemSnapshot>,
+    pub osd_configured: bool,
+    pub guarded: bool,
+    pub alarming: bool,
+    pub target_mode: Option<String>,
+    pub target_box: Option<(f32, f32, f32, f32)>,
+    pub drag_zoom_box: Option<(f32, f32, f32, f32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +583,28 @@ fn initial_runtime_config(
                 item.video_bit_rate = Some(media.bitrate_kbps.to_string());
             }
         }
+    }
+    if let Some(osd) = response.osd_config.as_mut() {
+        let (width, height) = config
+            .media_profile
+            .as_ref()
+            .map(|media| (media.width, media.height))
+            .unwrap_or((1920, 1080));
+        osd.length = width;
+        osd.width = height;
+        osd.time_x = 10;
+        osd.time_y = 10;
+        osd.items = config
+            .channels
+            .first()
+            .map(|channel| {
+                vec![gb28181_protocol::manscdp::OsdTextItem {
+                    text: channel.name.clone(),
+                    x: 10,
+                    y: 34,
+                }]
+            })
+            .unwrap_or_default();
     }
     response
 }
@@ -498,6 +701,7 @@ impl DeviceSimulator {
             ptz_dialog: tokio::sync::Mutex::new(None),
             ptz_notify_count: std::sync::atomic::AtomicU32::new(0),
             presets: std::sync::Mutex::new(default_presets()),
+            preset_poses: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             control_state: std::sync::Mutex::new(ControlState::default()),
             runtime_config: std::sync::Mutex::new(runtime_config),
             runtime_change: std::sync::Mutex::new(RuntimeChange {
@@ -638,7 +842,7 @@ impl DeviceSimulator {
             picture_mask_enabled: config
                 .as_ref()
                 .and_then(|value| value.picture_mask.as_ref())
-                .map(|value| value.enabled),
+                .map(|value| value.on),
             frame_mirror_mode: config
                 .as_ref()
                 .and_then(|value| value.frame_mirror.as_ref())
@@ -650,11 +854,11 @@ impl DeviceSimulator {
             osd_time_show: config
                 .as_ref()
                 .and_then(|value| value.osd_config.as_ref())
-                .map(|value| value.time_show_flag),
+                .map(|value| value.time_visible() as u32),
             osd_show: config
                 .as_ref()
                 .and_then(|value| value.osd_config.as_ref())
-                .map(|value| value.osd_show_flag),
+                .map(|value| value.text_visible() as u32),
             last_change: change
                 .as_ref()
                 .map(|value| value.kind.clone())
@@ -663,6 +867,270 @@ impl DeviceSimulator {
                 .as_ref()
                 .map(|value| value.updated_at_ms)
                 .unwrap_or_default(),
+        }
+    }
+
+    /// 前端积分出的当前姿态回写。预置位设置、扫描边界都以此为准。
+    pub fn set_local_pose(&self, pan: f32, tilt: f32, zoom: f32, focus: f32, iris: f32) {
+        if let Ok(mut state) = self.control_state.lock() {
+            state.pose = (
+                pan.clamp(-180.0, 180.0),
+                tilt.clamp(-90.0, 90.0),
+                zoom.clamp(1.0, 20.0),
+            );
+            state.focus = focus.clamp(0.0, 1.0);
+            state.iris = iris.clamp(0.0, 1.0);
+        }
+    }
+
+    /// 模拟器中心的一次性只读快照。
+    pub fn control_snapshot(&self) -> ControlSnapshot {
+        let state = self
+            .control_state
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+
+        let names = self
+            .presets
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let poses = self
+            .preset_poses
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let presets = names
+            .into_iter()
+            .map(|(id, name)| {
+                let (pan, tilt, zoom) = poses.get(&id).copied().unwrap_or((0.0, 0.0, 1.0));
+                PresetSnapshot { id, name, pan, tilt, zoom }
+            })
+            .collect();
+
+        let cruise = state
+            .cruise_tracks
+            .iter()
+            .map(|(id, points)| CruiseSnapshot {
+                id: *id,
+                points: points.clone(),
+                speed: state.cruise_speed.get(id).copied(),
+                dwell: state.cruise_dwell.get(id).copied(),
+                active: state.active_cruise == Some(*id),
+            })
+            .collect();
+
+        let scan = state
+            .scan_groups
+            .iter()
+            .map(|(id, group)| ScanSnapshot {
+                id: *id,
+                left: group.left,
+                right: group.right,
+                speed: group.speed,
+                active: state.active_scan == Some(*id),
+            })
+            .collect();
+
+        let storage_cards = if state.storage_queried {
+            vec![StorageCardSnapshot {
+                id: 1,
+                name: "SD Card 1".into(),
+                capacity_mb: 32768,
+                free_mb: 24576,
+                status: "正常".into(),
+                progress: None,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        let (mask_configured, mask_on, mask_regions) = {
+            let config = self.runtime_config.lock().ok();
+            let mask = config
+                .as_ref()
+                .and_then(|value| value.picture_mask.as_ref());
+            let configured = mask.is_some();
+            let on = mask.map(|value| value.on == 1).unwrap_or(false);
+            let regions = mask
+                .and_then(|value| value.region_list.as_ref())
+                .map(|list| {
+                    list.items
+                        .iter()
+                        .filter_map(|item| {
+                            let parts = item
+                                .point
+                                .split(',')
+                                .map(|part| part.trim().parse::<u32>().ok())
+                                .collect::<Option<Vec<_>>>()?;
+                            if parts.len() != 4 {
+                                return None;
+                            }
+                            let (left, top, right, bottom) =
+                                (parts[0], parts[1], parts[2], parts[3]);
+                            (right > left && bottom > top).then_some(MaskRegionSnapshot {
+                                seq: item.seq,
+                                left,
+                                top,
+                                right,
+                                bottom,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (configured, on, regions)
+        };
+
+        let (osd_configured, osd_length, osd_width, osd_time_x, osd_time_y, osd_time_visible, osd_text_visible, osd_time_type, osd_items) = {
+            let config = self.runtime_config.lock().ok();
+            let osd = config
+                .as_ref()
+                .and_then(|value| value.osd_config.as_ref());
+            (
+                osd.is_some(),
+                osd.map(|value| value.length).unwrap_or(1920),
+                osd.map(|value| value.width).unwrap_or(1080),
+                osd.map(|value| value.time_x).unwrap_or(10),
+                osd.map(|value| value.time_y).unwrap_or(10),
+                osd.map(|value| value.time_visible()).unwrap_or(false),
+                osd.map(|value| value.text_visible()).unwrap_or(false),
+                osd.and_then(|value| value.time_type),
+                osd.map(|value| {
+                    value
+                        .items
+                        .iter()
+                        .map(|item| OsdItemSnapshot {
+                            text: item.text.clone(),
+                            x: item.x,
+                            y: item.y,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            )
+        };
+
+        ControlSnapshot {
+            pan: state.pose.0,
+            tilt: state.pose.1,
+            zoom: state.pose.2,
+            focus: state.focus,
+            iris: state.iris,
+            presets,
+            home_enabled: state.home_enabled,
+            home_preset_index: state.home_preset_index,
+            home_reset_time: state.home_reset_time,
+            cruise,
+            scan,
+            storage_queried: state.storage_queried,
+            storage_cards,
+            mask_configured,
+            mask_on,
+            mask_regions,
+            osd_configured,
+            osd_length,
+            osd_width,
+            osd_time_x,
+            osd_time_y,
+            osd_time_visible,
+            osd_text_visible,
+            osd_time_type,
+            osd_items,
+            guarded: state.guarded,
+            alarming: state.alarming,
+            target_mode: state.target_mode,
+            target_box: state.target_box,
+            drag_zoom_box: state.drag_zoom_box,
+        }
+    }
+
+    /// 导出跨进程持久化的控制配置。
+    pub fn export_persisted_control_state(&self) -> PersistedControlState {
+        let snapshot = self.control_snapshot();
+        PersistedControlState {
+            presets: snapshot
+                .presets
+                .into_iter()
+                .map(|preset| PersistedPreset {
+                    id: preset.id,
+                    name: preset.name,
+                    pan: preset.pan,
+                    tilt: preset.tilt,
+                    zoom: preset.zoom,
+                })
+                .collect(),
+            home_enabled: snapshot.home_enabled,
+            home_preset_index: snapshot.home_preset_index,
+            home_reset_time: snapshot.home_reset_time,
+            cruise: snapshot
+                .cruise
+                .into_iter()
+                .map(|track| PersistedCruise {
+                    id: track.id,
+                    points: track.points,
+                    speed: track.speed,
+                    dwell: track.dwell,
+                })
+                .collect(),
+            scan: snapshot
+                .scan
+                .into_iter()
+                .map(|group| PersistedScan {
+                    id: group.id,
+                    left: group.left,
+                    right: group.right,
+                    speed: group.speed,
+                })
+                .collect(),
+        }
+    }
+
+    /// 恢复跨进程持久化的控制配置；瞬态运行态(active/目标/查询)不恢复。
+    pub fn import_persisted_control_state(&self, saved: &PersistedControlState) {
+        if let Ok(mut presets) = self.presets.lock() {
+            presets.clear();
+            for preset in &saved.presets {
+                presets.insert(preset.id, preset.name.clone());
+            }
+        }
+        if let Ok(mut poses) = self.preset_poses.lock() {
+            poses.clear();
+            for preset in &saved.presets {
+                poses.insert(preset.id, (preset.pan, preset.tilt, preset.zoom));
+            }
+        }
+        if let Ok(mut state) = self.control_state.lock() {
+            state.home_enabled = saved.home_enabled;
+            state.home_preset_index = saved.home_preset_index;
+            state.home_reset_time = saved.home_reset_time;
+            state.home_set = saved.home_preset_index.is_some();
+            state.cruise_tracks.clear();
+            state.cruise_speed.clear();
+            state.cruise_dwell.clear();
+            for track in &saved.cruise {
+                state.cruise_tracks.insert(track.id, track.points.clone());
+                if let Some(speed) = track.speed {
+                    state.cruise_speed.insert(track.id, speed);
+                }
+                if let Some(dwell) = track.dwell {
+                    state.cruise_dwell.insert(track.id, dwell);
+                }
+            }
+            state.scan_groups.clear();
+            for group in &saved.scan {
+                state.scan_groups.insert(
+                    group.id,
+                    ScanGroupState {
+                        left: group.left,
+                        right: group.right,
+                        speed: group.speed,
+                    },
+                );
+            }
+            state.active_cruise = None;
+            state.active_scan = None;
         }
     }
 
@@ -2115,6 +2583,16 @@ impl DeviceSimulator {
                 }
             };
         }
+        // 自动扫描(表 A.10)。
+        if let Some(scan) = ctrl.scan_op() {
+            use gb28181_protocol::manscdp::ScanOp;
+            return match scan {
+                ScanOp::Start { group } => format!("扫描{group}启动"),
+                ScanOp::SetLeft { group } => format!("扫描{group}设左边界"),
+                ScanOp::SetRight { group } => format!("扫描{group}设右边界"),
+                ScanOp::SetSpeed { group, speed } => format!("扫描{group}设速{speed}"),
+            };
+        }
         // 辅助控制。
         if let Some(aux) = ctrl.aux_op() {
             return format!(
@@ -2136,6 +2614,21 @@ impl DeviceSimulator {
         }
         if let Some(p) = &ctrl.ptz_precise_ctrl {
             return format!("精确云台 Pan{} Tilt{} Zoom{}", p.pan, p.tilt, p.zoom);
+        }
+        if let Some(hp) = &ctrl.home_position {
+            return format!(
+                "看守位设置:Enabled{} Preset{} Reset{}",
+                hp.enabled, hp.preset_index, hp.reset_time
+            );
+        }
+        if let Some(t) = &ctrl.target_track {
+            return format!("目标跟踪:{}", t.mode);
+        }
+        if ctrl.format_sd_card.is_some() {
+            return format!("格式化SD卡:Disk{}", ctrl.disk_num.unwrap_or(0));
+        }
+        if let Some(upgrade) = &ctrl.device_upgrade {
+            return format!("在线升级:{}", upgrade.firmware);
         }
         ctrl.kind().to_string()
     }
@@ -2635,6 +3128,9 @@ impl DeviceSimulator {
             }
             "SDCardStatus" => {
                 // 存储卡状态查询(FR-17):模拟单张 32G 卡余 24G。
+                if let Ok(mut s) = self.control_state.lock() {
+                    s.storage_queried = true;
+                }
                 StorageCardStatusResponse::mock(&query.device_id, query.sn).to_xml()
             }
             "CruiseTrackListQuery" => {
@@ -2647,14 +3143,28 @@ impl DeviceSimulator {
                 CruiseTrackListResponse::new(&query.device_id, query.sn, &tracks).to_xml()
             }
             "CruiseTrackQuery" => {
-                // 巡航轨迹详情查询(FR-17):读 GroupID(缺省 1),返回该轨迹预置点(Speed/DwellTime 固定 5/3)。
+                // 巡航轨迹详情查询(FR-17):读 GroupID(缺省 1),返回该轨迹预置点与组级速度/停留。
                 let group = query.group_id.unwrap_or(1);
-                let presets: Vec<u32> = self
+                let (presets, speed, dwell) = self
                     .control_state
                     .lock()
-                    .map(|s| s.cruise_tracks.get(&group).cloned().unwrap_or_default())
+                    .map(|s| {
+                        (
+                            s.cruise_tracks.get(&group).cloned().unwrap_or_default(),
+                            s.cruise_speed.get(&group).copied().unwrap_or(5),
+                            s.cruise_dwell.get(&group).copied().unwrap_or(3),
+                        )
+                    })
                     .unwrap_or_default();
-                CruiseTrackQueryResponse::new(&query.device_id, query.sn, group, &presets).to_xml()
+                CruiseTrackQueryResponse::new_with_params(
+                    &query.device_id,
+                    query.sn,
+                    group,
+                    &presets,
+                    speed,
+                    dwell,
+                )
+                .to_xml()
             }
             "PTZPosition" => {
                 // PTZ 精准状态查询(FR-17,GB-2022):返回最近精准云台姿态。
@@ -2713,11 +3223,22 @@ impl DeviceSimulator {
                     if let Ok(mut p) = self.presets.lock() {
                         p.insert(idx, name.clone());
                     }
+                    let pose = self
+                        .control_state
+                        .lock()
+                        .map(|state| state.pose)
+                        .unwrap_or((0.0, 0.0, 1.0));
+                    if let Ok(mut poses) = self.preset_poses.lock() {
+                        poses.insert(idx, pose);
+                    }
                     tracing::info!(preset = idx, preset_name = %name, "预置位设置");
                 }
                 Some((PresetAction::Delete, idx)) => {
                     if let Ok(mut p) = self.presets.lock() {
                         p.remove(&idx);
+                    }
+                    if let Ok(mut poses) = self.preset_poses.lock() {
+                        poses.remove(&idx);
                     }
                     tracing::info!(preset = idx, "预置位删除");
                 }
@@ -2728,14 +3249,21 @@ impl DeviceSimulator {
                         .ok()
                         .and_then(|presets| presets.get(&idx).cloned())
                         .unwrap_or_else(|| format!("预置位{idx}"));
+                    let pose = self
+                        .preset_poses
+                        .lock()
+                        .ok()
+                        .and_then(|poses| poses.get(&idx).copied());
                     tracing::info!(preset = idx, preset_name = %name, "预置位调用(转到)");
                     self.observer
-                        .on_event(common::DeviceEvent::PtzPresetCall { preset: idx, name });
+                        .on_event(common::DeviceEvent::PtzPresetCall { preset: idx, name, pose });
                 }
                 None => {
                     // 优先级:巡航/辅助(0x8x)→ FI 光圈聚焦(0x4x)→ 方向/变倍运动。
                     if let Some(op) = ctrl.cruise_op() {
                         self.apply_cruise_op(op);
+                    } else if let Some(scan) = ctrl.scan_op() {
+                        self.apply_scan_op(scan);
                     } else if let Some(aux) = ctrl.aux_op() {
                         tracing::info!(func = aux.function.label(), on = aux.on, "辅助控制");
                     } else if let Some(fi) = ctrl.fi_op() {
@@ -2755,6 +3283,12 @@ impl DeviceSimulator {
                             tilt_speed: m.tilt_speed,
                             zoom_speed: m.zoom_speed,
                         });
+                        if m.is_stop() {
+                            if let Ok(mut state) = self.control_state.lock() {
+                                state.active_cruise = None;
+                                state.active_scan = None;
+                            }
+                        }
                     } else {
                         tracing::info!(ptz = %ptz, "PTZ 云台控制(模拟接受)");
                     }
@@ -2766,12 +3300,49 @@ impl DeviceSimulator {
             tracing::info!(pan = p.pan, tilt = p.tilt, zoom = p.zoom, "精确云台控制");
             if let Ok(mut s) = self.control_state.lock() {
                 s.precise_pose = (p.pan, p.tilt, p.zoom);
+                s.pose = (p.pan, p.tilt, p.zoom);
+            }
+        }
+        // 拉框联动：记录平台给出的播放窗口/框像素，供模拟器中心画线框。
+        if let Some(zoom) = ctrl.drag_zoom_in.as_ref().or(ctrl.drag_zoom_out.as_ref()) {
+            if zoom.length > 0 && zoom.width > 0 && zoom.length_x > 0 && zoom.length_y > 0 {
+                let left = (zoom.midpoint_x as f32 - zoom.length_x as f32 / 2.0)
+                    / zoom.length as f32;
+                let top = (zoom.midpoint_y as f32 - zoom.length_y as f32 / 2.0)
+                    / zoom.width as f32;
+                if let Ok(mut s) = self.control_state.lock() {
+                    s.drag_zoom_box = Some((
+                        left.clamp(0.0, 1.0),
+                        top.clamp(0.0, 1.0),
+                        (zoom.length_x as f32 / zoom.length as f32).clamp(0.0, 1.0),
+                        (zoom.length_y as f32 / zoom.width as f32).clamp(0.0, 1.0),
+                    ));
+                }
             }
         }
         // 目标跟踪:白名单模式外忽略,仍应答 200/OK。
         if let Some(t) = &ctrl.target_track {
             let mode = t.mode.trim();
             if matches!(mode, "Auto" | "Manual" | "Stop") {
+                let target_box = t.target_area.as_ref().and_then(|area| {
+                    if area.length == 0 || area.width == 0 || area.length_x == 0 || area.length_y == 0 {
+                        return None;
+                    }
+                    let left = (area.midpoint_x as f32 - area.length_x as f32 / 2.0)
+                        / area.length as f32;
+                    let top = (area.midpoint_y as f32 - area.length_y as f32 / 2.0)
+                        / area.width as f32;
+                    Some((
+                        left.clamp(0.0, 1.0),
+                        top.clamp(0.0, 1.0),
+                        (area.length_x as f32 / area.length as f32).clamp(0.0, 1.0),
+                        (area.length_y as f32 / area.width as f32).clamp(0.0, 1.0),
+                    ))
+                });
+                if let Ok(mut s) = self.control_state.lock() {
+                    s.target_mode = if mode == "Stop" { None } else { Some(mode.to_string()) };
+                    s.target_box = if mode == "Stop" { None } else { target_box };
+                }
                 tracing::info!(mode, object = ?t.object_id, "目标跟踪");
             } else {
                 tracing::info!(mode, "目标跟踪(模式未识别,忽略)");
@@ -2809,6 +3380,8 @@ impl DeviceSimulator {
             if let Ok(mut s) = self.control_state.lock() {
                 s.home_enabled = hp.enabled != 0;
                 s.home_set = hp.enabled != 0;
+                s.home_preset_index = (hp.preset_index != 0).then_some(hp.preset_index);
+                s.home_reset_time = Some(hp.reset_time);
             }
             tracing::info!(enabled = hp.enabled, preset = hp.preset_index, "看守位设置");
         }
@@ -2862,8 +3435,8 @@ impl DeviceSimulator {
             tracing::info!("设备配置:报警上报开关(模拟接受)");
         }
         if let Some(osd) = &ctrl.cfg_osd_config {
-            let time_show = osd.time_show_flag != 0;
-            let osd_show = osd.osd_show_flag != 0;
+            let time_show = osd.time_visible();
+            let osd_show = osd.text_visible();
             tracing::info!(time_show, osd_show, "设备配置:前端OSD(已应用)");
             // 上报观察者:供 UI 展示"平台下发 OSD 配置、设备已应用"(国标 A.2.3.2.11)。
             self.observer.on_event(common::DeviceEvent::OsdConfig {
@@ -2976,19 +3549,59 @@ impl DeviceSimulator {
             }
             CruiseOp::SetSpeed { track, speed } => {
                 s.cruise_tracks.entry(track).or_default();
+                s.cruise_speed.insert(track, speed);
                 tracing::info!(track, speed, "巡航设速");
             }
             CruiseOp::SetDwell { track, dwell } => {
                 s.cruise_tracks.entry(track).or_default();
+                s.cruise_dwell.insert(track, dwell);
                 tracing::info!(track, dwell, "巡航设停留");
             }
             CruiseOp::Start { track } => {
                 if track == 0 {
+                    s.active_cruise = None;
                     tracing::info!("巡航停止");
                 } else {
                     s.cruise_tracks.entry(track).or_default();
+                    s.active_cruise = Some(track);
+                    // 巡航与扫描互斥：同一套机械不能同时跑两个自主行为。
+                    s.active_scan = None;
                     tracing::info!(track, "巡航启动");
                 }
+            }
+        }
+    }
+
+    /// 应用自动扫描控制(表 A.10)。设边界只快照当前姿态，不移动镜头。
+    fn apply_scan_op(&self, op: gb28181_protocol::manscdp::ScanOp) {
+        use gb28181_protocol::manscdp::ScanOp;
+        let Ok(mut state) = self.control_state.lock() else {
+            return;
+        };
+        match op {
+            ScanOp::SetLeft { group } => {
+                let pose = state.pose;
+                let group_state = state.scan_groups.entry(group).or_default();
+                group_state.left = Some(pose);
+                tracing::info!(group, "扫描设左边界");
+            }
+            ScanOp::SetRight { group } => {
+                let pose = state.pose;
+                let group_state = state.scan_groups.entry(group).or_default();
+                group_state.right = Some(pose);
+                tracing::info!(group, "扫描设右边界");
+            }
+            ScanOp::SetSpeed { group, speed } => {
+                let group_state = state.scan_groups.entry(group).or_default();
+                group_state.speed = Some(speed);
+                tracing::info!(group, speed, "扫描设速度");
+            }
+            ScanOp::Start { group } => {
+                state.scan_groups.entry(group).or_default();
+                state.active_scan = Some(group);
+                // 扫描与巡航互斥。
+                state.active_cruise = None;
+                tracing::info!(group, "扫描启动");
             }
         }
     }
@@ -5405,7 +6018,8 @@ mod tests {
         assert!(xml.contains("<Expiration>7200</Expiration>"));
         assert!(xml.contains("<HeartBeatInterval>15</HeartBeatInterval>"));
         assert!(xml.contains("<HeartBeatCount>5</HeartBeatCount>"));
-        assert!(xml.contains("<PictureMask><Enabled>1</Enabled></PictureMask>"));
+        assert!(xml.contains("<On>1</On>"));
+        assert!(xml.contains("<SumNum>0</SumNum>"));
         assert!(xml.contains("<AlarmReport><Enabled>0</Enabled></AlarmReport>"));
 
         let snapshot = sim.runtime_snapshot();
@@ -5521,5 +6135,137 @@ mod tests {
         assert!(packets[0].contains("<SumNum>0</SumNum>"));
         assert!(!packets[0].contains("<Item>"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn 控制快照_预置位姿态_看守位_扫描与存储() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.set_local_pose(12.5, 20.0, 2.0, 0.6, 0.4);
+
+        let set = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID><PTZCmd>A50F0181010100</PTZCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&set).await.unwrap();
+        let snapshot = sim.control_snapshot();
+        let preset = snapshot
+            .presets
+            .iter()
+            .find(|item| item.id == 1)
+            .expect("预置位 1 应存在");
+        assert_eq!((preset.pan, preset.tilt, preset.zoom), (12.5, 20.0, 2.0));
+
+        let home = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>2</SN><DeviceID>d</DeviceID><HomePosition><Enabled>1</Enabled><ResetTime>15</ResetTime><PresetIndex>1</PresetIndex></HomePosition></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&home).await.unwrap();
+        let snapshot = sim.control_snapshot();
+        assert!(snapshot.home_enabled);
+        assert_eq!(snapshot.home_preset_index, Some(1));
+        assert_eq!(snapshot.home_reset_time, Some(15));
+
+        let left = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>3</SN><DeviceID>d</DeviceID><PTZCmd>A50F0189010100</PTZCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&left).await.unwrap();
+        let right = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>4</SN><DeviceID>d</DeviceID><PTZCmd>A50F0189010200</PTZCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&right).await.unwrap();
+        let speed = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>5</SN><DeviceID>d</DeviceID><PTZCmd>A50F018A01FF10</PTZCmd></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&speed).await.unwrap();
+        let snapshot = sim.control_snapshot();
+        let scan = snapshot.scan.iter().find(|item| item.id == 1).expect("扫描组 1 应存在");
+        assert_eq!(scan.left.map(|pose| pose.0), Some(12.5));
+        assert_eq!(scan.right.map(|pose| pose.0), Some(12.5));
+        assert_eq!(scan.speed, Some(511));
+
+        let target = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>6</SN><DeviceID>d</DeviceID><TargetTrack><Mode>Manual</Mode><TargetArea><Length>1000</Length><Width>500</Width><MidPointX>500</MidPointX><MidPointY>250</MidPointY><LengthX>200</LengthX><LengthY>100</LengthY></TargetArea></TargetTrack></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&target).await.unwrap();
+        let snapshot = sim.control_snapshot();
+        assert_eq!(snapshot.target_mode.as_deref(), Some("Manual"));
+        let target_box = snapshot.target_box.expect("手动跟踪应带框");
+        assert!((target_box.0 - 0.4).abs() < 0.001);
+        assert!((target_box.1 - 0.4).abs() < 0.001);
+        assert!((target_box.2 - 0.2).abs() < 0.001);
+        assert!((target_box.3 - 0.2).abs() < 0.001);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["target_mode"], "Manual");
+        assert!(json["target_box"].is_array());
+
+        let query = gb28181_protocol::manscdp::Query::parse(
+            "<Query><CmdType>SDCardStatus</CmdType><SN>6</SN><DeviceID>d</DeviceID></Query>",
+        )
+        .unwrap();
+        let _ = sim.handle_query(&query).unwrap();
+        let snapshot = sim.control_snapshot();
+        assert!(snapshot.storage_queried);
+        assert_eq!(snapshot.storage_cards.len(), 1);
+        assert_eq!(snapshot.storage_cards[0].capacity_mb, 32768);
+
+        let mask = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>7</SN><DeviceID>d</DeviceID><PictureMask><On>1</On><SumNum>2</SumNum><RegionList Num=\"2\"><Item><Seq>1</Seq><Point>20,30,50,60</Point></Item><Item><Seq>2</Seq><Point>100,100,200,200</Point></Item></RegionList></PictureMask></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&mask).await.unwrap();
+        let snapshot = sim.control_snapshot();
+        assert!(snapshot.mask_configured);
+        assert!(snapshot.mask_on);
+        assert_eq!(snapshot.mask_regions.len(), 2);
+        assert_eq!(
+            (
+                snapshot.mask_regions[0].seq,
+                snapshot.mask_regions[0].left,
+                snapshot.mask_regions[0].top,
+                snapshot.mask_regions[0].right,
+                snapshot.mask_regions[0].bottom
+            ),
+            (1, 20, 30, 50, 60)
+        );
+
+        let drag = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceControl</CmdType><SN>8</SN><DeviceID>d</DeviceID><DragZoomIn><Length>1000</Length><Width>500</Width><MidPointX>500</MidPointX><MidPointY>250</MidPointY><LengthX>200</LengthX><LengthY>100</LengthY></DragZoomIn></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&drag).await.unwrap();
+        let snapshot = sim.control_snapshot();
+        let drag_box = snapshot.drag_zoom_box.expect("拉框应记录框");
+        assert!((drag_box.0 - 0.4).abs() < 0.001);
+        assert!((drag_box.1 - 0.4).abs() < 0.001);
+        assert!((drag_box.2 - 0.2).abs() < 0.001);
+        assert!((drag_box.3 - 0.2).abs() < 0.001);
+
+        let osd = gb28181_protocol::manscdp::Control::parse(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>9</SN><DeviceID>d</DeviceID><OSDConfig><Length>1920</Length><Width>1080</Width><TimeX>12</TimeX><TimeY>8</TimeY><TimeEnable>1</TimeEnable><TextEnable>1</TextEnable><SumNum>1</SumNum><Item><Text>通道A</Text><X>20</X><Y>40</Y></Item></OSDConfig></Control>",
+        )
+        .unwrap();
+        sim.handle_control(&osd).await.unwrap();
+        let snapshot = sim.control_snapshot();
+        assert!(snapshot.osd_configured);
+        assert_eq!(snapshot.osd_length, 1920);
+        assert_eq!(snapshot.osd_width, 1080);
+        assert!(snapshot.osd_time_visible);
+        assert!(snapshot.osd_text_visible);
+        assert_eq!(snapshot.osd_items.len(), 1);
+        assert_eq!(snapshot.osd_items[0].text, "通道A");
+
+        let saved = sim.export_persisted_control_state();
+        let restored = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        restored.import_persisted_control_state(&saved);
+        let restored_snapshot = restored.control_snapshot();
+        assert!(restored_snapshot.presets.iter().any(|item| item.id == 1));
+        assert_eq!(restored_snapshot.home_preset_index, Some(1));
+        assert_eq!(restored_snapshot.home_reset_time, Some(15));
+        assert!(restored_snapshot.scan.iter().any(|item| item.id == 1));
+        assert_eq!(restored_snapshot.scan[0].speed, Some(511));
     }
 }

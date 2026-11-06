@@ -3,14 +3,14 @@
 // 不在左侧导航里，路由 /ptz-lab 手动访问。
 import { onUnmounted, ref } from "vue";
 import ThreePtzCamera from "../components/ThreePtzCamera.vue";
-import PtzDomeCamera from "../components/PtzDomeCamera.vue";
+import PtzCamera3D from "../components/PtzCamera3D.vue";
 
 const pan = ref(-36);
 const tilt = ref(14);
 const zoom = ref(3.2);
 const active = ref(false);
 const guarded = ref(false);
-const showFovCone = ref(false);
+const showFovCone = ref(true);
 const selfTest = ref(false);
 const cruising = ref(false);
 
@@ -100,20 +100,18 @@ onUnmounted(() => {
 
       <section class="stage-card new">
         <div class="stage-meta">
-          <div><span class="tag accent">新版 A</span><b>室外变速球机</b></div>
-          <small>铸铝底座 + 烟灰球罩 + 内部云台</small>
+          <div><span class="tag accent">新版 A</span><b>红外变速球机（立杆）</b></div>
+          <small>叉臂云台 + 视场锥 + 地面投影</small>
         </div>
         <div class="stage">
           <div class="stage-glow" />
-          <PtzDomeCamera
+          <PtzCamera3D
             :pan="pan"
             :tilt="tilt"
             :zoom="zoom"
             :active="active"
             :seeking="cruising"
-            :guarded="guarded"
-            :self-test="selfTest"
-            :show-fov-cone="showFovCone"
+            :show-fov="showFovCone"
           />
         </div>
       </section>

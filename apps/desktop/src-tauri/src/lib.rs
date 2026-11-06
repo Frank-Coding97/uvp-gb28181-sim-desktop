@@ -295,6 +295,53 @@ fn app_config_store(state: &AppState, app: &AppHandle) -> Result<ConfigStore, St
         .clone())
 }
 
+fn control_state_file(state: &AppState, app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app_data_root(state, app)?.join("device-control-state-v1.json"))
+}
+
+fn load_control_state(
+    sim: &gb28181_simulator::DeviceSimulator,
+    state: &AppState,
+    app: &AppHandle,
+) {
+    let Ok(path) = control_state_file(state, app) else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    match serde_json::from_str::<gb28181_simulator::PersistedControlState>(&raw) {
+        Ok(saved) => {
+            sim.import_persisted_control_state(&saved);
+            tracing::info!(target: "uvp::device", path = %path.display(), "已恢复设备控制状态");
+        }
+        Err(error) => {
+            tracing::warn!(target: "uvp::device", %error, path = %path.display(), "设备控制状态文件损坏，忽略");
+        }
+    }
+}
+
+fn save_control_state(
+    sim: &gb28181_simulator::DeviceSimulator,
+    state: &AppState,
+    app: &AppHandle,
+) {
+    let Ok(path) = control_state_file(state, app) else {
+        return;
+    };
+    let saved = sim.export_persisted_control_state();
+    match serde_json::to_vec_pretty(&saved) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(&path, bytes) {
+                tracing::warn!(target: "uvp::device", %error, path = %path.display(), "设备控制状态写入失败");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target: "uvp::device", %error, "设备控制状态序列化失败");
+        }
+    }
+}
+
 /// 把设备事件映射成 `device_state` 字符串,通过 Tauri 事件推给前端(状态灯)。
 struct StateEmitter {
     app: AppHandle,
@@ -411,10 +458,16 @@ impl DeviceObserver for StateEmitter {
                 );
                 return;
             }
-            DeviceEvent::PtzPresetCall { preset, name } => {
+            DeviceEvent::PtzPresetCall { preset, name, pose } => {
                 let _ = self.app.emit(
                     "ptz_preset",
-                    serde_json::json!({ "id": preset, "name": name }),
+                    serde_json::json!({
+                        "id": preset,
+                        "name": name,
+                        "pose": pose.map(|(pan, tilt, zoom)| serde_json::json!({
+                            "pan": pan, "tilt": tilt, "zoom": zoom,
+                        })),
+                    }),
                 );
                 return;
             }
@@ -1035,6 +1088,32 @@ async fn get_device_runtime_state(
     Ok(handle.sim.runtime_snapshot().into())
 }
 
+/// 模拟器中心一次性只读快照：姿态、预置位姿态、看守位、巡航、扫描、存储卡等。
+#[tauri::command]
+async fn get_device_control_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<gb28181_simulator::ControlSnapshot, String> {
+    let device = state.device.lock().await;
+    let handle = device.as_ref().ok_or("设备未启动")?;
+    Ok(handle.sim.control_snapshot())
+}
+
+/// 前端姿态积分结果回写；预置位设置/扫描边界以这份姿态为准。
+#[tauri::command]
+async fn report_ptz_pose(
+    pan: f32,
+    tilt: f32,
+    zoom: f32,
+    focus: f32,
+    iris: f32,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let device = state.device.lock().await;
+    let handle = device.as_ref().ok_or("设备未启动")?;
+    handle.sim.set_local_pose(pan, tilt, zoom, focus, iris);
+    Ok(())
+}
+
 /// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
 /// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
 #[tauri::command]
@@ -1636,6 +1715,7 @@ async fn start_device(
     if let Some(prepared) = prepared_file {
         sim.install_prepared_file(prepared)?;
     }
+    load_control_state(sim.as_ref(), &state, &app);
     sim.install_recording_store(app_recording_store(&state, &app)?);
     sim.set_preview_sink(Some(
         state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
@@ -1811,6 +1891,7 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
     let mut guard = state.device.lock().await;
     match guard.take() {
         Some(h) => {
+            save_control_state(h.sim.as_ref(), &state, &app);
             let recording_result = match h.sim.recording_service() {
                 Some(service) => service.stop().await.map_err(|error| error.to_string()),
                 None => Ok(None),
@@ -2578,6 +2659,8 @@ pub fn run() {
             get_stress_status,
             get_device_status,
             get_device_runtime_state,
+            get_device_control_state,
+            report_ptz_pose,
             load_catalog_template,
             get_catalog_tree,
             replace_catalog_tree,
@@ -2604,6 +2687,7 @@ pub fn run() {
                     let state = app.state::<AppState>();
                     let device = state.device.lock().await.take();
                     if let Some(handle) = device {
+                        save_control_state(handle.sim.as_ref(), &state, &app);
                         if let Some(service) = handle.sim.recording_service() {
                             let _ = service.stop().await;
                         }
