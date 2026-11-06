@@ -8,6 +8,7 @@ import {
   type CameraMode,
   type MediaProfile,
 } from "./media-profile.ts";
+import type { RecordPlanSettings } from "./record-plan.mjs";
 
 export type SignalingTransport = "UDP" | "TCP";
 /** 音频流(语音广播/对讲下行)传输方式,与信令传输相互独立。 */
@@ -85,6 +86,8 @@ export interface DesktopConfigV2 {
   osd?: OsdSettings;
   /** NTP 校时配置；旧后端缺省时按默认值（关闭）展示。 */
   time_sync?: TimeSyncSettings;
+  /** 定时录像周计划；旧后端缺省时按空计划（关闭）展示。 */
+  record_plan?: RecordPlanSettings;
 }
 
 /** 逻辑协议时钟的 NTP 配置，与 Rust 侧 `TimeSyncSettings` 一一对应。 */
@@ -472,6 +475,32 @@ export async function getClockState(): Promise<ClockState> {
 /** 手动执行一次 NTP 校时，成功后立即生效。 */
 export async function syncNtpNow(): Promise<NtpProbeResult> {
   return invoke<NtpProbeResult>("sync_ntp_now");
+}
+
+/** 定时录像计划（后端 config_store::RecordPlanSettings）。 */
+export interface RecordPlanState {
+  plan: RecordPlanSettings;
+  config_revision: number;
+  /** 调度任务是否在跑（设备未启动时为 false）。 */
+  scheduler_running: boolean;
+  /** 今天周几（0=周一）。 */
+  weekday: number;
+  weekday_label: string;
+  secs_of_day: number;
+  /** 此刻是否落在计划时段内（已计入总开关）。 */
+  in_window: boolean;
+  recording: { phase: string; active_id: string | null; error: string | null } | null;
+}
+
+export async function getRecordPlan(): Promise<RecordPlanState> {
+  return invoke<RecordPlanState>("get_record_plan");
+}
+
+export async function saveRecordPlan(
+  plan: RecordPlanSettings,
+  expectedRevision: number,
+): Promise<DesktopConfigV2> {
+  return invoke<DesktopConfigV2>("save_record_plan", { plan, expectedRevision });
 }
 
 /** 报警单（后端 gb28181_protocol::alarm::AlarmReport）。 */

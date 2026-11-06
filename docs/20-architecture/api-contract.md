@@ -73,6 +73,22 @@ interface ClockSnapshot {
 
 > 语义约束:NTP 生效期间 `sync_from_date_header` 只更新 `sip_offset_secs`,不覆盖 `offset_secs`;NTP 失败时回退到 `sip_offset_secs`,无可回退值时保持原偏移。
 
+### 录像计划命令(FR-48)
+
+| 命令 | 入参 | 返回 | 说明 |
+|---|---|---|---|
+| `get_record_plan` | — | `RecordPlanStateDto` | 计划 + `config_revision` + 调度运行态 + 当前周几/秒偏移 + 此刻是否在时段内 + 录像状态 |
+| `save_record_plan` | `{ plan: RecordPlanSettings, expectedRevision: number }` | `DesktopConfigV2` | 保存并归一化（排序/合并/裁剪）；运行中的设备立即生效，无需重启 |
+
+```ts
+interface RecordPlanSettings {
+  enabled: boolean;                 // 默认 false
+  week: { days: Array<{ segments: Array<{ start_sec: number; end_sec: number }> }> }; // 7 天，周一在前
+}
+```
+
+> 语义约束:时段左闭右开 `[start_sec, end_sec)`，相邻段自动合并，每天上限 8 段；`end_sec` 最大 86400。调度每 10s 判定一次，只停「计划自己起的」录像，手动录像不受影响；设备停止时先取消调度再收尾录像。`ConfigDownload/VideoRecordPlan` 的 `RecordPlanType` 随实际生效状态在 0（定时）/2（无定时计划）之间切换。
+
 ### 报警单命令(FR-9)
 
 | 命令 | 入参 | 返回 | 说明 |

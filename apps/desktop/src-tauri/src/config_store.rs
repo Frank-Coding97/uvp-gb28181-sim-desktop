@@ -139,6 +139,21 @@ impl ConfigStore {
         self.save(&current)
     }
 
+    pub fn save_record_plan(
+        &self,
+        plan: RecordPlanSettings,
+        expected_revision: u64,
+    ) -> Result<DesktopConfigV2, String> {
+        let plan = plan.normalized();
+        plan.validate()?;
+        let mut current = self.load()?;
+        if current.config_revision != expected_revision {
+            return Err("配置版本冲突，请重新读取后保存".into());
+        }
+        current.record_plan = plan;
+        self.save(&current)
+    }
+
     fn write_config(&self, config: &DesktopConfigV2) -> Result<(), String> {
         config.validate()?;
         let bytes = serde_json::to_vec_pretty(config)
@@ -264,6 +279,9 @@ pub struct DesktopConfigV2 {
     /// 本地 OSD 水印样式；旧配置文件缺省时取移动端一致的默认值。
     #[serde(default)]
     pub osd: OsdSettings,
+    /// 定时录像的周计划；缺省=关闭（不改变既有设备行为）。
+    #[serde(default)]
+    pub record_plan: RecordPlanSettings,
     /// 逻辑协议时钟的 NTP 校时配置；默认关闭，按 JSON 缺失字段补默认值。
     #[serde(default)]
     pub time_sync: TimeSyncSettings,
@@ -273,6 +291,35 @@ pub struct DesktopConfigV2 {
 ///
 /// 与移动端 `SimConfig.timeSync` 同语义：**默认关闭**，关闭或查询失败时使用
 /// 注册 200 OK 的 SIP Date。`refresh_interval_secs` 是两次查询之间的间隔。
+/// 定时录像设置（周计划 + 总开关）。
+///
+/// 默认关闭：旧配置升级上来不能突然开始自动录像 —— 那会在用户没预期的情况下
+/// 占满磁盘，也会让"为什么多出录像文件"变成一个查不清的问题。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RecordPlanSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub week: record_plan::WeekPlan,
+}
+
+impl RecordPlanSettings {
+    /// 补齐 7 天并合并相邻/重叠段。
+    pub fn normalized(mut self) -> Self {
+        self.week = self.week.normalized();
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.week.validate()
+    }
+
+    /// 计划里是否存在任何时段（空计划即使 enabled 也不会有动作）。
+    pub fn has_segments(&self) -> bool {
+        self.week.total_segments() > 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimeSyncSettings {
     #[serde(default)]
@@ -359,6 +406,7 @@ impl DesktopConfigV1 {
             network: self.network,
             catalog_tree: self.catalog_tree,
             osd: OsdSettings::default(),
+            record_plan: RecordPlanSettings::default(),
             time_sync: TimeSyncSettings::default(),
         }
     }
@@ -566,6 +614,7 @@ impl Default for DesktopConfigV2 {
             },
             catalog_tree: Vec::new(),
             osd: OsdSettings::default(),
+            record_plan: RecordPlanSettings::default(),
             time_sync: TimeSyncSettings::default(),
         }
     }
@@ -635,6 +684,7 @@ impl DesktopConfigV2 {
         }
         self.media.validate()?;
         self.osd.validate()?;
+        self.record_plan.validate()?;
         self.time_sync.validate()?;
         if self.network.bind_mode == BindMode::Specific
             && self.network.bind_address.parse::<IpAddr>().is_err()

@@ -2093,6 +2093,19 @@ impl DeviceSimulator {
         self.mark_runtime_change("alarm_reset");
     }
 
+    /// 把定时录像计划开关同步到 ConfigDownload 回读。
+    ///
+    /// 平台查 `VideoRecordPlan` 时看到的是设备**实际在执行**的计划类型：
+    /// 计划已关闭却仍回 0（定时录像），平台会以为设备还在按表录像。
+    /// 关闭时回 2（手动录像）—— 这是"当前没有生效的定时计划"最接近的真话。
+    pub fn set_record_plan_enabled(&self, enabled: bool) {
+        if let Ok(mut response) = self.runtime_config.lock() {
+            if let Some(plan) = response.video_record_plan.as_mut() {
+                plan.record_plan_type = if enabled { 0 } else { 2 };
+            }
+        }
+    }
+
     /// 平台是否已建立 Event:Alarm 订阅对话。
     ///
     /// 决定报警走订阅内 NOTIFY 还是独立 MESSAGE；桌面端把这条信息记进报警历史，

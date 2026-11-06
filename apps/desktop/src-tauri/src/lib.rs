@@ -29,7 +29,7 @@ mod preview_channel;
 mod preview_manager;
 use config_store::{
     BindMode, CatalogNodeConfig, ConfigStore, DesktopConfigV2, EffectiveDeviceConfig,
-    StartDeviceInput, TimeSyncSettings,
+    RecordPlanSettings, StartDeviceInput, TimeSyncSettings,
 };
 use preview_channel::DesktopPreviewBus;
 use preview_manager::{PreviewEventSink, PreviewForwardTarget, PreviewManager};
@@ -72,6 +72,11 @@ struct AppState {
     preview_manager: Arc<PreviewManager>,
     /// NTP 周期刷新任务（设备运行期才启动）。
     ntp: Mutex<NtpRuntime>,
+    /// 运行期录像计划。与配置文件同源，但调度任务每 10s 要读一次，
+    /// 走内存共享而不是磁盘读，避免把 IO 抖动带进起停判断。
+    record_plan: Arc<tokio::sync::RwLock<RecordPlanSettings>>,
+    /// 定时录像调度任务（设备运行期才启动）。
+    plan_scheduler: Mutex<NtpRuntime>,
 }
 
 /// NTP 刷新任务的运行态。
@@ -208,6 +213,37 @@ impl AppState {
         self.ntp.lock().await.running.load(Ordering::Acquire)
     }
 
+    /// 启动定时录像调度任务（重复启动会先取消旧任务）。
+    async fn start_plan_scheduler(&self, sim: Arc<DeviceSimulator>) {
+        let mut runtime = self.plan_scheduler.lock().await;
+        if let Some(cancel) = runtime.cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        // 每次启动换新的运行标志：旧任务退出时不能把新任务标成"未运行"。
+        let running = Arc::new(AtomicBool::new(true));
+        runtime.cancel = Some(Arc::clone(&cancel));
+        runtime.running = Arc::clone(&running);
+        let plan = Arc::clone(&self.record_plan);
+        tokio::spawn(record_plan_loop(sim, plan, cancel, running));
+    }
+
+    async fn stop_plan_scheduler(&self) {
+        let mut runtime = self.plan_scheduler.lock().await;
+        if let Some(cancel) = runtime.cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        runtime.running.store(false, Ordering::Release);
+    }
+
+    async fn plan_scheduler_running(&self) -> bool {
+        self.plan_scheduler
+            .lock()
+            .await
+            .running
+            .load(Ordering::Acquire)
+    }
+
     fn begin_device_start(&self) -> Result<DeviceStartup<'_>, String> {
         let mut pending = self
             .media_preparation
@@ -271,6 +307,8 @@ impl AppState {
             preview_bus,
             preview_manager,
             ntp: Mutex::new(NtpRuntime::new()),
+            record_plan: Arc::new(tokio::sync::RwLock::new(RecordPlanSettings::default())),
+            plan_scheduler: Mutex::new(NtpRuntime::new()),
         }
     }
 }
@@ -279,6 +317,85 @@ impl AppState {
 ///
 /// 失败不终止循环：NTP 服务器通常是内网地址，偶发超时不该让校时永久停摆；
 /// 每次失败都会回退到 SIP Date 并把原因写进 [`common::clock`]，界面可查。
+/// 计划是否真的会生效：开关打开且至少有一段时间。
+///
+/// 只开开关不画时段等于不生效；这种情况按"没有定时计划"处理，避免平台侧看到
+/// 一个永远不会触发的定时计划类型。
+fn plan_effective(plan: &RecordPlanSettings) -> bool {
+    plan.enabled && plan.has_segments()
+}
+
+/// 定时录像调度：每 10 秒判断"此刻是否落在计划时段内"，据此起停录像。
+///
+/// 10 秒而不是 1 秒：计划粒度是 30 分钟格（可精确到秒），10 秒的判定延迟远小于
+/// 误差容忍，又不会让一台设备在后台每秒抢一次锁。
+async fn record_plan_loop(
+    sim: Arc<DeviceSimulator>,
+    plan: Arc<tokio::sync::RwLock<RecordPlanSettings>>,
+    cancel: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+) {
+    // 只有本任务会写这个标记：用来区分「计划起的录像」和「用户手动起的录像」。
+    // 时段结束时不能把用户手动录的那段一起停掉。
+    let mut plan_owned = false;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        let settings = plan.read().await.clone();
+        let (weekday, secs) = record_plan::weekday_and_secs(common::clock::synced_epoch_secs());
+        let in_window = settings.enabled && settings.week.should_record(weekday, secs);
+        let phase = sim.recording_service().map(|service| service.state().phase);
+        match phase {
+            Some(RecordingPhase::Idle) if in_window => {
+                if !plan_owned {
+                    match sim
+                        .start_recording(RecordingKind::Time, RecordingSource::Local)
+                        .await
+                    {
+                        Ok(state) => {
+                            plan_owned = true;
+                            tracing::info!(
+                                target: "uvp::record_plan",
+                                weekday,
+                                secs,
+                                active_id = state.active_id.as_deref().unwrap_or(""),
+                                "进入计划时段，开始定时录像"
+                            );
+                        }
+                        Err(error) => {
+                            // 起不来通常是媒体未就绪；下一轮再试，不把任务打死。
+                            tracing::warn!(target: "uvp::record_plan", %error, "定时录像启动失败，等待下一轮重试");
+                        }
+                    }
+                }
+            }
+            Some(RecordingPhase::Recording) if !in_window && plan_owned => {
+                match sim.stop_recording().await {
+                    Ok(entry) => {
+                        plan_owned = false;
+                        tracing::info!(
+                            target: "uvp::record_plan",
+                            weekday,
+                            secs,
+                            entry = entry.as_ref().map(|item| item.id.as_str()).unwrap_or(""),
+                            "计划时段结束，已停止定时录像"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "uvp::record_plan", %error, "停止定时录像失败");
+                    }
+                }
+            }
+            // 录像被外部停掉（用户手动停止/失败收尾）后，计划拥有权随之释放。
+            Some(RecordingPhase::Idle) => plan_owned = false,
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    running.store(false, Ordering::Release);
+}
+
 async fn ntp_refresh_loop(
     settings: TimeSyncSettings,
     cancel: Arc<AtomicBool>,
@@ -1133,6 +1250,89 @@ async fn sync_ntp_now(
     })
 }
 
+/// 录像计划运行态（界面用来显示"此刻是否在计划时段内"）。
+#[derive(Debug, Serialize)]
+struct RecordPlanStateDto {
+    plan: RecordPlanSettings,
+    config_revision: u64,
+    scheduler_running: bool,
+    /// 今天周几（0=周一）。
+    weekday: usize,
+    weekday_label: String,
+    /// 当前一天内秒偏移。
+    secs_of_day: u32,
+    /// 此刻是否落在计划时段内（已计入总开关）。
+    in_window: bool,
+    /// 当前录像状态；设备未启动时为 None。
+    recording: Option<RecordingState>,
+}
+
+#[tauri::command]
+async fn get_record_plan(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<RecordPlanStateDto, String> {
+    let store = app_config_store(&state, &app)?;
+    let (plan, config_revision) = {
+        let _io = state.config_io.lock().await;
+        tokio::task::spawn_blocking(move || {
+            store
+                .load()
+                .map(|config| (config.record_plan, config.config_revision))
+        })
+        .await
+        .map_err(|error| format!("读取配置任务异常: {error}"))??
+    };
+    let (weekday, secs_of_day) =
+        record_plan::weekday_and_secs(common::clock::synced_epoch_secs());
+    let in_window = plan.enabled && plan.week.should_record(weekday, secs_of_day);
+    // 运行态从设备句柄取：配置文件说"计划开着"不代表调度任务真的在跑。
+    let (recording, scheduler_running) = {
+        let guard = state.device.lock().await;
+        (
+            guard
+                .as_ref()
+                .and_then(|handle| handle.sim.recording_service())
+                .map(|service| service.state()),
+            state.plan_scheduler_running().await,
+        )
+    };
+    Ok(RecordPlanStateDto {
+        plan,
+        config_revision,
+        scheduler_running,
+        weekday,
+        weekday_label: record_plan::weekday_label(weekday).to_string(),
+        secs_of_day,
+        in_window,
+        recording,
+    })
+}
+
+#[tauri::command]
+async fn save_record_plan(
+    plan: RecordPlanSettings,
+    expected_revision: u64,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopConfigV2, String> {
+    let store = app_config_store(&state, &app)?;
+    let saved = {
+        let _io = state.config_io.lock().await;
+        tokio::task::spawn_blocking(move || store.save_record_plan(plan, expected_revision))
+            .await
+            .map_err(|error| format!("保存录像计划任务异常: {error}"))??
+    };
+    // 调度任务每轮读共享状态，保存后立即生效，不用等设备重启。
+    *state.record_plan.write().await = saved.record_plan.clone();
+    let effective = plan_effective(&saved.record_plan);
+    let guard = state.device.lock().await;
+    if let Some(handle) = guard.as_ref() {
+        handle.sim.set_record_plan_enabled(effective);
+    }
+    Ok(saved)
+}
+
 /// OSD 能否烧进码流：FFmpeg 带 drawtext/drawbox，且有中文字体。
 #[derive(serde::Serialize)]
 struct OsdCapability {
@@ -1888,6 +2088,8 @@ async fn start_device(
     app: AppHandle,
 ) -> Result<String, String> {
     let startup = state.begin_device_start()?;
+    // 设备句柄建好后再把 sim 交给调度任务（handle 会拿走所有权）。
+    let mut sim_for_plan: Option<Arc<DeviceSimulator>> = None;
     let mut guard = state.device.lock().await;
     if state.shutting_down.load(Ordering::Acquire) {
         return Err("应用正在退出".into());
@@ -2195,6 +2397,8 @@ async fn start_device(
                 .await;
         });
 
+        // 调度任务要长期持有 sim，而 handle 会拿走所有权，故先克隆一份。
+        sim_for_plan = Some(Arc::clone(&sim));
         *guard = Some(DeviceHandle {
             sim,
             transport,
@@ -2206,6 +2410,15 @@ async fn start_device(
     })?;
     if persisted.time_sync.ntp_enabled {
         state.restart_ntp_refresh(persisted.time_sync.clone()).await;
+    }
+    // 计划以配置文件为准：设备启动时把持久化计划灌进共享状态，避免调度任务
+    // 读到上一个设备实例留下的旧值。
+    *state.record_plan.write().await = persisted.record_plan.clone();
+    if let Some(sim) = sim_for_plan {
+        // 先对齐 ConfigDownload 回读，再启动调度：平台在任何时刻查到到的都应是
+        // 与设备实际行为一致的计划类型。
+        sim.set_record_plan_enabled(plan_effective(&persisted.record_plan));
+        state.start_plan_scheduler(sim).await;
     }
     Ok("设备已启动".into())
 }
@@ -2329,6 +2542,8 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
     // 设备停止后不再有"设备时间"的维护者，先停 NTP 周期任务；偏移保留，
     // 这样平台侧看到的最后一次时间不会突然跳回本机时钟。
     state.stop_ntp_refresh().await;
+    // 先取消调度，再收尾录像：否则任务可能在收尾之后又把录像起起来。
+    state.stop_plan_scheduler().await;
     match guard.take() {
         Some(h) => {
             save_control_state(h.sim.as_ref(), &state, &app);
@@ -3187,6 +3402,8 @@ pub fn run() {
             get_clock_state,
             save_time_sync,
             sync_ntp_now,
+            get_record_plan,
+            save_record_plan,
             report_alarm,
             preview_alarm_xml,
             list_alarm_history,

@@ -12,6 +12,7 @@ members = [
     "crates/sip-core",
     "crates/gb28181-protocol",
     "crates/media-rtp",
+    "crates/record-plan",
     "crates/gb28181-simulator",
     "crates/scenario",
     "crates/stress-engine",
