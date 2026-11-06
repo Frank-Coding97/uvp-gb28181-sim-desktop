@@ -17,7 +17,7 @@ pub use device::{
     CatalogQueryActivity, ChannelConfig, ControlSnapshot, CruiseSnapshot, DeviceConfig,
     DeviceInfo, DeviceRuntimeSnapshot, DeviceSimulator, DeviceState, MaskRegionSnapshot,
     OsdItemSnapshot, PersistedControlState, PersistedCruise, PersistedPreset, PersistedScan,
-    PresetSnapshot, ScanSnapshot, StorageCardSnapshot,
+    PresetSnapshot, ScanSnapshot, StorageCardSnapshot, SubscriptionSnapshot,
 };
 pub use recording::{
     RecordingEntry, RecordingKind, RecordingPhase, RecordingQuery, RecordingService,

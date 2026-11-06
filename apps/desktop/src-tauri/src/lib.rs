@@ -1098,6 +1098,16 @@ async fn get_device_control_state(
     Ok(handle.sim.control_snapshot())
 }
 
+/// 查询四类订阅的当前状态；页面刷新/重新进入时补一次基线。
+#[tauri::command]
+async fn get_device_subscriptions(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<gb28181_simulator::SubscriptionSnapshot>, String> {
+    let device = state.device.lock().await;
+    let handle = device.as_ref().ok_or("设备未启动")?;
+    Ok(handle.sim.subscription_snapshot().await)
+}
+
 /// 前端姿态积分结果回写；预置位设置/扫描边界以这份姿态为准。
 #[tauri::command]
 async fn report_ptz_pose(
@@ -2660,6 +2670,7 @@ pub fn run() {
             get_device_status,
             get_device_runtime_state,
             get_device_control_state,
+            get_device_subscriptions,
             report_ptz_pose,
             load_catalog_template,
             get_catalog_tree,

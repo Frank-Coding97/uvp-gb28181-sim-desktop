@@ -287,6 +287,10 @@ pub struct DeviceSimulator {
     ptz_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
     /// PTZ 精准状态已上报次数(供前端「活跃订阅面板」显示)。
     ptz_notify_count: std::sync::atomic::AtomicU32,
+    /// 报警/目录/位置订阅已上报次数(供前端「活跃订阅面板」显示)。
+    alarm_notify_count: std::sync::atomic::AtomicU32,
+    catalog_notify_count: std::sync::atomic::AtomicU32,
+    position_notify_count: std::sync::atomic::AtomicU32,
     /// 预置位表(编号 → 名称)。PTZ 预置位设置/删除命令更新,PresetQuery 返回。
     presets: std::sync::Mutex<std::collections::BTreeMap<u8, String>>,
     /// 预置位姿态表。与名称表分开保存，PresetQuery 协议只回名称，UI 快照需要姿态。
@@ -521,6 +525,14 @@ pub struct ControlSnapshot {
     pub drag_zoom_box: Option<(f32, f32, f32, f32)>,
 }
 
+/// 一条活跃订阅的只读快照（供 UI 订阅卡片）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SubscriptionSnapshot {
+    pub kind: String,
+    pub active: bool,
+    pub notify_count: u32,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeChange {
     kind: String,
@@ -700,6 +712,9 @@ impl DeviceSimulator {
             catalog_dialog: tokio::sync::Mutex::new(None),
             ptz_dialog: tokio::sync::Mutex::new(None),
             ptz_notify_count: std::sync::atomic::AtomicU32::new(0),
+            alarm_notify_count: std::sync::atomic::AtomicU32::new(0),
+            catalog_notify_count: std::sync::atomic::AtomicU32::new(0),
+            position_notify_count: std::sync::atomic::AtomicU32::new(0),
             presets: std::sync::Mutex::new(default_presets()),
             preset_poses: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             control_state: std::sync::Mutex::new(ControlState::default()),
@@ -1782,6 +1797,58 @@ impl DeviceSimulator {
         Ok(resp_status)
     }
 
+    /// 订阅状态变化统一出口：前端「活跃订阅面板」靠它点亮四类订阅。
+    fn emit_subscription(&self, kind: &str, active: bool, notify_count: u32) {
+        self.observer
+            .on_event(common::DeviceEvent::SubscriptionChanged {
+                kind: kind.into(),
+                active,
+                notify_count,
+            });
+    }
+
+    /// 查询四类订阅的当前状态（页面刷新/重新进入时补一次基线，避免只依赖事件）。
+    pub async fn subscription_snapshot(&self) -> Vec<SubscriptionSnapshot> {
+        let mobile_active = self
+            .subscriptions
+            .lock()
+            .await
+            .contains_key("MobilePosition");
+        let alarm_active = self.alarm_dialog.lock().await.is_some();
+        let catalog_active = self.catalog_dialog.lock().await.is_some();
+        let ptz_active = self.ptz_dialog.lock().await.is_some();
+        vec![
+            SubscriptionSnapshot {
+                kind: "MobilePosition".into(),
+                active: mobile_active,
+                notify_count: self
+                    .position_notify_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+            SubscriptionSnapshot {
+                kind: "Alarm".into(),
+                active: alarm_active,
+                notify_count: self
+                    .alarm_notify_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+            SubscriptionSnapshot {
+                kind: "Catalog".into(),
+                active: catalog_active,
+                notify_count: self
+                    .catalog_notify_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+            SubscriptionSnapshot {
+                kind: "PTZPosition".into(),
+                active: ptz_active,
+                notify_count: self
+                    .ptz_notify_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        ]
+    }
+
     /// 主动上报一条视频侦测报警(FR-9)。设备 → 平台 MESSAGE + Alarm Notify XML。
     /// `description` 为报警描述;返回平台响应状态码。
     pub async fn report_alarm(
@@ -1827,7 +1894,13 @@ impl DeviceSimulator {
             )
             .await;
             transport.unregister(&dialog.call_id);
-            return Ok(result?.status);
+            let status = result?.status;
+            let n = self
+                .alarm_notify_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            self.emit_subscription("Alarm", true, n);
+            return Ok(status);
         }
 
         self.send_message_xml(transport, local_host, local_port, &xml)
@@ -1926,8 +1999,13 @@ impl DeviceSimulator {
             CATALOG_UDP_BODY_MAX_BYTES,
             CATALOG_UDP_PAYLOAD_MAX_BYTES,
         )?;
-        self.send_catalog_notify_pages(transport, dst, dialog, pages)
-            .await
+        let status = self.send_catalog_notify_pages(transport, dst, dialog, pages).await?;
+        let n = self
+            .catalog_notify_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.emit_subscription("Catalog", true, n);
+        Ok(status)
     }
 
     /// 目录变更后推送增量 NOTIFY(FR-32/34)。
@@ -1962,6 +2040,11 @@ impl DeviceSimulator {
         )?;
         self.send_catalog_notify_pages(transport, dst, &dialog, pages)
             .await?;
+        let n = self
+            .catalog_notify_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.emit_subscription("Catalog", true, n);
         Ok(())
     }
 
@@ -2035,11 +2118,20 @@ impl DeviceSimulator {
                     _ = &mut stop_rx => break, // 订阅被替换/取消。
                     _ = ticker.tick() => {
                         let (lon, lat) = sim.position.lock().map(|p| *p).unwrap_or((0.0, 0.0));
-                        if let Err(e) = sim
+                        match sim
                             .report_position(&tp, &local_host, local_port, lon, lat)
                             .await
                         {
-                            tracing::warn!(error=%e, "位置订阅周期上报失败");
+                            Ok(_) => {
+                                let n = sim
+                                    .position_notify_count
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                sim.emit_subscription("MobilePosition", true, n);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error=%e, "位置订阅周期上报失败");
+                            }
                         }
                     }
                 }
@@ -2055,6 +2147,9 @@ impl DeviceSimulator {
                 stop_tx,
             },
         );
+        self.position_notify_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.emit_subscription("MobilePosition", true, 0);
         tracing::info!(interval = secs, "移动位置订阅已建立,开始周期上报");
     }
 
@@ -2191,6 +2286,17 @@ impl DeviceSimulator {
         // PTZ 事件订阅同样随设备下线失效:清对话后
         // notify_ptz_if_pose_changed 会静默跳过,不再向上报(平台侧订阅也会被标 expired)。
         *self.ptz_dialog.lock().await = None;
+        self.ptz_notify_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.alarm_notify_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.catalog_notify_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.position_notify_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        for kind in ["MobilePosition", "Alarm", "Catalog", "PTZPosition"] {
+            self.emit_subscription(kind, false, 0);
+        }
     }
 
     /// 处理一条入站请求:OPTIONS 简单回 200;MESSAGE 解析 XML 查询并应答;
@@ -2365,6 +2471,33 @@ impl DeviceSimulator {
                                     .and_then(|s| s.trim().parse().ok())
                                     .unwrap_or(3600),
                             };
+                            // Expires: 0 是退订：清掉对应对话/周期任务并通知 UI。
+                            if dialog.expires == 0 {
+                                match query.cmd_type.as_str() {
+                                    "MobilePosition" => {
+                                        let sub = self
+                                            .subscriptions
+                                            .lock()
+                                            .await
+                                            .remove("MobilePosition");
+                                        if let Some(sub) = sub {
+                                            let _ = sub.stop_tx.send(());
+                                        }
+                                    }
+                                    "Alarm" => {
+                                        *self.alarm_dialog.lock().await = None;
+                                    }
+                                    "Catalog" => {
+                                        *self.catalog_dialog.lock().await = None;
+                                    }
+                                    "PTZPosition" => {
+                                        *self.ptz_dialog.lock().await = None;
+                                    }
+                                    _ => {}
+                                }
+                                self.emit_subscription(&query.cmd_type, false, 0);
+                                return Ok(true);
+                            }
                             match query.cmd_type.as_str() {
                                 // 移动位置订阅:启动周期位置 NOTIFY(独立 MESSAGE 路径)。
                                 "MobilePosition" => {
@@ -2375,6 +2508,9 @@ impl DeviceSimulator {
                                 "Catalog" => {
                                     *self.catalog_dialog.lock().await =
                                         Some((dialog.clone(), incoming.from));
+                                    self.catalog_notify_count
+                                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                                    self.emit_subscription("Catalog", true, 0);
                                     let sim = Arc::clone(self);
                                     let tp = Arc::clone(transport);
                                     let sn = query.sn;
@@ -2391,6 +2527,9 @@ impl DeviceSimulator {
                                 // 报警订阅:记录对话,后续 report_alarm 走对话内 NOTIFY。
                                 "Alarm" => {
                                     *self.alarm_dialog.lock().await = Some((dialog, incoming.from));
+                                    self.alarm_notify_count
+                                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                                    self.emit_subscription("Alarm", true, 0);
                                 }
                                 // PTZ 精准位置事件订阅(GB28181-2022 §9.11.1/9.11.2):
                                 // 事件型 —— 只登记订阅对话,姿态变化时发对话内 NOTIFY,不周期上报。
@@ -5576,6 +5715,12 @@ mod tests {
             .lock()
             .await
             .contains_key("MobilePosition"));
+        let snapshot = sim.subscription_snapshot().await;
+        let mobile = snapshot
+            .iter()
+            .find(|item| item.kind == "MobilePosition")
+            .expect("位置订阅快照应存在");
+        assert!(mobile.active);
 
         // 停止订阅,任务应退出(不再 panic/泄漏)。
         sim.stop_subscriptions().await;
@@ -5642,6 +5787,12 @@ mod tests {
         assert_eq!(dialog.expires, 3600);
         assert!(dialog.remote_from.contains("tag=plat7"));
         assert_eq!(dst, platform_addr);
+        let snapshot = sim.subscription_snapshot().await;
+        let alarm = snapshot
+            .iter()
+            .find(|item| item.kind == "Alarm")
+            .expect("报警订阅快照应存在");
+        assert!(alarm.active);
 
         // 下线清理:对话应被清除。
         sim.stop_subscriptions().await;
@@ -5737,6 +5888,12 @@ mod tests {
         assert_eq!(dialog.expires, 3600);
         assert!(dialog.remote_from.contains("tag=plat9"));
         assert_eq!(dst, platform_addr);
+        let snapshot = sim.subscription_snapshot().await;
+        let ptz = snapshot
+            .iter()
+            .find(|item| item.kind == "PTZPosition")
+            .expect("PTZ 订阅快照应存在");
+        assert!(ptz.active);
 
         // (2) 事件型订阅建立后补推一次当前姿态:必须是 NOTIFY + <Notify> 根元素,
         //     而不是旧的 MESSAGE 周期上报(后者会被平台当查询应答丢弃)。

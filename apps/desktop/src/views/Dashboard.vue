@@ -170,6 +170,18 @@ function resetSubscriptions() {
   }
 }
 
+async function refreshSubscriptions() {
+  if (!isTauri) return;
+  try {
+    const states = await invoke<SubscriptionState[]>("get_device_subscriptions");
+    for (const state of states) {
+      if (state.kind in subscriptions) subscriptions[state.kind] = state;
+    }
+  } catch {
+    // 设备未启动时后端会拒绝；保持未订阅状态即可。
+  }
+}
+
 const draft = reactive({
   name: "",
   server_host: "",
@@ -701,6 +713,8 @@ watch(deviceLive, (running) => {
     previewState.value = "idle";
     clearPreviewStats();
     resetSubscriptions();
+  } else {
+    void refreshSubscriptions();
   }
 });
 
@@ -739,6 +753,7 @@ onMounted(async () => {
   });
   const [runtime] = await Promise.all([reconcile(), refreshSources(false)]);
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
+  await refreshSubscriptions();
   await refreshRecordingState();
   recordingRefreshTimer = window.setInterval(() => void refreshRecordingState(), 1000);
   await startPreview();
@@ -748,6 +763,7 @@ onActivated(async () => {
   previewPageActive = true;
   const runtime = await reconcile();
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
+  await refreshSubscriptions();
   await refreshRecordingState();
   await startPreview();
 });
