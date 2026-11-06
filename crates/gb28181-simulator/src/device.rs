@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use common::{DeviceId, Error, Result, Transport};
+use gb28181_protocol::alarm::AlarmReport;
 use gb28181_protocol::manscdp::Keepalive;
 use serde::{Deserialize, Serialize};
 use sip_core::{authorization, Challenge, SipTransport};
@@ -2021,17 +2022,28 @@ impl DeviceSimulator {
         local_port: u16,
         description: &str,
     ) -> Result<u16> {
+        let report = AlarmReport::video(description);
+        self.report_alarm_report(transport, local_host, local_port, &report)
+            .await
+    }
+
+    /// 按报警单上报(类型/等级/方式/经纬度/描述/时间偏移均可指定)。
+    ///
+    /// 与 [`Self::report_alarm`] 共用同一条上报路径:订阅对话存在时走 NOTIFY,
+    /// 否则退化为独立 MESSAGE —— 这条分支决定了平台能否在 Event:Alarm 订阅里
+    /// 收到结构化报警,两条路径不能分叉。
+    pub async fn report_alarm_report(
+        &self,
+        transport: &Arc<SipTransport>,
+        local_host: &str,
+        local_port: u16,
+        report: &AlarmReport,
+    ) -> Result<u16> {
         // 报警是设备本地已经发生的事实，不取决于平台是否成功应答通知。
         self.mark_alarm_active();
         let sn = self.next_cseq();
-        // 报警时间用校时后的 ISO8601(与平台时间对齐,见 common::clock)。
-        let time = common::clock::synced_iso8601();
-        let alarm = gb28181_protocol::manscdp::AlarmNotify::video(
-            self.config.device_id.as_str(),
-            sn,
-            time,
-            description,
-        );
+        // 时间戳由协议层统一按校时后的挂钟生成("N 分钟前"只挪时间戳,不延迟发送)。
+        let alarm = report.to_notify(self.config.device_id.as_str(), sn)?;
         let xml = alarm.to_xml()?;
 
         // 若存在报警订阅对话:在对话内以 SIP NOTIFY 上报(GB28181 订阅语义);
@@ -2068,6 +2080,25 @@ impl DeviceSimulator {
 
         self.send_message_xml(transport, local_host, local_port, &xml)
             .await
+    }
+
+    /// 本机复位报警:清掉 `alarming` 运行态标记。
+    ///
+    /// 只改设备本地状态,不向平台发任何报文 —— 平台侧的报警单由平台自己闭合,
+    /// 设备能做的是让下一次 DeviceStatus 查询回到「无报警」。
+    pub fn reset_alarm(&self) {
+        if let Ok(mut state) = self.control_state.lock() {
+            state.alarming = false;
+        }
+        self.mark_runtime_change("alarm_reset");
+    }
+
+    /// 平台是否已建立 Event:Alarm 订阅对话。
+    ///
+    /// 决定报警走订阅内 NOTIFY 还是独立 MESSAGE；桌面端把这条信息记进报警历史，
+    /// 排查"平台没收到报警"时先看它比翻报文快。
+    pub async fn has_alarm_subscription(&self) -> bool {
+        self.alarm_dialog.lock().await.is_some()
     }
 
     /// 主动上报实时视音频回传通知(VideoUploadNotify,GB28181-2022 A.2.5.8)。

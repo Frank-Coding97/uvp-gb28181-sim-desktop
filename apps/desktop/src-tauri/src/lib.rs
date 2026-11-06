@@ -45,6 +45,10 @@ struct AppState {
     recording_store: OnceLock<Arc<RecordingStore>>,
     /// 本地抓拍图库（预览帧旁路落盘）。
     snapshot_store: OnceLock<Arc<media_rtp::snapshot::SnapshotStore>>,
+    /// 报警历史（最近 50 条，成功与失败都记）。
+    alarm_history: Mutex<std::collections::VecDeque<AlarmRecord>>,
+    /// 报警记录单调递增 ID，避免同一毫秒的多条记录排序不稳定。
+    next_alarm_id: AtomicU64,
     /// 配置文件读写串行化，避免并发保存与读取看到半次操作。
     config_io: Mutex<()>,
     /// Independent cancellation path: preparation holds the device startup lock.
@@ -104,6 +108,32 @@ struct DeviceHandle {
     local_port: u16,
     stop_tx: tokio::sync::oneshot::Sender<()>,
     effective_config: EffectiveDeviceConfig,
+}
+
+/// 报警历史上限。50 条够覆盖一次联调会话，又不会让页面滚动失去意义。
+const ALARM_HISTORY_LIMIT: usize = 50;
+
+/// 一条报警上报记录（成功与失败都记）。
+#[derive(Debug, Clone, Serialize)]
+struct AlarmRecord {
+    id: u64,
+    device_id: String,
+    priority: u8,
+    method: u8,
+    alarm_type: Option<u32>,
+    description: Option<String>,
+    longitude: Option<f64>,
+    latitude: Option<f64>,
+    /// 报文里实际写入的报警时间（可能因"N 分钟前"而早于 `captured_at_ms`）。
+    alarm_time: String,
+    /// 落库时刻。
+    captured_at_ms: i64,
+    /// 是否走了平台 Event:Alarm 订阅对话（否则是独立 MESSAGE）。
+    via_notify: bool,
+    /// 平台响应码；失败时为 None。
+    status: Option<u16>,
+    /// 失败原因；成功时为 None。
+    error: Option<String>,
 }
 
 /// Reserve startup before awaiting the device lock, and keep cancellation live
@@ -227,6 +257,8 @@ impl AppState {
             data_root: OnceLock::new(),
             recording_store: OnceLock::new(),
             snapshot_store: OnceLock::new(),
+            alarm_history: Mutex::new(std::collections::VecDeque::new()),
+            next_alarm_id: AtomicU64::new(1),
             config_io: Mutex::new(()),
             media_preparation: std::sync::Mutex::new(None),
             shutting_down: AtomicBool::new(false),
@@ -2314,28 +2346,139 @@ async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Resul
     }
 }
 
-/// 主动上报一条报警。
+/// 主动上报一条报警（首页快捷入口，等价于默认视频报警单）。
 #[tauri::command]
 async fn fire_alarm(
     description: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    let desc = if description.is_empty() {
+        "移动侦测报警".to_string()
+    } else {
+        description
+    };
+    let record = dispatch_alarm(&state, gb28181_protocol::alarm::AlarmReport::video(desc)).await?;
+    Ok(format!(
+        "报警上报完成(平台响应 {})",
+        record.status.unwrap_or_default()
+    ))
+}
+
+/// 按报警单上报（报警单管理页）。返回落库后的历史记录。
+#[tauri::command]
+async fn report_alarm(
+    report: gb28181_protocol::alarm::AlarmReport,
+    state: tauri::State<'_, AppState>,
+) -> Result<AlarmRecord, String> {
+    dispatch_alarm(&state, report).await
+}
+
+/// 预览报警 XML：与实际发送共用同一份组装逻辑，SN 固定为 1。
+#[tauri::command]
+async fn preview_alarm_xml(
+    report: gb28181_protocol::alarm::AlarmReport,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let device_id = {
+        let guard = state.device.lock().await;
+        match &*guard {
+            Some(handle) => handle.sim.config().device_id.as_str().to_string(),
+            // 设备未启动时用国标示例 ID，让用户先把报文看清楚再去注册。
+            None => "34020000001320000001".to_string(),
+        }
+    };
+    let notify = report
+        .to_notify(device_id, 1)
+        .map_err(|error| error.to_string())?;
+    notify.to_xml().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_alarm_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<AlarmRecord>, String> {
+    let history = state
+        .alarm_history
+        .lock()
+        .await
+        .iter()
+        .cloned()
+        .collect();
+    Ok(history)
+}
+
+#[tauri::command]
+async fn clear_alarm_history(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.alarm_history.lock().await.clear();
+    Ok(())
+}
+
+/// 本机复位报警（只清设备本地状态，不向平台发报文）。
+#[tauri::command]
+async fn reset_alarm(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let guard = state.device.lock().await;
     match &*guard {
-        Some(h) => {
-            let desc = if description.is_empty() {
-                "移动侦测报警".to_string()
-            } else {
-                description
-            };
-            let code = h
-                .sim
-                .report_alarm(&h.transport, &h.local_host, h.local_port, &desc)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(format!("报警上报完成(平台响应 {code})"))
+        Some(handle) => {
+            handle.sim.reset_alarm();
+            Ok("已复位本机报警状态".into())
         }
         None => Err("设备未启动".into()),
+    }
+}
+
+/// 报警上报的统一出口：成功/失败都写进历史，再决定是否向上抛错。
+///
+/// 失败也记录，是因为"平台没收到报警"是现场最常见的排查起点 —— 只把错误弹在
+/// toast 里，用户一刷新就再也找不到当时那条报了什么。
+async fn dispatch_alarm(
+    state: &AppState,
+    report: gb28181_protocol::alarm::AlarmReport,
+) -> Result<AlarmRecord, String> {
+    report.validate().map_err(|error| error.to_string())?;
+    let guard = state.device.lock().await;
+    let Some(handle) = guard.as_ref() else {
+        return Err("设备未启动".into());
+    };
+    let via_notify = handle.sim.has_alarm_subscription().await;
+    let device_id = handle.sim.config().device_id.as_str().to_string();
+    let captured_at_ms = common::clock::local_epoch_ms();
+    // 记录里存的是"发出去的那个时间戳"，而不是落库时间，二者可能差 N 分钟。
+    let alarm_time = gb28181_protocol::alarm::alarm_time(report.minutes_ago);
+    let outcome = handle
+        .sim
+        .report_alarm_report(
+            &handle.transport,
+            &handle.local_host,
+            handle.local_port,
+            &report,
+        )
+        .await
+        .map_err(|error| error.to_string());
+
+    let mut history = state.alarm_history.lock().await;
+    let id = state.next_alarm_id.fetch_add(1, Ordering::Relaxed);
+    let record = AlarmRecord {
+        id,
+        device_id,
+        priority: report.priority,
+        method: report.method,
+        alarm_type: report.alarm_type,
+        description: report.description.clone(),
+        longitude: report.longitude,
+        latitude: report.latitude,
+        alarm_time,
+        captured_at_ms,
+        via_notify,
+        status: outcome.as_ref().ok().copied(),
+        error: outcome.as_ref().err().cloned(),
+    };
+    history.push_front(record.clone());
+    history.truncate(ALARM_HISTORY_LIMIT);
+    drop(history);
+
+    match outcome {
+        Ok(_) => Ok(record),
+        Err(error) => Err(error),
     }
 }
 
@@ -3044,6 +3187,11 @@ pub fn run() {
             get_clock_state,
             save_time_sync,
             sync_ntp_now,
+            report_alarm,
+            preview_alarm_xml,
+            list_alarm_history,
+            clear_alarm_history,
+            reset_alarm,
             take_snapshot,
             list_snapshots,
             read_snapshot,

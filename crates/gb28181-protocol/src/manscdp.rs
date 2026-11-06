@@ -1476,6 +1476,35 @@ pub struct AlarmNotify {
     /// 报警描述。
     #[serde(rename = "AlarmDescription", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 经度(可选)。用字符串保存而不是 f64：`AlarmNotify` 要 `Eq`(测试里直接比结构体),
+    /// 浮点会破坏 `Eq`;同时避免 `1.0` 被序列化成 `1` 的平台兼容问题。
+    #[serde(rename = "Longitude", skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<String>,
+    /// 纬度(可选)。
+    #[serde(rename = "Latitude", skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<String>,
+    /// 报警类型扩展容器(可选)。GB28181-2022 A.2.5.1 把 AlarmType/AlarmTypeParam 放在 `<Info>` 下。
+    #[serde(rename = "Info", skip_serializing_if = "Option::is_none")]
+    pub info: Option<AlarmNotifyInfo>,
+}
+
+/// 报警通知的 `<Info>` 容器(GB28181-2022 A.2.5.1)。
+///
+/// 注意与 [`AlarmInfo`](复位命令的 Info)区分:两者都叫 Info,但字段语义不同 ——
+/// 上报用数值 `AlarmType`,复位用可组合的 `AlarmMethod/AlarmType` 字符串。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "Info")]
+pub struct AlarmNotifyInfo {
+    /// 报警类型:取值随 AlarmMethod 变化(1 视频丢失/2 设备防拆/3 存储满/4 设备故障/5 其他)。
+    #[serde(rename = "AlarmType")]
+    pub alarm_type: u32,
+    /// 报警类型参数(可选,补充说明)。
+    #[serde(
+        rename = "AlarmTypeParam",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alarm_type_param: Option<String>,
 }
 
 impl AlarmNotify {
@@ -1494,6 +1523,43 @@ impl AlarmNotify {
             method: 5,
             time: time.into(),
             description: Some(desc.into()),
+            longitude: None,
+            latitude: None,
+            info: None,
+        }
+    }
+
+    /// 构造一条自定义报警(类型/等级/方式/经纬度/描述均可指定)。
+    ///
+    /// 与 [`Self::video`] 的区别：这里不写死任何字段，供「报警单管理」页按现场需要
+    /// 拼装。`alarm_type` 为空时不输出 `<Info>`，保持与 2016 平台的最大兼容。
+    #[allow(clippy::too_many_arguments)]
+    pub fn custom(
+        device_id: impl Into<String>,
+        sn: u32,
+        time: impl Into<String>,
+        priority: u8,
+        method: u8,
+        description: Option<String>,
+        longitude: Option<String>,
+        latitude: Option<String>,
+        alarm_type: Option<u32>,
+        alarm_type_param: Option<String>,
+    ) -> Self {
+        AlarmNotify {
+            cmd_type: "Alarm".into(),
+            sn,
+            device_id: device_id.into(),
+            priority,
+            method,
+            time: time.into(),
+            description,
+            longitude,
+            latitude,
+            info: alarm_type.map(|alarm_type| AlarmNotifyInfo {
+                alarm_type,
+                alarm_type_param,
+            }),
         }
     }
 
@@ -2822,6 +2888,52 @@ mod tests {
         assert!(xml.contains("<AlarmMethod>5</AlarmMethod>"));
         assert!(xml.contains("<AlarmDescription>移动侦测</AlarmDescription>"));
         assert!(xml.contains("<DeviceID>35020000001310000132</DeviceID>"));
+        // 可选字段缺省时不能凭空输出空标签,否则部分平台会把它当成非法值。
+        assert!(!xml.contains("<Longitude>"), "实际: {xml}");
+        assert!(!xml.contains("<Info>"), "实际: {xml}");
+    }
+
+    #[test]
+    fn 自定义报警通知输出等级方式经纬度与类型() {
+        let a = AlarmNotify::custom(
+            "35020000001310000132",
+            9,
+            "2026-11-06T14:00:00",
+            2,
+            2,
+            Some("设备防拆报警".into()),
+            Some("116.397128".into()),
+            Some("39.916527".into()),
+            Some(2),
+            Some("外壳".into()),
+        );
+        let xml = a.to_xml().unwrap();
+        assert!(xml.contains("<AlarmPriority>2</AlarmPriority>"), "实际: {xml}");
+        assert!(xml.contains("<AlarmMethod>2</AlarmMethod>"), "实际: {xml}");
+        assert!(xml.contains("<Longitude>116.397128</Longitude>"), "实际: {xml}");
+        assert!(xml.contains("<Latitude>39.916527</Latitude>"), "实际: {xml}");
+        // AlarmType 必须在 <Info> 容器内(A.2.5.1),不能平铺到 Notify 根下。
+        assert!(xml.contains("<Info><AlarmType>2</AlarmType>"), "实际: {xml}");
+        assert!(xml.contains("<AlarmTypeParam>外壳</AlarmTypeParam>"), "实际: {xml}");
+    }
+
+    #[test]
+    fn 自定义报警不带类型时不输出info() {
+        let a = AlarmNotify::custom(
+            "35020000001310000132",
+            9,
+            "2026-11-06T14:00:00",
+            4,
+            7,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let xml = a.to_xml().unwrap();
+        assert!(!xml.contains("<Info>"), "实际: {xml}");
+        assert!(!xml.contains("<AlarmDescription>"), "实际: {xml}");
     }
 
     #[test]

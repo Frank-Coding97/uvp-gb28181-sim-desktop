@@ -5,5 +5,6 @@
 //!
 //! M0 为可编译骨架,`manscdp` / `id_codec` M1 起实现。
 
+pub mod alarm;
 pub mod id_codec;
 pub mod manscdp;

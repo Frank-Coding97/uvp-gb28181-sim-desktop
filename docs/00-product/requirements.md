@@ -20,7 +20,7 @@
 | FR-6 | 响应设备信息(DeviceInfo)/ 设备状态(DeviceStatus)查询 | P0 | M2 |
 | FR-7 | 响应实时点播:INVITE 建流 / ACK / BYE 停流 / CANCEL 取消 | P0 | M2 ✅ |
 | FR-8 | 推送 H.264/H.265 码流,PS 封装,RTP over UDP/TCP;音视频复合流(G.711A);MP4/FLV/MKV 容器源 | P0 | M2 ✅ |
-| FR-9 | 上报报警(Alarm Notify) | P1 | M3+ ✅ |
+| FR-9 | 上报报警(Alarm Notify);报警单管理:类型/等级/方式/经纬度/描述/时间偏移可配、固定单与随机发送、XML 预览、最近 50 条历史(含失败原因与发送路径)、本机复位 | P1 | M3+ ✅ |
 | FR-10 | 响应录像查询(RecordInfo)、历史回放、倍速播放、录像下载 | P2 | M3+ ✅ |
 | FR-11 | GB-2016 / GB-2022 版本切换 | P1 | M2 ✅ |
 | FR-12 | 网络校时(解析平台 REGISTER 200 OK 的 Date 头对齐时钟) | P1 | M3+ ✅ |

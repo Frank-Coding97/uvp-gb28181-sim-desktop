@@ -22,6 +22,7 @@ import FilmOutline from "@vicons/ionicons5/es/FilmOutline.js";
 import WifiOutline from "@vicons/ionicons5/es/WifiOutline.js";
 import TimeOutline from "@vicons/ionicons5/es/TimeOutline.js";
 import CameraOutline from "@vicons/ionicons5/es/CameraOutline.js";
+import WarningOutline from "@vicons/ionicons5/es/WarningOutline.js";
 import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
@@ -41,6 +42,7 @@ const menuOptions: MenuOption[] = [
   { label: "目录管理",   key: "/channels",         icon: icon(GitNetworkOutline) },
   { label: "录像中心",   key: "/recordings",       icon: icon(FilmOutline) },
   { label: "抓拍图库",   key: "/snapshots",        icon: icon(CameraOutline) },
+  { label: "报警管理",   key: "/alarms",           icon: icon(WarningOutline) },
   { label: "压力测试",   key: "/scenario",         icon: icon(PulseOutline) },
   { label: "设备配置",   key: "/device-settings",  icon: icon(SettingsOutline) },
   { label: "音视频配置", key: "/media-settings",   icon: icon(VideocamOutline) },

@@ -16,6 +16,7 @@ import Settings from "./views/Settings.vue";
 import Recordings from "./views/Recordings.vue";
 import Clock from "./views/Clock.vue";
 import Snapshots from "./views/Snapshots.vue";
+import Alarms from "./views/Alarms.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -37,6 +38,7 @@ const router = createRouter({
     { path: "/network-settings", component: Settings, props: { section: "network" } },
     { path: "/clock",            component: Clock },
     { path: "/snapshots",        component: Snapshots },
+    { path: "/alarms",           component: Alarms },
     { path: "/about",            component: Settings, props: { section: "about" } },
     { path: "/logs",      component: System },
     { path: "/settings",  redirect: "/device-settings" }, // 旧设置入口兼容

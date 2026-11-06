@@ -73,6 +73,42 @@ interface ClockSnapshot {
 
 > 语义约束:NTP 生效期间 `sync_from_date_header` 只更新 `sip_offset_secs`,不覆盖 `offset_secs`;NTP 失败时回退到 `sip_offset_secs`,无可回退值时保持原偏移。
 
+### 报警单命令(FR-9)
+
+| 命令 | 入参 | 返回 | 说明 |
+|---|---|---|---|
+| `fire_alarm` | `{ description: string }` | `string` | 首页快捷入口，等价于默认视频报警单；同样写入历史 |
+| `report_alarm` | `{ report: AlarmReport }` | `AlarmRecord` | 按报警单上报；成功/失败都写入历史，失败时向上返回错误 |
+| `preview_alarm_xml` | `{ report: AlarmReport }` | `string` | 与实际发送共用 `to_notify`，SN 固定为 1，便于核对报文 |
+| `list_alarm_history` | — | `AlarmRecord[]` | 最近 50 条，最新在前 |
+| `clear_alarm_history` | — | `void` | 清空内存历史（不落盘） |
+| `reset_alarm` | — | `string` | 只清设备本地 `alarming` 标记，不向平台发报文 |
+
+```ts
+interface AlarmReport {
+  priority: number;            // 1-4
+  method: number;              // 1-7
+  alarm_type?: number | null;  // 1-5，null 表示不输出 <Info>
+  alarm_type_param?: string | null;
+  description?: string | null;
+  longitude?: number | null;   // -180~180
+  latitude?: number | null;    // -90~90
+  minutes_ago?: number;        // 0~10080，只改 AlarmTime 不延迟发送
+}
+
+interface AlarmRecord extends Required<AlarmReport> {
+  id: number;
+  device_id: string;
+  alarm_time: string;       // 报文里实际写入的时间
+  captured_at_ms: number;   // 落库时刻
+  via_notify: boolean;      // true=订阅对话内 NOTIFY，false=独立 MESSAGE
+  status: number | null;    // 平台响应码；失败为 null
+  error: string | null;
+}
+```
+
+> 语义约束:`AlarmType` / `AlarmTypeParam` 必须放在 `<Info>` 容器内(A.2.5.1)；`alarm_type` 为空时整段 `<Info>` 不输出，兼容只认 2016 字段的平台。经纬度以字符串进 XML(最多 6 位小数、去尾零)，避免 `1.0→1` 与 `-0` 这类平台解析告警。
+
 ### 抓拍与日志导出命令(FR-47 / FR-44)
 
 | 命令 | 入参 | 返回 | 说明 |

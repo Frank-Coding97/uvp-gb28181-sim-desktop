@@ -474,6 +474,62 @@ export async function syncNtpNow(): Promise<NtpProbeResult> {
   return invoke<NtpProbeResult>("sync_ntp_now");
 }
 
+/** 报警单（后端 gb28181_protocol::alarm::AlarmReport）。 */
+export interface AlarmReport {
+  /** 报警级别 1-4（1 最高）。 */
+  priority: number;
+  /** 报警方式 1-7。 */
+  method: number;
+  /** 报警类型 1-5；null/undefined 表示不输出 <Info>。 */
+  alarm_type?: number | null;
+  alarm_type_param?: string | null;
+  description?: string | null;
+  longitude?: number | null;
+  latitude?: number | null;
+  /** 报警时间往前挪的分钟数，0 表示现在。 */
+  minutes_ago?: number;
+}
+
+/** 一条报警上报记录（成功与失败都记）。 */
+export interface AlarmRecord {
+  id: number;
+  device_id: string;
+  priority: number;
+  method: number;
+  alarm_type: number | null;
+  description: string | null;
+  longitude: number | null;
+  latitude: number | null;
+  alarm_time: string;
+  captured_at_ms: number;
+  /** 是否走平台 Event:Alarm 订阅对话。 */
+  via_notify: boolean;
+  status: number | null;
+  error: string | null;
+}
+
+export async function reportAlarm(report: AlarmReport): Promise<AlarmRecord> {
+  return invoke<AlarmRecord>("report_alarm", { report });
+}
+
+/** 预览报警 XML；与实际发送共用同一份组装逻辑，SN 固定为 1。 */
+export async function previewAlarmXml(report: AlarmReport): Promise<string> {
+  return invoke<string>("preview_alarm_xml", { report });
+}
+
+export async function listAlarmHistory(): Promise<AlarmRecord[]> {
+  return invoke<AlarmRecord[]>("list_alarm_history");
+}
+
+export async function clearAlarmHistory(): Promise<void> {
+  await invoke("clear_alarm_history");
+}
+
+/** 本机复位报警状态（不向平台发报文）。 */
+export async function resetAlarm(): Promise<string> {
+  return invoke<string>("reset_alarm");
+}
+
 /** 本地抓拍元数据（后端 media-rtp::snapshot::SnapshotMeta）。 */
 export interface SnapshotMeta {
   id: string;
