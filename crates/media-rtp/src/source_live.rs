@@ -2706,17 +2706,25 @@ impl LiveSource {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
-                    .map_err(|e| Error::Media(format!("failed to start H.265 encoder: {e}")))?;
-                let mut stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| Error::Media("failed to open H.265 encoder stdin".into()))?;
-                let mut stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| Error::Media("failed to open H.265 encoder stdout".into()))?;
+                    .map_err(|e| {
+                        Error::Media(format!("failed to start FFmpeg screen encoder: {e}"))
+                    })?;
+                let mut stdin = child.stdin.take().ok_or_else(|| {
+                    Error::Media("failed to open FFmpeg screen encoder stdin".into())
+                })?;
+                let mut stdout = child.stdout.take().ok_or_else(|| {
+                    Error::Media("failed to open FFmpeg screen encoder stdout".into())
+                })?;
+                // 标签按实际编码区分,H.264 也走这条 rawvideo → FFmpeg 管道。
+                let encoder_label = format!(
+                    "{} screen encoder",
+                    match screen_codec {
+                        LiveVideoCodec::H264 => "H.264",
+                        LiveVideoCodec::H265 => "H.265",
+                    }
+                );
                 let (stderr_tail, stderr_thread) =
-                    capture_stderr_tail(&mut child, "H.265 screen encoder")?;
+                    capture_stderr_tail(&mut child, &encoder_label)?;
                 screen_startup.track(stderr_thread);
                 let writer_tail = Arc::clone(&stderr_tail);
                 let reader_tail = Arc::clone(&stderr_tail);
@@ -2746,7 +2754,7 @@ impl LiveSource {
                         if let Err(error) = std::io::Write::write_all(&mut stdin, &frame.data) {
                             if let Ok(mut terminal) = writer_error.lock() {
                                 *terminal = Some(format!(
-                                    "H.265 screen encoder input failed: {error}; stderr: {}",
+                                    "FFmpeg screen encoder input failed: {error}; stderr: {}",
                                     locked_tail(&writer_tail)
                                 ));
                             }
@@ -2797,7 +2805,7 @@ impl LiveSource {
                     if !reader_stop.load(Ordering::Acquire) {
                         if let Ok(mut terminal) = reader_error.lock() {
                             *terminal = Some(format!(
-                                "H.265 screen encoder stopped unexpectedly; stderr: {}",
+                                "FFmpeg screen encoder stopped unexpectedly; stderr: {}",
                                 locked_tail(&reader_tail)
                             ));
                         }

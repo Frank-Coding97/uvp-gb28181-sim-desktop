@@ -216,6 +216,10 @@ function detectMediaMode(source: string): MediaMode {
 const mediaMode = ref<MediaMode>(detectMediaMode(form.value.video_source.trim()));
 const selectedCamera = ref<number | null>(null);
 const selectedScreen = ref<number | null>(null);
+// 实时源的音频选择，直接对应 URI 的 audio= 取值：
+// 摄像头 `none | <麦克风序号>`；屏幕 `none | system | microphone:<序号>`。
+const selectedAudio = ref<string>(liveSourceAudio(form.value.video_source));
+const isMacHost = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
 
 const mediaModes = [
   { value: "camera", label: "摄像头", icon: CameraOutline },
@@ -244,6 +248,25 @@ const screenOptions = computed(() =>
     label: `${item.name} · ${item.width}x${item.height}`,
     value: item.display_id,
   })),
+);
+const audioOptions = computed(() => {
+  const none = { label: "不采集声音", value: "none" };
+  if (mediaMode.value === "camera") {
+    return [none, ...catalog.value.microphones.map((item) => ({ label: `麦克风 · ${item.name}`, value: String(item.index) }))];
+  }
+  if (mediaMode.value === "screen") {
+    // Windows 屏幕采集的音频要等原生 WASAPI 采集落地，后端目前会直接拒绝。
+    if (!isMacHost) return [none];
+    return [
+      none,
+      { label: "系统声音", value: "system" },
+      ...catalog.value.microphones.map((item) => ({ label: `麦克风 · ${item.name}`, value: `microphone:${item.index}` })),
+    ];
+  }
+  return [none];
+});
+const audioPickerHint = computed(() =>
+  mediaMode.value === "screen" && !isMacHost ? "Windows 屏幕采集暂不支持声音" : "",
 );
 const mediaModeLabel = computed(() => mediaModes.find((item) => item.value === mediaMode.value)?.label ?? "未配置");
 // 设备列表为空时必须说明原因：枚举依赖 FFmpeg 的 DirectShow/AVFoundation 后端，
@@ -562,7 +585,11 @@ function cancelEdit() {
 
 function syncLiveSource() {
   sourceProbe.value = "";
-  const audioSource = liveSourceAudio(form.value.video_source);
+  // 当前模式不支持的取值（例如从屏幕切到摄像头时的 "system"）回落为不采集。
+  if (!audioOptions.value.some((item) => item.value === selectedAudio.value)) {
+    selectedAudio.value = "none";
+  }
+  const audioSource = selectedAudio.value;
   if (mediaMode.value === "camera") {
     form.value.video_source = selectedCamera.value === null
       ? ""
@@ -917,6 +944,18 @@ onUnmounted(() => {
             <button v-else-if="mediaMode === 'file'" type="button" class="file-source" :disabled="deviceLive" @click="pickVideoFile">
               {{ sourceSummary }}
             </button>
+          </div>
+          <div v-if="mediaMode === 'camera' || mediaMode === 'screen'" class="source-picker audio-picker" :title="audioPickerHint">
+            <n-select
+              v-model:value="selectedAudio"
+              size="small"
+              :options="audioOptions"
+              :loading="sourceLoading"
+              :disabled="deviceLive || audioOptions.length <= 1"
+              aria-label="声音来源"
+              placeholder="声音来源"
+              @update:value="syncLiveSource"
+            />
           </div>
           <n-button quaternary circle size="small" :loading="sourceLoading" :disabled="deviceLive" title="刷新采集设备" @click="refreshSources()">
             <template #icon><n-icon><RefreshOutline /></n-icon></template>

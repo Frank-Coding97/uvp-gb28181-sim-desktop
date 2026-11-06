@@ -50,7 +50,10 @@ assert.doesNotMatch(
   "首页不应残留仅信令模式提示",
 );
 assert.ok(syncLiveSource, "应存在首页实时源同步逻辑");
-assert.match(syncLiveSource ?? "", /liveSourceAudio/, "切换采集设备时应保留音频来源选择");
+// 音频选择由独立的 selectedAudio 状态保存(初值取自已保存 URI 的 audio=),
+// 切换摄像头/屏幕时沿用它,而不是被重置为 none。
+assert.match(source, /const selectedAudio = ref<string>\(liveSourceAudio\(form\.value\.video_source\)\)/, "音频选择初值应取自已保存的媒体源");
+assert.match(syncLiveSource ?? "", /selectedAudio\.value/, "切换采集设备时应保留音频来源选择");
 assert.doesNotMatch(
   syncLiveSource ?? "",
   /audio_codec|width|height|bitrate|video_codec|video_fps|keyframe_interval/,
