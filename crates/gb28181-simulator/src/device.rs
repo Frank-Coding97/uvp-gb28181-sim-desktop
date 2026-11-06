@@ -257,6 +257,11 @@ pub struct DeviceSimulator {
     config: DeviceConfig,
     /// 桌面端可选的同帧预览接收器。
     preview_sink: std::sync::Mutex<Option<Arc<dyn media_rtp::PreviewSink>>>,
+    /// 桌面端本地 OSD 样式；None 表示不烧录 OSD(CLI/压测)。
+    osd_settings: std::sync::Mutex<Option<media_rtp::osd::OsdSettings>>,
+    /// 平台经 DeviceConfig 下发的 OSDConfig。runtime_config 里的 osd_config
+    /// 总有出厂默认值，无法区分「平台设置过」，所以单独记录。
+    platform_osd: std::sync::Mutex<Option<gb28181_protocol::manscdp::OSDConfig>>,
     /// 注册后启动的唯一采集源；平台点播只订阅它，不再重复打开摄像头/文件。
     shared_media: tokio::sync::Mutex<Option<Arc<media_rtp::SharedMedia>>>,
     prepared_file: std::sync::Mutex<Option<media_rtp::file_profile::PreparedFileProfile>>,
@@ -481,6 +486,10 @@ pub struct PersistedControlState {
     pub home_reset_time: Option<u32>,
     pub cruise: Vec<PersistedCruise>,
     pub scan: Vec<PersistedScan>,
+    /// 平台下发的 OSDConfig(未下发过为 None)。
+    pub osd_config: Option<gb28181_protocol::manscdp::OSDConfig>,
+    /// 平台下发的视频遮挡。
+    pub picture_mask: Option<gb28181_protocol::manscdp::PictureMask>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -559,6 +568,129 @@ pub struct DeviceRuntimeSnapshot {
     pub osd_show: Option<u32>,
     pub last_change: String,
     pub updated_at_ms: u64,
+}
+
+/// 解析遮挡区域 `Point=左,上,右,下`；格式错误或零面积的区域忽略。
+fn mask_regions(mask: &gb28181_protocol::manscdp::PictureMask) -> Vec<MaskRegionSnapshot> {
+    let Some(list) = mask.region_list.as_ref() else {
+        return Vec::new();
+    };
+    list.items
+        .iter()
+        .filter_map(|item| {
+            let parts = item
+                .point
+                .split(',')
+                .map(|part| part.trim().parse::<u32>().ok())
+                .collect::<Option<Vec<_>>>()?;
+            if parts.len() != 4 {
+                return None;
+            }
+            let (left, top, right, bottom) = (parts[0], parts[1], parts[2], parts[3]);
+            (right > left && bottom > top).then_some(MaskRegionSnapshot {
+                seq: item.seq,
+                left,
+                top,
+                right,
+                bottom,
+            })
+        })
+        .collect()
+}
+
+/// 合并本地 OSD 样式、平台 OSDConfig 与遮挡，得到一次采集要烧录的内容。
+///
+/// - 平台下发过 OSDConfig：时间/文字的开关与坐标以平台为准，样式取本地。
+/// - 未下发：时间左上、通道名右上(对齐移动端)。
+/// - 斜铺水印只来自本地配置；遮挡仅在 `On=1` 时生效。
+pub fn merge_osd_overlay(
+    settings: &media_rtp::osd::OsdSettings,
+    platform: Option<&gb28181_protocol::manscdp::OSDConfig>,
+    mask: Option<&gb28181_protocol::manscdp::PictureMask>,
+    channel_name: &str,
+    output: (u32, u32),
+) -> Option<media_rtp::osd::OsdOverlay> {
+    use media_rtp::osd::*;
+    let truncate = |text: &str| text.chars().take(OSD_TEXT_MAX_CHARS).collect::<String>();
+    let (base_width, base_height, time, texts) = match platform {
+        Some(osd) => {
+            let base = (
+                if osd.length > 0 { osd.length } else { output.0 },
+                if osd.width > 0 { osd.width } else { output.1 },
+            );
+            let time = osd.time_visible().then(|| OsdTime {
+                anchor: OsdAnchor::Pixel { x: osd.time_x, y: osd.time_y },
+                format: if osd.time_type == Some(1) {
+                    OsdTimeFormat::Chinese
+                } else {
+                    OsdTimeFormat::Dash
+                },
+                style: settings.timestamp.clone(),
+            });
+            let texts = if osd.text_visible() {
+                osd.items
+                    .iter()
+                    .take(OSD_ITEMS_MAX)
+                    .filter(|item| !item.text.is_empty())
+                    .map(|item| OsdText {
+                        text: truncate(&item.text),
+                        anchor: OsdAnchor::Pixel { x: item.x, y: item.y },
+                        style: settings.channel_name.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (base.0, base.1, time, texts)
+        }
+        None => {
+            let time = settings.timestamp.enabled.then(|| OsdTime {
+                anchor: OsdAnchor::Pixel { x: 6, y: 6 },
+                format: OsdTimeFormat::Dash,
+                style: settings.timestamp.clone(),
+            });
+            let texts = (settings.channel_name.enabled && !channel_name.is_empty())
+                .then(|| OsdText {
+                    text: truncate(channel_name),
+                    anchor: OsdAnchor::TopRight,
+                    style: settings.channel_name.clone(),
+                })
+                .into_iter()
+                .collect();
+            (output.0, output.1, time, texts)
+        }
+    };
+    let watermark = (settings.watermark.enabled && !settings.watermark.text.trim().is_empty())
+        .then(|| OsdText {
+            text: truncate(&settings.watermark.text),
+            anchor: OsdAnchor::TopRight,
+            style: settings.watermark.clone(),
+        });
+    let masks = mask
+        .filter(|mask| mask.on == 1)
+        .map(|mask| {
+            mask_regions(mask)
+                .into_iter()
+                .take(OSD_MASKS_MAX)
+                .map(|region| OsdRect {
+                    left: region.left,
+                    top: region.top,
+                    right: region.right,
+                    bottom: region.bottom,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let overlay = OsdOverlay {
+        base_width,
+        base_height,
+        time,
+        texts,
+        watermark,
+        mask_base: output,
+        masks,
+    };
+    (!overlay.is_empty()).then_some(overlay)
 }
 
 fn epoch_millis() -> u64 {
@@ -698,6 +830,8 @@ impl DeviceSimulator {
         Self {
             config,
             preview_sink: std::sync::Mutex::new(None),
+            osd_settings: std::sync::Mutex::new(None),
+            platform_osd: std::sync::Mutex::new(None),
             shared_media: tokio::sync::Mutex::new(None),
             prepared_file: std::sync::Mutex::new(None),
             recording_service: std::sync::Mutex::new(None),
@@ -968,33 +1102,7 @@ impl DeviceSimulator {
                 .and_then(|value| value.picture_mask.as_ref());
             let configured = mask.is_some();
             let on = mask.map(|value| value.on == 1).unwrap_or(false);
-            let regions = mask
-                .and_then(|value| value.region_list.as_ref())
-                .map(|list| {
-                    list.items
-                        .iter()
-                        .filter_map(|item| {
-                            let parts = item
-                                .point
-                                .split(',')
-                                .map(|part| part.trim().parse::<u32>().ok())
-                                .collect::<Option<Vec<_>>>()?;
-                            if parts.len() != 4 {
-                                return None;
-                            }
-                            let (left, top, right, bottom) =
-                                (parts[0], parts[1], parts[2], parts[3]);
-                            (right > left && bottom > top).then_some(MaskRegionSnapshot {
-                                seq: item.seq,
-                                left,
-                                top,
-                                right,
-                                bottom,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let regions = mask.map(mask_regions).unwrap_or_default();
             (configured, on, regions)
         };
 
@@ -1099,11 +1207,32 @@ impl DeviceSimulator {
                     speed: group.speed,
                 })
                 .collect(),
+            osd_config: self.platform_osd.lock().ok().and_then(|value| value.clone()),
+            // 出厂默认(关闭、无区域)不落盘，保持旧文件格式干净。
+            picture_mask: self
+                .runtime_config
+                .lock()
+                .ok()
+                .and_then(|config| config.picture_mask.clone())
+                .filter(|mask| *mask != gb28181_protocol::manscdp::PictureMask::default()),
         }
     }
 
     /// 恢复跨进程持久化的控制配置；瞬态运行态(active/目标/查询)不恢复。
     pub fn import_persisted_control_state(&self, saved: &PersistedControlState) {
+        if let Some(osd) = &saved.osd_config {
+            if let Ok(mut platform) = self.platform_osd.lock() {
+                *platform = Some(osd.clone());
+            }
+        }
+        if let Ok(mut config) = self.runtime_config.lock() {
+            if let Some(osd) = &saved.osd_config {
+                config.osd_config = Some(osd.clone());
+            }
+            if let Some(mask) = &saved.picture_mask {
+                config.picture_mask = Some(mask.clone());
+            }
+        }
         if let Ok(mut presets) = self.presets.lock() {
             presets.clear();
             for preset in &saved.presets {
@@ -1255,6 +1384,9 @@ impl DeviceSimulator {
         }
         if let Some(value) = &ctrl.cfg_osd_config {
             current.osd_config = Some(value.clone());
+            if let Ok(mut platform) = self.platform_osd.lock() {
+                *platform = Some(value.clone());
+            }
             changed = true;
         }
         if let Some(value) = &ctrl.cfg_svac_encode {
@@ -1275,6 +1407,35 @@ impl DeviceSimulator {
     /// 设置桌面端预览接收器。必须在启动设备前调用。
     pub fn set_preview_sink(&self, sink: Option<Arc<dyn media_rtp::PreviewSink>>) {
         *self.preview_sink.lock().unwrap() = sink;
+    }
+
+    /// 设置本地 OSD 样式。必须在启动设备前调用；None 表示不烧录 OSD。
+    pub fn set_osd_settings(&self, settings: Option<media_rtp::osd::OsdSettings>) {
+        *self.osd_settings.lock().unwrap() = settings;
+    }
+
+    /// 当前要烧进实时采集画面的 OSD(本地样式 + 平台 OSDConfig + 遮挡)。
+    pub fn osd_overlay(&self) -> Option<media_rtp::osd::OsdOverlay> {
+        let settings = self.osd_settings.lock().ok()?.clone()?;
+        let platform = self.platform_osd.lock().ok()?.clone();
+        let mask = self
+            .runtime_config
+            .lock()
+            .ok()
+            .and_then(|config| config.picture_mask.clone());
+        let output = self
+            .config
+            .media_profile
+            .as_ref()
+            .map(|media| (media.width, media.height))
+            .unwrap_or((1920, 1080));
+        let channel_name = self
+            .config
+            .channels
+            .first()
+            .map(|channel| channel.name.as_str())
+            .unwrap_or_default();
+        merge_osd_overlay(&settings, platform.as_ref(), mask.as_ref(), channel_name, output)
     }
 
     /// Install a verified immutable file output prepared before REGISTER.
@@ -1327,11 +1488,13 @@ impl DeviceSimulator {
             .map_err(|_| Error::Media("文件准备状态锁异常".into()))?
             .clone();
         let preview = self.preview_sink.lock().unwrap().clone();
+        // OSD 只烧进实时采集；文件循环不重新编码。
+        let osd = path.starts_with("live:").then(|| self.osd_overlay()).flatten();
         let source = tokio::task::spawn_blocking(move || {
             if path.starts_with("live:") {
                 let capture = match profile {
                     Some(profile) => {
-                        media_rtp::LiveSource::capture_with_profile(&path, profile, preview)
+                        media_rtp::LiveSource::capture_with_profile_osd(&path, profile, preview, osd)
                     }
                     None => media_rtp::LiveSource::capture(&path, fps, preview),
                 };
@@ -4556,6 +4719,116 @@ impl DeviceSimulator {
 }
 
 #[cfg(test)]
+mod osd_merge_tests {
+    use super::*;
+    use gb28181_protocol::manscdp::{
+        OSDConfig, OsdTextItem, PictureMask, PictureMaskRegion, PictureMaskRegionList,
+    };
+    use media_rtp::osd::*;
+
+    #[test]
+    fn 未下发平台配置时时间左上通道名右上() {
+        let overlay = merge_osd_overlay(&OsdSettings::default(), None, None, "大门", (1280, 720))
+            .expect("默认有时间和通道名");
+        assert_eq!(overlay.time.unwrap().anchor, OsdAnchor::Pixel { x: 6, y: 6 });
+        assert_eq!(overlay.texts.len(), 1);
+        assert_eq!(overlay.texts[0].text, "大门");
+        assert_eq!(overlay.texts[0].anchor, OsdAnchor::TopRight);
+        assert!(overlay.watermark.is_none() && overlay.masks.is_empty());
+    }
+
+    #[test]
+    fn 平台配置覆盖坐标和开关并保留本地样式() {
+        let mut settings = OsdSettings::default();
+        settings.timestamp.size = OsdSize::Large;
+        let platform = OSDConfig {
+            length: 704,
+            width: 576,
+            time_x: 100,
+            time_y: 50,
+            time_enable: Some(1),
+            time_type: Some(1),
+            text_enable: Some(1),
+            sum_num: 2,
+            items: vec![
+                OsdTextItem { text: "一号".into(), x: 10, y: 500 },
+                OsdTextItem { text: "".into(), x: 0, y: 0 },
+            ],
+            ..Default::default()
+        };
+        let overlay =
+            merge_osd_overlay(&settings, Some(&platform), None, "大门", (1920, 1080)).unwrap();
+        assert_eq!((overlay.base_width, overlay.base_height), (704, 576));
+        let time = overlay.time.unwrap();
+        assert_eq!(time.anchor, OsdAnchor::Pixel { x: 100, y: 50 });
+        assert_eq!(time.format, OsdTimeFormat::Chinese);
+        assert_eq!(time.style.size, OsdSize::Large);
+        // 空文字行忽略，本地通道名不再额外绘制。
+        assert_eq!(overlay.texts.len(), 1);
+        assert_eq!(overlay.texts[0].text, "一号");
+    }
+
+    #[test]
+    fn 平台全部关闭且无水印无遮挡时不烧录() {
+        let platform = OSDConfig {
+            length: 1920,
+            width: 1080,
+            time_enable: Some(0),
+            text_enable: Some(0),
+            ..Default::default()
+        };
+        assert!(merge_osd_overlay(&OsdSettings::default(), Some(&platform), None, "x", (1920, 1080)).is_none());
+    }
+
+    #[test]
+    fn 遮挡仅在开启时生效且使用媒体分辨率坐标() {
+        let mut settings = OsdSettings::default();
+        settings.timestamp.enabled = false;
+        settings.channel_name.enabled = false;
+        let mut mask = PictureMask {
+            on: 0,
+            sum_num: 1,
+            region_list: Some(PictureMaskRegionList {
+                num: 1,
+                items: vec![PictureMaskRegion { seq: 1, point: "10,20,110,220".into() }],
+            }),
+        };
+        assert!(merge_osd_overlay(&settings, None, Some(&mask), "", (1280, 720)).is_none());
+        mask.on = 1;
+        let overlay = merge_osd_overlay(&settings, None, Some(&mask), "", (1280, 720)).unwrap();
+        assert_eq!(overlay.mask_base, (1280, 720));
+        assert_eq!(overlay.masks, vec![OsdRect { left: 10, top: 20, right: 110, bottom: 220 }]);
+    }
+
+    #[test]
+    fn 平台osd与遮挡跨重启持久化() {
+        let config = test_device_config_for_osd();
+        let device = DeviceSimulator::new(config.clone());
+        let platform = OSDConfig { length: 704, width: 576, time_x: 8, ..Default::default() };
+        let mask = PictureMask { on: 1, sum_num: 0, region_list: None };
+        let saved = PersistedControlState {
+            osd_config: Some(platform.clone()),
+            picture_mask: Some(mask.clone()),
+            ..Default::default()
+        };
+        device.import_persisted_control_state(&saved);
+        let exported = device.export_persisted_control_state();
+        assert_eq!(exported.osd_config, Some(platform));
+        assert_eq!(exported.picture_mask, Some(mask));
+        // 旧格式文件(无新字段)仍可读取。
+        let legacy: PersistedControlState = serde_json::from_str(r#"{"presets":[]}"#).unwrap();
+        assert!(legacy.osd_config.is_none() && legacy.picture_mask.is_none());
+        // 未下发过时不落盘遮挡默认值。
+        let fresh = DeviceSimulator::new(config).export_persisted_control_state();
+        assert!(fresh.osd_config.is_none() && fresh.picture_mask.is_none());
+    }
+
+    fn test_device_config_for_osd() -> DeviceConfig {
+        super::tests::test_cfg("127.0.0.1", 5060)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sip_core::{Headers, Response, SipMessage};
@@ -4594,7 +4867,7 @@ mod tests {
         assert_eq!(item.video_bit_rate.as_deref(), Some("600"));
     }
 
-    fn test_cfg(host: &str, port: u16) -> DeviceConfig {
+    pub(super) fn test_cfg(host: &str, port: u16) -> DeviceConfig {
         DeviceConfig {
             device_id: DeviceId::new("34020000001320000001").unwrap(),
             username: "34020000001320000001".into(),

@@ -14,12 +14,13 @@ const [app, router, settings, channels, system, dashboard, ptz, recordings] = aw
 
 const expectedMenu = [
   ["首页", "/dashboard"],
-  ["云台控制", "/ptz"],
+  ["模拟器中心", "/simulator"],
   ["目录管理", "/channels"],
   ["录像中心", "/recordings"],
   ["压力测试", "/scenario"],
   ["设备配置", "/device-settings"],
   ["音视频配置", "/media-settings"],
+  ["OSD 水印", "/osd-settings"],
   ["网络配置", "/network-settings"],
   ["日志", "/logs"],
   ["关于", "/about"],
@@ -39,7 +40,9 @@ assert.match(router, /path: "\/about"[\s\S]{0,100}section: "about"/, "关于必�
 assert.match(router, /path: "\/settings"[\s\S]{0,80}redirect: "\/device-settings"/, "旧设置地址必须兼容重定向");
 assert.match(router, /path: "\/device"[\s\S]{0,80}redirect: "\/dashboard"/, "旧设备联调地址必须回到首页");
 assert.match(router, /path: "\/system"[\s\S]{0,80}redirect: "\/logs"/, "旧运行日志地址必须兼容重定向");
-assert.match(router, /path: "\/ptz"[\s\S]{0,80}component: Ptz/, "云台控制必须有独立一级路由");
+assert.match(router, /path: "\/ptz"[\s\S]{0,40}redirect: "\/simulator"/, "旧云台入口必须兼容重定向到模拟器中心");
+assert.match(router, /path: "\/osd-settings"[\s\S]{0,100}section: "osd"/, "OSD 水印必须有独立路由");
+assert.match(settings, /activeKey === 'osd'/, "OSD 水印页面必须由一级路由决定内容");
 assert.match(router, /path: "\/recordings"[\s\S]{0,80}component: Recordings/, "录像中心必须有独立一级路由");
 
 assert.doesNotMatch(settings, /settings-nav-item|nav-caption">设置项/, "设置页内部不应再保留二级菜单");

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useDevice } from "../device";
 import {
   MEDIA_AUDIO_CODECS,
@@ -32,15 +32,30 @@ import {
   type GbVersion,
   type LocalIpOption,
   type NetworkSettings,
+  type OsdCapability,
+  type OsdLayer,
+  type OsdSettings,
+  getOsdCapability,
 } from "../platform";
+import {
+  OSD_SIZE_OPTIONS,
+  OSD_TEXT_MAX_CHARS,
+  defaultOsdSettings,
+  formatOsdTime,
+  normalizeOsdSettings,
+  osdPixelSize,
+  osdSettingsEqual,
+  validateOsdSettings,
+} from "../osd-settings";
 
-type SettingKey = "device" | "media" | "network" | "about";
+type SettingKey = "device" | "media" | "osd" | "network" | "about";
 
 const props = defineProps<{ section: SettingKey }>();
 
 const settings = [
   { key: "device" as const, icon: "◈", title: "设备配置", description: "设备身份、注册周期与出厂信息" },
   { key: "media" as const, icon: "◉", title: "音视频配置", description: "画质预设、视频编码与音频参数" },
+  { key: "osd" as const, icon: "▤", title: "OSD 水印", description: "时间、通道名与斜铺水印，实时采集时烧进码流" },
   { key: "network" as const, icon: "⌁", title: "网络配置", description: "本机绑定与 SIP 追踪" },
   { key: "about" as const, icon: "ⓘ", title: "关于", description: "版本、协议与开源信息" },
 ];
@@ -54,6 +69,7 @@ const {
   active: activePlatform,
   saveDesktopConfig,
   saveMediaConfig,
+  saveOsdConfig,
   resetDesktopConfig,
 } = usePlatform();
 const locked = computed(() => deviceLive.value
@@ -68,6 +84,12 @@ const mediaDraft = ref<MediaProfile | null>(null);
 const mediaDraftBase = ref<MediaProfile | null>(null);
 const mediaDraftRevision = ref(0);
 const networkDraft = ref<NetworkSettings | null>(null);
+const osdDraft = ref<OsdSettings | null>(null);
+const osdDraftBase = ref<OsdSettings | null>(null);
+const osdDraftRevision = ref(0);
+const osdCapability = ref<OsdCapability | null>(null);
+const osdNow = ref(new Date());
+let osdClock: ReturnType<typeof setInterval> | null = null;
 const profileVersion = ref<GbVersion>("V2022");
 const mediaAdvancedOpen = ref(false);
 const localIpOptions = ref<LocalIpOption[]>([]);
@@ -107,6 +129,12 @@ function replaceDrafts(force = false) {
     mediaDraftRevision.value = config.value.config_revision;
   }
   if (!preserveNetwork) networkDraft.value = { ...config.value.network };
+  // OSD 草稿与媒体草稿同一策略：没有未保存修改时才跟随后端刷新。
+  if (force || !osdDraft.value || !osdDraftBase.value || osdSettingsEqual(osdDraft.value, osdDraftBase.value)) {
+    osdDraft.value = normalizeOsdSettings(config.value.osd);
+    osdDraftBase.value = normalizeOsdSettings(config.value.osd);
+    osdDraftRevision.value = config.value.config_revision;
+  }
   if (!preserveVersion) profileVersion.value = activePlatform.value?.gb_version ?? "V2022";
 }
 
@@ -133,7 +161,49 @@ async function refreshLocalIpOptions() {
 
 watch(activeKey, (key) => {
   if (key === "network") void refreshLocalIpOptions();
+  if (key === "osd") {
+    if (!osdCapability.value) {
+      getOsdCapability()
+        .then((value) => { osdCapability.value = value; })
+        .catch(() => { osdCapability.value = { ffmpeg: false, filters: false, font: null }; });
+    }
+    osdClock ??= setInterval(() => { osdNow.value = new Date(); }, 1000);
+  } else if (osdClock) {
+    clearInterval(osdClock);
+    osdClock = null;
+  }
 }, { immediate: true });
+onUnmounted(() => { if (osdClock) clearInterval(osdClock); });
+
+const osdLayers: { key: keyof OsdSettings; label: string; hint: string }[] = [
+  { key: "timestamp", label: "时间", hint: "默认左上角，YYYY-MM-DD HH:MM:SS" },
+  { key: "channel_name", label: "通道名", hint: "默认右上角，文字取当前通道名称" },
+  { key: "watermark", label: "斜铺水印", hint: "整屏 30° 斜铺，透明度 28%" },
+];
+const osdDirty = computed(() => !!osdDraft.value && !!osdDraftBase.value
+  && !osdSettingsEqual(osdDraft.value, osdDraftBase.value));
+const osdBurnable = computed(() => !!osdCapability.value?.filters && !!osdCapability.value?.font);
+const osdPreviewSize = computed(() => ({
+  width: config.value?.media.width ?? 1920,
+  height: config.value?.media.height ?? 1080,
+}));
+const osdChannelName = computed(() => config.value?.device.channel_name || "通道 1");
+/** 预览框按 16:9 宽度 100% 显示，字号按「像素 / 画面高」换算成百分比。 */
+function osdPreviewFont(item: OsdLayer): string {
+  const { height } = osdPreviewSize.value;
+  return `${(osdPixelSize(item.size, height) / height) * 100}cqh`;
+}
+function osdTextStyle(item: OsdLayer) {
+  return {
+    fontSize: osdPreviewFont(item),
+    color: item.fill_color,
+    textShadow: `-1px -1px 0 ${item.outline_color}, 1px -1px 0 ${item.outline_color}, -1px 1px 0 ${item.outline_color}, 1px 1px 0 ${item.outline_color}`,
+  };
+}
+const osdWatermarkTiles = computed(() => Array.from({ length: 24 }, (_, index) => index));
+function resetOsdDraft() {
+  osdDraft.value = defaultOsdSettings();
+}
 
 const activeSetting = computed(() => settings.find((item) => item.key === activeKey.value)!);
 const platformSummary = computed(() => {
@@ -299,8 +369,21 @@ async function saveCurrent() {
     feedback.value = { ok: false, text: validation };
     return;
   }
+  if (activeKey.value === "osd" && osdDraft.value) {
+    const osdError = validateOsdSettings(osdDraft.value);
+    if (osdError) {
+      feedback.value = { ok: false, text: osdError };
+      return;
+    }
+  }
   saving.value = true;
   try {
+    if (activeKey.value === "osd" && osdDraft.value) {
+      await saveOsdConfig(normalizeOsdSettings(osdDraft.value), osdDraftRevision.value);
+      replaceDrafts(true);
+      feedback.value = { ok: true, text: "OSD 设置已保存，下次启动设备时生效" };
+      return;
+    }
     if (activeKey.value === "media" && mediaDraft.value) {
       await saveMediaConfig({ ...mediaDraft.value }, mediaDraftRevision.value);
       replaceDrafts(true);
@@ -322,6 +405,10 @@ async function saveCurrent() {
     feedback.value = { ok: false, text: String(cause) };
     if (activeKey.value === "media" && config.value && /版本冲突/.test(String(cause))) {
       mediaDraftRevision.value = config.value.config_revision;
+      feedback.value.text += "；草稿已保留，请核对后再次保存。";
+    }
+    if (activeKey.value === "osd" && config.value && /版本冲突/.test(String(cause))) {
+      osdDraftRevision.value = config.value.config_revision;
       feedback.value.text += "；草稿已保留，请核对后再次保存。";
     }
   } finally {
@@ -369,7 +456,8 @@ function setBindMode(mode: BindMode) {
         <div v-if="editableSection" class="content-heading">
           <div class="content-context"><span class="content-icon">{{ activeSetting.icon }}</span>模拟器有效配置</div>
           <div v-if="activeKey !== 'media'" class="content-actions">
-            <button class="btn ghost" type="button" :disabled="locked" @click="resetCurrent">恢复全部默认</button>
+            <button v-if="activeKey === 'osd'" class="btn ghost" type="button" :disabled="locked" @click="resetOsdDraft">恢复 OSD 默认</button>
+            <button v-else class="btn ghost" type="button" :disabled="locked" @click="resetCurrent">恢复全部默认</button>
             <button class="btn primary" type="button" :disabled="locked || !config" @click="saveCurrent">保存有效设置</button>
           </div>
         </div>
@@ -501,6 +589,62 @@ function setBindMode(mode: BindMode) {
           </div>
         </section>
 
+        <section v-else-if="activeKey === 'osd' && osdDraft" class="settings-section osd-section">
+          <div class="section-label">生效范围</div>
+          <div class="osd-scope" :class="{ warn: osdCapability && !osdBurnable }">
+            <template v-if="!osdCapability">正在检测 FFmpeg 与字体…</template>
+            <template v-else-if="osdBurnable">
+              Windows 摄像头 / 屏幕实时采集：烧进推流、录像与本地预览画面。文件回放、压测：不重新编码，画面中不带 OSD。
+              平台下发 OSDConfig 后，时间与文字的位置、开关以平台为准，样式沿用此处设置；平台 PictureMask 开启时叠加黑色遮挡。
+            </template>
+            <template v-else-if="!osdCapability.ffmpeg">未找到 FFmpeg，OSD 无法烧进码流。</template>
+            <template v-else-if="!osdCapability.filters">当前 FFmpeg 缺少 drawtext/drawbox 滤镜(需 libfreetype 编译)，OSD 不会烧进码流。</template>
+            <template v-else>未找到中文字体，OSD 不会烧进码流；可设置环境变量 UVP_OSD_FONT 指定字体文件。</template>
+          </div>
+
+          <div class="section-label">预览（{{ osdPreviewSize.width }}×{{ osdPreviewSize.height }}，本地默认布局）</div>
+          <div class="osd-preview" :style="{ aspectRatio: `${osdPreviewSize.width} / ${osdPreviewSize.height}` }">
+            <div v-if="osdDraft.watermark.enabled && osdDraft.watermark.text.trim()" class="osd-watermark">
+              <span v-for="tile in osdWatermarkTiles" :key="tile" :style="{ ...osdTextStyle(osdDraft.watermark), opacity: 0.28 }">{{ osdDraft.watermark.text }}</span>
+            </div>
+            <span v-if="osdDraft.timestamp.enabled" class="osd-time" :style="osdTextStyle(osdDraft.timestamp)">{{ formatOsdTime(osdNow) }}</span>
+            <span v-if="osdDraft.channel_name.enabled" class="osd-channel" :style="osdTextStyle(osdDraft.channel_name)">{{ osdChannelName }}</span>
+          </div>
+
+          <div v-for="layer in osdLayers" :key="layer.key" class="osd-layer">
+            <div class="osd-layer-head">
+              <label class="osd-switch">
+                <input v-model="osdDraft[layer.key].enabled" type="checkbox" :disabled="locked" />
+                <strong>{{ layer.label }}</strong>
+              </label>
+              <small>{{ layer.hint }}</small>
+            </div>
+            <div class="field-grid osd-fields">
+              <label v-if="layer.key === 'watermark'" class="field osd-text">
+                <span>水印文字（≤{{ OSD_TEXT_MAX_CHARS }} 字）</span>
+                <input v-model="osdDraft.watermark.text" :maxlength="OSD_TEXT_MAX_CHARS" :disabled="locked" placeholder="例如：内部测试" />
+              </label>
+              <label class="field">
+                <span>字号</span>
+                <select v-model="osdDraft[layer.key].size" :disabled="locked">
+                  <option v-for="option in OSD_SIZE_OPTIONS" :key="option.value" :value="option.value">
+                    {{ option.label }}（{{ osdPixelSize(option.value, osdPreviewSize.height) }}px）
+                  </option>
+                </select>
+              </label>
+              <label class="field">
+                <span>填充色</span>
+                <input v-model="osdDraft[layer.key].fill_color" type="color" :disabled="locked" />
+              </label>
+              <label class="field">
+                <span>描边色</span>
+                <input v-model="osdDraft[layer.key].outline_color" type="color" :disabled="locked" />
+              </label>
+            </div>
+          </div>
+          <div class="osd-footnote">{{ osdDirty ? "有未保存修改" : "已保存" }} · 修改在下次启动设备时生效</div>
+        </section>
+
         <section v-else-if="activeKey === 'network' && networkDraft" class="settings-section">
           <div class="section-label">网络绑定</div>
           <div class="network-options">
@@ -626,4 +770,19 @@ function setBindMode(mode: BindMode) {
 @media (max-width: 980px) { .settings-header { align-items: flex-start; flex-direction: column; } }
 @media (max-width: 900px) { .media-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); } .media-codec-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 680px) { .field-grid.two, .network-options, .about-grid, .media-codec-grid { grid-template-columns: 1fr; } .media-presets { grid-template-columns: 1fr 1fr; } .content-heading { align-items: flex-start; flex-direction: column; } .media-summary-card { align-items: flex-start; flex-direction: column; gap: 9px; } }
+.osd-scope { padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 9px; background: rgba(255,255,255,.55); color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.osd-scope.warn { border-color: #e6a23c; background: #fdf6ec; color: #a8661c; }
+.osd-preview { position: relative; width: 100%; max-width: 640px; overflow: hidden; container-type: size; border-radius: 10px; background: linear-gradient(135deg, #3a4a5c, #1e2833); font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }
+.osd-time { position: absolute; top: 0.6cqh; left: 0.4cqw; white-space: nowrap; }
+.osd-channel { position: absolute; top: 0.6cqh; right: 0.4cqw; white-space: nowrap; }
+.osd-watermark { position: absolute; inset: -40%; display: flex; flex-wrap: wrap; align-content: space-around; justify-content: space-around; gap: 8cqh 6cqw; transform: rotate(-30deg); pointer-events: none; }
+.osd-watermark span { white-space: nowrap; }
+.osd-layer { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.45); }
+.osd-layer-head { display: flex; align-items: center; gap: 12px; }
+.osd-layer-head small { color: var(--text-tertiary); font-size: 11px; }
+.osd-switch { display: flex; align-items: center; gap: 6px; color: var(--text-primary); font-size: 13px; }
+.osd-fields { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.osd-fields .osd-text { grid-column: 1 / -1; }
+.field input[type="color"] { padding: 2px 4px; cursor: pointer; }
+.osd-footnote { color: var(--text-tertiary); font-size: 11px; }
 </style>

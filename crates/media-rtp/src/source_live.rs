@@ -1725,6 +1725,19 @@ impl LiveSource {
         profile: MediaProfile,
         preview: Option<Arc<dyn PreviewSink>>,
     ) -> Result<Self> {
+        Self::capture_with_profile_osd(uri, profile, preview, None)
+    }
+
+    /// 同 [`Self::capture_with_profile`]，并把 OSD 烧进编码前的画面。
+    ///
+    /// 仅 Windows 的 FFmpeg 摄像头/屏幕路径支持；其他平台或 FFmpeg 缺少
+    /// drawtext 时忽略 OSD，采集照常启动。
+    pub fn capture_with_profile_osd(
+        uri: &str,
+        profile: MediaProfile,
+        preview: Option<Arc<dyn PreviewSink>>,
+        osd: Option<crate::osd::OsdOverlay>,
+    ) -> Result<Self> {
         let capture_profile = LiveCaptureProfile::from_media(&profile)?;
         let spec = LiveSourceSpec::parse(uri)?;
         #[cfg(any(target_os = "macos", windows))]
@@ -1733,9 +1746,14 @@ impl LiveSource {
                 #[cfg(windows)]
                 LiveSourceSpec::Screen {
                     display_id, audio, ..
-                } => {
-                    Self::capture_screen_profile(display_id, audio, capture_profile, preview, true)
-                }
+                } => Self::capture_screen_profile(
+                    display_id,
+                    audio,
+                    capture_profile,
+                    preview,
+                    true,
+                    osd,
+                ),
                 LiveSourceSpec::Camera {
                     video_index,
                     audio_index,
@@ -1746,18 +1764,24 @@ impl LiveSource {
                     capture_profile,
                     preview,
                     true,
+                    osd,
                 ),
                 #[cfg(target_os = "macos")]
                 LiveSourceSpec::Screen {
                     display_id, audio, ..
-                } => {
-                    Self::capture_screen_profile(display_id, audio, capture_profile, preview, true)
-                }
+                } => Self::capture_screen_profile(
+                    display_id,
+                    audio,
+                    capture_profile,
+                    preview,
+                    true,
+                    osd,
+                ),
             }
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
-            let _ = (capture_profile, preview);
+            let _ = (capture_profile, preview, osd);
             match spec {
                 LiveSourceSpec::Camera { .. } => Err(Error::Media(
                     "canonical camera capture is not supported on this platform".into(),
@@ -1827,6 +1851,7 @@ impl LiveSource {
             LiveCaptureProfile::legacy_camera(fps, audio_codec),
             preview,
             false,
+            None,
         )
     }
 
@@ -1837,6 +1862,7 @@ impl LiveSource {
         profile: LiveCaptureProfile,
         preview: Option<Arc<dyn PreviewSink>>,
         timed: bool,
+        osd: Option<crate::osd::OsdOverlay>,
     ) -> Result<Self> {
         let audio_codec = profile.audio_codec;
         let fps = profile.video_fps;
@@ -1908,6 +1934,12 @@ impl LiveSource {
                 "摄像头不支持配置的输出分辨率，已按最接近的受支持尺寸采集并缩放补齐"
             );
         }
+        #[cfg(windows)]
+        let osd_burn_in = osd.and_then(|overlay| crate::osd::OsdBurnIn::resolve(&ffmpeg, overlay));
+        #[cfg(target_os = "macos")]
+        if osd.is_some() {
+            tracing::warn!("macOS 摄像头采集暂不支持 OSD 烧录，画面中不带 OSD");
+        }
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let mut command = common::hidden_command(&ffmpeg);
         #[cfg(target_os = "macos")]
@@ -1928,6 +1960,7 @@ impl LiveSource {
             &profile,
             (input_mode.width, input_mode.height),
             &input_mode.input_args,
+            osd_burn_in.as_ref(),
         );
         let stop_flag = Arc::new(AtomicBool::new(false));
         let mut timing_video_stats_reader: Option<Box<dyn Read + Send>> = None;
@@ -2377,6 +2410,7 @@ impl LiveSource {
             LiveCaptureProfile::legacy_screen(profile, fps, audio_codec),
             None,
             false,
+            None,
         )
     }
 
@@ -2387,7 +2421,12 @@ impl LiveSource {
         profile: LiveCaptureProfile,
         preview: Option<Arc<dyn PreviewSink>>,
         timed: bool,
+        osd: Option<crate::osd::OsdOverlay>,
     ) -> Result<Self> {
+        // macOS 屏幕走 ScreenCaptureKit + OpenH264，本期不烧录 OSD。
+        if osd.is_some() {
+            tracing::warn!("macOS 屏幕采集暂不支持 OSD 烧录，画面中不带 OSD");
+        }
         use openh264::encoder::{Encoder, EncoderConfig, RateControlMode};
         use openh264::formats::{RgbSliceU8, YUVBuffer};
         use openh264::OpenH264API;
@@ -3230,6 +3269,7 @@ impl LiveSource {
             LiveCaptureProfile::legacy_screen(profile, fps, audio_codec),
             None,
             false,
+            None,
         )
     }
 
@@ -3244,6 +3284,7 @@ impl LiveSource {
         profile: LiveCaptureProfile,
         preview: Option<Arc<dyn PreviewSink>>,
         timed: bool,
+        osd: Option<crate::osd::OsdOverlay>,
     ) -> Result<Self> {
         if audio.is_enabled() {
             return Err(Error::Media(format!(
@@ -3265,7 +3306,9 @@ impl LiveSource {
         let display_id = monitor.display_id;
         let audio_codec = profile.audio_codec;
         let fps = profile.video_fps;
-        let mut screen_args = windows_screen::command_args(&monitor, &profile);
+        let osd_burn_in = osd.and_then(|overlay| crate::osd::OsdBurnIn::resolve(&ffmpeg, overlay));
+        let mut screen_args =
+            windows_screen::command_args(&monitor, &profile, osd_burn_in.as_ref());
         tracing::info!(
             display_id,
             output_idx = display_id.saturating_sub(1),

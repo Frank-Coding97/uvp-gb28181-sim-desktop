@@ -81,6 +81,30 @@ export interface DesktopConfigV2 {
   device: DeviceSettings;
   network: NetworkSettings;
   catalog_tree: CatalogNodeConfig[];
+  /** 本地 OSD 水印样式；旧后端缺省时由 normalizeOsdSettings 补齐。 */
+  osd?: OsdSettings;
+}
+
+export type OsdSize = "small" | "medium" | "large";
+
+export interface OsdLayer {
+  enabled: boolean;
+  text: string;
+  size: OsdSize;
+  fill_color: string;
+  outline_color: string;
+}
+
+export interface OsdSettings {
+  timestamp: OsdLayer;
+  channel_name: OsdLayer;
+  watermark: OsdLayer;
+}
+
+export interface OsdCapability {
+  ffmpeg: boolean;
+  filters: boolean;
+  font: string | null;
 }
 
 /** @deprecated Rust 配置已统一为 V2；保留类型别名兼容旧的前端调用方。 */
@@ -322,6 +346,25 @@ export async function saveMediaConfig(media: MediaProfile, expectedRevision?: nu
   }
 }
 
+export async function saveOsdConfig(osd: OsdSettings, expectedRevision?: number): Promise<DesktopConfigV2> {
+  if (!config.value) throw new Error("桌面端配置尚未加载");
+  try {
+    const saved = await invoke<DesktopConfigV2>("save_osd_config", {
+      osd,
+      expectedRevision: expectedRevision ?? config.value.config_revision,
+    });
+    return applyConfig(saved);
+  } catch (cause) {
+    error.value = String(cause);
+    await refreshAfterRevisionConflict(cause);
+    throw cause;
+  }
+}
+
+export async function getOsdCapability(): Promise<OsdCapability> {
+  return invoke<OsdCapability>("get_osd_capability");
+}
+
 export async function resetDesktopConfig(): Promise<DesktopConfigV2> {
   try {
     const reset = await invoke<DesktopConfigV2>("reset_desktop_config");
@@ -394,7 +437,7 @@ export function usePlatform() {
 
   return {
     config, profiles, activeId, active, loading, error,
-    loadDesktopConfig, saveDesktopConfig, saveMediaConfig, resetDesktopConfig,
+    loadDesktopConfig, saveDesktopConfig, saveMediaConfig, saveOsdConfig, resetDesktopConfig,
     setActive, addProfile, updateProfile, removeProfile, passwordFor,
   };
 }

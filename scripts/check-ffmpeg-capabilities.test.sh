@@ -45,6 +45,8 @@ assert ffprobe["version"].startswith("ffprobe version"), report
 assert report["expected_backend"] == "videotoolbox", report
 assert report["expected_backend_present"] is True, report
 assert report["probe_input"]["devices_accessed"] is False, report
+assert set(report["osd_filters"]) == {"drawtext", "drawbox"}, report
+assert all(isinstance(value, bool) for value in report["osd_filters"].values()), report
 
 probes = report["probes"]
 expected = {

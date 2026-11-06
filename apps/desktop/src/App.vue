@@ -17,6 +17,7 @@ import GitNetworkOutline from "@vicons/ionicons5/es/GitNetworkOutline.js";
 import TerminalOutline from "@vicons/ionicons5/es/TerminalOutline.js";
 import SettingsOutline from "@vicons/ionicons5/es/SettingsOutline.js";
 import VideocamOutline from "@vicons/ionicons5/es/VideocamOutline.js";
+import TextOutline from "@vicons/ionicons5/es/TextOutline.js";
 import FilmOutline from "@vicons/ionicons5/es/FilmOutline.js";
 import WifiOutline from "@vicons/ionicons5/es/WifiOutline.js";
 import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutline.js";
@@ -40,6 +41,7 @@ const menuOptions: MenuOption[] = [
   { label: "压力测试",   key: "/scenario",         icon: icon(PulseOutline) },
   { label: "设备配置",   key: "/device-settings",  icon: icon(SettingsOutline) },
   { label: "音视频配置", key: "/media-settings",   icon: icon(VideocamOutline) },
+  { label: "OSD 水印",   key: "/osd-settings",     icon: icon(TextOutline) },
   { label: "网络配置",   key: "/network-settings", icon: icon(WifiOutline) },
   { label: "日志",       key: "/logs",             icon: icon(TerminalOutline) },
   { label: "关于",       key: "/about",            icon: icon(InformationCircleOutline) },

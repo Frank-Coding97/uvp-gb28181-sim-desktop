@@ -11,6 +11,7 @@ use common::{AudioTransport, DeviceId, GbVersion, SignalingEncoding, Transport};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+use media_rtp::osd::OsdSettings;
 use media_rtp::profile::MediaProfile;
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,20 @@ impl ConfigStore {
             return Err("配置版本冲突，请重新读取后保存".into());
         }
         current.media = media;
+        self.save(&current)
+    }
+
+    pub fn save_osd(
+        &self,
+        osd: OsdSettings,
+        expected_revision: u64,
+    ) -> Result<DesktopConfigV2, String> {
+        osd.validate()?;
+        let mut current = self.load()?;
+        if current.config_revision != expected_revision {
+            return Err("配置版本冲突，请重新读取后保存".into());
+        }
+        current.osd = osd;
         self.save(&current)
     }
 
@@ -231,6 +246,9 @@ pub struct DesktopConfigV2 {
     /// 目录树持久化真相；空表示启动时生成默认目录。
     #[serde(default)]
     pub catalog_tree: Vec<CatalogNodeConfig>,
+    /// 本地 OSD 水印样式；旧配置文件缺省时取移动端一致的默认值。
+    #[serde(default)]
+    pub osd: OsdSettings,
 }
 
 /// Kept private: only schema 1 on-disk input uses the legacy FPS location.
@@ -265,6 +283,7 @@ impl DesktopConfigV1 {
             device: self.device.settings,
             network: self.network,
             catalog_tree: self.catalog_tree,
+            osd: OsdSettings::default(),
         }
     }
 }
@@ -389,6 +408,7 @@ pub struct ResolvedStartConfig {
     pub video_source: Option<String>,
     pub catalog_template: String,
     pub catalog_tree: Vec<CatalogNodeConfig>,
+    pub osd: OsdSettings,
 }
 
 impl fmt::Debug for StartDeviceInput {
@@ -469,6 +489,7 @@ impl Default for DesktopConfigV2 {
                 sip_trace: true,
             },
             catalog_tree: Vec::new(),
+            osd: OsdSettings::default(),
         }
     }
 }
@@ -536,6 +557,7 @@ impl DesktopConfigV2 {
             return Err("连续心跳失败阈值必须大于 0".into());
         }
         self.media.validate()?;
+        self.osd.validate()?;
         if self.network.bind_mode == BindMode::Specific
             && self.network.bind_address.parse::<IpAddr>().is_err()
         {
@@ -578,6 +600,7 @@ impl DesktopConfigV2 {
             video_source: input.video_source,
             catalog_template: input.catalog_template.trim().to_string(),
             catalog_tree: self.catalog_tree.clone(),
+            osd: self.osd.clone(),
         })
     }
 }

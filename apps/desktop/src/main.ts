@@ -31,6 +31,7 @@ const router = createRouter({
     { path: "/scenario",  component: Scenario },
     { path: "/device-settings",  component: Settings, props: { section: "device" } },
     { path: "/media-settings",   component: Settings, props: { section: "media" } },
+    { path: "/osd-settings",     component: Settings, props: { section: "osd" } },
     { path: "/network-settings", component: Settings, props: { section: "network" } },
     { path: "/about",            component: Settings, props: { section: "about" } },
     { path: "/logs",      component: System },

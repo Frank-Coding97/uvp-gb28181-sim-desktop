@@ -90,14 +90,26 @@ pub(super) fn resolve(display_id: u32) -> Result<ScreenMonitor> {
 ///
 /// The encoder tail is shared with the DirectShow camera path so both Windows
 /// sources keep identical codec, GOP and PTS behavior.
-pub(super) fn command_args(monitor: &ScreenMonitor, profile: &LiveCaptureProfile) -> Vec<String> {
+pub(super) fn command_args(
+    monitor: &ScreenMonitor,
+    profile: &LiveCaptureProfile,
+    osd: Option<&crate::osd::OsdBurnIn>,
+) -> Vec<String> {
     let output_idx = monitor.display_id.saturating_sub(1);
-    let filter = format!(
+    let base = format!(
         "ddagrab=output_idx={output_idx}:framerate={fps}:draw_mouse=1,\
-hwdownload,format=bgra,{scale},format=yuv420p[v]",
+hwdownload,format=bgra,{scale},format=yuv420p",
         fps = profile.video_fps,
         scale = windows_capture::scale_pad_filter(profile.width, profile.height),
     );
+    // OSD 画在缩放之后；水印叠加会改变像素格式，末尾再统一转回 yuv420p。
+    let filter = match osd {
+        Some(osd) => format!(
+            "{},format=yuv420p[v]",
+            osd.graph(&base, profile.width, profile.height)
+        ),
+        None => format!("{base}[v]"),
+    };
     let mut args: Vec<String> = [
         "-hide_banner",
         "-nostdin",
@@ -253,7 +265,7 @@ mod tests {
 
     #[test]
     fn ddagrab_command_selects_the_monitor_and_reuses_the_shared_encoder() {
-        let args = command_args(&monitor(2), &profile(LiveVideoCodec::H264));
+        let args = command_args(&monitor(2), &profile(LiveVideoCodec::H264), None);
         let filter = args
             .windows(2)
             .find(|pair| pair[0] == "-filter_complex")
@@ -275,7 +287,7 @@ mod tests {
 
     #[test]
     fn hevc_screen_command_keeps_hevc_and_the_configured_gop() {
-        let args = command_args(&monitor(1), &profile(LiveVideoCodec::H265));
+        let args = command_args(&monitor(1), &profile(LiveVideoCodec::H265), None);
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx265"]));
         assert!(args.windows(2).any(|pair| pair == ["-f", "hevc"]));
         assert!(args.windows(2).any(|pair| pair == ["-g", "25"]));

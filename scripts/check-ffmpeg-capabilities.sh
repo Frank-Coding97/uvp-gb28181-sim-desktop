@@ -350,6 +350,17 @@ report = {
 }
 report["overall_status"] = "passed" if all(item["status"] == "passed" for item in probes.values()) else "failed"
 
+# OSD 水印依赖 drawtext(需 libfreetype)与 drawbox。缺失时桌面端降级为不烧录，
+# 所以这里只报告并告警，不影响 overall_status。
+filters_listing = subprocess.run(
+    [ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, errors="replace"
+).stdout
+filter_names = {parts[1] for parts in (line.split() for line in filters_listing.splitlines()) if len(parts) > 1}
+report["osd_filters"] = {name: name in filter_names for name in ("drawtext", "drawbox")}
+missing_osd = [name for name, present in report["osd_filters"].items() if not present]
+if missing_osd:
+    print(f"[WARN] FFmpeg 缺少 OSD 滤镜 {', '.join(missing_osd)}，OSD 水印不会烧进码流", file=sys.stderr)
+
 with open(report_path, "w", encoding="utf-8") as handle:
     json.dump(report, handle, ensure_ascii=False, indent=2)
     handle.write("\n")

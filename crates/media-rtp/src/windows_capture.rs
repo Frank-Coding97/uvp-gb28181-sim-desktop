@@ -9,6 +9,8 @@ pub(super) fn command_args(
     // 保证推出去的画面尺寸始终等于配置的输出分辨率。
     input_size: (u32, u32),
     mode_args: &[String],
+    // 需要烧进码流的 OSD；None 时滤镜与原来完全一致。
+    osd: Option<&crate::osd::OsdBurnIn>,
 ) -> Vec<String> {
     // Use the Windows capture graph clock. Redirected cameras can report a
     // device clock that lags the microphone clock; keep actual capture timing
@@ -43,11 +45,18 @@ pub(super) fn command_args(
     // 摄像头不支持配置的输出分辨率时(如 720p 摄像头配 1080p 档位),
     // 先按比例缩放再用黑边补齐,而不是把 720p 原始帧直接推给平台:
     // 平台的 SDP/目录里声明的是 profile 尺寸,实际帧也必须一致。
-    if input_size != (profile.width, profile.height) {
-        args.extend([
-            "-vf".into(),
-            scale_pad_filter(profile.width, profile.height),
-        ]);
+    let base = if input_size != (profile.width, profile.height) {
+        scale_pad_filter(profile.width, profile.height)
+    } else {
+        String::new()
+    };
+    // OSD 必须画在缩放之后，坐标才对应输出分辨率。
+    let filter = match osd {
+        Some(osd) => osd.graph(&base, profile.width, profile.height),
+        None => base,
+    };
+    if !filter.is_empty() {
+        args.extend(["-vf".into(), filter]);
     }
     args.extend(encoder_args(profile));
     args
@@ -135,6 +144,7 @@ mod tests {
             &profile(LiveVideoCodec::H264),
             (1920, 1080),
             &mode,
+            None,
         );
         for pair in [
             ["-f", "dshow"],
@@ -167,6 +177,7 @@ mod tests {
             &profile(LiveVideoCodec::H265),
             (1920, 1080),
             &[],
+            None,
         );
         assert!(args
             .windows(2)
@@ -198,6 +209,7 @@ mod tests {
             &profile(LiveVideoCodec::H264),
             (1280, 720),
             &mode,
+            None,
         );
         let filter = args
             .windows(2)
@@ -211,5 +223,51 @@ mod tests {
         let codec = args.iter().position(|arg| arg == "-c:v").unwrap();
         assert!(vf < codec);
         assert!(args.windows(2).any(|pair| pair == ["-r", "30"]));
+    }
+
+    #[test]
+    fn osd_is_drawn_after_scaling_and_before_the_encoder() {
+        use crate::osd::*;
+        let osd = OsdBurnIn {
+            overlay: OsdOverlay {
+                base_width: 1920,
+                base_height: 1080,
+                time: Some(OsdTime {
+                    anchor: OsdAnchor::Pixel { x: 10, y: 10 },
+                    format: OsdTimeFormat::Dash,
+                    style: OsdLayer::default(),
+                }),
+                texts: vec![],
+                watermark: None,
+                mask_base: (1920, 1080),
+                masks: vec![],
+            },
+            font: "C:/f.ttc".into(),
+        };
+        let args = command_args(
+            "camera",
+            None,
+            &profile(LiveVideoCodec::H264),
+            (1280, 720),
+            &[],
+            Some(&osd),
+        );
+        let filter = args
+            .windows(2)
+            .find(|pair| pair[0] == "-vf")
+            .map(|pair| pair[1].as_str())
+            .expect("osd needs a filter");
+        let scale = filter.find("scale=1920:1080").expect("scale first");
+        assert!(scale < filter.find("drawtext").unwrap(), "{filter}");
+        // 输入尺寸与输出一致时也必须挂 OSD 滤镜。
+        let same = command_args(
+            "camera",
+            None,
+            &profile(LiveVideoCodec::H264),
+            (1920, 1080),
+            &[],
+            Some(&osd),
+        );
+        assert!(same.windows(2).any(|pair| pair[0] == "-vf" && pair[1].starts_with("null,drawtext")));
     }
 }

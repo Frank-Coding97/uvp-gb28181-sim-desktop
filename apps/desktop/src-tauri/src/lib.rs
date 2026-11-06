@@ -736,6 +736,46 @@ async fn save_media_config(
 }
 
 #[tauri::command]
+async fn save_osd_config(
+    osd: media_rtp::osd::OsdSettings,
+    expected_revision: u64,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<DesktopConfigV2, String> {
+    let device = state.device.lock().await;
+    state.ensure_config_writable(device.is_some())?;
+    let store = app_config_store(&state, &app)?;
+    let _io = state.config_io.lock().await;
+    tokio::task::spawn_blocking(move || store.save_osd(osd, expected_revision))
+        .await
+        .map_err(|error| format!("保存 OSD 配置任务异常: {error}"))?
+}
+
+/// OSD 能否烧进码流：FFmpeg 带 drawtext/drawbox，且有中文字体。
+#[derive(serde::Serialize)]
+struct OsdCapability {
+    ffmpeg: bool,
+    filters: bool,
+    font: Option<String>,
+}
+
+#[tauri::command]
+async fn get_osd_capability() -> Result<OsdCapability, String> {
+    tokio::task::spawn_blocking(|| {
+        let ffmpeg = media_rtp::ffmpeg_bin();
+        OsdCapability {
+            ffmpeg: ffmpeg.is_some(),
+            filters: ffmpeg
+                .as_deref()
+                .is_some_and(media_rtp::osd::ffmpeg_supports_osd),
+            font: media_rtp::osd::font_file().map(|path| path.display().to_string()),
+        }
+    })
+    .await
+    .map_err(|error| format!("检测 OSD 能力任务异常: {error}"))
+}
+
+#[tauri::command]
 async fn reset_desktop_config(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
@@ -1730,6 +1770,8 @@ async fn start_device(
     sim.set_preview_sink(Some(
         state.preview_bus.clone() as Arc<dyn media_rtp::PreviewSink>
     ));
+    // 单设备实时采集时把 OSD 烧进码流；文件源在模拟器内部自动跳过。
+    sim.set_osd_settings(Some(resolved.osd.clone()));
     // 语音广播/对讲下行的 PCM 输出:转成 Tauri 事件,由前端 Web Audio 播放。
     sim.set_broadcast_audio_sink(Arc::new(BroadcastAudioEmitter { app: app.clone() }));
 
@@ -2641,6 +2683,8 @@ pub fn run() {
             get_desktop_config,
             save_desktop_config,
             save_media_config,
+            save_osd_config,
+            get_osd_capability,
             reset_desktop_config,
             exchange_sip_provision,
             validate_scenario,

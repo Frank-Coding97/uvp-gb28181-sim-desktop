@@ -9,6 +9,7 @@
 //! - `pusher`:把视频源→PS→RTP 按帧率推流的驱动
 
 pub mod file_profile;
+pub mod osd;
 pub mod preview;
 pub mod preview_source;
 pub mod preview_worker;
