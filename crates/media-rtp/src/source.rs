@@ -578,7 +578,7 @@ impl SharedMedia {
             .map(|video| {
                 (
                     Frame {
-                        data: video.data,
+                        data: video.data.to_vec(),
                         key_frame: video.key_frame,
                     },
                     video.codec,
@@ -711,7 +711,7 @@ impl VideoSource for SharedVideoSource {
             match self.next_media_event()? {
                 MediaEvent::Video(video) => {
                     return Some(Frame {
-                        data: video.data,
+                        data: video.data.to_vec(),
                         key_frame: video.key_frame,
                     });
                 }
@@ -725,11 +725,11 @@ impl VideoSource for SharedVideoSource {
         let mut out: Vec<Vec<u8>> = self
             .pending_audio
             .drain(..)
-            .map(|audio| audio.data)
+            .map(|audio| audio.data.to_vec())
             .collect();
         while let Some(event) = self.next_media_event() {
             match event {
-                MediaEvent::Audio(audio) => out.push(audio.data),
+                MediaEvent::Audio(audio) => out.push(audio.data.to_vec()),
                 other => {
                     self.pending_event = Some(other);
                     break;
@@ -1540,7 +1540,7 @@ impl VideoSource for FileSource {
                 match self.next_historical_event()? {
                     MediaEvent::Video(video) => {
                         return Some(Frame {
-                            data: video.data,
+                            data: video.data.to_vec(),
                             key_frame: video.key_frame,
                         });
                     }
@@ -1604,11 +1604,11 @@ impl VideoSource for FileSource {
             let mut out: Vec<Vec<u8>> = self
                 .historical_pending_audio
                 .drain(..)
-                .map(|audio| audio.data)
+                .map(|audio| audio.data.to_vec())
                 .collect();
             while let Some(event) = self.next_historical_event() {
                 match event {
-                    MediaEvent::Audio(audio) => out.push(audio.data),
+                    MediaEvent::Audio(audio) => out.push(audio.data.to_vec()),
                     other => {
                         self.historical_pending_event = Some(other);
                         break;
