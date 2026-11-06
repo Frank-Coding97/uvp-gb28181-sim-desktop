@@ -1,8 +1,20 @@
 # crate: media-rtp
 
-**状态:M2 完成** · RTP/PS 封装与推流引擎。
+**状态:M2 完成 + v2 P1** · RTP/PS 封装与推流引擎。演进方向见 [`20-architecture/media-pipeline-v2.md`](../20-architecture/media-pipeline-v2.md)。
 
-> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **Windows 摄像头/屏幕采集**(DirectShow + ddagrab,共享编码与真实 PTS)✅ · 单测 111 全绿。待补:Windows 屏幕音频、TCP(RFC 4571)推流。
+> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **Windows 摄像头/屏幕采集**(DirectShow + ddagrab,共享编码与真实 PTS)✅ · **TCP 主动/被动推流**(RFC 4571)✅ · **v2 P1**:`Bytes` 零拷贝、订阅端事件唤醒、PS 音视频交织、按会话关闭音频 ✅。待补:Windows 屏幕音频。
+
+## v2 P1 变更摘要
+
+- **数据**:`TimedVideoAu.data` / `TimedAudioAu.data` 为 `bytes::Bytes`,订阅者之间共享,clone 只增加引用计数。
+- **推流入口**:`push_stream_to(source, RtpTarget, PushOptions, control, stop)`。
+  - `RtpTarget::{Udp, TcpActive, TcpPassive { listener, accept_timeout }}`:被动模式的监听端口由调用方在 200 OK 前绑定;accept 期间收到 stop 立即返回。
+  - `PushOptions { ssrc, fps, with_audio }`:`with_audio=false` 时 PSM 只声明视频并丢弃音频事件。
+  - `push_stream` / `push_stream_controlled` 保留为兼容封装。
+- **事件接收**:`VideoSource::{has_async_events, recv_event, wait_event_blocking, take_buffered}`。`SharedVideoSource` 直接 await 总线;积压被丢弃时报告一次 `Discontinuity` 并从下一带参数集关键帧恢复。`LiveEventQueue` 用条件变量唤醒采集线程。
+- **交织**:`interleave::InterleavedSource` 在 60ms 窗口内按 PTS 排序音视频,推流(协商音频时)与录像都经过它。
+- **LightSource**:关键帧前置伪 SPS/PPS,否则共享总线订阅者等不到起播点。
+- 旧接口 `next_frame` / `next_audio` 仍在,P3 替换采集层时删除。
 
 ## 容器格式支持(FileSource)
 
