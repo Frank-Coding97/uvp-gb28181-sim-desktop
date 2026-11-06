@@ -416,6 +416,13 @@ pub trait VideoSource: Send {
         Box::pin(std::future::ready(self.next_media_event()))
     }
 
+    /// 取出已从内部源读出、但还在包装层缓冲里的事件(按输出顺序)。
+    ///
+    /// 消费者停止前调用,避免交织窗口里的最后几十毫秒数据丢失。默认没有缓冲。
+    fn take_buffered(&mut self) -> Vec<MediaEvent> {
+        Vec::new()
+    }
+
     /// 在采集线程里阻塞等待下一个事件,最长 `timeout`。
     ///
     /// 默认实现取一次,没有事件时睡 1ms;有内部队列的源覆盖为条件变量等待。

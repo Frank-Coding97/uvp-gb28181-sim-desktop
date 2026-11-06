@@ -9,6 +9,7 @@
 //! - `pusher`:把视频源→PS→RTP 按帧率推流的驱动
 
 pub mod file_profile;
+pub mod interleave;
 pub mod osd;
 pub mod preview;
 pub mod preview_source;
@@ -25,6 +26,7 @@ pub mod rtp;
 pub mod snapshot;
 pub mod source;
 
+pub use interleave::{InterleavedSource, Interleaver};
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};
 pub use pusher::{
     contains_codec_config, push_stream, push_stream_controlled, push_stream_to, PlaybackControl,

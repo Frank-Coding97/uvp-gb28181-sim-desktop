@@ -276,6 +276,15 @@ pub async fn push_stream_to(
         PsMuxer::with_video(source.codec())
     };
     if source.supports_timed_events() {
+        // 音视频复合流:复用前按 PTS 交织,纯视频会话无需额外延迟。
+        let source: Box<dyn VideoSource> = if audio_enabled {
+            Box::new(crate::interleave::InterleavedSource::new(
+                source,
+                crate::interleave::DEFAULT_WINDOW_90K,
+            ))
+        } else {
+            source
+        };
         return push_timed_events(source, sender, control, stop, mux, audio_enabled).await;
     }
     let fps = fps.max(1);
