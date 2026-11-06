@@ -77,6 +77,7 @@ async fn main() {
             manufacturer: "UVP".into(),
             model: "Desktop-Sim".into(),
             firmware: "0.1.0-dev".into(),
+            hardware_version: None,
         },
         video_source: std::env::var("VIDEO_SOURCE").ok(),
         media_profile: None,

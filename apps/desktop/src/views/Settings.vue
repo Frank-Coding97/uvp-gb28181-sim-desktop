@@ -102,6 +102,7 @@ function sameDeviceDraft(left: DeviceSettings, right: DeviceSettings): boolean {
     && left.manufacturer === right.manufacturer
     && left.model === right.model
     && left.firmware === right.firmware
+    && left.hardware_version === right.hardware_version
     && left.channel_name === right.channel_name
     && left.register_expires_secs === right.register_expires_secs
     && left.heartbeat_interval_secs === right.heartbeat_interval_secs
@@ -358,6 +359,9 @@ function validateDraft(): string | null {
   if (device.register_expires_secs < 3600) return "注册有效期不得短于 3600 秒";
   if (device.heartbeat_interval_secs < 1) return "心跳间隔必须大于 0 秒";
   if (device.heartbeat_fail_threshold < 1) return "连续心跳失败阈值必须大于 0";
+  // 硬件版本会直接拼进 DeviceInfo XML，长度与 XML 元字符都要挡住。
+  if (device.hardware_version.trim().length > 64) return "硬件版本不得超过 64 个字符";
+  if (/[<>&]/.test(device.hardware_version)) return "硬件版本不能包含 < > & 字符";
   if (network.bind_mode === "specific" && !network.bind_address.trim()) return "指定绑定模式必须填写本机 IP";
   return null;
 }
@@ -486,7 +490,15 @@ function setBindMode(mode: BindMode) {
             <label class="field"><span>厂商</span><input v-model="deviceDraft.manufacturer" :disabled="locked" /></label>
             <label class="field"><span>型号</span><input v-model="deviceDraft.model" :disabled="locked" /></label>
             <label class="field"><span>固件版本</span><input v-model="deviceDraft.firmware" :disabled="locked" /></label>
-            <button class="future-field" disabled>硬件版本（后续阶段）</button>
+            <label class="field">
+              <span>硬件版本{{ profileVersion === "V2022" ? "" : "（2016 不输出）" }}</span>
+              <input
+                v-model="deviceDraft.hardware_version"
+                maxlength="64"
+                placeholder="留空则不应答该字段"
+                :disabled="locked"
+              />
+            </label>
           </div>
         </section>
 

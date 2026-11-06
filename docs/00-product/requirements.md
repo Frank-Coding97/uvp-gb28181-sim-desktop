@@ -28,7 +28,7 @@
 | FR-14 | 设备配置查询(ConfigDownload)、预置位查询(PresetQuery) | P2 | M3+ ✅ |
 | FR-15 | 订阅通知:目录/报警(对话内 NOTIFY)、移动位置周期上报 | P1 | M3+ ✅ |
 | FR-16 | 回放控制:会话内 INFO/MANSRTSP 倍速、暂停/恢复 | P2 | M3+ ✅ |
-| FR-17 | 扩展查询应答:报警状态(AlarmStatus)、看守位(HomePositionQuery)、存储卡状态(StorageCardStatusQuery)、巡航轨迹列表/详情(CruiseTrackListQuery/CruiseTrackQuery)、PTZ 精准状态(PTZPreciseStatusQuery)、移动位置单次查询;ConfigDownload 增 VideoParamOpt | P1 | M6 |
+| FR-17 | 扩展查询应答:报警状态(AlarmStatus)、看守位(HomePositionQuery)、存储卡状态(StorageCardStatusQuery)、巡航轨迹列表/详情(CruiseTrackListQuery/CruiseTrackQuery)、PTZ 精准状态(PTZPreciseStatusQuery,六字段 Pan/Tilt/Zoom + 视场角 + 最大可视距离,光学三量随变焦换算)、移动位置单次查询;ConfigDownload 增 VideoParamOpt | P1 | M6 |
 | FR-18 | 扩展设备控制:精确云台(PTZPreciseCtrl)、巡航轨迹控制(PTZCmd 0x84-0x88)、辅助控制雨刷/红外/加热/除雾/制冷(PTZCmd 0x89/0x8A)、Focus 聚焦/光圈、目标跟踪(TargetTrack)、格式化 SD 卡(FormatSDCard) | P1 | M6 |
 | FR-19 | 平台下发抓拍:SnapShotCmd(经 Alarm Notify 上报)+ SnapShotConfig(GB-2022,JPEG 经 HTTP PUT 上传 + 完成 NOTIFY,含 SSRF 上传白名单校验) | P2 | M6 |
 | FR-30 | 在线升级 DeviceUpgrade:4 步进度(0/30/60/100%)DeviceUpgradeResult NOTIFY 闭环 | P2 | M6 |
@@ -42,6 +42,8 @@
 | FR-46 | 设备校时可视化:平台基准时间/本机时间/偏移/来源凭证/SIP 回退值/最近失败原因一屏可见;NTP 服务器、端口、刷新间隔可配,NTP 生效期不受 SIP Date 覆盖,失败自动回退 | P1 | M7 |
 | FR-47 | 本地抓拍与图库:预览页一键抓拍(取预览总线最新帧,不打断推流)、图库缩略图/尺寸/时间、放大查看、另存为、删除 | P2 | M7 |
 | FR-48 | 定时录像计划:周时间表(周一至周日、每天最多 8 段、30 分钟网格 + 秒级编辑、相邻段自动合并)、设备运行期 10s 调度自动起停并标记「定时」来源、ConfigDownload/VideoRecordPlan 回读与实际行为对齐、计划默认关闭 | P1 | M7 |
+| FR-49 | 订阅运行详情:四类订阅(位置/目录/报警/PTZ 精准位置)显示订阅者、Expires、剩余秒数倒计时、累计上报次数、最近应答码、最近错误;生命周期区分未订阅/已订阅/已过期/已退订/异常;设备下线清空详情 | P1 | M7 |
+| FR-50 | 硬件版本可配:设置页可填硬件版本(≤64 字符、禁 XML 元字符),仅 GB-2022 的 DeviceInfo 应答输出,留空不输出空节点 | P2 | M7 |
 
 ### 压力测试(核心)
 

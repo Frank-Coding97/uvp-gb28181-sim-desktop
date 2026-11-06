@@ -36,6 +36,7 @@ fn wvp_cfg(template_channels: Vec<ChannelConfig>) -> DeviceConfig {
             manufacturer: "UVP".into(),
             model: "Desktop-Sim".into(),
             firmware: "0.1.0".into(),
+            hardware_version: None,
         },
         video_source: None,
         media_profile: None,

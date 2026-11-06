@@ -77,10 +77,35 @@ interface MediaPreparationEvent {
 
 type SubscriptionKind = "MobilePosition" | "Catalog" | "Alarm" | "PTZPosition";
 
+type SubscriptionLifecycle =
+  | "not_subscribed"
+  | "subscribed"
+  | "expired"
+  | "cancelled"
+  | "exception";
+
+/** PTZ 六字段姿态快照（GB/T 28181-2022 A.2.6.15）。 */
+interface PtzPositionSnapshot {
+  pan: number;
+  tilt: number;
+  zoom: number;
+  horizontal_field_angle: number;
+  vertical_field_angle: number;
+  max_view_distance: number;
+}
+
 interface SubscriptionState {
   kind: SubscriptionKind;
   active: boolean;
+  lifecycle: SubscriptionLifecycle;
+  subscriber: string | null;
+  expires_secs: number;
+  remaining_secs: number;
   notify_count: number;
+  last_notify_at_ms: number | null;
+  last_notify_result: string | null;
+  last_error: string | null;
+  ptz_position: PtzPositionSnapshot | null;
 }
 
 const message = useMessage();
@@ -156,18 +181,67 @@ async function refreshRecordingState() {
   }
 }
 
+const EMPTY_SUBSCRIPTION = {
+  active: false,
+  lifecycle: "not_subscribed" as SubscriptionLifecycle,
+  subscriber: null,
+  expires_secs: 0,
+  remaining_secs: 0,
+  notify_count: 0,
+  last_notify_at_ms: null,
+  last_notify_result: null,
+  last_error: null,
+  ptz_position: null,
+};
+
 const subscriptions = reactive<Record<SubscriptionKind, SubscriptionState>>({
-  MobilePosition: { kind: "MobilePosition", active: false, notify_count: 0 },
-  Catalog: { kind: "Catalog", active: false, notify_count: 0 },
-  Alarm: { kind: "Alarm", active: false, notify_count: 0 },
-  PTZPosition: { kind: "PTZPosition", active: false, notify_count: 0 },
+  MobilePosition: { kind: "MobilePosition", ...EMPTY_SUBSCRIPTION },
+  Catalog: { kind: "Catalog", ...EMPTY_SUBSCRIPTION },
+  Alarm: { kind: "Alarm", ...EMPTY_SUBSCRIPTION },
+  PTZPosition: { kind: "PTZPosition", ...EMPTY_SUBSCRIPTION },
 });
 
 function resetSubscriptions() {
   for (const item of Object.values(subscriptions)) {
-    item.active = false;
-    item.notify_count = 0;
+    Object.assign(item, EMPTY_SUBSCRIPTION);
   }
+}
+
+/** 订阅卡片主行文案：过期/异常要能一眼看出来，不能只显示「已订阅」。 */
+function subscriptionLabel(item: SubscriptionState): string {
+  if (item.lifecycle === "expired") return "已过期";
+  if (item.lifecycle === "exception") return "上报异常";
+  if (!item.active) return item.lifecycle === "cancelled" ? "已退订" : "未订阅";
+  if (item.remaining_secs > 0) return `剩余 ${formatRemaining(item.remaining_secs)}`;
+  return "已订阅";
+}
+
+/** 剩余时间按量级换单位，超过一天只报小时。 */
+function formatRemaining(totalSecs: number): string {
+  const secs = Math.max(0, Math.floor(totalSecs));
+  const hours = Math.floor(secs / 3600);
+  const minutes = Math.floor((secs % 3600) / 60);
+  const rest = secs % 60;
+  if (hours > 0) return `${hours}小时${minutes}分`;
+  if (minutes > 0) return `${minutes}分${rest}秒`;
+  return `${rest}秒`;
+}
+
+/** 悬停详情：订阅者、有效期、累计上报、最近一次结果与错误。 */
+function subscriptionTip(item: SubscriptionState): string {
+  const lines: string[] = [`状态：${subscriptionLabel(item)}`];
+  if (item.subscriber) lines.push(`订阅者：${item.subscriber}`);
+  if (item.expires_secs > 0) lines.push(`有效期：${item.expires_secs} 秒`);
+  lines.push(`累计上报：${item.notify_count} 次`);
+  if (item.last_notify_result) lines.push(`最近应答：${item.last_notify_result}`);
+  if (item.last_error) lines.push(`最近错误：${item.last_error}`);
+  if (item.ptz_position) {
+    const p = item.ptz_position;
+    lines.push(`Pan ${p.pan.toFixed(2)}° / Tilt ${p.tilt.toFixed(2)}° / Zoom ${p.zoom.toFixed(2)}x`);
+    lines.push(`视场角 ${p.horizontal_field_angle.toFixed(2)}°×${p.vertical_field_angle.toFixed(2)}°`);
+    lines.push(`最大可视距离 ${p.max_view_distance.toFixed(0)} 米`);
+  }
+  return lines.join("\n");
 }
 
 async function refreshSubscriptions() {
@@ -179,6 +253,26 @@ async function refreshSubscriptions() {
     }
   } catch {
     // 设备未启动时后端会拒绝；保持未订阅状态即可。
+  }
+}
+
+let subscriptionRefreshTimer: number | null = null;
+
+/** 事件密集时（位置订阅每几秒一条）合并成一次快照回读，避免打爆 IPC。 */
+function scheduleSubscriptionRefresh() {
+  if (subscriptionRefreshTimer !== null) return;
+  subscriptionRefreshTimer = window.setTimeout(() => {
+    subscriptionRefreshTimer = null;
+    void refreshSubscriptions();
+  }, 300);
+}
+
+/** 本地秒级倒数：到期即时翻成「已过期」，不必等下次快照。 */
+function tickSubscriptionCountdown() {
+  for (const item of Object.values(subscriptions)) {
+    if (!item.active || item.remaining_secs <= 0) continue;
+    item.remaining_secs -= 1;
+    if (item.remaining_secs === 0) item.lifecycle = "expired";
   }
 }
 
@@ -260,6 +354,10 @@ const sourceHint = computed(() => {
   return "";
 });
 const mediaSourceReady = computed(() => form.value.video_source.trim().length > 0);
+// 平台点播/回放/下载期间设备侧会推 StreamStart/StreamStop,前端只把它折成
+// device_state=InCall。这里直接复用该状态:再单开一条"观看人数"事件既重复,
+// 也会和推流生命周期出现两套真源。
+const platformWatching = computed(() => deviceState.value === "InCall");
 const previewStateText = computed(() => ({
   idle: "等待启动",
   starting: "等待画面",
@@ -743,9 +841,14 @@ onMounted(async () => {
       previewError.value = event.payload.message;
     }
   });
-  unlistenSub = await listen<SubscriptionState>("subscription_state", (event) => {
-    if (event.payload.kind in subscriptions) {
-      subscriptions[event.payload.kind] = event.payload;
+  unlistenSub = await listen<Pick<SubscriptionState, "kind" | "active" | "notify_count">>("subscription_state", (event) => {
+    const item = subscriptions[event.payload.kind];
+    if (item) {
+      // 事件只带「是否活跃 + 累计条数」，运行详情（订阅者/有效期/最近错误）
+      // 要回后端取一次快照，否则会把已有详情覆盖成 undefined。
+      item.active = event.payload.active;
+      item.notify_count = event.payload.notify_count;
+      scheduleSubscriptionRefresh();
     }
   });
   unlistenMediaPreparation = await listen<MediaPreparationEvent>("media_preparation", (event) => {
@@ -755,7 +858,10 @@ onMounted(async () => {
   if (runtime) captureState.value = runtime.capture_state as CaptureState;
   await refreshSubscriptions();
   await refreshRecordingState();
-  recordingRefreshTimer = window.setInterval(() => void refreshRecordingState(), 1000);
+  recordingRefreshTimer = window.setInterval(() => {
+    void refreshRecordingState();
+    tickSubscriptionCountdown();
+  }, 1000);
   await startPreview();
 });
 
@@ -781,6 +887,7 @@ onUnmounted(() => {
   unlistenSub?.();
   unlistenMediaPreparation?.();
   if (recordingRefreshTimer) clearInterval(recordingRefreshTimer);
+  if (subscriptionRefreshTimer !== null) clearTimeout(subscriptionRefreshTimer);
 });
 </script>
 
@@ -819,6 +926,19 @@ onUnmounted(() => {
               </n-button>
             </div>
             <div class="preview-overlay top-left"><i :class="{ on: previewState === 'playing' }" /> UVP-SIM</div>
+            <!-- 平台侧正在收流时在画面上打标:本地预览无论是谁都照常出图,
+                 没有这层标识就分不清"平台在看"还是"只有本机在看"。
+                 视觉只保留绿点闪动 + LIVE;完整语义留给 aria-label/title。 -->
+            <div
+              v-if="platformWatching"
+              class="preview-watching"
+              role="status"
+              aria-label="平台正在观看"
+              :title="`${displayedProfile?.name ?? '平台'} 正在接收该设备的实时流`"
+            >
+              <i aria-hidden="true" />
+              <span aria-hidden="true">LIVE</span>
+            </div>
             <div class="preview-overlay bottom-row">
               <span>{{ sourceSummary }}</span>
               <span v-if="previewWidth !== null && previewHeight !== null">
@@ -973,13 +1093,20 @@ onUnmounted(() => {
         </div>
 
         <div class="config-grid">
-          <label class="field wide">
-            <span>服务器</span>
+          <!-- 地址与端口各带一行标题:两者并排时只有整组一个「服务器」标签,
+               端口框只看得到 5060 这个占位值,分不清哪个框填端口。 -->
+          <div class="field wide">
             <div class="host-port">
-              <n-input v-model:value="draft.server_host" size="medium" clearable :disabled="!editing" placeholder="例如 192.168.1.100" />
-              <n-input-number v-model:value="draft.server_port" size="medium" clearable :disabled="!editing" :min="1" :max="65535" :show-button="false" placeholder="5060" />
+              <label class="host-port-cell">
+                <span>服务器地址</span>
+                <n-input v-model:value="draft.server_host" size="medium" clearable :disabled="!editing" placeholder="例如 192.168.1.100" />
+              </label>
+              <label class="host-port-cell">
+                <span>端口</span>
+                <n-input-number v-model:value="draft.server_port" size="medium" clearable :disabled="!editing" :min="1" :max="65535" :show-button="false" placeholder="5060" />
+              </label>
             </div>
-          </label>
+          </div>
           <label class="field">
             <span>服务器 ID</span>
             <n-input
@@ -1117,20 +1244,45 @@ onUnmounted(() => {
             <span>{{ canReport ? "可触发" : "未就绪" }}</span>
             <i v-if="subscriptions.Alarm.active" class="subscription-dot" title="报警订阅已建立" />
           </button>
-          <div class="quick-card subscription" :class="{ active: subscriptions.MobilePosition.active }">
+          <div
+            class="quick-card subscription"
+            :class="{ active: subscriptions.MobilePosition.active, stale: subscriptions.MobilePosition.lifecycle === 'expired' || subscriptions.MobilePosition.lifecycle === 'exception' }"
+            :title="subscriptionTip(subscriptions.MobilePosition)"
+          >
             <n-icon><LocationOutline /></n-icon>
             <strong>位置订阅</strong>
-            <span><i />{{ subscriptions.MobilePosition.active ? "已订阅" : "未订阅" }}</span>
+            <span><i />{{ subscriptionLabel(subscriptions.MobilePosition) }}</span>
+            <small v-if="subscriptions.MobilePosition.notify_count > 0" class="subscription-count">
+              已上报 {{ subscriptions.MobilePosition.notify_count }} 次
+            </small>
           </div>
-          <div class="quick-card subscription" :class="{ active: subscriptions.Catalog.active }">
+          <div
+            class="quick-card subscription"
+            :class="{ active: subscriptions.Catalog.active, stale: subscriptions.Catalog.lifecycle === 'expired' || subscriptions.Catalog.lifecycle === 'exception' }"
+            :title="subscriptionTip(subscriptions.Catalog)"
+          >
             <n-icon><FolderOpenOutline /></n-icon>
             <strong>目录订阅</strong>
-            <span><i />{{ subscriptions.Catalog.active ? "已订阅" : "未订阅" }}</span>
+            <span><i />{{ subscriptionLabel(subscriptions.Catalog) }}</span>
+            <small v-if="subscriptions.Catalog.notify_count > 0" class="subscription-count">
+              已上报 {{ subscriptions.Catalog.notify_count }} 次
+            </small>
           </div>
-          <div class="quick-card subscription" :class="{ active: subscriptions.PTZPosition.active }">
+          <div
+            class="quick-card subscription"
+            :class="{ active: subscriptions.PTZPosition.active, stale: subscriptions.PTZPosition.lifecycle === 'expired' || subscriptions.PTZPosition.lifecycle === 'exception' }"
+            :title="subscriptionTip(subscriptions.PTZPosition)"
+          >
             <n-icon><OptionsOutline /></n-icon>
             <strong class="long-label">PTZ 精准位置订阅</strong>
-            <span><i />{{ subscriptions.PTZPosition.active ? "已订阅" : "未订阅" }}</span>
+            <span><i />{{ subscriptionLabel(subscriptions.PTZPosition) }}</span>
+            <small
+              v-if="subscriptions.PTZPosition.ptz_position"
+              class="subscription-count"
+            >
+              {{ subscriptions.PTZPosition.ptz_position.zoom.toFixed(2) }}x ·
+              {{ subscriptions.PTZPosition.ptz_position.horizontal_field_angle.toFixed(1) }}°视场
+            </small>
           </div>
         </div>
 
@@ -1309,6 +1461,47 @@ onUnmounted(() => {
 .top-left i.on { background: #43d59d; }
 .bottom-row { right: 0; bottom: 0; left: 0; display: flex; justify-content: space-between; gap: 12px; padding: 9px 12px; background: linear-gradient(transparent, rgba(3, 10, 20, .78)); }
 .bottom-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 平台观看标识(LIVE):压在画面右上角,暗底 + 绿色光晕保证亮暗画面上都能看清;
+   闪烁点只在"正在看"时存在,元素出现/消失本身就是状态切换。
+   绿色与画面左上角 UVP-SIM 的"出图中"点同色,不额外引入一套状态色。 */
+.preview-watching {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid rgba(67, 213, 157, .45);
+  border-radius: 999px;
+  color: #d9fcee;
+  background: rgba(8, 26, 20, .62);
+  backdrop-filter: blur(6px);
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+}
+.preview-watching i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #43d59d;
+  animation: preview-watch-pulse 1.6s ease-out infinite;
+}
+@keyframes preview-watch-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(67, 213, 157, .6); }
+  70% { box-shadow: 0 0 0 6px rgba(67, 213, 157, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(67, 213, 157, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .preview-watching i { animation: none; }
+}
 
 .source-bar { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto auto; align-items: center; gap: 7px; min-width: 0; }
 .source-modes { display: inline-flex; gap: 3px; padding: 3px; border-radius: 6px; background: var(--bg-hover); }
@@ -1371,7 +1564,11 @@ onUnmounted(() => {
 .transport-card-title { display: flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; }
 .transport-card-title .n-icon { color: var(--accent-primary, #2f7cf6); font-size: 14px; }
 .char-count { color: var(--text-tertiary); font-size: 10px; font-variant-numeric: tabular-nums; }
-.host-port { display: grid; grid-template-columns: minmax(0, 1fr) 78px; gap: 6px; }
+/* 端口固定列 78px 时五位端口贴着输入框边框,再加一行标题又显得比地址框窄一截,
+   放到 96px:既容得下 65535,也留出与地址框一致的左右留白。 */
+.host-port { display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 6px; align-items: end; }
+.host-port-cell { display: grid; gap: 3px; min-width: 0; }
+.host-port-cell > span { color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
 .primary-actions { display: grid; grid-template-columns: minmax(0, 1fr); margin-top: 10px; }
 .broadcast-indicator {
   display: flex;
@@ -1423,6 +1620,9 @@ onUnmounted(() => {
 .quick-card.action:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
 .quick-card.action:disabled { cursor: not-allowed; color: var(--text-tertiary); }
 .quick-card.subscription.active { border-color: rgba(24, 160, 88, .38); color: var(--success); background: rgba(24, 160, 88, .07); }
+/* 订阅过期/上报异常：保留卡片形状但换成告警色，避免和"从未订阅"混为一谈。 */
+.quick-card.subscription.stale { border-color: rgba(208, 120, 24, .42); color: var(--warning, #d07818); background: rgba(208, 120, 24, .08); }
+.quick-card .subscription-count { font-family: "SF Mono", Menlo, monospace; font-size: 8px; opacity: .62; line-height: 1.1; }
 .subscription-dot { position: absolute; top: 7px; right: 7px; width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
 .config-foot { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--text-tertiary); font-size: 10px; }
 

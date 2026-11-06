@@ -515,6 +515,7 @@ mod tests {
                 manufacturer: "UVP".into(),
                 model: "Sim".into(),
                 firmware: "0.1".into(),
+                hardware_version: None,
             },
             video_source: None,
             media_profile: None,

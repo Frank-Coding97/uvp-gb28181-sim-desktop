@@ -2216,6 +2216,11 @@ async fn start_device(
             manufacturer: resolved.device.manufacturer.clone(),
             model: resolved.device.model.clone(),
             firmware: resolved.device.firmware.clone(),
+            // 硬件版本只在 GB-2022 下有意义：2016 平台不认识这个字段。
+            // 空串视同未填写，避免报文里出现空节点。
+            hardware_version: (resolved.profile.gb_version == common::GbVersion::V2022
+                && !resolved.device.hardware_version.trim().is_empty())
+            .then(|| resolved.device.hardware_version.clone()),
         },
         video_source: resolved.video_source.clone(),
         video_fps: resolved.media.video_fps,

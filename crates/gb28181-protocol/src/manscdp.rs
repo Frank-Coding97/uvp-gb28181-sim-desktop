@@ -1402,6 +1402,9 @@ pub struct DeviceInfoResponse {
     pub model: String,
     #[serde(rename = "Firmware")]
     pub firmware: String,
+    /// 硬件版本（GB-2022 新增）。缺省时不输出该标签，避免 2016 平台解析异常。
+    #[serde(rename = "HardwareVersion", skip_serializing_if = "Option::is_none")]
+    pub hardware_version: Option<String>,
     /// 通道数。
     #[serde(rename = "Channel")]
     pub channel: u32,
@@ -2659,6 +2662,9 @@ impl CruiseTrackQueryResponse {
 }
 
 /// PTZ 精准状态查询应答(PTZPosition,GB-2022,设备 → 平台)。
+///
+/// 六字段齐全(A.2.6.15):三轴姿态 `Pan`/`Tilt`/`Zoom` + 光学三量
+/// `HorizontalFieldAngle`/`VerticalFieldAngle`/`MaxViewDistance`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "Response")]
 pub struct PtzPreciseStatusResponse {
@@ -2677,18 +2683,31 @@ pub struct PtzPreciseStatusResponse {
     /// 变倍(≥1.00,%.2f)。
     #[serde(rename = "Zoom")]
     pub zoom: String,
+    /// 水平视场角(度,%.2f)。变焦的函数,不独立配置。
+    #[serde(rename = "HorizontalFieldAngle")]
+    pub horizontal_field_angle: String,
+    /// 垂直视场角(度,%.2f)。变焦的函数,不独立配置。
+    #[serde(rename = "VerticalFieldAngle")]
+    pub vertical_field_angle: String,
+    /// 最大可视距离(米,%.2f)。变焦的函数,不独立配置。
+    #[serde(rename = "MaxViewDistance")]
+    pub max_view_distance: String,
 }
 
 impl PtzPreciseStatusResponse {
-    /// 用当前姿态构造(格式化为 %.2f)。
+    /// 用当前姿态构造(六字段统一 %.2f,光学三量由变焦换算)。
     pub fn new(device_id: impl Into<String>, sn: u32, pan: f32, tilt: f32, zoom: f32) -> Self {
+        let optics = crate::ptz::PtzOptics::from_zoom(zoom);
         PtzPreciseStatusResponse {
             cmd_type: "PTZPosition".into(),
             sn,
             device_id: device_id.into(),
-            pan: format!("{pan:.2}"),
-            tilt: format!("{tilt:.2}"),
-            zoom: format!("{zoom:.2}"),
+            pan: crate::ptz::format_two(pan),
+            tilt: crate::ptz::format_two(tilt),
+            zoom: crate::ptz::format_two(zoom),
+            horizontal_field_angle: crate::ptz::format_two(optics.horizontal_field_angle_deg),
+            vertical_field_angle: crate::ptz::format_two(optics.vertical_field_angle_deg),
+            max_view_distance: crate::ptz::format_two(optics.max_view_distance_m),
         }
     }
 
@@ -2726,10 +2745,19 @@ pub struct PtzPreciseNotify {
     /// 变倍(≥1.00,%.2f)。
     #[serde(rename = "Zoom")]
     pub zoom: String,
+    /// 水平视场角(度,%.2f)。变焦的函数,不独立配置。
+    #[serde(rename = "HorizontalFieldAngle")]
+    pub horizontal_field_angle: String,
+    /// 垂直视场角(度,%.2f)。变焦的函数,不独立配置。
+    #[serde(rename = "VerticalFieldAngle")]
+    pub vertical_field_angle: String,
+    /// 最大可视距离(米,%.2f)。变焦的函数,不独立配置。
+    #[serde(rename = "MaxViewDistance")]
+    pub max_view_distance: String,
 }
 
 impl PtzPreciseNotify {
-    /// 用变化后的姿态构造一条通知(格式化为 %.2f)。
+    /// 用变化后的姿态构造一条通知(六字段统一 %.2f,光学三量由变焦换算)。
     pub fn new(
         device_id: impl Into<String>,
         sn: u32,
@@ -2738,14 +2766,18 @@ impl PtzPreciseNotify {
         tilt: f32,
         zoom: f32,
     ) -> Self {
+        let optics = crate::ptz::PtzOptics::from_zoom(zoom);
         PtzPreciseNotify {
             cmd_type: "PTZPosition".into(),
             sn,
             device_id: device_id.into(),
             time: time.into(),
-            pan: format!("{pan:.2}"),
-            tilt: format!("{tilt:.2}"),
-            zoom: format!("{zoom:.2}"),
+            pan: crate::ptz::format_two(pan),
+            tilt: crate::ptz::format_two(tilt),
+            zoom: crate::ptz::format_two(zoom),
+            horizontal_field_angle: crate::ptz::format_two(optics.horizontal_field_angle_deg),
+            vertical_field_angle: crate::ptz::format_two(optics.vertical_field_angle_deg),
+            max_view_distance: crate::ptz::format_two(optics.max_view_distance_m),
         }
     }
 
@@ -2858,11 +2890,33 @@ mod tests {
             manufacturer: "UVP".into(),
             model: "Desktop".into(),
             firmware: "0.1.0".into(),
+            hardware_version: None,
             channel: 1,
         };
         let xml = resp.to_xml().unwrap();
         assert!(xml.contains("<CmdType>DeviceInfo</CmdType>"));
+        // 未填硬件版本时不能输出空标签。
+        assert!(!xml.contains("<HardwareVersion>"), "实际: {xml}");
         assert!(xml.contains("<Manufacturer>UVP</Manufacturer>"));
+        assert!(xml.contains("<Firmware>0.1.0</Firmware>"));
+    }
+
+    #[test]
+    fn 设备信息应答可携带硬件版本() {
+        let resp = DeviceInfoResponse {
+            cmd_type: "DeviceInfo".into(),
+            sn: 4,
+            device_id: "34020000001320000001".into(),
+            result: "OK".into(),
+            device_name: "UVP-Sim".into(),
+            manufacturer: "UVP".into(),
+            model: "Desktop".into(),
+            firmware: "0.1.0".into(),
+            hardware_version: Some("HW-2.1".into()),
+            channel: 1,
+        };
+        let xml = resp.to_xml().unwrap();
+        assert!(xml.contains("<HardwareVersion>HW-2.1</HardwareVersion>"), "实际: {xml}");
         assert!(xml.contains("<Channel>1</Channel>"));
     }
 
@@ -3485,6 +3539,25 @@ mod tests {
         assert!(xml.contains("<Pan>12.35</Pan>"));
         assert!(xml.contains("<Tilt>-3.20</Tilt>"));
         assert!(xml.contains("<Zoom>1.00</Zoom>"));
+    }
+
+    #[test]
+    fn ptz精准状态六字段齐全且光学量随变焦换算() {
+        // A.2.6.15 六字段:三轴姿态 + 视场角 + 最大可视距离。
+        // 缺光学三量时平台算不出实际覆盖范围,所以两条上报路径都必须报全。
+        let xml = PtzPreciseStatusResponse::new("dev", 3, 0.0, 0.0, 3.0)
+            .to_xml()
+            .unwrap();
+        assert!(xml.contains("<HorizontalFieldAngle>20.00</HorizontalFieldAngle>"), "{xml}");
+        assert!(xml.contains("<VerticalFieldAngle>12.00</VerticalFieldAngle>"), "{xml}");
+        assert!(xml.contains("<MaxViewDistance>900.00</MaxViewDistance>"), "{xml}");
+
+        let notify = PtzPreciseNotify::new("dev", 4, "2026-09-15T16:40:00", 10.0, 5.0, 2.0)
+            .to_xml()
+            .unwrap();
+        assert!(notify.contains("<HorizontalFieldAngle>30.00</HorizontalFieldAngle>"), "{notify}");
+        assert!(notify.contains("<VerticalFieldAngle>18.00</VerticalFieldAngle>"), "{notify}");
+        assert!(notify.contains("<MaxViewDistance>600.00</MaxViewDistance>"), "{notify}");
     }
 
     #[test]

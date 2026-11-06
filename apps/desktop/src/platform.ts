@@ -44,6 +44,8 @@ export interface DeviceSettings {
   manufacturer: string;
   model: string;
   firmware: string;
+  /** 硬件版本，仅 GB-2022 的 DeviceInfo 应答输出；留空表示不填。 */
+  hardware_version: string;
   channel_name: string;
   register_expires_secs: number;
   heartbeat_interval_secs: number;
@@ -334,6 +336,7 @@ function migrateLegacy(base: DesktopConfigV2): DesktopConfigV2 | null {
       manufacturer: stringValue(legacyDevice.manufacturer, base.device.manufacturer),
       model: stringValue(legacyDevice.model, base.device.model),
       firmware: stringValue(legacyDevice.firmware, base.device.firmware),
+      hardware_version: stringValue(legacyDevice.hardware_version, base.device.hardware_version),
       channel_name: stringValue(legacyDevice.channel_name, base.device.channel_name),
       register_expires_secs: positiveInt(legacyProtocol.register_expires_secs, base.device.register_expires_secs),
       heartbeat_interval_secs: positiveInt(legacyProtocol.heartbeat_interval_secs, base.device.heartbeat_interval_secs),

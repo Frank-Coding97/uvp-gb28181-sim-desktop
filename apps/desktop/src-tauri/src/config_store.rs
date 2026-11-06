@@ -492,6 +492,9 @@ pub struct DeviceSettings {
     pub manufacturer: String,
     pub model: String,
     pub firmware: String,
+    /// 硬件版本（DeviceInfo 应答，GB-2022 才输出）。旧配置缺省为空。
+    #[serde(default)]
+    pub hardware_version: String,
     pub channel_name: String,
     pub register_expires_secs: u32,
     pub heartbeat_interval_secs: u64,
@@ -602,6 +605,7 @@ impl Default for DesktopConfigV2 {
                 manufacturer: "UVP".into(),
                 model: "Desktop-Sim".into(),
                 firmware: "0.1.2".into(),
+                hardware_version: String::new(),
                 channel_name: "Camera-1".into(),
                 register_expires_secs: 86_400,
                 heartbeat_interval_secs: 60,

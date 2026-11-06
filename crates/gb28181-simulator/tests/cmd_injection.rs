@@ -33,6 +33,7 @@ fn cfg() -> DeviceConfig {
             manufacturer: "UVP".into(),
             model: "Sim".into(),
             firmware: "1.0".into(),
+            hardware_version: None,
         },
         video_source: None,
         media_profile: None,

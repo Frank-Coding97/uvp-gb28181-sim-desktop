@@ -43,6 +43,49 @@
 
 > 当前设备状态**只经 `device_state` 事件**推送(见 §3),没有同名查询命令。
 
+### 订阅运行详情(FR-49)
+
+| 命令 | 入参 | 返回 | 说明 |
+|---|---|---|---|
+| `get_device_subscriptions` | — | `SubscriptionSnapshot[]` | 四类订阅的运行详情基线(进入页面/事件后回读) |
+
+```ts
+type SubscriptionLifecycle =
+  | "not_subscribed"   // 从未订阅
+  | "subscribed"       // 活跃且未过期
+  | "expired"          // 活跃但有效期已走完(平台未续订)
+  | "cancelled"        // 曾订阅后主动退订或设备下线
+  | "exception";       // 通知失败且当前无活跃对话
+
+interface SubscriptionSnapshot {
+  kind: "MobilePosition" | "Catalog" | "Alarm" | "PTZPosition";
+  active: boolean;
+  lifecycle: SubscriptionLifecycle;
+  subscriber: string | null;      // 平台地址 host:port
+  expires_secs: number;           // 平台 SUBSCRIBE 携带的 Expires
+  remaining_secs: number;         // 剩余秒数，饱和到 0
+  notify_count: number;
+  last_notify_at_ms: number | null;
+  last_notify_result: string | null;  // 最近一次成功的 SIP 状态码
+  last_error: string | null;          // 最近一次失败原因
+  ptz_position: {                     // 仅 PTZPosition 有值
+    pan: number; tilt: number; zoom: number;
+    horizontal_field_angle: number;
+    vertical_field_angle: number;
+    max_view_distance: number;
+  } | null;
+}
+```
+
+> `subscription_state` 事件**只带 `kind`/`active`/`notify_count`**。前端收到事件后必须回读一次
+> `get_device_subscriptions` 才拿得到详情,不能把事件载荷整体覆盖到本地状态上 —— 否则
+> `lifecycle`/`remaining_secs` 会被写成 `undefined`。
+
+> PTZ 六字段中的光学三量(`HorizontalFieldAngle`/`VerticalFieldAngle`/`MaxViewDistance`)
+> 不是独立读数,而是变焦倍数的函数(基准 60°/36°/300 m,除以或乘以有效变焦),
+> 报文与快照共用 `gb28181_protocol::ptz::PtzOptics` 同一套换算,保证两边一致。
+
+
 ### 设备校时命令(FR-46)
 
 | 命令 | 入参 | 返回 | 说明 |
@@ -177,6 +220,7 @@ interface LogExportResult {
 | `sip_trace` | `SipTraceEntry` | 可开关 | 结构化 SIP 报文(大规模默认关) |
 | `ptz_action` | `{ up, down, left, right, zoom_in, zoom_out, pan_speed, tilt_speed, zoom_speed }` | PTZ 控制到达时 | 前端云台动画 |
 | `ptz_preset` | 预置位号(number) | 预置位调用时 | 前端预置位调用演示 |
+| `subscription_state` | `{ kind, active, notify_count }` | 订阅建立/退订/每次上报时 | 订阅卡片点亮与计数;详情需另调 `get_device_subscriptions`(§2) |
 | `run_state`(规划,未实现) | `{ run_id, state }` | — | 压测生命周期(当前未发出) |
 | `engine_log`(规划,未实现) | `LogEntry` | — | 引擎日志转发(当前未发出) |
 

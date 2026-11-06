@@ -191,6 +191,8 @@ pub struct DeviceInfo {
     pub manufacturer: String,
     pub model: String,
     pub firmware: String,
+    /// 硬件版本（GB-2022 新增字段）。None 时不输出，兼容只认 2016 字段的平台。
+    pub hardware_version: Option<String>,
 }
 
 const REGISTER_RETRY_MIN_SECS: u64 = 60;
@@ -281,6 +283,9 @@ pub struct DeviceSimulator {
     position: std::sync::Mutex<(f64, f64)>,
     /// 活跃订阅表(CmdType → 订阅句柄)。平台 SUBSCRIBE 建立,退订/下线时清理。
     subscriptions: tokio::sync::Mutex<HashMap<String, Subscription>>,
+    /// 四类订阅的运行期元数据(CmdType → 订阅者/有效期/最近通知结果)。
+    /// 与 `subscriptions` 分开:后者只有 MobilePosition 有周期任务,元数据四类都有。
+    subscription_meta: std::sync::Mutex<HashMap<String, SubscriptionMeta>>,
     /// 报警订阅对话(平台 `SUBSCRIBE + Alarm` 时记录:对话标识 + 平台地址)。
     /// 存在时,report_alarm 走对话内 NOTIFY;否则退化为独立 MESSAGE(如手动触发)。
     alarm_dialog: tokio::sync::Mutex<Option<(builder::NotifyDialog, SocketAddr)>>,
@@ -536,11 +541,86 @@ pub struct ControlSnapshot {
 }
 
 /// 一条活跃订阅的只读快照（供 UI 订阅卡片）。
+///
+/// 除「是否已订阅 / 已发几条」外，还带上运行期细节：谁订阅的、有效期多久、
+/// 还剩多少秒、最近一次 NOTIFY 的结果与错误。移动端订阅面板展示的就是这一组，
+/// 桌面端此前只有前三项，平台侧排障时看不出「订阅已过期但界面仍显示已订阅」。
 #[derive(Debug, Clone, Serialize)]
 pub struct SubscriptionSnapshot {
     pub kind: String,
     pub active: bool,
+    /// `not_subscribed` / `subscribed` / `expired` / `cancelled` / `exception`。
+    pub lifecycle: String,
+    /// 发起订阅的平台地址（host:port），未订阅时为 None。
+    pub subscriber: Option<String>,
+    /// 平台在 SUBSCRIBE 里给的 Expires（秒）。
+    pub expires_secs: u32,
+    /// 距离过期的剩余秒数（已过期或无订阅为 0）。
+    pub remaining_secs: u32,
     pub notify_count: u32,
+    /// 最近一次 NOTIFY 的发起时刻（毫秒时间戳）。
+    pub last_notify_at_ms: Option<u64>,
+    /// 最近一次 NOTIFY 的 SIP 状态码，成功时写在这里。
+    pub last_notify_result: Option<String>,
+    /// 最近一次 NOTIFY 的错误描述，失败时写在这里。
+    pub last_error: Option<String>,
+    /// 仅 PTZPosition 有值：六字段姿态快照（A.2.6.15）。
+    pub ptz_position: Option<PtzPositionSnapshot>,
+}
+
+/// PTZ 六字段姿态快照（GB/T 28181-2022 A.2.6.15）。
+///
+/// 光学三量（视场角 / 最大可视距离）由变焦换算而来，与报文里的取值同源，
+/// 保证「界面看到的」和「平台收到的」不会互相矛盾。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PtzPositionSnapshot {
+    pub pan: f64,
+    pub tilt: f64,
+    pub zoom: f64,
+    pub horizontal_field_angle: f64,
+    pub vertical_field_angle: f64,
+    pub max_view_distance: f64,
+}
+
+impl PtzPositionSnapshot {
+    /// 由三轴姿态换算六字段。
+    pub fn from_pose(pan: f32, tilt: f32, zoom: f32) -> Self {
+        let optics = gb28181_protocol::ptz::PtzOptics::from_zoom(zoom);
+        PtzPositionSnapshot {
+            pan: f64::from(pan),
+            tilt: f64::from(tilt),
+            zoom: f64::from(zoom),
+            horizontal_field_angle: f64::from(optics.horizontal_field_angle_deg),
+            vertical_field_angle: f64::from(optics.vertical_field_angle_deg),
+            max_view_distance: f64::from(optics.max_view_distance_m),
+        }
+    }
+}
+
+/// 一条订阅的运行期元数据（订阅者 / 有效期 / 最近通知结果）。
+///
+/// 与 [`Subscription`]（周期任务句柄）分开：后者只有 MobilePosition 用，
+/// 而这里四类订阅都要记；且这份数据要能被快照读取，不能牵动任何任务。
+#[derive(Debug, Clone, Default)]
+struct SubscriptionMeta {
+    subscriber: Option<String>,
+    expires_secs: u32,
+    subscribed_at_ms: u64,
+    last_notify_at_ms: Option<u64>,
+    last_notify_result: Option<String>,
+    last_error: Option<String>,
+}
+
+impl SubscriptionMeta {
+    /// 剩余秒数：首次订阅时按 `Expires` 起算，过期后恒为 0。
+    fn remaining_secs(&self, now_ms: u64) -> u32 {
+        if self.expires_secs == 0 {
+            return 0;
+        }
+        let elapsed_ms = now_ms.saturating_sub(self.subscribed_at_ms);
+        let expires_ms = u64::from(self.expires_secs) * 1_000;
+        (expires_ms.saturating_sub(elapsed_ms) / 1_000).min(u64::from(u32::MAX)) as u32
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -701,6 +781,13 @@ fn epoch_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// 订阅运行详情只跟踪这四类；SIP 里出现别的 Event 时不该在快照里凭空多一行。
+const TRACKED_SUBSCRIPTIONS: [&str; 4] = ["MobilePosition", "Alarm", "Catalog", "PTZPosition"];
+
+fn is_tracked_subscription(kind: &str) -> bool {
+    TRACKED_SUBSCRIPTIONS.contains(&kind)
+}
+
 fn initial_runtime_config(
     config: &DeviceConfig,
 ) -> gb28181_protocol::manscdp::ConfigDownloadResponse {
@@ -843,6 +930,7 @@ impl DeviceSimulator {
             local_addr: std::sync::OnceLock::new(),
             position: std::sync::Mutex::new((116.397_428, 39.909_230)),
             subscriptions: tokio::sync::Mutex::new(HashMap::new()),
+            subscription_meta: std::sync::Mutex::new(HashMap::new()),
             alarm_dialog: tokio::sync::Mutex::new(None),
             catalog_dialog: tokio::sync::Mutex::new(None),
             ptz_dialog: tokio::sync::Mutex::new(None),
@@ -1981,36 +2069,140 @@ impl DeviceSimulator {
         let alarm_active = self.alarm_dialog.lock().await.is_some();
         let catalog_active = self.catalog_dialog.lock().await.is_some();
         let ptz_active = self.ptz_dialog.lock().await.is_some();
+        let ptz_position = ptz_active.then(|| {
+            let (pan, tilt, zoom) = self.precise_pose();
+            PtzPositionSnapshot::from_pose(pan, tilt, zoom)
+        });
         vec![
-            SubscriptionSnapshot {
-                kind: "MobilePosition".into(),
-                active: mobile_active,
-                notify_count: self
-                    .position_notify_count
+            self.build_subscription_snapshot(
+                "MobilePosition",
+                mobile_active,
+                self.position_notify_count
                     .load(std::sync::atomic::Ordering::Relaxed),
-            },
-            SubscriptionSnapshot {
-                kind: "Alarm".into(),
-                active: alarm_active,
-                notify_count: self
-                    .alarm_notify_count
+                None,
+            ),
+            self.build_subscription_snapshot(
+                "Alarm",
+                alarm_active,
+                self.alarm_notify_count
                     .load(std::sync::atomic::Ordering::Relaxed),
-            },
-            SubscriptionSnapshot {
-                kind: "Catalog".into(),
-                active: catalog_active,
-                notify_count: self
-                    .catalog_notify_count
+                None,
+            ),
+            self.build_subscription_snapshot(
+                "Catalog",
+                catalog_active,
+                self.catalog_notify_count
                     .load(std::sync::atomic::Ordering::Relaxed),
-            },
-            SubscriptionSnapshot {
-                kind: "PTZPosition".into(),
-                active: ptz_active,
-                notify_count: self
-                    .ptz_notify_count
+                None,
+            ),
+            self.build_subscription_snapshot(
+                "PTZPosition",
+                ptz_active,
+                self.ptz_notify_count
                     .load(std::sync::atomic::Ordering::Relaxed),
-            },
+                ptz_position,
+            ),
         ]
+    }
+
+    /// 组装单条订阅快照。生命周期由「是否活跃」+「有效期是否走完」共同决定：
+    /// 平台订阅到点未续订时，设备这边其实已不再上报，但界面若只看 `active`
+    /// 会一直显示"已订阅"，排障时最容易走错方向。
+    fn build_subscription_snapshot(
+        &self,
+        kind: &str,
+        active: bool,
+        notify_count: u32,
+        ptz_position: Option<PtzPositionSnapshot>,
+    ) -> SubscriptionSnapshot {
+        let now_ms = epoch_millis();
+        let meta = self
+            .subscription_meta
+            .lock()
+            .ok()
+            .and_then(|metas| metas.get(kind).cloned())
+            .unwrap_or_default();
+        let ever_subscribed = meta.subscribed_at_ms > 0;
+        let remaining_secs = if active { meta.remaining_secs(now_ms) } else { 0 };
+        let lifecycle = if active && remaining_secs > 0 {
+            "subscribed"
+        } else if active {
+            "expired"
+        } else if meta.last_error.is_some() {
+            // 通知失败后又没了订阅对话，优先暴露异常而不是"已取消"。
+            "exception"
+        } else if ever_subscribed {
+            "cancelled"
+        } else {
+            "not_subscribed"
+        };
+        SubscriptionSnapshot {
+            kind: kind.to_string(),
+            active,
+            lifecycle: lifecycle.to_string(),
+            subscriber: active.then(|| meta.subscriber.clone()).flatten(),
+            expires_secs: meta.expires_secs,
+            remaining_secs,
+            notify_count,
+            last_notify_at_ms: meta.last_notify_at_ms,
+            last_notify_result: meta.last_notify_result.clone(),
+            last_error: meta.last_error.clone(),
+            ptz_position,
+        }
+    }
+
+    /// 记录一条订阅已建立（SUBSCRIBE 到达且 Expires > 0）。
+    fn mark_subscribed(&self, kind: &str, subscriber: String, expires_secs: u32) {
+        if !is_tracked_subscription(kind) {
+            return;
+        }
+        let Ok(mut metas) = self.subscription_meta.lock() else {
+            return;
+        };
+        let entry = metas.entry(kind.to_string()).or_default();
+        entry.subscriber = Some(subscriber);
+        entry.expires_secs = expires_secs;
+        entry.subscribed_at_ms = epoch_millis();
+        // 重新订阅是新的生命周期起点，旧的通知痕迹不该留到新周期里。
+        entry.last_notify_at_ms = None;
+        entry.last_notify_result = None;
+        entry.last_error = None;
+    }
+
+    /// 记录一条订阅被取消（平台退订 Expires:0 / 设备下线）。
+    fn mark_unsubscribed(&self, kind: &str) {
+        if !is_tracked_subscription(kind) {
+            return;
+        }
+        let Ok(mut metas) = self.subscription_meta.lock() else {
+            return;
+        };
+        if let Some(entry) = metas.get_mut(kind) {
+            // 保留 subscribed_at_ms，让快照能区分"曾经订阅过"和"从未订阅"。
+            entry.expires_secs = 0;
+            entry.subscriber = None;
+        }
+    }
+
+    /// 记录一次 NOTIFY 结果。成功时清掉旧错误，避免界面挂着已修复的报错。
+    fn record_notify_outcome(&self, kind: &str, outcome: &Result<u16>) {
+        if !is_tracked_subscription(kind) {
+            return;
+        }
+        let Ok(mut metas) = self.subscription_meta.lock() else {
+            return;
+        };
+        let entry = metas.entry(kind.to_string()).or_default();
+        entry.last_notify_at_ms = Some(epoch_millis());
+        match outcome {
+            Ok(status) => {
+                entry.last_notify_result = Some(status.to_string());
+                entry.last_error = None;
+            }
+            Err(error) => {
+                entry.last_error = Some(error.to_string());
+            }
+        }
     }
 
     /// 主动上报一条视频侦测报警(FR-9)。设备 → 平台 MESSAGE + Alarm Notify XML。
@@ -2033,6 +2225,20 @@ impl DeviceSimulator {
     /// 否则退化为独立 MESSAGE —— 这条分支决定了平台能否在 Event:Alarm 订阅里
     /// 收到结构化报警,两条路径不能分叉。
     pub async fn report_alarm_report(
+        &self,
+        transport: &Arc<SipTransport>,
+        local_host: &str,
+        local_port: u16,
+        report: &AlarmReport,
+    ) -> Result<u16> {
+        let outcome = self
+            .report_alarm_report_inner(transport, local_host, local_port, report)
+            .await;
+        self.record_notify_outcome("Alarm", &outcome);
+        outcome
+    }
+
+    async fn report_alarm_report_inner(
         &self,
         transport: &Arc<SipTransport>,
         local_host: &str,
@@ -2181,6 +2387,20 @@ impl DeviceSimulator {
         dialog: &builder::NotifyDialog,
         sn: u32,
     ) -> Result<u16> {
+        let outcome = self
+            .notify_catalog_inner(transport, dst, dialog, sn)
+            .await;
+        self.record_notify_outcome("Catalog", &outcome);
+        outcome
+    }
+
+    async fn notify_catalog_inner(
+        &self,
+        transport: &Arc<SipTransport>,
+        dst: SocketAddr,
+        dialog: &builder::NotifyDialog,
+        sn: u32,
+    ) -> Result<u16> {
         use gb28181_protocol::manscdp::{CatalogNotifyItem, CatalogSnapshot};
         // 全量目录:多通道树优先,否则扁平通道。全量后刷新快照基线供后续增量 diff。
         let publishable = self.catalog_publishable();
@@ -2245,8 +2465,11 @@ impl DeviceSimulator {
             CATALOG_UDP_BODY_MAX_BYTES,
             CATALOG_UDP_PAYLOAD_MAX_BYTES,
         )?;
-        self.send_catalog_notify_pages(transport, dst, &dialog, pages)
-            .await?;
+        let outcome = self
+            .send_catalog_notify_pages(transport, dst, &dialog, pages)
+            .await;
+        self.record_notify_outcome("Catalog", &outcome);
+        outcome?;
         let n = self
             .catalog_notify_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2325,10 +2548,11 @@ impl DeviceSimulator {
                     _ = &mut stop_rx => break, // 订阅被替换/取消。
                     _ = ticker.tick() => {
                         let (lon, lat) = sim.position.lock().map(|p| *p).unwrap_or((0.0, 0.0));
-                        match sim
-                            .report_position(&tp, &local_host, local_port, lon, lat)
-                            .await
-                        {
+                        let outcome =
+                            sim.report_position(&tp, &local_host, local_port, lon, lat).await;
+                        // 先记运行详情再判分支：失败路径过去只打日志，界面看不到原因。
+                        sim.record_notify_outcome("MobilePosition", &outcome);
+                        match outcome {
                             Ok(_) => {
                                 let n = sim
                                     .position_notify_count
@@ -2438,6 +2662,19 @@ impl DeviceSimulator {
         dst: SocketAddr,
         dialog: &builder::NotifyDialog,
     ) -> Result<u16> {
+        let outcome = self
+            .notify_ptz_position_inner(transport, dst, dialog)
+            .await;
+        self.record_notify_outcome("PTZPosition", &outcome);
+        outcome
+    }
+
+    async fn notify_ptz_position_inner(
+        &self,
+        transport: &Arc<SipTransport>,
+        dst: SocketAddr,
+        dialog: &builder::NotifyDialog,
+    ) -> Result<u16> {
         let (pan, tilt, zoom) = self.precise_pose();
         let sn = self.next_cseq();
         let notify = gb28181_protocol::manscdp::PtzPreciseNotify::new(
@@ -2493,6 +2730,10 @@ impl DeviceSimulator {
         // PTZ 事件订阅同样随设备下线失效:清对话后
         // notify_ptz_if_pose_changed 会静默跳过,不再向上报(平台侧订阅也会被标 expired)。
         *self.ptz_dialog.lock().await = None;
+        // 四类订阅的运行详情一起收尾:设备下线后界面不该还挂着"已订阅 + 剩余 N 秒"。
+        for kind in TRACKED_SUBSCRIPTIONS {
+            self.mark_unsubscribed(kind);
+        }
         self.ptz_notify_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.alarm_notify_count
@@ -2703,8 +2944,15 @@ impl DeviceSimulator {
                                     _ => {}
                                 }
                                 self.emit_subscription(&query.cmd_type, false, 0);
+                                self.mark_unsubscribed(&query.cmd_type);
                                 return Ok(true);
                             }
+                            // 记录订阅者与有效期，供「订阅运行详情」显示谁订的、还剩多久。
+                            self.mark_subscribed(
+                                &query.cmd_type,
+                                incoming.from.to_string(),
+                                dialog.expires,
+                            );
                             match query.cmd_type.as_str() {
                                 // 移动位置订阅:启动周期位置 NOTIFY(独立 MESSAGE 路径)。
                                 "MobilePosition" => {
@@ -3380,6 +3628,12 @@ impl DeviceSimulator {
                     manufacturer: self.config.device_info.manufacturer.clone(),
                     model: self.config.device_info.model.clone(),
                     firmware: self.current_firmware(),
+                    hardware_version: self
+                        .config
+                        .device_info
+                        .hardware_version
+                        .clone()
+                        .filter(|value| !value.trim().is_empty()),
                     channel: self.config.channels.len() as u32,
                 };
                 resp.to_xml()
@@ -4911,6 +5165,115 @@ mod tests {
         assert_eq!(item.video_bit_rate.as_deref(), Some("600"));
     }
 
+    #[test]
+    fn subscription_remaining_secs_covers_fresh_halfway_and_expired() {
+        let meta = SubscriptionMeta {
+            subscriber: Some("10.0.0.9:5060".into()),
+            expires_secs: 3_600,
+            subscribed_at_ms: 1_000_000,
+            ..Default::default()
+        };
+        // 刚订阅：剩余就是完整的有效期。
+        assert_eq!(meta.remaining_secs(1_000_000), 3_600);
+        // 走了一半：向下取整，不四舍五入（宁可少报一秒也不提前宣告过期）。
+        assert_eq!(meta.remaining_secs(1_000_000 + 1_800_000), 1_800);
+        // 已过期：饱和到 0，不能下溢成天文数字。
+        assert_eq!(meta.remaining_secs(1_000_000 + 3_600_000 * 2), 0);
+        // 客户端时钟早于订阅时刻（对时回拨）：同样饱和到 0。
+        assert_eq!(meta.remaining_secs(0), 3_600);
+    }
+
+    #[test]
+    fn subscription_without_expires_has_no_remaining_secs() {
+        // Expires: 0 是退订语义，不该算出「剩余 0 秒但仍在订阅」的假象。
+        let meta = SubscriptionMeta {
+            subscriber: Some("10.0.0.9:5060".into()),
+            expires_secs: 0,
+            subscribed_at_ms: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(meta.remaining_secs(1_000_000), 0);
+    }
+
+    #[test]
+    fn ptz_position_snapshot_carries_six_fields() {
+        let snapshot = PtzPositionSnapshot::from_pose(30.0, -12.5, 2.0);
+        assert_eq!(snapshot.pan, 30.0);
+        assert_eq!(snapshot.tilt, -12.5);
+        assert_eq!(snapshot.zoom, 2.0);
+        // 光学三量按变焦换算，与报文里的取值同源。
+        assert_eq!(snapshot.horizontal_field_angle, 30.0);
+        assert_eq!(snapshot.vertical_field_angle, 18.0);
+        assert_eq!(snapshot.max_view_distance, 600.0);
+    }
+
+    #[tokio::test]
+    async fn fresh_simulator_reports_no_subscriptions_with_zero_remaining() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        let snapshots = sim.subscription_snapshot().await;
+        assert_eq!(snapshots.len(), 4);
+        for snapshot in &snapshots {
+            assert!(!snapshot.active, "{} 未订阅时不应显示活跃", snapshot.kind);
+            assert_eq!(snapshot.lifecycle, "not_subscribed", "{}", snapshot.kind);
+            assert_eq!(snapshot.remaining_secs, 0);
+            assert!(snapshot.subscriber.is_none());
+            assert!(snapshot.last_error.is_none());
+        }
+        // PTZ 未订阅时不该带姿态，否则界面会显示一份"没有订阅来源"的读数。
+        let ptz = snapshots
+            .iter()
+            .find(|item| item.kind == "PTZPosition")
+            .expect("PTZPosition 快照必须存在");
+        assert!(ptz.ptz_position.is_none());
+    }
+
+    #[test]
+    fn mark_subscribed_then_cancel_switches_lifecycle() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.mark_subscribed("Catalog", "10.0.0.9:5060".into(), 3_600);
+        let subscribed = sim.build_subscription_snapshot("Catalog", true, 0, None);
+        assert_eq!(subscribed.lifecycle, "subscribed");
+        assert_eq!(subscribed.expires_secs, 3_600);
+        assert_eq!(subscribed.subscriber.as_deref(), Some("10.0.0.9:5060"));
+        assert!(subscribed.remaining_secs > 0);
+
+        sim.mark_unsubscribed("Catalog");
+        let cancelled = sim.build_subscription_snapshot("Catalog", false, 0, None);
+        // 退订后既不是"从未订阅"，也不该继续显示剩余时间。
+        assert_eq!(cancelled.lifecycle, "cancelled");
+        assert_eq!(cancelled.remaining_secs, 0);
+        assert!(cancelled.subscriber.is_none());
+    }
+
+    #[test]
+    fn notify_failure_shows_exception_and_recovery_clears_it() {
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.mark_subscribed("Alarm", "10.0.0.9:5060".into(), 3_600);
+        sim.record_notify_outcome("Alarm", &Err(common::Error::Gb28181("平台无应答".into())));
+        let failed = sim.build_subscription_snapshot("Alarm", false, 0, None);
+        assert_eq!(failed.lifecycle, "exception");
+        assert!(failed
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("平台无应答"));
+
+        // 下一次成功必须清掉旧错误：否则界面会长期挂着已被修复的报错。
+        sim.record_notify_outcome("Alarm", &Ok(200));
+        let recovered = sim.build_subscription_snapshot("Alarm", true, 0, None);
+        assert!(recovered.last_error.is_none());
+        assert_eq!(recovered.last_notify_result.as_deref(), Some("200"));
+        assert!(recovered.last_notify_at_ms.is_some());
+    }
+
+    #[test]
+    fn untracked_event_kind_is_ignored() {
+        // SIP 里可能冒出自定义 Event，别让它污染四类订阅的运行详情。
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.mark_subscribed("Presence", "10.0.0.9:5060".into(), 600);
+        assert!(sim.subscription_meta.lock().unwrap().get("Presence").is_none());
+    }
+
     pub(super) fn test_cfg(host: &str, port: u16) -> DeviceConfig {
         DeviceConfig {
             device_id: DeviceId::new("34020000001320000001").unwrap(),
@@ -4931,6 +5294,7 @@ mod tests {
                 manufacturer: "UVP".into(),
                 model: "Sim".into(),
                 firmware: "0.1.0".into(),
+                hardware_version: None,
             },
             video_source: None,
             media_profile: None,

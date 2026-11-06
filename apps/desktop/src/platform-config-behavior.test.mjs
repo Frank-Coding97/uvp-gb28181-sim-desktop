@@ -51,6 +51,7 @@ function baseConfig() {
       manufacturer: "UVP",
       model: "Desktop",
       firmware: "0.1.2",
+      hardware_version: "",
       channel_name: "Camera-1",
       register_expires_secs: 86400,
       heartbeat_interval_secs: 60,

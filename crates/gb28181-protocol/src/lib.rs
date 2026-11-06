@@ -8,3 +8,4 @@
 pub mod alarm;
 pub mod id_codec;
 pub mod manscdp;
+pub mod ptz;

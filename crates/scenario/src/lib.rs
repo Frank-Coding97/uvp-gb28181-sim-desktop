@@ -93,6 +93,9 @@ pub struct DeviceInfoTemplate {
     pub manufacturer: String,
     pub model: String,
     pub firmware: String,
+    /// 硬件版本（可选，GB-2022 才输出）。压测场景通常留空。
+    #[serde(default)]
+    pub hardware_version: Option<String>,
 }
 
 /// 媒体档(对应压测强度,docs/10-functional/stress-testing.md#2)。
@@ -231,6 +234,7 @@ impl Scenario for LinearScenario {
                     manufacturer: self.device_info.manufacturer.clone(),
                     model: self.device_info.model.clone(),
                     firmware: self.device_info.firmware.clone(),
+                    hardware_version: self.device_info.hardware_version.clone(),
                 },
                 video_source,
                 media_profile: None,
