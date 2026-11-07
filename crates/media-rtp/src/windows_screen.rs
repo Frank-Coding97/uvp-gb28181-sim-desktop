@@ -10,6 +10,14 @@
 //! configured output profile is applied with the shared scale/pad filter in
 //! [`command_args`].  Always running that filter also keeps the output size
 //! correct when the process is DPI-virtualized.
+//!
+//! `hwdownload` is kept on purpose: on a hybrid machine the desktop is
+//! duplicated on the integrated GPU while NVENC lives on the discrete one, so
+//! every GPU-side handoff fails — `hwmap=derive_device=cuda` returns
+//! `ENOSYS` (cross-adapter), `scale_d3d11` cannot inherit `ddagrab`'s device,
+//! Vulkan device creation fails, and `h264_nvenc` rejects d3d11 frames
+//! directly.  Both ends were reproduced on a Radeon iGPU + T600 machine, so
+//! the CPU stage here is the cheapest remaining option, not an oversight.
 
 use common::{Error, Result};
 
@@ -96,11 +104,15 @@ pub(super) fn command_args(
     osd: Option<&crate::osd::OsdBurnIn>,
 ) -> Vec<String> {
     let output_idx = monitor.display_id.saturating_sub(1);
+    // 硬件编码器的参数本来就是 `-pix_fmt nv12`；无 OSD 时让滤镜链直接出 nv12，
+    // 可以省掉 `format=yuv420p` 之后再转 nv12 的一次整帧转换。
+    let pixel_format =
+        screen_pixel_format(osd.is_some(), profile.encoder.is_hardware());
     let base = format!(
         "ddagrab=output_idx={output_idx}:framerate={fps}:draw_mouse=1,\
-hwdownload,format=bgra,{scale},format=yuv420p",
+hwdownload,format=bgra,{scale},format={pixel_format}",
         fps = profile.video_fps,
-        scale = windows_capture::scale_pad_filter(profile.width, profile.height),
+        scale = scale_filter(monitor, profile),
     );
     // OSD 画在缩放之后；水印叠加会改变像素格式，末尾再统一转回 yuv420p。
     let filter = match osd {
@@ -125,6 +137,41 @@ hwdownload,format=bgra,{scale},format=yuv420p",
     .collect();
     args.extend(windows_capture::encoder_args(profile));
     args
+}
+
+/// 决定滤镜链输出哪种像素格式。
+///
+/// 硬件编码器的输入格式是 nv12，滤镜链直接出 nv12 可以省掉一次整帧转换；
+/// 但 OSD 的 drawtext/overlay 只吃 yuv420p 系列，有 OSD 时必须留在 yuv420p，
+/// 否则 FFmpeg 会自己插一次 nv12→yuv420p，比一开始就出 yuv420p 更贵。
+fn screen_pixel_format(has_osd: bool, hardware_encoder: bool) -> &'static str {
+    if has_osd || !hardware_encoder {
+        "yuv420p"
+    } else {
+        "nv12"
+    }
+}
+
+/// 构造缩放段。
+///
+/// `ddagrab` 只输出 BGRA，走到这一步帧已经在内存里，缩放只能由 CPU 做。
+/// 能省的有两处：宽高比一致时不必补边（`pad` 是一次整帧副本），以及缩小时
+/// 用 `area`（箱式平均）替代默认的 bicubic —— 前者省带宽，后者省算力且缩图
+/// 更清晰（bicubic 降采样会带振铃）。
+fn scale_filter(monitor: &ScreenMonitor, profile: &LiveCaptureProfile) -> String {
+    // 交叉相乘避免浮点误差：w1/h1 == w2/h2 ⇔ w1*h2 == w2*h1。
+    let same_aspect = u64::from(monitor.width) * u64::from(profile.height)
+        == u64::from(profile.width) * u64::from(monitor.height);
+    if !same_aspect {
+        // 宽高比不同才补边，保持既有的不拉伸语义。
+        return windows_capture::scale_pad_filter(profile.width, profile.height);
+    }
+    let flags = if monitor.width > profile.width {
+        "area"
+    } else {
+        "bilinear"
+    };
+    format!("scale={}:{}:flags={flags}", profile.width, profile.height)
 }
 
 fn describe_monitors(monitors: &[ScreenMonitor]) -> String {
@@ -275,8 +322,9 @@ mod tests {
         assert!(filter.contains("ddagrab=output_idx=1"), "{filter}");
         assert!(filter.contains("framerate=25"), "{filter}");
         assert!(filter.contains("hwdownload,format=bgra"), "{filter}");
-        assert!(filter.contains("scale=1280:720"), "{filter}");
-        assert!(filter.contains("pad=1280:720"), "{filter}");
+        // 1920x1080 → 1280x720 宽高比一致:不补边,直接按 area 降采样。
+        assert!(filter.contains("scale=1280:720:flags=area"), "{filter}");
+        assert!(!filter.contains("pad="), "宽高比一致时不该补边: {filter}");
         assert!(filter.contains("format=yuv420p"), "{filter}");
         assert!(args.windows(2).any(|pair| pair == ["-map", "[v]"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
@@ -284,6 +332,59 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
         assert_eq!(args.iter().filter(|arg| *arg == "-i").count(), 0);
         assert!(!args.iter().any(|arg| arg.contains("dshow")));
+    }
+
+    /// 取 `-filter_complex` 的值,避免每个用例重复一遍 windows(2)。
+    fn filter_of(args: &[String]) -> &str {
+        args.windows(2)
+            .find(|pair| pair[0] == "-filter_complex")
+            .map(|pair| pair[1].as_str())
+            .expect("ddagrab uses a filter source")
+    }
+
+    /// 硬件编码器的 `-pix_fmt` 是 nv12:滤镜链直接出 nv12 才能省掉整帧二次转换。
+    #[test]
+    fn hardware_screen_chain_emits_nv12_without_a_second_conversion() {
+        let hw = LiveCaptureProfile {
+            encoder: crate::encoder::EncoderBackend::Nvenc,
+            ..profile(LiveVideoCodec::H264)
+        };
+        let args = command_args(&monitor(1), &hw, None);
+        let filter = filter_of(&args);
+        assert!(filter.ends_with("format=nv12[v]"), "{filter}");
+        assert!(!filter.contains("format=yuv420p"), "{filter}");
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "nv12"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
+    }
+
+    /// 有 OSD 时必须留在 yuv420p:drawtext/overlay 不支持 nv12,硬转会让
+    /// FFmpeg 自己插一次转换,比一开始就出 yuv420p 更贵。
+    #[test]
+    fn osd_keeps_yuv420p_even_with_a_hardware_encoder() {
+        assert_eq!(screen_pixel_format(true, true), "yuv420p");
+        assert_eq!(screen_pixel_format(true, false), "yuv420p");
+        assert_eq!(screen_pixel_format(false, true), "nv12");
+        assert_eq!(screen_pixel_format(false, false), "yuv420p");
+    }
+
+    /// 宽高比不同时仍要补边,不能让画面被拉变形。
+    #[test]
+    fn letterbox_is_kept_when_the_monitor_aspect_differs() {
+        let wide = ScreenMonitor {
+            width: 2560,
+            height: 1600,
+            ..monitor(1)
+        };
+        let filter = filter_of(&command_args(
+            &wide,
+            &profile(LiveVideoCodec::H264),
+            None,
+        ))
+        .to_string();
+        assert!(
+            filter.contains("pad=1280:720:(ow-iw)/2:(oh-ih)/2"),
+            "{filter}"
+        );
     }
 
     #[test]
