@@ -69,7 +69,8 @@ fn write_system_header(out: &mut Vec<u8>) {
 }
 
 /// 视频编码,决定 PSM 的 stream_type(GB/T 28181 附录 / ISO13818-1)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoCodec {
     /// H.264/AVC,stream_type 0x1B。
     #[default]

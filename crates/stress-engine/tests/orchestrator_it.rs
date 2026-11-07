@@ -74,6 +74,7 @@ fn scenario_for(port: u16) -> LinearScenario {
             manufacturer: "UVP".into(),
             model: "Sim".into(),
             firmware: "0.1".into(),
+            hardware_version: None,
         },
         media_profile: MediaProfile::A,
         video_source: None,

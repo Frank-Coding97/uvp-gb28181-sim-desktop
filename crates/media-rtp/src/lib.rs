@@ -8,15 +8,21 @@
 //! - `source`:视频源抽象(空媒体 / 真实文件循环)
 //! - `pusher`:把视频源→PS→RTP 按帧率推流的驱动
 
+pub mod codec_string;
+pub mod encoder;
 pub mod file_profile;
+pub mod interleave;
 pub mod osd;
 pub mod preview;
-pub mod preview_source;
 pub mod preview_worker;
 pub mod profile;
-pub use preview::{CapturedAccessUnit, PreviewJpeg, PreviewPhase, PreviewSink, PreviewStatus};
+pub use preview::{
+    next_capture_generation, CapturedAccessUnit, PreviewJpeg, PreviewPhase, PreviewSink,
+    PreviewStatus,
+};
 pub use preview_worker::{
-    preview_worker_args, spawn_preview_worker, PreviewControl, PreviewSendResult,
+    preview_worker_args, spawn_preview_worker, spawn_preview_worker_with_codec, PreviewControl,
+    PreviewSendResult,
     PreviewWorkerHandle, PreviewWorkerInput,
 };
 pub mod ps;
@@ -26,8 +32,12 @@ pub mod snapshot;
 pub mod source;
 pub mod thumbnail;
 
+pub use interleave::{InterleavedSource, Interleaver};
 pub use ps::{AudioCodec, PsMuxer, VideoCodec};
-pub use pusher::{contains_codec_config, push_stream, push_stream_controlled, PlaybackControl};
+pub use pusher::{
+    contains_codec_config, push_stream, push_stream_controlled, push_stream_to, PlaybackControl,
+    PushOptions, RtpTarget,
+};
 pub use rtp::{build_rtcp_sr, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
     ffmpeg_bin, frame_to_jpeg, list_camera_modes, list_live_sources, prepare_video_source,

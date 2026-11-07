@@ -5,6 +5,7 @@
 //! 同时改造，也避免 PS 和 RTP 各自重新推算一套时钟。
 
 use crate::ps::{AudioCodec, VideoCodec};
+use bytes::Bytes;
 
 /// MPEG/GB28181 媒体时钟频率。
 pub const MEDIA_CLOCK_HZ: u64 = 90_000;
@@ -16,8 +17,8 @@ pub const RTP_TIMESTAMP_MASK: u64 = (1_u64 << 32) - 1;
 /// 带时间戳的视频编码访问单元。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimedVideoAu {
-    /// Annex-B 编码访问单元。
-    pub data: Vec<u8>,
+    /// Annex-B 编码访问单元。订阅者之间共享，clone 只增加引用计数。
+    pub data: Bytes,
     /// 实际视频编码。
     pub codec: VideoCodec,
     /// 是否包含可独立解码的关键帧/参数集。
@@ -30,14 +31,14 @@ pub struct TimedVideoAu {
 
 impl TimedVideoAu {
     pub fn new(
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         codec: VideoCodec,
         key_frame: bool,
         pts_90k: u64,
         duration_90k: u64,
     ) -> Self {
         Self {
-            data,
+            data: data.into(),
             codec,
             key_frame,
             pts_90k,
@@ -50,7 +51,7 @@ impl TimedVideoAu {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimedAudioAu {
     /// 编码后的音频访问单元（AAC 时包含 ADTS 头）。
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// 实际音频编码。
     pub codec: AudioCodec,
     /// 该访问单元的有效采样率。
@@ -67,14 +68,14 @@ impl TimedAudioAu {
     /// 从采样数创建一个访问单元。连续访问单元若使用非整除采样率，
     /// 应改用 [`SampleClock`] 计算 duration 以累计余数。
     pub fn from_samples(
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         codec: AudioCodec,
         sample_rate_hz: u32,
         sample_count: u32,
         pts_90k: u64,
     ) -> Self {
         Self {
-            data,
+            data: data.into(),
             codec,
             sample_rate_hz,
             sample_count,
@@ -84,7 +85,7 @@ impl TimedAudioAu {
     }
 
     pub fn with_duration(
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         codec: AudioCodec,
         sample_rate_hz: u32,
         sample_count: u32,
@@ -92,7 +93,7 @@ impl TimedAudioAu {
         duration_90k: u64,
     ) -> Self {
         Self {
-            data,
+            data: data.into(),
             codec,
             sample_rate_hz,
             sample_count,

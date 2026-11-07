@@ -6,8 +6,11 @@ import {
   type PreviewCallbacks,
   type PreviewCanvas,
   type PreviewConnection,
+  type PreviewDecodeMode,
   type PreviewTransport,
   type PreviewUiState,
+  type PreviewVideoDecoder,
+  type PreviewVideoDecoderFactory,
   type PreviewVisibilitySubscription,
 } from "./manager.ts";
 
@@ -18,6 +21,8 @@ export interface PreviewSessionState {
   skipped: number;
   error: string;
   backend: PreviewBackendStatus | null;
+  mode: PreviewDecodeMode | null;
+  codec: string;
 }
 
 export interface PreviewSessionCallbacks extends PreviewCallbacks {}
@@ -83,11 +88,47 @@ export class TauriPreviewTransport implements PreviewTransport {
   async retry(): Promise<void> {
     await invoke("retry_binary_preview");
   }
+
+  async setFallback(fallback: boolean): Promise<void> {
+    await invoke("set_preview_fallback", { fallback });
+  }
+}
+
+/** 浏览器 WebCodecs。WebView2(Chromium)与 WKWebView(macOS 13.3+)都提供。 */
+function webCodecsFactory(): PreviewVideoDecoderFactory | undefined {
+  const VideoDecoderCtor = (globalThis as { VideoDecoder?: any }).VideoDecoder;
+  const EncodedVideoChunkCtor = (globalThis as { EncodedVideoChunk?: any }).EncodedVideoChunk;
+  if (!VideoDecoderCtor || !EncodedVideoChunkCtor) return undefined;
+  return {
+    async isConfigSupported(codec) {
+      // 先问硬件;不行再问软件(H.264 软解在桌面端也很便宜)。
+      for (const hardwareAcceleration of ["prefer-hardware", "no-preference"]) {
+        try {
+          const result = await VideoDecoderCtor.isConfigSupported({ codec, hardwareAcceleration, optimizeForLatency: true });
+          if (result?.supported) return true;
+        } catch {
+          // 非法 codec 字符串等:当作不支持。
+        }
+      }
+      return false;
+    },
+    create(output, error) {
+      const decoder = new VideoDecoderCtor({ output, error });
+      return {
+        get state() { return decoder.state; },
+        get decodeQueueSize() { return decoder.decodeQueueSize; },
+        configure(config) { decoder.configure(config); },
+        decode(chunk) { decoder.decode(new EncodedVideoChunkCtor(chunk)); },
+        close() { decoder.close(); },
+      } satisfies PreviewVideoDecoder;
+    },
+  };
 }
 
 const previewManager = createPreviewManager({
   transport: new TauriPreviewTransport(),
   watchVisibility: watchPreviewWindowVisibility,
+  videoDecoder: webCodecsFactory(),
   async decode(jpeg) {
     const bytes = jpeg.buffer.slice(
       jpeg.byteOffset,
@@ -109,6 +150,8 @@ export function usePreviewSession(
     skipped: 0,
     error: "",
     backend: null,
+    mode: null,
+    codec: "",
   };
   let bindingId: number | null = null;
   let startGeneration = 0;
@@ -141,6 +184,8 @@ export function usePreviewSession(
         state.latencyMs = stats.latencyMs;
         state.fps = stats.fps;
         state.skipped = stats.skipped;
+        state.mode = stats.mode;
+        state.codec = stats.codec;
         callbacks.onFrame?.(stats);
       },
       onStatus: (status) => {
@@ -169,6 +214,8 @@ export function usePreviewSession(
     state.latencyMs = null;
     state.fps = 0;
     state.skipped = 0;
+    state.mode = null;
+    state.codec = "";
     setState("stopped");
     if (currentBinding !== null) await previewManager.detach(currentBinding);
   };

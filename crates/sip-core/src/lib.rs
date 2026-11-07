@@ -13,7 +13,10 @@ pub mod transport;
 // 常用类型再导出,方便上层 `use sip_core::{...}`。
 pub use auth::{authorization, Challenge};
 pub use message::{Headers, Method, Request, Response, SipMessage};
-pub use sdp::{build_broadcast_offer, parse_broadcast_answer, BroadcastAnswer, SessionDescription};
+pub use sdp::{
+    build_broadcast_offer, parse_broadcast_answer, BroadcastAnswer, MediaTransport,
+    SessionDescription,
+};
 pub use tcp::{FrameDecoder, TcpTransport, DEFAULT_CONNECTIONS, MAX_CONNECTIONS};
 pub use transaction::{client_transact, Timing};
 pub use transport::{

@@ -449,6 +449,35 @@ export async function getOsdCapability(): Promise<OsdCapability> {
   return invoke<OsdCapability>("get_osd_capability");
 }
 
+/** 视频编码后端(与 Rust `media_rtp::encoder::EncoderBackend` 一致)。 */
+export type EncoderBackend =
+  | "nvenc"
+  | "qsv"
+  | "amf"
+  | "media_foundation"
+  | "video_toolbox"
+  | "software";
+
+export interface EncoderStatus {
+  codec: "h264" | "h265";
+  backend: EncoderBackend;
+  hardware: boolean;
+}
+
+export const ENCODER_BACKEND_LABELS: Record<EncoderBackend, string> = {
+  nvenc: "NVENC",
+  qsv: "Quick Sync",
+  amf: "AMD AMF",
+  media_foundation: "Media Foundation",
+  video_toolbox: "VideoToolbox",
+  software: "CPU",
+};
+
+/** 本机 H.264 / H.265 实际使用的编码后端。首次调用会试编探测,约 1~3 秒。 */
+export async function getEncoderStatus(): Promise<EncoderStatus[]> {
+  return invoke<EncoderStatus[]>("get_encoder_status");
+}
+
 /**
  * 保存 NTP 校时配置。
  *

@@ -300,6 +300,8 @@ mod tests {
     }
 }
 use crate::profile::{MediaAudioCodec, MediaProfile, MediaVideoCodec};
+use crate::encoder::{self, probe_source_video, SourceVideoStream};
+use crate::ps::VideoCodec;
 use crate::source::{Frame, VideoSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -317,6 +319,70 @@ const CACHE_SCHEMA_VERSION: u32 = 1;
 const CACHE_ROOT_ENV: &str = "UVP_MEDIA_PROFILE_CACHE_DIR";
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// 文件转码策略(P6):直通 → 硬件 → 软编。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscodeStrategy {
+    /// `-c:v copy`:源文件编码/分辨率/帧率与目标完全一致。
+    Passthrough,
+    /// 硬件编码器(VideoToolbox / NVENC / QSV...)。
+    Hardware(encoder::EncoderBackend),
+    /// libx264 / libx265,最终兜底。
+    Software,
+}
+
+impl TranscodeStrategy {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Passthrough => "直通",
+            Self::Hardware(backend) => match backend {
+                encoder::EncoderBackend::VideoToolbox => "VideoToolbox",
+                encoder::EncoderBackend::Nvenc => "NVENC",
+                encoder::EncoderBackend::Qsv => "QSV",
+                encoder::EncoderBackend::Amf => "AMF",
+                encoder::EncoderBackend::MediaFoundation => "Media Foundation",
+                encoder::EncoderBackend::Software => unreachable!(),
+            },
+            Self::Software => "软编",
+        }
+    }
+}
+
+/// 返回从低代价到高代价的转码策略列表。源探测失败时只返回转码策略。
+fn video_strategies(
+    ffmpeg: &str,
+    profile: &MediaProfile,
+    source_video: Option<&SourceVideoStream>,
+) -> Vec<TranscodeStrategy> {
+    let mut strategies = Vec::new();
+    // 直通条件:编码、分辨率、帧率全部一致。
+    if let Some(source) = source_video {
+        let codec_match = match (source.codec, profile.video_codec) {
+            (VideoCodec::H264, MediaVideoCodec::H264) => true,
+            (VideoCodec::H265, MediaVideoCodec::H265) => true,
+            _ => false,
+        };
+        if codec_match
+            && source.width == profile.width
+            && source.height == profile.height
+            && source.fps_matches(profile.video_fps)
+        {
+            strategies.push(TranscodeStrategy::Passthrough);
+        }
+    }
+    // 硬件编码(P2a 选出的后端)。
+    let codec_for_encoder = match profile.video_codec {
+        MediaVideoCodec::H264 => VideoCodec::H264,
+        MediaVideoCodec::H265 => VideoCodec::H265,
+    };
+    let selected = encoder::select(ffmpeg, codec_for_encoder);
+    if selected.backend.is_hardware() {
+        strategies.push(TranscodeStrategy::Hardware(selected.backend));
+    }
+    // 软编兜底。
+    strategies.push(TranscodeStrategy::Software);
+    strategies
+}
 
 /// 文件准备过程中可以观察到的阶段。阶段事件不代表虚假的百分比。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1012,34 +1078,68 @@ fn prepare_uncached(
     report(progress, FilePreparationPhase::Transcoding);
     let source_copy = copy_source_snapshot(source, source_snapshot, cancel, temp_dir)?;
     let source_has_audio = has_audio_stream(ffprobe, &source_copy, cancel)?;
+    let source_video = probe_source_video(ffprobe, &source_copy).ok();
     let container = temp_dir.join("media.mkv");
-    transcode_source(ffmpeg, &source_copy, profile, &container, cancel)?;
-    check_source_unchanged(source, source_snapshot, cancel)?;
-
-    report(progress, FilePreparationPhase::Extracting);
     let video_file = temp_dir.join(video_filename(profile.video_codec));
-    extract_video(ffmpeg, &container, profile.video_codec, &video_file, cancel)?;
-    let output_has_audio = has_audio_stream(ffprobe, &container, cancel)?;
-    if source_has_audio && !output_has_audio {
-        return Err("源文件包含音频轨，但转码结果缺少音频轨".into());
-    }
-    let audio_file = if output_has_audio {
-        let audio_file = temp_dir.join(audio_filename(profile.audio_codec));
-        extract_audio(ffmpeg, &container, profile.audio_codec, &audio_file, cancel)?;
-        Some(audio_file)
-    } else {
-        None
-    };
 
-    report(progress, FilePreparationPhase::Probing);
-    let raw_video_index = build_video_index(ffprobe, &container, &video_file, profile, cancel)?;
-    let raw_audio_index = match &audio_file {
-        Some(audio_file) => build_audio_index(ffprobe, &container, audio_file, profile, cancel)?,
-        None => Vec::new(),
-    };
-    if raw_video_index.is_empty() {
-        return Err("转码结果不包含视频访问单元".into());
+    // 按代价从低到高尝试:直通 → 硬件转码 → 软编。任一步产物校验失败就退到下一档,
+    // 软编是最终兜底,它失败才真正报错。
+    let mut last_error = String::new();
+    let mut prepared: Option<(Option<PathBuf>, Vec<RawVideoAccessUnitIndex>, Vec<RawAudioAccessUnitIndex>)> = None;
+    for strategy in video_strategies(ffmpeg, profile, source_video.as_ref()) {
+        check_cancel(cancel)?;
+        let attempt = (|| -> Result<_, String> {
+            let _ = fs::remove_file(&container);
+            transcode_source(ffmpeg, &source_copy, profile, &container, strategy, cancel)?;
+            check_source_unchanged(source, source_snapshot, cancel)?;
+
+            report(progress, FilePreparationPhase::Extracting);
+            extract_video(ffmpeg, &container, profile.video_codec, &video_file, cancel)?;
+            let output_has_audio = has_audio_stream(ffprobe, &container, cancel)?;
+            if source_has_audio && !output_has_audio {
+                return Err("源文件包含音频轨，但转码结果缺少音频轨".to_string());
+            }
+            let audio_file = if output_has_audio {
+                let audio_file = temp_dir.join(audio_filename(profile.audio_codec));
+                extract_audio(ffmpeg, &container, profile.audio_codec, &audio_file, cancel)?;
+                Some(audio_file)
+            } else {
+                None
+            };
+
+            report(progress, FilePreparationPhase::Probing);
+            let raw_video_index =
+                build_video_index(ffprobe, &container, &video_file, profile, cancel)?;
+            let raw_audio_index = match &audio_file {
+                Some(audio_file) => {
+                    build_audio_index(ffprobe, &container, audio_file, profile, cancel)?
+                }
+                None => Vec::new(),
+            };
+            if raw_video_index.is_empty() {
+                return Err("转码结果不包含视频访问单元".to_string());
+            }
+            if !raw_video_index.first().is_some_and(|index| index.key_frame) {
+                return Err("视频首帧不是关键帧".to_string());
+            }
+            verify_output_stream(ffprobe, &container, profile, audio_file.is_some(), cancel)?;
+            Ok((audio_file, raw_video_index, raw_audio_index))
+        })();
+        match attempt {
+            Ok(result) => {
+                tracing::info!(strategy = strategy.label(), "文件源视频准备完成");
+                prepared = Some(result);
+                break;
+            }
+            Err(error) => {
+                check_cancel(cancel)?;
+                tracing::warn!(strategy = strategy.label(), %error, "文件源视频准备失败,尝试下一档");
+                last_error = error;
+            }
+        }
     }
+    let (audio_file, raw_video_index, raw_audio_index) =
+        prepared.ok_or_else(|| format!("文件转码失败: {last_error}"))?;
     let timeline_origin = raw_video_index
         .iter()
         .map(|index| index.pts_90k)
@@ -1153,6 +1253,7 @@ fn transcode_source(
     source: &Path,
     profile: &MediaProfile,
     output: &Path,
+    strategy: TranscodeStrategy,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let gop_frames = profile
@@ -1163,44 +1264,60 @@ fn transcode_source(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black,fps={}",
         profile.width, profile.height, profile.width, profile.height, profile.video_fps
     );
-    let video_encoder = match profile.video_codec {
-        MediaVideoCodec::H264 => "libx264",
-        MediaVideoCodec::H265 => "libx265",
-    };
     let mut command = common::hidden_command(ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
     command.arg(source);
-    command.args([
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-vf",
-        &filter,
-        "-fps_mode",
-        "cfr",
-        "-c:v",
-        video_encoder,
-        "-b:v",
-    ]);
-    command.arg(format!("{}k", profile.bitrate_kbps));
-    command.args(["-g", &gop_frames.to_string(), "-keyint_min"]);
-    command.arg(gop_frames.to_string());
-    command.args(["-sc_threshold", "0", "-bf", "0"]);
-    match profile.video_codec {
-        MediaVideoCodec::H264 => {
-            command.args([
-                "-x264-params",
-                &format!("keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:aud=1"),
-            ]);
+    command.args(["-map", "0:v:0", "-map", "0:a:0?"]);
+
+    // 根据策略决定视频参数。
+    match strategy {
+        TranscodeStrategy::Passthrough => {
+            // 直通:只裁剪到目标时长,不重编码。
+            command.args(["-c:v", "copy"]);
         }
-        MediaVideoCodec::H265 => {
-            command.args([
-                "-x265-params",
-                &format!("keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:aud=1"),
-            ]);
+        TranscodeStrategy::Hardware(backend) => {
+            // 硬件编码:用 P2a 选出的编码器。
+            let codec_for_encoder = match profile.video_codec {
+                MediaVideoCodec::H264 => VideoCodec::H264,
+                MediaVideoCodec::H265 => VideoCodec::H265,
+            };
+            let params = encoder::EncodeParams {
+                bitrate_kbps: profile.bitrate_kbps,
+                gop: gop_frames,
+            };
+            let encoder_args = encoder::encoder_args(backend, codec_for_encoder, params);
+            command.args(["-vf", &filter, "-fps_mode", "cfr"]);
+            for arg in encoder_args {
+                command.arg(arg);
+            }
+        }
+        TranscodeStrategy::Software => {
+            // 软编:libx264 / libx265,沿用 v1 参数。
+            let video_encoder = match profile.video_codec {
+                MediaVideoCodec::H264 => "libx264",
+                MediaVideoCodec::H265 => "libx265",
+            };
+            command.args(["-vf", &filter, "-fps_mode", "cfr", "-c:v", video_encoder]);
+            command.args(["-b:v", &format!("{}k", profile.bitrate_kbps)]);
+            command.args(["-g", &gop_frames.to_string(), "-keyint_min", &gop_frames.to_string()]);
+            command.args(["-sc_threshold", "0", "-bf", "0"]);
+            match profile.video_codec {
+                MediaVideoCodec::H264 => {
+                    command.args([
+                        "-x264-params",
+                        &format!("keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:aud=1"),
+                    ]);
+                }
+                MediaVideoCodec::H265 => {
+                    command.args([
+                        "-x265-params",
+                        &format!("keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:aud=1"),
+                    ]);
+                }
+            }
         }
     }
+
     append_audio_args(&mut command, profile);
     command.args(["-avoid_negative_ts", "disabled", "-f", "matroska"]);
     command.arg(output);

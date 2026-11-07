@@ -37,6 +37,9 @@ import {
   type OsdSettings,
   type SignalingEncoding,
   getOsdCapability,
+  getEncoderStatus,
+  ENCODER_BACKEND_LABELS,
+  type EncoderStatus,
 } from "../platform";
 import {
   OSD_SIZE_OPTIONS,
@@ -331,6 +334,32 @@ watch([activeKey, cameraIndex], () => {
   void refreshCameraModes();
 }, { immediate: true });
 
+// 编码后端只探测一次(后端有缓存),进入音视频页时加载。
+const encoderStatus = ref<EncoderStatus[] | null>(null);
+const encoderStatusError = ref("");
+watch(activeKey, (key) => {
+  if (key !== "media" || encoderStatus.value) return;
+  getEncoderStatus()
+    .then((value) => { encoderStatus.value = value; encoderStatusError.value = ""; })
+    .catch((cause) => { encoderStatusError.value = String(cause); });
+}, { immediate: true });
+const selectedEncoder = computed(() =>
+  encoderStatus.value?.find((item) => item.codec === mediaDraft.value?.video_codec) ?? null);
+const encoderBadge = computed(() => {
+  const encoder = selectedEncoder.value;
+  if (!encoder) return encoderStatusError.value ? "编码器未知" : "检测编码器…";
+  return encoder.hardware
+    ? `GPU 编码（${ENCODER_BACKEND_LABELS[encoder.backend]}）`
+    : "CPU 编码";
+});
+const encoderWarning = computed(() => {
+  const encoder = selectedEncoder.value;
+  if (!encoder || encoder.hardware) return "";
+  return encoder.codec === "h265"
+    ? "本机没有可用的 H.265 硬件编码器，CPU 编码 H.265 占用很高，建议改用 H.264 或 720p。"
+    : "本机没有可用的硬件编码器，CPU 编码占用较高，1080p 时建议降到 720p。";
+});
+
 // 草稿晚于能力数据就绪时（先探测、后载入配置），同样要收敛一次，
 // 否则已保存的超能力配置会原样留在表单里。
 watch(mediaDraft, (draft) => {
@@ -580,10 +609,11 @@ function setBindMode(mode: BindMode) {
           <div class="section-label">编码</div>
           <div class="field-grid media-codec-grid">
             <label class="field">
-              <span>视频编码</span>
+              <span>视频编码 <em class="encoder-badge" :class="{ hardware: selectedEncoder?.hardware, software: selectedEncoder && !selectedEncoder.hardware }" :title="encoderStatusError || ''">{{ encoderBadge }}</em></span>
               <select v-model="mediaDraft.video_codec" :disabled="locked">
                 <option v-for="codec in MEDIA_VIDEO_CODECS" :key="codec.value" :value="codec.value">{{ codec.label }}</option>
               </select>
+              <small v-if="encoderWarning" class="encoder-warning" role="note">{{ encoderWarning }}</small>
             </label>
             <label class="field">
               <span>音频编码</span>
@@ -790,6 +820,10 @@ function setBindMode(mode: BindMode) {
 .media-summary-card small { overflow: hidden; color: var(--text-secondary); font-family: "SF Mono", Menlo, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .media-dirty { flex: 0 0 auto; padding: 4px 9px; border-radius: 999px; background: color-mix(in srgb, var(--warning) 13%, transparent); color: var(--warning); font-size: 11px; }
 .media-dirty.saved { background: color-mix(in srgb, var(--success) 11%, transparent); color: var(--success); }
+.encoder-badge { margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-style: normal; font-size: 11px; background: color-mix(in srgb, var(--text-secondary, #888) 12%, transparent); }
+.encoder-badge.hardware { background: color-mix(in srgb, var(--success) 13%, transparent); color: var(--success); }
+.encoder-badge.software { background: color-mix(in srgb, var(--warning) 13%, transparent); color: var(--warning); }
+.encoder-warning { display: block; margin-top: 4px; color: var(--warning); font-size: 11px; line-height: 1.4; }
 .media-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .media-preset { display: flex; min-width: 0; min-height: 82px; flex-direction: column; align-items: flex-start; gap: 5px; padding: 12px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.44); color: var(--text-secondary); cursor: pointer; text-align: left; }
 .media-preset:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 60%, var(--border-default)); background: var(--accent-pale); }

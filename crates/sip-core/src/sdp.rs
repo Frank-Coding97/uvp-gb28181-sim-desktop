@@ -9,6 +9,17 @@ use std::net::IpAddr;
 
 use common::{AudioTransport, Error, Result};
 
+/// 设备侧媒体传输角色(由平台 offer 推导,见 [`SessionDescription::device_media_transport`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaTransport {
+    /// UDP 数据报。
+    Udp,
+    /// 设备主动连接平台(answer 声明 `a=setup:active`)。
+    TcpActive,
+    /// 设备监听,等平台连入(answer 声明 `a=setup:passive` 与真实监听端口)。
+    TcpPassive,
+}
+
 /// 一个 SDP 会话描述(面向单路视频流)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDescription {
@@ -31,6 +42,21 @@ pub struct SessionDescription {
 }
 
 impl SessionDescription {
+    /// 平台 offer 要求设备承担的媒体传输角色。
+    ///
+    /// - `m=` proto 不含 TCP → UDP;
+    /// - TCP 且 `a=setup:active`(平台主动连入)→ 设备被动监听;
+    /// - TCP 且 `a=setup:passive` 或未声明 → 设备主动连接平台(GB28181 常见默认)。
+    pub fn device_media_transport(&self) -> MediaTransport {
+        if !self.media.proto.to_ascii_uppercase().contains("TCP") {
+            return MediaTransport::Udp;
+        }
+        match self.setup.as_deref().map(str::trim) {
+            Some(setup) if setup.eq_ignore_ascii_case("active") => MediaTransport::TcpPassive,
+            _ => MediaTransport::TcpActive,
+        }
+    }
+
     /// 是否为录像下载会话(会话名 `s=Download`)。
     pub fn is_download(&self) -> bool {
         self.session_name.eq_ignore_ascii_case("Download")
@@ -191,8 +217,10 @@ impl SessionDescription {
 
     /// 根据平台 offer 构造设备侧 SDP answer。
     ///
-    /// 回放/下载必须保留 offer 的业务会话名和时间窗；TCP passive offer
-    /// 由设备主动建连，answer 声明 `setup:active` 和 `connection:new`。
+    /// 回放/下载必须保留 offer 的业务会话名和时间窗。TCP 角色按
+    /// [`Self::device_media_transport`]:设备主动时 answer 声明 `setup:active`
+    /// (端口按 RFC 4145 填 discard 9);设备被动时声明 `setup:passive`,
+    /// `rtp_port` 必须是真实监听端口。两种都带 `connection:new`。
     pub fn new_device_answer(
         username: &str,
         local_ip: IpAddr,
@@ -200,8 +228,12 @@ impl SessionDescription {
         ssrc: u32,
         offer: &SessionDescription,
     ) -> Self {
-        let tcp = offer.media.proto.to_ascii_uppercase().contains("TCP");
+        let transport = offer.device_media_transport();
+        let tcp = transport != MediaTransport::Udp;
         let mut answer = Self::new_device_response(username, local_ip, rtp_port, ssrc, tcp);
+        if transport == MediaTransport::TcpPassive {
+            answer.setup = Some("passive".into());
+        }
         answer.session_name = offer.session_name.clone();
         answer.timing = offer.timing.clone();
         answer
@@ -614,6 +646,50 @@ y=1031889862\r\n",
         assert!(answer.contains("a=setup:active\r\n"));
         assert!(answer.contains("a=connection:new\r\n"));
         assert!(answer.contains("y=1031889862\r\n"));
+    }
+
+    #[test]
+    fn tcp_active_offer_设备被动监听并回填真实端口() {
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+o=34020000002000000002 0 0 IN IP4 192.168.10.220\r\n\
+s=Play\r\n\
+c=IN IP4 192.168.10.220\r\n\
+t=0 0\r\n\
+m=video 40020 TCP/RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+a=setup:active\r\n\
+a=connection:new\r\n\
+y=0100000001\r\n",
+        )
+        .unwrap();
+        assert_eq!(offer.device_media_transport(), MediaTransport::TcpPassive);
+
+        let answer = SessionDescription::new_device_answer(
+            "35020000001310000132",
+            "127.0.0.1".parse().unwrap(),
+            51234,
+            100_000_001,
+            &offer,
+        )
+        .to_string();
+
+        assert!(answer.contains("m=video 51234 TCP/RTP/AVP 96\r\n"));
+        assert!(answer.contains("a=setup:passive\r\n"));
+        assert!(answer.contains("a=connection:new\r\n"));
+    }
+
+    #[test]
+    fn 传输角色推导() {
+        let mut sdp = SessionDescription::parse(SAMPLE_SDP).unwrap();
+        assert_eq!(sdp.device_media_transport(), MediaTransport::Udp);
+        sdp.media.proto = "TCP/RTP/AVP".into();
+        sdp.setup = None;
+        assert_eq!(sdp.device_media_transport(), MediaTransport::TcpActive);
+        sdp.setup = Some("passive".into());
+        assert_eq!(sdp.device_media_transport(), MediaTransport::TcpActive);
+        sdp.setup = Some("ACTIVE".into());
+        assert_eq!(sdp.device_media_transport(), MediaTransport::TcpPassive);
     }
 
     #[test]

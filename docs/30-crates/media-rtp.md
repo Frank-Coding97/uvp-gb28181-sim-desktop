@@ -1,8 +1,36 @@
 # crate: media-rtp
 
-**状态:M2 完成** · RTP/PS 封装与推流引擎。
+**状态:M2 完成 + v2 P1** · RTP/PS 封装与推流引擎。演进方向见 [`20-architecture/media-pipeline-v2.md`](../20-architecture/media-pipeline-v2.md)。
 
-> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **Windows 摄像头/屏幕采集**(DirectShow + ddagrab,共享编码与真实 PTS)✅ · 单测 111 全绿。待补:Windows 屏幕音频、TCP(RFC 4571)推流。
+> 进度:rtp 包头+切片+统计、PS 封装 H.264、FileSource(C 档 Annex B 切帧循环)、NoneSource(A 档)、LightSource(B 档合成伪流)、push_stream 驱动 ✅ · **PlaybackControl + push_stream_controlled**(回放倍速/暂停/恢复,运行时可调)✅ · **容器解封装**(MP4/FLV/MKV/MOV 经 ffmpeg 转 Annex B,带缓存)✅ · **音视频复合流(G.711A)**(`mux_frame_av` + PSM 声明音频 0x90 + `source.next_audio()`)✅ · **Windows 摄像头/屏幕采集**(DirectShow + ddagrab,共享编码与真实 PTS)✅ · **TCP 主动/被动推流**(RFC 4571)✅ · **v2 P1**:`Bytes` 零拷贝、订阅端事件唤醒、PS 音视频交织、按会话关闭音频 ✅。待补:Windows 屏幕音频。
+
+## v2 P1 变更摘要
+
+- **数据**:`TimedVideoAu.data` / `TimedAudioAu.data` 为 `bytes::Bytes`,订阅者之间共享,clone 只增加引用计数。
+- **推流入口**:`push_stream_to(source, RtpTarget, PushOptions, control, stop)`。
+  - `RtpTarget::{Udp, TcpActive, TcpPassive { listener, accept_timeout }}`:被动模式的监听端口由调用方在 200 OK 前绑定;accept 期间收到 stop 立即返回。
+  - `PushOptions { ssrc, fps, with_audio }`:`with_audio=false` 时 PSM 只声明视频并丢弃音频事件。
+  - `push_stream` / `push_stream_controlled` 保留为兼容封装。
+- **事件接收**:`VideoSource::{has_async_events, recv_event, wait_event_blocking, take_buffered}`。`SharedVideoSource` 直接 await 总线;积压被丢弃时报告一次 `Discontinuity` 并从下一带参数集关键帧恢复。`LiveEventQueue` 用条件变量唤醒采集线程。
+- **交织**:`interleave::InterleavedSource` 在 60ms 窗口内按 PTS 排序音视频,推流(协商音频时)与录像都经过它。
+- **LightSource**:关键帧前置伪 SPS/PPS,否则共享总线订阅者等不到起播点。
+- 旧接口 `next_frame` / `next_audio` 仍在,P3 替换采集层时删除。
+
+## v2 P2a:硬件编码器选择(`encoder` 模块)
+
+- `encoder::select(ffmpeg, codec) -> SelectedEncoder`:按平台候选顺序试编探测,结果进程内缓存;`mark_failed` 标记运行期失败的后端。
+- `encoder::encoder_args(backend, codec, EncodeParams)`:纯函数,生成 `-c:v` 起的全部编码参数(无 B 帧、固定 GOP、CBR、`dump_extra`),Windows 摄像头/屏幕与 macOS 摄像头/屏幕共用。
+- `LiveCaptureProfile.encoder`:构造时为软编,`capture_*_profile` 启动 FFmpeg 前填入探测结果。
+- 环境变量 `UVP_VIDEO_ENCODER=nvenc|qsv|amf|mf|videotoolbox|software` 强制指定后端。
+- Tauri 命令 `get_encoder_status` 返回两种编码的选择结果,供设置页显示。
+- 设计与实测数据见 [`media-pipeline-v2.md` §5.5](../20-architecture/media-pipeline-v2.md)。
+
+## v2 P4:本地预览改为总线订阅
+
+- 删除 `preview_source::PreviewingSource`;`DeviceSimulator` 不再持有预览 sink,采集源启动时 `preview` 参数恒为 `None`。
+- 本地预览由桌面端 `PreviewManager` 订阅 `SharedMedia`,编码帧直送前端 WebCodecs;`preview_worker` 只作为 JPEG 回退被调用。
+- 新增 `codec_string` 模块:由 SPS 生成 WebCodecs codec 字符串。
+- `DeviceSimulator::current_keyframe_jpeg()`:平台抓拍与本地抓拍共用,取共享媒体当前关键帧转 JPEG。
 
 ## 容器格式支持(FileSource)
 

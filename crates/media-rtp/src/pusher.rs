@@ -166,7 +166,7 @@ pub async fn push_stream(
 /// 倍速影响取帧间隔(2x → 间隔减半),暂停时保持会话但不取帧/发送。
 #[allow(clippy::too_many_arguments)]
 pub async fn push_stream_controlled(
-    mut source: Box<dyn VideoSource>,
+    source: Box<dyn VideoSource>,
     dst: SocketAddr,
     ssrc: u32,
     fps: u32,
@@ -174,22 +174,118 @@ pub async fn push_stream_controlled(
     control: Arc<PlaybackControl>,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
-    let mut sender = if use_tcp {
-        RtpSender::new_tcp(dst, ssrc).await?
+    let target = if use_tcp {
+        RtpTarget::TcpActive(dst)
     } else {
-        RtpSender::new(dst, ssrc).await?
+        RtpTarget::Udp(dst)
     };
-    tracing::info!(%dst, ssrc = format!("{ssrc:#x}"), use_tcp, fps, live = source.is_live(), "推流开始:已建立发送通道");
-    // PSM stream_type 跟随源编码,并按源能力稳定声明音频 ES。
+    push_stream_to(
+        source,
+        target,
+        PushOptions {
+            ssrc,
+            fps,
+            with_audio: true,
+        },
+        control,
+        stop,
+    )
+    .await
+}
+
+/// RTP 发送目标。
+pub enum RtpTarget {
+    /// UDP 发往平台地址。
+    Udp(SocketAddr),
+    /// 设备主动连接平台 TCP 监听端口。
+    TcpActive(SocketAddr),
+    /// 设备在已绑定的端口上等平台连入。监听端口必须在 200 OK 前绑定,
+    /// 以便写进 SDP answer;accept 在推流任务里完成。
+    TcpPassive {
+        listener: tokio::net::TcpListener,
+        accept_timeout: std::time::Duration,
+    },
+}
+
+impl RtpTarget {
+    fn describe(&self) -> String {
+        match self {
+            Self::Udp(dst) => format!("udp://{dst}"),
+            Self::TcpActive(dst) => format!("tcp-active://{dst}"),
+            Self::TcpPassive { listener, .. } => format!(
+                "tcp-passive://{}",
+                listener
+                    .local_addr()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|_| "?".into())
+            ),
+        }
+    }
+
+    async fn connect(self, ssrc: u32) -> Result<RtpSender> {
+        match self {
+            Self::Udp(dst) => RtpSender::new(dst, ssrc).await,
+            Self::TcpActive(dst) => RtpSender::new_tcp(dst, ssrc).await,
+            Self::TcpPassive {
+                listener,
+                accept_timeout,
+            } => RtpSender::accept_tcp(listener, ssrc, accept_timeout).await,
+        }
+    }
+}
+
+/// 单个推流会话的封装选项。
+#[derive(Debug, Clone, Copy)]
+pub struct PushOptions {
+    pub ssrc: u32,
+    /// 旧的按帧率打拍路径使用;带时间戳的源忽略。
+    pub fps: u32,
+    /// 是否把音频复用进 PS。平台 SDP 未协商音频时为 false:PSM 只声明视频,
+    /// 音频事件直接丢弃。源本身无音频时此项无效。
+    pub with_audio: bool,
+}
+
+/// 推流主入口:建立发送通道,按源的类型选择定时事件或旧的按帧率打拍路径。
+pub async fn push_stream_to(
+    mut source: Box<dyn VideoSource>,
+    target: RtpTarget,
+    options: PushOptions,
+    control: Arc<PlaybackControl>,
+    stop: impl Future<Output = ()>,
+) -> Result<()> {
+    let PushOptions {
+        ssrc,
+        fps,
+        with_audio,
+    } = options;
+    let target_desc = target.describe();
+    tokio::pin!(stop);
+    // TCP 被动的 accept 可能要等数秒,期间收到 BYE 必须能立即退出。
+    let mut sender = tokio::select! {
+        _ = &mut stop => return Ok(()),
+        sender = target.connect(ssrc) => sender?,
+    };
+    let audio_enabled = with_audio && source.has_audio();
+    tracing::info!(target = %target_desc, ssrc = format!("{ssrc:#x}"), fps, audio = audio_enabled, live = source.is_live(), "推流开始:已建立发送通道");
+    // PSM stream_type 跟随源编码;音频 ES 只在本会话协商了音频时声明。
     let audio_codec = source.audio_codec();
     let audio_frame_duration = audio_codec.frame_duration_90k();
-    let mux = if source.has_audio() {
+    let mux = if audio_enabled {
         PsMuxer::with_codecs(source.codec(), audio_codec)
     } else {
         PsMuxer::with_video(source.codec())
     };
     if source.supports_timed_events() {
-        return push_timed_events(source, sender, control, stop, mux).await;
+        // 音视频复合流:复用前按 PTS 交织,纯视频会话无需额外延迟。
+        let source: Box<dyn VideoSource> = if audio_enabled {
+            Box::new(crate::interleave::InterleavedSource::new(
+                source,
+                crate::interleave::DEFAULT_WINDOW_90K,
+            ))
+        } else {
+            source
+        };
+        return push_timed_events(source, sender, control, stop, mux, audio_enabled).await;
     }
     let fps = fps.max(1);
     let ts_step = CLOCK_HZ / fps;
@@ -207,7 +303,6 @@ pub async fn push_stream_controlled(
     let mut first_frame = true;
     let mut empty_polls: u64 = 0;
 
-    tokio::pin!(stop);
     let result = loop {
         // 按当前倍速动态计算取帧间隔(倍速越高间隔越短);暂停时用固定轮询间隔。
         let sleep_us = if control.is_paused() {
@@ -235,7 +330,10 @@ pub async fn push_stream_controlled(
                 }
                 if let Some(frame) = source.next_frame() {
                     // 音视频复合流：取该视频时间窗内的完整编码音频访问单元。
-                    let audio = source.next_audio();
+                    let mut audio = source.next_audio();
+                    if !audio_enabled {
+                        audio.clear();
+                    }
                     let audio_start_pts = audio_timestamp.map_or(ps_timestamp, |candidate| {
                         // 33-bit PS 时钟上的模运算：恢复时若音频落后视频超过 100ms，
                         // 重新对齐当前视频 PTS，避免静音/设备切换造成持续过期音频。
@@ -323,11 +421,13 @@ async fn push_timed_events(
     mut source: Box<dyn VideoSource>,
     mut sender: RtpSender,
     control: Arc<PlaybackControl>,
-    stop: impl Future<Output = ()>,
+    stop: std::pin::Pin<&mut impl Future<Output = ()>>,
     mux: PsMuxer,
+    audio_enabled: bool,
 ) -> Result<()> {
     let live = source.is_live();
     let paced_by_source = source.timed_events_are_paced();
+    let async_events = source.has_async_events();
     let mut first_pts: Option<u64> = None;
     let mut last_sent_pts: Option<u64> = None;
     let mut wall_anchor = std::time::Instant::now();
@@ -336,7 +436,7 @@ async fn push_timed_events(
     let mut applied_speed_milli = effective_speed_milli(&control);
     let mut units_sent = 0_u64;
     let mut bytes_sent = 0_u64;
-    tokio::pin!(stop);
+    let mut stop = stop;
 
     'events: loop {
         if let Some(error) = source.take_error() {
@@ -367,9 +467,19 @@ async fn push_timed_events(
             was_paused = false;
         }
 
-        let event = if let Some(event) = pending_event.take() {
-            event
-        } else if let Some(event) = source.next_media_event() {
+        let next = if pending_event.is_some() {
+            pending_event.take()
+        } else if async_events {
+            // 订阅端直接 await 总线,没有事件时不再空转。超时返回 None 后
+            // 走下面的存活/错误检查,再回到循环顶部处理暂停与 seek。
+            tokio::select! {
+                _ = &mut stop => return Ok(()),
+                event = source.recv_event() => event,
+            }
+        } else {
+            source.next_media_event()
+        };
+        let event = if let Some(event) = next {
             event
         } else {
             // 有限源可能在最后一次读取时才把异步错误写入自身状态，
@@ -378,14 +488,19 @@ async fn push_timed_events(
                 return Err(Error::Media(error));
             }
             if source.is_live() {
-                tokio::select! {
-                    _ = &mut stop => return Ok(()),
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                if !async_events {
+                    tokio::select! {
+                        _ = &mut stop => return Ok(()),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
                 }
                 continue;
             }
             return Ok(());
         };
+        if !audio_enabled && matches!(&event, MediaEvent::Audio(_)) {
+            continue;
+        }
         let pts = event.pts_90k();
         if matches!(&event, MediaEvent::Discontinuity { .. }) {
             first_pts = None;
@@ -510,6 +625,164 @@ mod tests {
 
         let _ = tx_stop.send(());
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_被动_平台连入后收到_rfc4571_帧() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let source = Box::new(FileSource::from_bytes(&sample_h264()).unwrap());
+        let (tx_stop, rx_stop) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            push_stream_to(
+                source,
+                RtpTarget::TcpPassive {
+                    listener,
+                    accept_timeout: std::time::Duration::from_secs(2),
+                },
+                PushOptions {
+                    ssrc: 0x5566,
+                    fps: 50,
+                    with_audio: true,
+                },
+                PlaybackControl::new(),
+                async {
+                    let _ = rx_stop.await;
+                },
+            )
+            .await
+        });
+
+        // 模拟平台:收到 200 OK 后主动连入设备监听端口。
+        let mut platform = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut len = [0u8; 2];
+        tokio::time::timeout(std::time::Duration::from_secs(2), platform.read_exact(&mut len))
+            .await
+            .expect("超时未收到 RFC 4571 帧")
+            .unwrap();
+        let len = u16::from_be_bytes(len) as usize;
+        assert!(len >= 12);
+        let mut pkt = vec![0u8; len];
+        platform.read_exact(&mut pkt).await.unwrap();
+        assert_eq!(pkt[0], 0x80);
+        assert_eq!(&pkt[8..12], &0x5566u32.to_be_bytes());
+
+        let _ = tx_stop.send(());
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_被动_无人连入时超时报错_收到停止立即返回() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let result = push_stream_to(
+            Box::new(FileSource::from_bytes(&sample_h264()).unwrap()),
+            RtpTarget::TcpPassive {
+                listener,
+                accept_timeout: std::time::Duration::from_millis(100),
+            },
+            PushOptions {
+                ssrc: 1,
+                fps: 25,
+                with_audio: true,
+            },
+            PlaybackControl::new(),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(result.is_err(), "无人连入应超时报错");
+
+        // accept 等待期间收到 BYE,不应等到超时。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let started = std::time::Instant::now();
+        let result = push_stream_to(
+            Box::new(FileSource::from_bytes(&sample_h264()).unwrap()),
+            RtpTarget::TcpPassive {
+                listener,
+                accept_timeout: std::time::Duration::from_secs(30),
+            },
+            PushOptions {
+                ssrc: 1,
+                fps: 25,
+                with_audio: true,
+            },
+            PlaybackControl::new(),
+            async {},
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn 未协商音频时定时事件只发视频() {
+        struct AvEvents(std::collections::VecDeque<MediaEvent>);
+        impl VideoSource for AvEvents {
+            fn next_frame(&mut self) -> Option<Frame> {
+                None
+            }
+            fn supports_timed_events(&self) -> bool {
+                true
+            }
+            fn timed_events_are_paced(&self) -> bool {
+                true
+            }
+            fn next_media_event(&mut self) -> Option<MediaEvent> {
+                self.0.pop_front()
+            }
+            fn has_audio(&self) -> bool {
+                true
+            }
+        }
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let events = vec![
+            MediaEvent::Audio(TimedAudioAu::from_samples(
+                vec![0xD5; 160],
+                crate::ps::AudioCodec::G711A,
+                8_000,
+                160,
+                0,
+            )),
+            MediaEvent::Video(TimedVideoAu::new(
+                sample_h264(),
+                crate::ps::VideoCodec::H264,
+                true,
+                0,
+                3_600,
+            )),
+        ];
+        push_stream_to(
+            Box::new(AvEvents(events.into())),
+            RtpTarget::Udp(rx_addr),
+            PushOptions {
+                ssrc: 7,
+                fps: 25,
+                with_audio: false,
+            },
+            PlaybackControl::new(),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+
+        let mut payload = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv(&mut buf)).await
+        {
+            payload.extend_from_slice(&buf[12..n]);
+        }
+        assert!(!payload.is_empty());
+        // 音频 PES stream_id 为 0xC0;未协商音频时不得出现。
+        assert!(
+            !payload.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xC0]),
+            "未协商音频的会话不应携带音频 PES"
+        );
+        assert!(payload.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xE0]));
     }
 
     struct SlowLive {

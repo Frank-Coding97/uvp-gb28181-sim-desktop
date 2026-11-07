@@ -402,8 +402,18 @@ impl RecordingService {
         let final_path = self.store.root().join(format!("{id}.mp4"));
         let channel_id = channel_id.into();
         let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
-        let mut stream = media.subscribe();
         use media_rtp::VideoSource;
+        let subscription = media.subscribe();
+        let has_audio = subscription.has_audio();
+        // 音视频复合录像按 PTS 交织后再写入 PS。
+        let mut stream: Box<dyn VideoSource> = if has_audio {
+            Box::new(media_rtp::InterleavedSource::new(
+                Box::new(subscription),
+                media_rtp::interleave::DEFAULT_WINDOW_90K,
+            ))
+        } else {
+            Box::new(subscription)
+        };
         let media_spec = RecordingMediaSpec {
             fps: fps.max(1),
             video_codec: stream.codec(),
@@ -436,11 +446,30 @@ impl RecordingService {
             let mut bytes_written = 0_u64;
             let mut audio_sample_rate_hz = None;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            // 停止后先写完交织窗口里已到达的事件,再收尾。
+            let mut tail: Option<std::collections::VecDeque<media_rtp::source::MediaEvent>> = None;
             loop {
-                if *stop_rx.borrow() {
-                    break;
-                }
-                if let Some(event) = stream.next_media_event() {
+                let next = if let Some(tail) = tail.as_mut() {
+                    match tail.pop_front() {
+                        Some(event) => Some(event),
+                        None => break,
+                    }
+                } else if *stop_rx.borrow() {
+                    tail = Some(stream.take_buffered().into());
+                    continue;
+                } else {
+                    // 事件到达即唤醒;最长 100ms 返回一次以检查超时。
+                    tokio::select! {
+                        changed = stop_rx.changed() => {
+                            if changed.is_err() || *stop_rx.borrow() {
+                                tail = Some(stream.take_buffered().into());
+                            }
+                            continue;
+                        }
+                        event = stream.recv_event() => event,
+                    }
+                };
+                if let Some(event) = next {
                     match event {
                         media_rtp::source::MediaEvent::Video(video) => {
                             if video.codec != media_spec.video_codec {
@@ -497,14 +526,8 @@ impl RecordingService {
                     }
                 } else if tokio::time::Instant::now() >= deadline && file.is_none() {
                     return Err(Error::Media("等待可解码关键帧超时".into()));
-                }
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_ok() && *stop_rx.borrow() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                } else if !stream.has_async_events() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
             if let Some(mut output) = file {

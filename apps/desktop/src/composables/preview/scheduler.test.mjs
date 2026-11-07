@@ -3,22 +3,14 @@ import {
   parsePreviewFrame,
   PREVIEW_HEADER_LEN,
 } from "./scheduler.ts";
+import { envelopeV2 } from "./envelope.fixture.mjs";
 
 function equal(actual, expected) {
   if (actual !== expected) throw new Error(`expected ${String(expected)}, got ${String(actual)}`);
 }
 
 function envelope(capturedAtMs, jpegBytes, generation = 7, sequence = 11) {
-  const bytes = new Uint8Array(PREVIEW_HEADER_LEN + jpegBytes.length);
-  bytes.set([0x55, 0x56, 0x50, 0x4a], 0);
-  const view = new DataView(bytes.buffer);
-  view.setUint16(4, 1, true);
-  view.setUint16(6, PREVIEW_HEADER_LEN, true);
-  view.setBigUint64(8, BigInt(generation), true);
-  view.setBigUint64(16, BigInt(sequence), true);
-  view.setBigUint64(24, BigInt(capturedAtMs), true);
-  bytes.set(jpegBytes, PREVIEW_HEADER_LEN);
-  return bytes.buffer;
+  return envelopeV2({ capturedAtMs, payload: jpegBytes, generation, sequence });
 }
 
 const jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x11, 0x22, 0xff, 0xd9];
@@ -45,6 +37,36 @@ new Uint8Array(badMagic)[0] = 0;
 equal(parsePreviewFrame(badMagic), null);
 // 不以 SOI 开头说明流对齐出了问题，必须报错而不是喂给解码器。
 equal(parsePreviewFrame(envelope(1, [0x00, 0x01, 0x02, 0x03])), null);
+equal(frame.kind, "jpeg");
+equal(frame.keyFrame, true);
+
+// ---- v2 编码帧 ----
+
+const au = [0, 0, 0, 1, 0x65, 0x88, 0x84];
+const key = parsePreviewFrame(envelopeV2({ kind: "h264", key: true, codec: "avc1.64001F", payload: au, sequence: 3 }));
+equal(key.kind, "h264");
+equal(key.keyFrame, true);
+equal(key.codec, "avc1.64001F");
+equal(key.payload.length, au.length);
+equal(key.payload[4], 0x65);
+equal(key.sequence, 3);
+const delta = parsePreviewFrame(envelopeV2({ kind: "h265", key: false, payload: [0, 0, 1, 0x02, 0x01] }));
+equal(delta.kind, "h265");
+equal(delta.keyFrame, false);
+equal(delta.codec, "");
+// 编码帧必须以 Annex B 起始码开头。
+equal(parsePreviewFrame(envelopeV2({ kind: "h264", payload: [0xff, 0xd8, 0xff, 0x00] })), null);
+// 未知 kind / 旧版本拒绝。
+const unknownKind = envelopeV2({ payload: jpeg });
+new DataView(unknownKind).setUint8(8, 9);
+equal(parsePreviewFrame(unknownKind), null);
+const v1 = envelopeV2({ payload: jpeg });
+new DataView(v1).setUint16(4, 1, true);
+equal(parsePreviewFrame(v1), null);
+// codec 长度越界(载荷为空)拒绝。
+const overflow = envelopeV2({ kind: "h264", codec: "avc1", payload: [0, 0, 1, 0x65] });
+new DataView(overflow).setUint16(10, 200, true);
+equal(parsePreviewFrame(overflow), null);
 
 // ---- 最新帧调度 ----
 

@@ -399,7 +399,51 @@ pub trait VideoSource: Send {
     fn preview_control(&self) -> Option<std::sync::Arc<crate::preview_worker::PreviewControl>> {
         None
     }
+
+    /// 是否支持 [`recv_event`](Self::recv_event) 的异步等待。
+    ///
+    /// 为 `true` 时消费者 await 事件到达,不再 1ms 轮询 [`next_media_event`]。
+    fn has_async_events(&self) -> bool {
+        false
+    }
+
+    /// 异步等待下一个事件。
+    ///
+    /// 返回 `None` 表示源已结束,或者等待超过一个内部上限(约 100ms)仍无事件;
+    /// 调用方据 [`is_live`](Self::is_live) 区分两者。默认实现等价于一次
+    /// [`next_media_event`](Self::next_media_event)。
+    fn recv_event(&mut self) -> EventFuture<'_> {
+        Box::pin(std::future::ready(self.next_media_event()))
+    }
+
+    /// 取出已从内部源读出、但还在包装层缓冲里的事件(按输出顺序)。
+    ///
+    /// 消费者停止前调用,避免交织窗口里的最后几十毫秒数据丢失。默认没有缓冲。
+    fn take_buffered(&mut self) -> Vec<MediaEvent> {
+        Vec::new()
+    }
+
+    /// 在采集线程里阻塞等待下一个事件,最长 `timeout`。
+    ///
+    /// 默认实现取一次,没有事件时睡 1ms;有内部队列的源覆盖为条件变量等待。
+    fn wait_event_blocking(&mut self, timeout: std::time::Duration) -> Option<MediaEvent> {
+        let event = self.next_media_event();
+        if event.is_none() {
+            std::thread::sleep(timeout.min(std::time::Duration::from_millis(1)));
+        }
+        event
+    }
 }
+
+/// [`VideoSource::recv_event`] 返回的 future。
+pub type EventFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<MediaEvent>> + Send + 'a>>;
+
+/// 共享媒体采集线程单次阻塞等待事件的上限。
+const SHARED_MEDIA_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 异步接收一次等待的上限。到点返回 `None`,让调用方检查停止/错误/存活状态。
+const RECV_EVENT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// 注册期唯一采集源的帧总线。预览和平台点播各自订阅，任何慢消费者都不会阻塞采集。
 pub struct SharedMedia {
@@ -459,10 +503,10 @@ pub fn start_shared_media(
                 *producer.error.lock().unwrap() = Some(error);
                 break;
             }
-            let mut emitted = false;
             if timed_source {
-                if let Some(event) = source.next_media_event() {
-                    emitted = true;
+                // 有内部队列的实时源在这里阻塞等待(条件变量),不再 1ms 空转;
+                // 最长 50ms 返回一次,以便及时响应 stop/seek。
+                if let Some(event) = source.wait_event_blocking(SHARED_MEDIA_WAIT) {
                     publish_media_event(&producer, event);
                 } else if !source.is_live() {
                     if let Some(error) = source.take_error() {
@@ -480,20 +524,18 @@ pub fn start_shared_media(
                         MediaEvent::Audio(legacy_clock.audio(packet, None)),
                     );
                 }
-                emitted = true;
             } else if !source.is_live() {
                 if let Some(error) = source.take_error() {
                     *producer.error.lock().unwrap() = Some(error);
                 }
                 break;
             }
-            if timed_source {
-                // 编码源本身负责输出节奏；总线不再按 fps 二次节流。
-                if !emitted {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+            // 定时源本身负责输出节奏,无事件时的等待已在 wait_event_blocking 内完成;
+            // 只有旧的按帧率源由总线打拍。
+            if !timed_source {
+                if let Some(remaining) = interval.checked_sub(tick.elapsed()) {
+                    std::thread::sleep(remaining);
                 }
-            } else if let Some(remaining) = interval.checked_sub(tick.elapsed()) {
-                std::thread::sleep(remaining);
             }
         }
         // LiveSource::drop 会等待并回收它持有的 camera/preview children。
@@ -578,7 +620,7 @@ impl SharedMedia {
             .map(|video| {
                 (
                     Frame {
-                        data: video.data,
+                        data: video.data.to_vec(),
                         key_frame: video.key_frame,
                     },
                     video.codec,
@@ -650,6 +692,47 @@ pub struct SharedVideoSource {
     need_key_frame: bool,
 }
 
+impl SharedVideoSource {
+    /// 本地暂存的事件优先于总线:先是旧接口拆出的 pending,再是起播关键帧。
+    fn take_local(&mut self) -> Option<MediaEvent> {
+        if let Some(event) = self.pending_event.take() {
+            return Some(event);
+        }
+        // 启动补发只带视频参数集；不能把该关键帧产生时的旧音频一并补发。
+        self.bootstrap.take().map(MediaEvent::Video)
+    }
+
+    /// 订阅端积压被总线丢弃:向消费者报告一次间断,之后等下一个可独立解码的关键帧。
+    /// 返回的间断事件经 [`admit`](Self::admit) 置位 `need_key_frame`。
+    fn lagged(&mut self) -> MediaEvent {
+        MediaEvent::Discontinuity { pts_90k: 0 }
+    }
+
+    /// 起播/恢复过滤:关键帧到来前丢弃 delta 帧与音频。返回 `None` 表示丢弃。
+    fn admit(&mut self, event: MediaEvent) -> Option<MediaEvent> {
+        match event {
+            MediaEvent::Video(video) => {
+                if self.need_key_frame
+                    && (!video.key_frame
+                        || !crate::pusher::contains_codec_config(&video.data, video.codec))
+                {
+                    return None;
+                }
+                self.need_key_frame = false;
+                Some(MediaEvent::Video(video))
+            }
+            // 在首个完整视频关键帧之前，音频事件没有可用的解码起点。
+            MediaEvent::Audio(audio) => (!self.need_key_frame).then_some(MediaEvent::Audio(audio)),
+            discontinuity @ MediaEvent::Discontinuity { .. } => {
+                // 连续多次间断只报告一次,避免消费者反复重建时间锚点。
+                let first = !self.need_key_frame;
+                self.need_key_frame = true;
+                first.then_some(discontinuity)
+            }
+        }
+    }
+}
+
 impl VideoSource for SharedVideoSource {
     fn supports_timed_events(&self) -> bool {
         true
@@ -664,46 +747,49 @@ impl VideoSource for SharedVideoSource {
 
     fn next_media_event(&mut self) -> Option<MediaEvent> {
         loop {
-            let event = if let Some(event) = self.pending_event.take() {
-                Some(event)
-            } else if let Some(video) = self.bootstrap.take() {
-                // 启动补发只带视频参数集；不能把该关键帧产生时的旧音频一并补发。
-                Some(MediaEvent::Video(video))
-            } else {
-                match self.events.try_recv() {
-                    Ok(event) => Some(event),
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                        self.need_key_frame = true;
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => None,
+            if let Some(event) = self.take_local() {
+                if let Some(event) = self.admit(event) {
+                    return Some(event);
                 }
-            }?;
-            match event {
-                MediaEvent::Video(video) => {
-                    if self.need_key_frame
-                        && (!video.key_frame
-                            || !crate::pusher::contains_codec_config(&video.data, video.codec))
-                    {
-                        continue;
-                    }
-                    self.need_key_frame = false;
-                    return Some(MediaEvent::Video(video));
-                }
-                MediaEvent::Audio(audio) => {
-                    // 在首个完整视频关键帧之前，音频事件没有可用的解码起点。
-                    if self.need_key_frame {
-                        continue;
-                    }
-                    return Some(MediaEvent::Audio(audio));
-                }
-                discontinuity @ MediaEvent::Discontinuity { .. } => {
-                    self.need_key_frame = true;
-                    return Some(discontinuity);
-                }
+                continue;
+            }
+            let event = match self.events.try_recv() {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => self.lagged(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return None,
+            };
+            if let Some(event) = self.admit(event) {
+                return Some(event);
             }
         }
+    }
+
+    fn has_async_events(&self) -> bool {
+        true
+    }
+
+    fn recv_event(&mut self) -> EventFuture<'_> {
+        Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + RECV_EVENT_POLL;
+            loop {
+                if let Some(event) = self.take_local() {
+                    if let Some(event) = self.admit(event) {
+                        return Some(event);
+                    }
+                    continue;
+                }
+                let event = match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                    Err(_elapsed) => return None,
+                    Ok(Ok(event)) => event,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => self.lagged(),
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+                };
+                if let Some(event) = self.admit(event) {
+                    return Some(event);
+                }
+            }
+        })
     }
 
     fn next_frame(&mut self) -> Option<Frame> {
@@ -711,7 +797,7 @@ impl VideoSource for SharedVideoSource {
             match self.next_media_event()? {
                 MediaEvent::Video(video) => {
                     return Some(Frame {
-                        data: video.data,
+                        data: video.data.to_vec(),
                         key_frame: video.key_frame,
                     });
                 }
@@ -725,11 +811,11 @@ impl VideoSource for SharedVideoSource {
         let mut out: Vec<Vec<u8>> = self
             .pending_audio
             .drain(..)
-            .map(|audio| audio.data)
+            .map(|audio| audio.data.to_vec())
             .collect();
         while let Some(event) = self.next_media_event() {
             match event {
-                MediaEvent::Audio(audio) => out.push(audio.data),
+                MediaEvent::Audio(audio) => out.push(audio.data.to_vec()),
                 other => {
                     self.pending_event = Some(other);
                     break;
@@ -814,10 +900,17 @@ impl VideoSource for LightSource {
         let key_frame = self.counter % self.keyframe_interval == 0;
         self.counter = self.counter.wrapping_add(1);
         // 伪 NAL:Annex B 起始码 + NAL 头(IDR type5 / slice type1)+ 填充占位。
+        // 关键帧前置伪 SPS/PPS:共享总线与订阅者只从"带参数集的关键帧"起播,
+        // 缺参数集会导致 B 档设备点播后永远等不到起播点。参数集计入帧长之外。
+        const FAKE_PARAM_SETS: [u8; 12] = [0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xCE];
         let nal_type: u8 = if key_frame { 0x65 } else { 0x61 };
-        let mut data = Vec::with_capacity(self.frame_bytes + 5);
+        let prefix = if key_frame { FAKE_PARAM_SETS.len() } else { 0 };
+        let mut data = Vec::with_capacity(prefix + self.frame_bytes + 5);
+        if key_frame {
+            data.extend_from_slice(&FAKE_PARAM_SETS);
+        }
         data.extend_from_slice(&[0, 0, 0, 1, nal_type]);
-        data.resize(self.frame_bytes + 5, 0xAB);
+        data.resize(prefix + self.frame_bytes + 5, 0xAB);
         Some(Frame { data, key_frame })
     }
 }
@@ -1540,7 +1633,7 @@ impl VideoSource for FileSource {
                 match self.next_historical_event()? {
                     MediaEvent::Video(video) => {
                         return Some(Frame {
-                            data: video.data,
+                            data: video.data.to_vec(),
                             key_frame: video.key_frame,
                         });
                     }
@@ -1604,11 +1697,11 @@ impl VideoSource for FileSource {
             let mut out: Vec<Vec<u8>> = self
                 .historical_pending_audio
                 .drain(..)
-                .map(|audio| audio.data)
+                .map(|audio| audio.data.to_vec())
                 .collect();
             while let Some(event) = self.next_historical_event() {
                 match event {
-                    MediaEvent::Audio(audio) => out.push(audio.data),
+                    MediaEvent::Audio(audio) => out.push(audio.data.to_vec()),
                     other => {
                         self.historical_pending_event = Some(other);
                         break;
@@ -2598,8 +2691,13 @@ mod tests {
         let mut s = LightSource::new(200, 25);
         let f0 = s.next_frame().unwrap();
         assert!(f0.key_frame); // 首帧为关键帧
-        assert_eq!(f0.data.len(), 1000 + 5); // 起始码+NAL头+填充
-        assert_eq!(&f0.data[..5], &[0, 0, 0, 1, 0x65]); // IDR
+        // 关键帧 = 伪 SPS/PPS(12B) + 起始码+NAL头+填充。
+        assert_eq!(f0.data.len(), 12 + 1000 + 5);
+        assert!(crate::pusher::contains_codec_config(
+            &f0.data,
+            crate::ps::VideoCodec::H264
+        ));
+        assert_eq!(&f0.data[12..17], &[0, 0, 0, 1, 0x65]); // IDR
         let f1 = s.next_frame().unwrap();
         assert!(!f1.key_frame); // 第二帧非关键帧
         assert_eq!(&f1.data[..5], &[0, 0, 0, 1, 0x61]); // slice
@@ -2608,6 +2706,8 @@ mod tests {
     #[test]
     fn 轻量源最小帧下限() {
         let mut s = LightSource::new(1, 25); // 极低码率 → 命中 64 字节下限
+        let f = s.next_frame().unwrap();
+        assert_eq!(f.data.len(), 12 + 64 + 5); // 首帧为带参数集的关键帧
         let f = s.next_frame().unwrap();
         assert_eq!(f.data.len(), 64 + 5);
     }
@@ -2692,6 +2792,77 @@ mod tests {
         fn audio_codec(&self) -> crate::ps::AudioCodec {
             crate::ps::AudioCodec::G711A
         }
+    }
+
+    fn config_keyframe(pts_90k: u64) -> MediaEvent {
+        MediaEvent::Video(TimedVideoAu::new(
+            vec![0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3],
+            crate::ps::VideoCodec::H264,
+            true,
+            pts_90k,
+            3_600,
+        ))
+    }
+
+    fn delta_frame(pts_90k: u64) -> MediaEvent {
+        MediaEvent::Video(TimedVideoAu::new(
+            vec![0, 0, 0, 1, 0x61, 9],
+            crate::ps::VideoCodec::H264,
+            false,
+            pts_90k,
+            3_600,
+        ))
+    }
+
+    #[test]
+    fn 订阅端积压被丢弃时只报告一次间断并从下一关键帧恢复() {
+        // fps=1 → 总线容量 64;生产端线程对 NoneSource 立即退出,总线仍可发布。
+        let media = start_shared_media(Box::new(NoneSource), 1);
+        let mut sub = media.subscribe();
+        // 先进入"已起播"状态;尚未起播的订阅者没有时间轴可中断,不报告间断。
+        publish_media_event(&media, config_keyframe(0));
+        assert!(matches!(sub.next_media_event(), Some(MediaEvent::Video(_))));
+        for i in 0..100 {
+            publish_media_event(&media, delta_frame(i * 3_600));
+        }
+        publish_media_event(&media, delta_frame(100 * 3_600));
+        publish_media_event(&media, config_keyframe(101 * 3_600));
+
+        assert!(matches!(
+            sub.next_media_event(),
+            Some(MediaEvent::Discontinuity { .. })
+        ));
+        match sub.next_media_event() {
+            Some(MediaEvent::Video(video)) => {
+                assert!(video.key_frame);
+                assert_eq!(video.pts_90k, 101 * 3_600);
+            }
+            other => panic!("间断后应从带参数集的关键帧恢复,实际 {other:?}"),
+        }
+        assert!(sub.next_media_event().is_none());
+    }
+
+    #[tokio::test]
+    async fn 订阅端异步等待被新事件唤醒且空闲时按上限返回() {
+        let media = start_shared_media(Box::new(NoneSource), 25);
+        let mut sub = media.subscribe();
+        assert!(sub.has_async_events());
+
+        let publisher = std::sync::Arc::clone(&media);
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            publish_media_event(&publisher, config_keyframe(0));
+        });
+        match sub.recv_event().await {
+            Some(MediaEvent::Video(video)) => assert!(video.key_frame),
+            other => panic!("应被关键帧唤醒,实际 {other:?}"),
+        }
+        assert!(started.elapsed() < RECV_EVENT_POLL, "应由事件唤醒而不是等满上限");
+
+        let idle = std::time::Instant::now();
+        assert!(sub.recv_event().await.is_none());
+        assert!(idle.elapsed() >= RECV_EVENT_POLL - std::time::Duration::from_millis(5));
     }
 
     #[test]

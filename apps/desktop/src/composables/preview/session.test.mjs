@@ -2,6 +2,7 @@ import {
   shutdownPreviewSession,
   usePreviewSession,
 } from "./session.ts";
+import { jpegEnvelope } from "./envelope.fixture.mjs";
 
 function equal(actual, expected) {
   if (actual !== expected) throw new Error(`expected ${String(expected)}, got ${String(actual)}`);
@@ -78,17 +79,7 @@ globalThis.createImageBitmap = async () => {
 };
 
 function envelope() {
-  const jpeg = [0xff, 0xd8, 0xff, 0x01, 0xff, 0xd9];
-  const bytes = new Uint8Array(32 + jpeg.length);
-  bytes.set([0x55, 0x56, 0x50, 0x4a], 0);
-  const view = new DataView(bytes.buffer);
-  view.setUint16(4, 1, true);
-  view.setUint16(6, 32, true);
-  view.setBigUint64(8, 1n, true);
-  view.setBigUint64(16, 1n, true);
-  view.setBigUint64(24, BigInt(Date.now()), true);
-  bytes.set(jpeg, 32);
-  return bytes.buffer;
+  return jpegEnvelope(1, 1);
 }
 
 // start_binary_preview 尚未完成时 stop，start 完成后也必须保持 stopped，且释放迟到 token。

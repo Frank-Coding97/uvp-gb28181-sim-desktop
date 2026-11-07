@@ -14,7 +14,14 @@ INVITE 携平台侧 SDP(平台接收 IP/端口、期望的 payload type、SSRC�
 - `m=video <port> RTP/AVP 96`,`a=rtpmap:96 PS/90000`(PS 流,时钟 90kHz)。
 - `y=` 行携带 SSRC(GB28181 扩展)。
 - `a=sendonly`(设备推、平台收)。
-- 传输:UDP 或 TCP(`TCP/RTP/AVP`,被动/主动)。
+- 传输:UDP 或 TCP(`TCP/RTP/AVP`,RFC 4571 两字节长度分帧)。TCP 角色按平台 offer 的 `a=setup`(RFC 4145)决定:
+
+  | 平台 offer | 设备角色 | 设备 answer |
+  |---|---|---|
+  | `a=setup:passive` 或未声明 | 主动连接平台 `c=`/`m=` 地址 | `m=video 9 TCP/RTP/AVP 96` + `a=setup:active` |
+  | `a=setup:active` | 被动监听,等平台连入(超时 10s) | `m=video <真实监听端口> ...` + `a=setup:passive` |
+
+  两种都带 `a=connection:new`。被动模式的监听端口在发送 200 OK 前绑定。
 
 ## PS 封装
 
@@ -22,6 +29,8 @@ INVITE 携平台侧 SDP(平台接收 IP/端口、期望的 payload type、SSRC�
 - 视频 PES 复用 H.264/H.265 NAL(stream_id 0xE0);**音频 PES 复用 G.711A(stream_id 0xC0)**。
 - 音视频复合流:视频源含音频轨时,PSM 同时声明视频(stream_type 0x1B)与音频(G.711A=0x90),
   每个视频帧后按 PTS 就近插入该时间窗内的音频 PES(0xC0);无音频轨则退化为纯视频(行为不变)。
+- 带真实 PTS 的源(实时采集、按 PTS 读取的文件):音视频事件复用前经 60ms 交织窗口按 PTS 排序,
+  同 PTS 视频在前,保证 PS 内 PTS 单调;每个推流会话可单独关闭音频(`PushOptions::with_audio`)。
 - 音频来源:`FileSource` 从容器(MP4 等)经 ffmpeg 抽 G.711A(`-c:a pcm_alaw -ar 8000 -ac 1`)裸流,
   按 20ms 分包(160 字节/包)。裸流视频源无音频。
 - 时间戳(PTS/DTS)基于 90kHz 时钟递增(音频 8kHz 采样按 90kHz 折算)。

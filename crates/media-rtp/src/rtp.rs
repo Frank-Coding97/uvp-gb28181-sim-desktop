@@ -123,15 +123,41 @@ impl RtpSender {
             Error::Io(e)
         })?;
         tracing::info!(%dst, "TCP-ACTIVE 已连接平台收流端口");
+        Ok(Self::from_tcp_stream(stream, ssrc))
+    }
+
+    /// TCP-PASSIVE 模式:在已绑定的监听端口上等待平台连入,RFC 4571 分帧。
+    ///
+    /// 监听端口必须在发送 200 OK 之前绑定(answer 里要写真实端口),
+    /// 因此由调用方创建 `listener`,这里只负责带超时的 accept。
+    pub async fn accept_tcp(
+        listener: tokio::net::TcpListener,
+        ssrc: u32,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let local = listener.local_addr().ok();
+        let (stream, peer) = tokio::time::timeout(timeout, listener.accept())
+            .await
+            .map_err(|_| {
+                tracing::warn!(?local, ?timeout, "TCP-PASSIVE 等待平台连入超时");
+                Error::Media(format!("TCP 被动模式等待平台连入超时({}s)", timeout.as_secs()))
+            })?
+            .map_err(Error::Io)?;
+        tracing::info!(?local, %peer, "TCP-PASSIVE 平台已连入");
+        Ok(Self::from_tcp_stream(stream, ssrc))
+    }
+
+    /// 用一条已建立的 TCP 连接构造发送器(主动/被动共用)。
+    pub fn from_tcp_stream(stream: TcpStream, ssrc: u32) -> Self {
         stream.set_nodelay(true).ok();
-        Ok(RtpSender {
+        RtpSender {
             channel: Channel::Tcp { stream },
             ssrc,
             payload_type: PT_PS,
             seq: 0,
             max_payload: 1400,
             stats: Arc::new(SendStats::default()),
-        })
+        }
     }
 
     /// 共享的发送统计句柄。
