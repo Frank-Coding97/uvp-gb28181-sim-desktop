@@ -600,34 +600,19 @@ onUnmounted(() => {
 <template>
   <div class="page page-wrap">
 
-    <!-- ── 顶部标题栏 ── -->
-    <header class="page-header">
-      <div class="header-left">
-        <div class="eyebrow">LOAD TESTING</div>
-        <h1>压力测试</h1>
-        <p>批量注册 · 心跳 · 媒体 · 主动上报，实时观测平台承载能力</p>
-      </div>
-      <div class="header-right">
-        <div class="status-pill" :class="statusTone">
-          <span class="status-dot" />
-          <span>{{ statusText }}</span>
-        </div>
-        <n-button size="small" secondary :disabled="!hasReport" @click="exportReport">导出报告</n-button>
-      </div>
-    </header>
-
-    <!-- ── 运行横幅 ── -->
-    <transition name="slide-banner">
-      <div v-if="running" class="run-banner">
-        <span class="rb-pulse" />
-        <span class="rb-text">{{ statusText }}</span>
-        <span class="rb-sep">·</span>
-        <span class="rb-stat">运行 <b>{{ elapsedStr }}</b></span>
-        <span class="rb-sep">·</span>
-        <span class="rb-stat">TPS <b>{{ tps }}</b> reg/s</span>
-        <span class="rb-platform">{{ platformLabel }}</span>
-      </div>
-    </transition>
+    <!-- ── 状态条：常驻单行，承载状态、运行统计与报告导出 ── -->
+    <div class="status-bar" :class="statusTone">
+      <span class="sb-dot" />
+      <span class="sb-text">{{ statusText }}</span>
+      <template v-if="running">
+        <span class="sb-sep">·</span>
+        <span class="sb-stat">运行 <b>{{ elapsedStr }}</b></span>
+        <span class="sb-sep">·</span>
+        <span class="sb-stat">TPS <b>{{ tps }}</b> reg/s</span>
+      </template>
+      <span class="sb-platform">{{ platformLabel }}</span>
+      <n-button size="small" secondary :disabled="!hasReport" @click="exportReport">导出报告</n-button>
+    </div>
 
     <!-- ── 主体：左配置 / 右监控 ── -->
     <div class="workspace">
@@ -880,45 +865,28 @@ onUnmounted(() => {
 /* ── 页面骨架 ── */
 .page { width: min(1440px, 100%); margin: 0 auto; display: flex; flex-direction: column; overflow: hidden; }
 
-.page-header {
-  display: flex; justify-content: space-between; align-items: center;
-  gap: 16px; padding: 10px 0 8px; flex-shrink: 0;
-}
-.eyebrow { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: 1.8px; }
-h1 { margin: 3px 0 0; color: var(--text-primary); font-size: 22px; letter-spacing: -.4px; font-weight: 800; }
-.page-header p { margin: 3px 0 0; color: var(--text-tertiary); font-size: 12px; }
-.header-right { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
-
-/* 状态胶囊 */
-.status-pill {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 5px 14px; border-radius: 999px;
+/* ── 顶部状态条（替代原页头，单行常驻） ── */
+.status-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 12px 6px 14px; border-radius: var(--radius-sm);
   border: 1px solid var(--border-default);
   background: rgba(255,255,255,.55);
-  font-size: 12px; font-weight: 650; color: var(--text-secondary);
-}
-.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); flex: 0 0 auto; }
-.status-pill.running { color: var(--success); border-color: rgba(8,179,136,.28); background: rgba(8,179,136,.07); }
-.status-pill.running .status-dot { background: var(--success); animation: pulse 1.8s infinite; box-shadow: 0 0 0 4px rgba(8,179,136,.12); }
-.status-pill.busy { color: var(--warning); }
-.status-pill.busy .status-dot { background: var(--warning); }
-
-/* 运行横幅 */
-.run-banner {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 6px 14px; border-radius: var(--radius-sm);
-  background: rgba(8,179,136,.07); border: 1px solid rgba(8,179,136,.2);
   margin-bottom: 8px; font-size: 12px; flex-shrink: 0;
 }
-.rb-pulse { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--success); animation: pulse 1.8s infinite; box-shadow: 0 0 0 4px rgba(8,179,136,.12); }
-.rb-text { font-weight: 700; color: var(--success); }
-.rb-sep { color: var(--text-tertiary); }
-.rb-stat { color: var(--text-secondary); }
-.rb-stat b { color: var(--text-primary); font-weight: 700; font-variant-numeric: tabular-nums; }
-.rb-platform { margin-left: auto; color: var(--text-tertiary); font-size: 11.5px; }
+.sb-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--text-tertiary); }
+.sb-text { font-weight: 700; color: var(--text-secondary); }
+.sb-sep { color: var(--text-tertiary); }
+.sb-stat { color: var(--text-secondary); }
+.sb-stat b { color: var(--text-primary); font-weight: 700; font-variant-numeric: tabular-nums; }
+.sb-platform { margin-left: auto; color: var(--text-tertiary); font-size: 11.5px; }
 
-.slide-banner-enter-active, .slide-banner-leave-active { transition: all .25s cubic-bezier(.4,0,.2,1); }
-.slide-banner-enter-from, .slide-banner-leave-to { opacity: 0; transform: translateY(-5px); }
+.status-bar.running { background: rgba(8,179,136,.07); border-color: rgba(8,179,136,.2); }
+.status-bar.running .sb-dot { background: var(--success); animation: pulse 1.8s infinite; box-shadow: 0 0 0 4px rgba(8,179,136,.12); }
+.status-bar.running .sb-text { color: var(--success); }
+.status-bar.busy { border-color: rgba(240,160,32,.22); background: rgba(240,160,32,.07); }
+.status-bar.busy .sb-dot { background: var(--warning); animation: pulse-warn 1.8s infinite; box-shadow: 0 0 0 4px rgba(240,160,32,.12); }
+.status-bar.busy .sb-text { color: var(--warning); }
+
 .fade-enter-active, .fade-leave-active { transition: opacity .2s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
 
@@ -1066,6 +1034,7 @@ h1 { margin: 3px 0 0; color: var(--text-primary); font-size: 22px; letter-spacin
 
 /* 动画 */
 @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(8,179,136,0); } }
+@keyframes pulse-warn { 50% { box-shadow: 0 0 0 7px rgba(240,160,32,0); } }
 @keyframes dot-appear { from { opacity: 0; transform: scale(.5); } to { opacity: 1; transform: scale(1); } }
 
 /* 响应式 */
@@ -1089,9 +1058,8 @@ h1 { margin: 3px 0 0; color: var(--text-primary); font-size: 22px; letter-spacin
   .fl-extra { margin-left: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .slide-banner-enter-active, .slide-banner-leave-active,
   .fade-enter-active, .fade-leave-active { transition: none; }
-  .status-pill.running .status-dot, .rb-pulse, .live-pulse { animation: none; }
+  .status-bar.running .sb-dot, .status-bar.busy .sb-dot, .live-pulse { animation: none; }
   .dot-grid.active .dot-cell.ok { animation: none; }
 }
 </style>
