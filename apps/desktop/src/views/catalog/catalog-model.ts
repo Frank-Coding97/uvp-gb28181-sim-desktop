@@ -85,6 +85,33 @@ export function genChildId(domain: string, nodeType: CatalogNodeType, seq: numbe
 
 // ── 模板 ────────────────────────────────────────────────────────────────
 
+/** 视频通道默认名前缀：Uvp-Camera-序号。 */
+export const CHANNEL_NAME_PREFIX = "Uvp-Camera";
+
+/** 解析 `Uvp-Camera-N` 形式的序号；不是该前缀返回 null。 */
+function channelSeqOf(name: string, prefix: string): number | null {
+  const trimmed = name.trim();
+  const head = `${prefix}-`;
+  if (!trimmed.startsWith(head)) return null;
+  const tail = trimmed.slice(head.length);
+  return /^\d+$/.test(tail) ? Number(tail) : null;
+}
+
+/** 下一个可用通道序号：树内同前缀 `Uvp-Camera-N` 的最大 N + 1。 */
+export function nextChannelSeq(tree: CatalogNode[], prefix = CHANNEL_NAME_PREFIX): number {
+  let max = 0;
+  for (const node of tree) {
+    const seq = channelSeqOf(node.name, prefix);
+    if (seq !== null) max = Math.max(max, seq);
+  }
+  return max + 1;
+}
+
+/** 新增视频通道的默认名，如 Uvp-Camera-3。 */
+export function defaultChannelName(tree: CatalogNode[], prefix = CHANNEL_NAME_PREFIX): string {
+  return `${prefix}-${nextChannelSeq(tree, prefix)}`;
+}
+
 export interface TemplateContext {
   deviceId: string;
   deviceName: string;
@@ -113,7 +140,7 @@ function singleTemplate(ctx: TemplateContext): CatalogNode[] {
   const root = ctx.deviceId;
   return [
     makeNode(root, "Device", ctx.deviceName, root),
-    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", `${ctx.channelName || ctx.deviceName}-通道1`, root),
+    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", ctx.channelName || `${CHANNEL_NAME_PREFIX}-1`, root),
     makeNode(templateSeq(ctx, "AlarmChannel", 1), "AlarmChannel", `${ctx.deviceName}-报警`, root),
   ];
 }
@@ -126,7 +153,7 @@ function nvr8Template(ctx: TemplateContext): CatalogNode[] {
     makeNode(group, "BusinessGroup", "NVR-8", root),
   ];
   for (let i = 1; i <= 8; i += 1) {
-    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", i), "VideoChannel", `通道-${String(i).padStart(2, "0")}`, group));
+    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", i), "VideoChannel", `${CHANNEL_NAME_PREFIX}-${i}`, group));
   }
   return nodes;
 }
@@ -143,7 +170,7 @@ function civil3x2Template(ctx: TemplateContext): CatalogNode[] {
       nodes.push(makeNode(
         templateSeq(ctx, "VideoChannel", channelSeq),
         "VideoChannel",
-        `${area}-${k}号`,
+        `${CHANNEL_NAME_PREFIX}-${channelSeq}`,
         org,
         { civil_code: civil },
       ));
@@ -164,11 +191,11 @@ function large16Template(ctx: TemplateContext): CatalogNode[] {
   ];
   let channelSeq = 1;
   for (let i = 1; i <= 8; i += 1) {
-    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `室内-${String(i).padStart(2, "0")}`, indoor));
+    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `${CHANNEL_NAME_PREFIX}-${channelSeq}`, indoor));
     channelSeq += 1;
   }
   for (let i = 1; i <= 8; i += 1) {
-    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `室外-${String(i).padStart(2, "0")}`, outdoor));
+    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `${CHANNEL_NAME_PREFIX}-${channelSeq}`, outdoor));
     channelSeq += 1;
   }
   nodes.push(makeNode(templateSeq(ctx, "AlarmChannel", 1), "AlarmChannel", "总报警", root));
@@ -196,8 +223,8 @@ function standardBusinessGroupTemplate(ctx: TemplateContext): CatalogNode[] {
     makeNode(groupId, "BusinessGroup", "校园安防", systemId, { civil_code: civilCode }),
     makeNode(firstOrg, "VirtualOrg", "出入口", groupId, { business_group_id: groupId }),
     makeNode(nestedOrg, "VirtualOrg", "教学区域", firstOrg, { business_group_id: groupId }),
-    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", ctx.channelName || `${ctx.deviceName}-通道1`, firstOrg),
-    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", `${ctx.channelName || ctx.deviceName}-通道2`, nestedOrg),
+    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", ctx.channelName || `${CHANNEL_NAME_PREFIX}-1`, firstOrg),
+    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", `${CHANNEL_NAME_PREFIX}-2`, nestedOrg),
   ];
 }
 

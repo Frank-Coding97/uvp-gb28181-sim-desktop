@@ -387,7 +387,7 @@ pub fn catalog_template(
                 v.push(CatalogNode::new(
                     vid(i),
                     CatalogNodeType::VideoChannel,
-                    format!("通道-{i:02}"),
+                    format!("Uvp-Camera-{i}"),
                     &g,
                 ));
             }
@@ -408,12 +408,12 @@ pub fn catalog_template(
                     )
                     .with_civil_code(*civil),
                 );
-                for k in 1..=2 {
+                for _ in 1..=2 {
                     v.push(
                         CatalogNode::new(
                             vid(ch_seq),
                             CatalogNodeType::VideoChannel,
-                            format!("{area}-{k}号"),
+                            format!("Uvp-Camera-{ch_seq}"),
                             &o,
                         )
                         .with_civil_code(*civil),
@@ -440,20 +440,20 @@ pub fn catalog_template(
                 device_id,
             ));
             let mut ch_seq = 1u32;
-            for i in 1..=8 {
+            for _ in 1..=8 {
                 v.push(CatalogNode::new(
                     vid(ch_seq),
                     CatalogNodeType::VideoChannel,
-                    format!("室内-{i:02}"),
+                    format!("Uvp-Camera-{ch_seq}"),
                     &indoor,
                 ));
                 ch_seq += 1;
             }
-            for i in 1..=8 {
+            for _ in 1..=8 {
                 v.push(CatalogNode::new(
                     vid(ch_seq),
                     CatalogNodeType::VideoChannel,
-                    format!("室外-{i:02}"),
+                    format!("Uvp-Camera-{ch_seq}"),
                     &outdoor,
                 ));
                 ch_seq += 1;
@@ -469,12 +469,7 @@ pub fn catalog_template(
         // "single" 及未知:默认单设备 + 1 视频 + 1 报警。
         _ => vec![
             root(),
-            CatalogNode::new(
-                vid(1),
-                CatalogNodeType::VideoChannel,
-                format!("{device_name}-通道1"),
-                device_id,
-            ),
+            CatalogNode::new(vid(1), CatalogNodeType::VideoChannel, "Uvp-Camera-1", device_id),
             CatalogNode::new(
                 alarm(1),
                 CatalogNodeType::AlarmChannel,

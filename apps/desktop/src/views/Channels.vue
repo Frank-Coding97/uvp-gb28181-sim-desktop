@@ -16,10 +16,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDevice } from "../device";
 import { previewCatalogXml, usePlatform, type CatalogNodeConfig } from "../platform";
 import {
-  TYPE_LABELS, allowedChildTypes, attachCatalogNode, availableTemplates,
+  CHANNEL_NAME_PREFIX, TYPE_LABELS, allowedChildTypes, attachCatalogNode, availableTemplates,
   buildTreeRows, canMove, collectDescendants, countByType, decodeCatalogJson,
-  displayParent, encodeCatalogJson, filterTreeByQuery, humanizedAgo, isLeaf, isRoot,
-  makeNode, moveCatalogNode, nextSeqId, validateDraft,
+  defaultChannelName, displayParent, encodeCatalogJson, filterTreeByQuery, humanizedAgo,
+  isLeaf, isRoot, makeNode, moveCatalogNode, nextChannelSeq, nextSeqId, validateDraft,
   type CatalogTemplateDef, type DecodeResult, type JsonFlavor, type TreeRow,
 } from "./catalog/catalog-model";
 
@@ -66,7 +66,7 @@ const templateContext = computed(() => {
   return {
     deviceId,
     deviceName: config.value?.device.device_name || "演示设备",
-    channelName: channelNameDraft.value || config.value?.device.channel_name || "通道1",
+    channelName: channelNameDraft.value || config.value?.device.channel_name || `${CHANNEL_NAME_PREFIX}-1`,
     domain: active.value?.server_domain || deviceId.slice(0, 10) || "3402000000",
     gbVersion: (active.value?.gb_version ?? "V2022") as "V2016" | "V2022",
   };
@@ -172,9 +172,26 @@ function openAdd(parent: ChannelNode | null = null) {
   addParentId.value = target?.id ?? null;
   const options = allowedChildTypes(target);
   addType.value = options[0] ?? "VideoChannel";
-  addName.value = "新节点";
+  addNameTouched.value = false;
+  addName.value = defaultAddName(addType.value);
   addCountText.value = "1";
   showAdd.value = true;
+}
+
+/** 新增对话框的默认名：视频通道走 Uvp-Camera-序号，其它类型沿用「新节点」。 */
+function defaultAddName(type: ChannelNode["node_type"]): string {
+  return type === "VideoChannel" ? defaultChannelName(draft.value) : "新节点";
+}
+
+/** 切换类型时，若用户还没手动改过名称，就跟着换默认名，避免业务分组叫成 Uvp-Camera-3。 */
+function onAddTypeChange(value: string) {
+  addType.value = value as ChannelNode["node_type"];
+  if (!addNameTouched.value) addName.value = defaultAddName(addType.value);
+}
+
+function onAddNameInput(value: string) {
+  addName.value = String(value ?? "");
+  addNameTouched.value = true;
 }
 
 function confirmAdd() {
@@ -184,6 +201,15 @@ function confirmAdd() {
     : 1;
   const ids = new Set(draft.value.map((node) => node.id));
   const created: ChannelNode[] = [];
+  // 视频通道统一 `Uvp-Camera-序号`：沿用输入里的序号往后递增，没写序号就接着树里最大值。
+  let videoPrefix = "";
+  let videoSeqStart = 0;
+  if (addType.value === "VideoChannel") {
+    const typed = addName.value.trim();
+    const matched = /^(.*?)-(\d+)$/.exec(typed);
+    videoPrefix = matched?.[1] || typed || CHANNEL_NAME_PREFIX;
+    videoSeqStart = matched ? Number(matched[2]) : nextChannelSeq(draft.value, videoPrefix);
+  }
   for (let i = 0; i < count; i += 1) {
     let id = nextSeqId(domain.value, [...draft.value, ...created], addType.value);
     while (ids.has(id)) {
@@ -191,9 +217,11 @@ function confirmAdd() {
       id = `${id.slice(0, 13)}${String(tail).padStart(7, "0")}`;
     }
     ids.add(id);
-    const name = count > 1
-      ? `${addName.value.trim() || TYPE_LABELS[addType.value]}-${String(i + 1).padStart(3, "0")}`
-      : (addName.value.trim() || TYPE_LABELS[addType.value]);
+    const name = addType.value === "VideoChannel"
+      ? `${videoPrefix}-${videoSeqStart + i}`
+      : count > 1
+        ? `${addName.value.trim() || TYPE_LABELS[addType.value]}-${String(i + 1).padStart(3, "0")}`
+        : (addName.value.trim() || TYPE_LABELS[addType.value]);
     let node = makeNode(id, addType.value, name, parent?.id ?? id);
     if (parent) node = attachCatalogNode(node, parent);
     created.push(node);
@@ -286,6 +314,7 @@ const showAdd = ref(false);
 const addParentId = ref<string | null>(null);
 const addType = ref<ChannelNode["node_type"]>("VideoChannel");
 const addName = ref("新节点");
+const addNameTouched = ref(false);
 const addCountText = ref("1");
 const showMove = ref(false);
 const movingId = ref<string | null>(null);
@@ -628,9 +657,11 @@ onMounted(async () => {
         </n-form-item>
         <n-form-item label="类型">
           <n-select :value="addType" :options="addTypeOptions"
-            @update:value="(v: string) => addType = v as ChannelNode['node_type']" />
+            @update:value="(v: string) => onAddTypeChange(v)" />
         </n-form-item>
-        <n-form-item label="名称"><n-input v-model:value="addName" /></n-form-item>
+        <n-form-item label="名称">
+          <n-input :value="addName" @update:value="(v: string) => onAddNameInput(v)" />
+        </n-form-item>
         <n-form-item v-if="addBatch" label="数量（1-50）">
           <n-input :value="addCountText"
             @update:value="(v: string) => addCountText = String(v ?? '').replace(/\D/g, '').slice(0, 2)" />
@@ -639,7 +670,7 @@ onMounted(async () => {
           层级：设备(111)/系统(200) → 业务分组(215) → 虚拟组织(216) → 通道(132/134)。业务分组按业务归口，
           虚拟组织可多级嵌套；容器类型下继续点「新增子节点」往下挂。
         </div>
-        <div class="hint">批量新增（1-50）按 name-001 顺序命名；国标 ID 由域编码 + 类型码 + 下一个可用序号自动生成。</div>
+        <div class="hint">批量新增（1-50）按名称序号递增（如 Uvp-Camera-1、Uvp-Camera-2）；国标 ID 由域编码 + 类型码 + 下一个可用序号自动生成。</div>
       </n-form>
       <template #footer>
         <n-space justify="end">

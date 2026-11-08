@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   ALL_TYPES,
   CATALOG_TEMPLATES,
+  CHANNEL_NAME_PREFIX,
   TYPE_CODES,
   allowedChildTypes,
   attachCatalogNode,
@@ -13,12 +14,14 @@ import {
   collectDescendants,
   countByType,
   decodeCatalogJson,
+  defaultChannelName,
   displayParent,
   encodeCatalogJson,
   filterTreeByQuery,
   genChildId,
   makeNode,
   moveCatalogNode,
+  nextChannelSeq,
   nextSeqId,
   validateDraft,
 } from "./catalog-model.ts";
@@ -64,6 +67,29 @@ test("5 个模板全部能通过保存预检，且节点 ID 无重复", () => {
   assert.equal(standard[0].id.slice(10, 13), "200");
   assert.equal(countByType(standard, "VirtualOrg"), 2);
   assert.ok(standard.filter((n) => n.node_type === "VirtualOrg").every((n) => n.business_group_id));
+});
+
+test("视频通道默认名统一为 Uvp-Camera-序号", () => {
+  const unnamed = { ...CTX, channelName: "" };
+  for (const tpl of CATALOG_TEMPLATES) {
+    const channels = tpl.build(unnamed).filter((node) => node.node_type === "VideoChannel");
+    assert.ok(channels.length > 0, `${tpl.id} 应至少有一个视频通道`);
+    assert.deepEqual(
+      channels.map((node) => node.name),
+      channels.map((_, index) => `${CHANNEL_NAME_PREFIX}-${index + 1}`),
+      `${tpl.id} 的通道名应为 Uvp-Camera-1..N，序号连续`,
+    );
+  }
+  // 单设备与标准模板的首个通道沿用设备配置里的通道名，未配置时才回退默认名。
+  assert.equal(byId(CATALOG_TEMPLATES, "single").build(CTX)[1].name, CTX.channelName);
+  assert.equal(byId(CATALOG_TEMPLATES, "single").build(unnamed)[1].name, "Uvp-Camera-1");
+
+  assert.equal(CHANNEL_NAME_PREFIX, "Uvp-Camera");
+  assert.equal(nextChannelSeq([]), 1);
+  assert.equal(defaultChannelName([]), "Uvp-Camera-1");
+  const used = [makeNode("a", "VideoChannel", "Uvp-Camera-7", "r"), makeNode("b", "VideoChannel", "大门", "r")];
+  assert.equal(nextChannelSeq(used), 8, "只统计同前缀的序号，手工命名不参与");
+  assert.equal(defaultChannelName(used), "Uvp-Camera-8");
 });
 
 test("新增子节点类型按父节点限制，设备根下放开 215/216", () => {
