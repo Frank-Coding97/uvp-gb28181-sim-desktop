@@ -193,9 +193,19 @@ onActivated(() => { void load(); });
 
 <template>
   <div class="page page-wrap">
+    <div class="page-header">
+      <div>
+        <div class="page-title">报警管理</div>
+        <div class="page-sub">组 Alarm 报文并发送，右侧核对平台应答与发送路径</div>
+      </div>
+    </div>
+
     <div class="layout">
       <section class="glass-card panel">
-        <div class="panel-title">报警单</div>
+        <div class="panel-head">
+          <div class="panel-title">报警单</div>
+          <span class="source">报警源 <code class="channel">{{ deviceIdText }}</code></span>
+        </div>
 
         <div class="presets">
           <span class="label">固定单</span>
@@ -204,53 +214,59 @@ onActivated(() => { void load(); });
           </button>
         </div>
 
-        <div class="field">
-          <span class="label">报警源通道</span>
-          <code class="channel">{{ deviceIdText }}</code>
-        </div>
+        <div class="form-grid">
+          <div class="field">
+            <span class="label">报警等级 <code>AlarmPriority</code></span>
+            <n-select v-model:value="draft.priority" :options="PRIORITIES" size="small" />
+          </div>
 
-        <div class="field">
-          <span class="label">报警等级 AlarmPriority</span>
-          <n-select v-model:value="draft.priority" :options="PRIORITIES" size="small" />
-        </div>
+          <div class="field">
+            <span class="label">报警方式 <code>AlarmMethod</code></span>
+            <n-select v-model:value="draft.method" :options="METHODS" size="small" />
+          </div>
 
-        <div class="field">
-          <span class="label">报警方式 AlarmMethod</span>
-          <n-select v-model:value="draft.method" :options="METHODS" size="small" />
-        </div>
+          <div class="field">
+            <span class="label">报警类型 <code>AlarmType</code></span>
+            <n-select v-model:value="draft.alarm_type" :options="TYPES" size="small" clearable />
+            <span class="hint-inline">清空则报文不带 &lt;Info&gt;</span>
+          </div>
 
-        <div class="field">
-          <span class="label">报警类型 AlarmType</span>
-          <n-select v-model:value="draft.alarm_type" :options="TYPES" size="small" clearable />
-          <span class="hint-inline">清空则不带 &lt;Info&gt;，兼容只认 2016 字段的平台</span>
-        </div>
+          <div class="field">
+            <span class="label">报警时间</span>
+            <n-select v-model:value="draft.minutes_ago" :options="TIME_OPTIONS" size="small" />
+            <span class="hint-inline">只改 AlarmTime，不延迟发送</span>
+          </div>
 
-        <div class="field">
-          <span class="label">报警描述</span>
-          <n-input v-model:value="draft.description" size="small" placeholder="如：磁吸触发" />
-        </div>
+          <div class="field span-2">
+            <span class="label">报警描述</span>
+            <n-input v-model:value="draft.description" size="small" placeholder="如：磁吸触发" />
+          </div>
 
-        <div class="field">
-          <span class="label">报警时间</span>
-          <n-select v-model:value="draft.minutes_ago" :options="TIME_OPTIONS" size="small" />
-          <span class="hint-inline">只改报文里的 AlarmTime，不延迟发送</span>
-        </div>
-
-        <div class="field row">
-          <span class="label">经纬度（可选）</span>
-          <div class="coords">
-            <n-input-number v-model:value="draft.longitude" size="small" :step="0.000001" placeholder="经度" />
-            <n-input-number v-model:value="draft.latitude" size="small" :step="0.000001" placeholder="纬度" />
+          <div class="field span-2">
+            <span class="label">经纬度（可选）</span>
+            <div class="coords">
+              <n-input-number v-model:value="draft.longitude" size="small" :step="0.000001" placeholder="经度" />
+              <n-input-number v-model:value="draft.latitude" size="small" :step="0.000001" placeholder="纬度" />
+            </div>
           </div>
         </div>
 
-        <div class="actions">
-          <n-button type="primary" size="small" :loading="sending" :disabled="!canSend" @click="send">发送报警</n-button>
-          <n-button size="small" :disabled="!canSend" @click="sendRandom">随机发一条</n-button>
-          <n-button size="small" :disabled="!canSend" @click="openXml">预览 XML</n-button>
-          <n-button size="small" :loading="busy === 'reset'" :disabled="deviceState === 'Disconnected'" @click="doReset">复位本机报警</n-button>
+        <div class="panel-foot">
+          <div class="actions">
+            <n-button type="primary" size="small" :loading="sending" :disabled="!canSend" @click="send">发送报警</n-button>
+            <n-button size="small" :disabled="!canSend" @click="sendRandom">随机发一条</n-button>
+            <n-button size="small" :disabled="!canSend" @click="openXml">预览 XML</n-button>
+            <n-button
+              class="reset-btn"
+              size="small"
+              quaternary
+              :loading="busy === 'reset'"
+              :disabled="deviceState === 'Disconnected'"
+              @click="doReset"
+            >复位本机报警</n-button>
+          </div>
+          <div class="hint">复位只清设备本地 alarming 标记（下一次 DeviceStatus 回到“无报警”），不补发任何报文。</div>
         </div>
-        <div class="hint">复位只清设备本地 alarming 标记（下一次 DeviceStatus 回到“无报警”），不会向平台补发任何报文。</div>
       </section>
 
       <section class="glass-card panel history-panel">
@@ -263,7 +279,11 @@ onActivated(() => { void load(); });
         </div>
 
         <div v-if="!history.length" class="empty-wrap">
-          <n-empty description="还没有发送过报警" />
+          <n-empty description="还没有发送过报警">
+            <template #extra>
+              <span class="empty-tip">发送后这里会显示时间、平台应答与发送路径</span>
+            </template>
+          </n-empty>
         </div>
 
         <div v-else class="rows">
@@ -298,25 +318,33 @@ onActivated(() => { void load(); });
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.layout { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px; align-items: start; }
-.panel { padding: 18px; }
+.layout { display: grid; grid-template-columns: minmax(0, 640px) minmax(0, 1fr); gap: 18px; align-items: stretch; }
+.panel { display: flex; flex-direction: column; padding: 18px; }
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .panel-title { color: var(--text-primary); font-size: 15px; font-weight: 700; }
 .panel-title small { margin-left: 6px; color: var(--text-tertiary); font-size: 11px; font-weight: 500; }
+.source { color: var(--text-tertiary); font-size: 11px; }
+.channel { color: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
 .presets { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 16px; }
-.preset { padding: 4px 10px; border: 1px solid var(--border-default); border-radius: 999px; background: rgba(255,255,255,.6); color: var(--text-secondary); font-size: 11px; cursor: pointer; }
-.preset:hover { border-color: var(--accent); color: var(--accent); }
-.field { display: grid; gap: 6px; margin-bottom: 14px; }
-.field.row .coords { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.label { color: var(--text-tertiary); font-size: 11px; }
-.channel { overflow-wrap: anywhere; color: var(--text-secondary); font-size: 12px; }
-.hint-inline { color: var(--text-tertiary); font-size: 10px; }
-.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
-.hint { margin-top: 14px; padding: 10px 12px; border-radius: 9px; background: var(--accent-dim); color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
-.history-panel { min-height: 420px; }
+.preset { padding: 5px 11px; border: 1px solid var(--border-default); border-radius: 999px; background: rgba(255,255,255,.6); color: var(--text-secondary); font-size: 12px; line-height: 1.2; cursor: pointer; transition: var(--transition); }
+.preset:hover { border-color: var(--border-accent); background: var(--bg-hover); color: var(--accent); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 16px; row-gap: 12px; }
+.field { display: grid; gap: 6px; align-content: start; }
+.field.span-2 { grid-column: span 2; }
+.field .coords { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.label { display: flex; align-items: baseline; gap: 6px; color: var(--text-tertiary); font-size: 11px; }
+.label code { color: var(--text-tertiary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: .75; }
+.hint-inline { color: var(--text-tertiary); font-size: 10px; line-height: 1.4; }
+.panel-foot { margin-top: auto; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border-default); }
+.reset-btn { margin-left: auto; }
+.hint { margin-top: 12px; color: var(--text-tertiary); font-size: 10.5px; line-height: 1.6; }
+.history-panel { min-height: 452px; max-height: 640px; }
 .history-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .history-actions { display: flex; gap: 6px; }
-.empty-wrap { display: grid; place-items: center; padding: 60px 0; }
-.rows { display: grid; gap: 10px; max-height: 620px; overflow: auto; }
+.empty-wrap { flex: 1; display: grid; place-items: center; min-height: 280px; padding: 24px 0; }
+.empty-tip { color: var(--text-tertiary); font-size: 11px; }
+.rows { display: grid; flex: 1; align-content: start; gap: 10px; min-height: 0; overflow: auto; }
 .row-item { display: grid; gap: 5px; padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.5); }
 .row-top { display: flex; align-items: center; gap: 8px; }
 .row-top .time { color: var(--text-tertiary); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -328,5 +356,6 @@ onActivated(() => { void load(); });
 .row-meta .err { color: var(--error); }
 .xml-card { width: min(880px, 92vw); }
 .xml { margin: 0; padding: 12px; border-radius: 10px; background: #071424; color: #cfe0f7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6; overflow: auto; max-height: 60vh; }
-@media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+@media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } .history-panel { min-height: 360px; } }
+@media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } .field.span-2 { grid-column: auto; } .reset-btn { margin-left: 0; } }
 </style>
