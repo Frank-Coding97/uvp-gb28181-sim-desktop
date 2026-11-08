@@ -194,11 +194,6 @@ onUnmounted(() => { unlistenLog?.(); unlistenTrace?.(); unlistenCommand?.(); });
 
 <template>
   <div class="page page-wrap">
-    <div class="page-header">
-      <div class="page-title">日志</div>
-      <div class="page-sub">集中查看完整 SIP 报文、系统运行日志和平台命令，不因切换业务页面而清空</div>
-    </div>
-
     <section class="glass-card panel">
       <div class="tabs" role="tablist" aria-label="日志类型">
         <button v-for="tab in tabs" :key="tab.key" role="tab" :aria-selected="activeTab === tab.key" :class="{ active: activeTab === tab.key }" @click="activeTab = tab.key">

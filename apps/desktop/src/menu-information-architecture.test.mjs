@@ -54,7 +54,7 @@ assert.match(settings, /配置正在加载/, "配置未加载时必须显示明�
 
 assert.doesNotMatch(channels, /<div class="page-title">目录管理<\/div>/, "目录管理页顶部标题横条已移除");
 assert.match(channels, /当前通道名称/, "目录管理应承载当前通道配置");
-assert.match(system, /<div class="page-title">日志<\/div>/, "日志页面标题应与菜单一致");
+assert.doesNotMatch(system, /class="page-header"|class="page-title"|class="page-sub"/, "日志页顶部标题横条已移除");
 assert.match(system, /SIP 日志/, "日志页必须承载 SIP 信令日志");
 assert.match(system, /系统日志/, "日志页必须承载系统运行日志");
 assert.match(system, /平台命令/, "平台命令时间线必须迁移到日志页");
