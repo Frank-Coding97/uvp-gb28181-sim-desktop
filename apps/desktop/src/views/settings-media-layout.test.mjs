@@ -18,3 +18,13 @@ assert.match(
   /保存后，下次启动设备时生效；运行中请先注销后修改。/,
   "媒体页提示应说明生效时机和运行中修改约束",
 );
+
+// ── 页面滚动边界 ─────────────────────────────────────────────────────────
+// 回归背景：App.vue 的 .content 是 overflow:hidden，设置页原先没有自己的滚动上下文，
+// 窗口偏矮时底部提示条与「保存音视频设置」按钮被直接裁掉，且不会出现垂直滚动条。
+const pageStyles = source.match(/^\.settings-page \{([^}]*)\}/m)?.[1] ?? "";
+assert.ok(pageStyles, "应存在设置页根容器样式");
+assert.match(pageStyles, /overflow-y:\s*auto;/, "设置页必须可垂直滚动，不能裁切底部内容");
+assert.match(pageStyles, /overflow-x:\s*hidden;/, "设置页只保留垂直滚动，避免横向溢出");
+assert.match(pageStyles, /min-height:\s*0;/, "滚动容器需允许被父级 flex 压到视口高度");
+assert.match(pageStyles, /padding-bottom:\s*16px;/, "滚动到底需留出底部呼吸空间");

@@ -774,7 +774,10 @@ function setBindMode(mode: BindMode) {
 </template>
 
 <style scoped>
-.settings-page { max-width: 1420px; flex: 1; min-height: 0; }
+/* 与 theme.css 的 .page-wrap 同口径：父级 .content 是 overflow:hidden，
+   页面自身必须建立垂直滚动上下文，否则参数区超出视口会被直接裁掉且没有滚动条。
+   底部留白保证滚到底时提示条与「保存音视频设置」按钮不贴边。 */
+.settings-page { max-width: 1420px; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-bottom: 16px; }
 .settings-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .settings-header-meta { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .platform-summary { color: var(--text-secondary); }
