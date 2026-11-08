@@ -176,13 +176,14 @@
 
 <a href="docs/screenshots/stress-test.png"><img src="docs/screenshots/stress-test.png" alt="压力测试：场景预设、设备注册进度、成功率与实时趋势" width="100%"/></a>
 
+<a href="docs/screenshots/device-settings.png"><img src="docs/screenshots/device-settings.png" alt="设备配置：国标版本、信令字符集、设备与注册参数" width="100%"/></a>
+
 > 截图取自开发环境，平台 IP、设备编号、端口与本机路径已替换为示例值，注册密码保持隐藏。点击图片可查看原图。
 
 <!--
-其余页面截图待补：图片统一放 docs/screenshots/，命名用小写英文 + 连字符，宽屏图压到
-1600px 宽 / 500KB 以内；敏感字段（IP、20 位设备编号、口令、本机绝对路径）需先脱敏。
-待补命名：device-settings / sip-trace。
-素材到位后按两列网格排布，每张用 <a href="原图"><img src="..." width="100%"/></a> 包一层以便点开看原图。
+新增截图约定：图片放 docs/screenshots/，小写英文 + 连字符命名，宽屏图压到 1600px 宽 / 500KB 内；
+平台 IP、20 位设备编号、口令、本机绝对路径需先脱敏；每张用 <a href="原图"><img ... width="100%"/></a> 包一层。
+日志页在设备未启动时是空态，暂不收录。
 -->
 
 | 菜单 | 用途 |
