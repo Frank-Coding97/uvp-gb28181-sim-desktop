@@ -1678,7 +1678,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   min-width: 0;
-  padding: 7px 9px;
+  padding: 9px 10px;
   font: inherit;
   color: inherit;
   cursor: pointer;
@@ -1775,7 +1775,7 @@ onUnmounted(() => {
   .preview-panel, .config-panel { padding: 12px; }
   .preview-panel { gap: 7px; }
   .sip-profile-switcher { margin-top: 6px; }
-  .config-grid { gap: 6px; margin-top: 7px; }
+  .config-grid { row-gap: 9px; margin-top: 8px; }
   .primary-actions { margin-top: 7px; }
   .quick-actions { margin-top: 5px; }
 }
@@ -1784,7 +1784,7 @@ onUnmounted(() => {
   .preview-panel, .config-panel { padding: 10px; }
   .preview-panel { grid-template-rows: auto minmax(0, 1fr) auto auto; gap: 6px; }
   .sip-profile-switcher { margin-top: 5px; }
-  .config-grid { gap: 5px; margin-top: 6px; }
+  .config-grid { row-gap: 7px; margin-top: 7px; }
   .primary-actions { margin-top: 6px; }
   .quick-actions, .config-foot { margin-top: 5px; }
 }
