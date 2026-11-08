@@ -581,6 +581,14 @@ export async function previewAlarmXml(report: AlarmReport): Promise<string> {
   return invoke<string>("preview_alarm_xml", { report });
 }
 
+/**
+ * 预览当前编辑中的目录树对应的 Catalog NOTIFY XML（移动端「预览 NOTIFY」同款）。
+ * 纯预览：不落盘、不触碰运行态、不发 SIP 报文；deviceId 为根设备/系统编码。
+ */
+export function previewCatalogXml(nodes: CatalogNodeConfig[], deviceId: string): Promise<string> {
+  return invoke<string>("preview_catalog_xml", { nodes, deviceId });
+}
+
 export async function listAlarmHistory(): Promise<AlarmRecord[]> {
   return invoke<AlarmRecord[]>("list_alarm_history");
 }

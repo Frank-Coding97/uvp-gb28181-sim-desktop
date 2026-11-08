@@ -3187,6 +3187,42 @@ async fn get_catalog_activity(
     }))
 }
 
+/// 预览当前编辑中的目录树对应的 Catalog NOTIFY XML(移动端「预览 NOTIFY」同款)。
+///
+/// 纯函数:不落盘、不触碰运行态、不发 SIP 报文,SN 固定为 1。
+/// 与实际出站共用 `CatalogNotify::to_xml` 组装逻辑;实际发送还会按 UDP 预算分片,
+/// 预览固定输出单包全量,便于核对字段与层级。
+#[tauri::command]
+async fn preview_catalog_xml(
+    nodes: Vec<ChannelNodeDto>,
+    device_id: String,
+) -> Result<String, String> {
+    use gb28181_protocol::manscdp::{CatalogNotify, CatalogNotifyItem};
+    use gb28181_protocol::id_codec::CatalogNode;
+
+    let protocol_nodes: Vec<CatalogNode> = nodes
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<_, _>>()?;
+    gb28181_protocol::id_codec::validate_catalog_tree(&protocol_nodes)?;
+    let items: Vec<CatalogNotifyItem> = protocol_nodes
+        .iter()
+        .map(|node| CatalogNotifyItem {
+            device_id: node.id.clone(),
+            name: node.name.clone(),
+            civil_code: node.civil_code.clone(),
+            parental: Some(node.node_type.parental()),
+            parent_id: Some(node.parent_id.clone()),
+            business_group_id: node.business_group_id.clone(),
+            event: "ON".into(),
+            status: node.status.clone(),
+        })
+        .collect();
+    CatalogNotify::new(device_id, 1, items)
+        .to_xml()
+        .map_err(|error| error.to_string())
+}
+
 /// 后台推送目录增量 NOTIFY(fire-and-forget)。
 ///
 /// NOTIFY 是通知平台的副作用,不该阻塞 IPC 返回:目录订阅存在但平台不及时回 200 时,
@@ -3602,6 +3638,7 @@ pub fn run() {
             upsert_channel,
             remove_channel,
             get_catalog_activity,
+            preview_catalog_xml,
             set_log_level,
             get_log_level,
             get_recent_logs,
