@@ -1008,7 +1008,7 @@ onUnmounted(() => {
               <span aria-hidden="true">LIVE</span>
             </div>
             <div class="preview-status" :class="previewEnabled ? previewState : 'off'"><i />{{ previewStateText }}</div>
-            <n-button v-if="previewEnabled" size="tiny" quaternary @click="disablePreview">关闭预览</n-button>
+            <n-button v-if="previewEnabled" size="small" secondary @click="disablePreview">关闭预览</n-button>
           </div>
         </div>
 
