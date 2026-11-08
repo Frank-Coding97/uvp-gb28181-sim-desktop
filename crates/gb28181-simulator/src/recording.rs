@@ -200,25 +200,27 @@ impl RecordingFinalizer for FfmpegRecordingFinalizer {
             )));
         }
         if let Some(audio_codec) = media.audio_codec {
-            let probed = probe_recording_audio(output)?;
-            let expected_codec = match audio_codec {
-                media_rtp::AudioCodec::G711A
-                | media_rtp::AudioCodec::G711U
-                | media_rtp::AudioCodec::Aac => "aac",
-                media_rtp::AudioCodec::Opus => "opus",
-            };
-            if probed.codec_name != expected_codec {
-                return Err(Error::Media(format!(
-                    "录像音轨编码不符: 期望 {expected_codec}, 实际 {}",
-                    probed.codec_name
-                )));
-            }
-            if let Some(expected_rate) = media.audio_sample_rate_hz {
-                if probed.sample_rate_hz != Some(expected_rate) {
+            // `None` 表示环境里没有 ffprobe：跳过校验但保留已写好的录像。
+            if let Some(probed) = probe_recording_audio(output)? {
+                let expected_codec = match audio_codec {
+                    media_rtp::AudioCodec::G711A
+                    | media_rtp::AudioCodec::G711U
+                    | media_rtp::AudioCodec::Aac => "aac",
+                    media_rtp::AudioCodec::Opus => "opus",
+                };
+                if probed.codec_name != expected_codec {
                     return Err(Error::Media(format!(
-                        "录像音轨采样率不符: 期望 {expected_rate}, 实际 {:?}",
-                        probed.sample_rate_hz
+                        "录像音轨编码不符: 期望 {expected_codec}, 实际 {}",
+                        probed.codec_name
                     )));
+                }
+                if let Some(expected_rate) = media.audio_sample_rate_hz {
+                    if probed.sample_rate_hz != Some(expected_rate) {
+                        return Err(Error::Media(format!(
+                            "录像音轨采样率不符: 期望 {expected_rate}, 实际 {:?}",
+                            probed.sample_rate_hz
+                        )));
+                    }
                 }
             }
         }
@@ -232,9 +234,18 @@ struct ProbedRecordingAudio {
     sample_rate_hz: Option<u32>,
 }
 
-fn probe_recording_audio(path: &Path) -> Result<ProbedRecordingAudio> {
-    let ffprobe = recording_ffprobe_bin()
-        .ok_or_else(|| Error::Media("未找到 ffprobe，无法验证录像音轨".into()))?;
+/// 读取成品音轨的真实编码与采样率。
+///
+/// 返回 `Ok(None)` 表示当前环境探测不到 ffprobe：收尾校验属于自检项，不是录像成立
+/// 的前提，缺失时必须让录像继续落库，否则用户会把"环境缺工具"误判为"录像功能坏了"。
+fn probe_recording_audio(path: &Path) -> Result<Option<ProbedRecordingAudio>> {
+    let Some(ffprobe) = recording_ffprobe_bin() else {
+        tracing::warn!(
+            path = %path.display(),
+            "未找到 ffprobe，跳过录像音轨校验（录像文件保留）"
+        );
+        return Ok(None);
+    };
     let result = common::hidden_command(ffprobe)
         .args([
             "-v",
@@ -275,34 +286,16 @@ fn probe_recording_audio(path: &Path) -> Result<ProbedRecordingAudio> {
         .get("sample_rate")
         .and_then(serde_json::Value::as_str)
         .and_then(|rate| rate.parse::<u32>().ok());
-    Ok(ProbedRecordingAudio {
+    Ok(Some(ProbedRecordingAudio {
         codec_name,
         sample_rate_hz,
-    })
+    }))
 }
 
 fn recording_ffprobe_bin() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("FFPROBE_BIN").map(PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Some(ffmpeg) = media_rtp::ffmpeg_bin() {
-        if let Some(sibling) = PathBuf::from(ffmpeg)
-            .parent()
-            .map(|parent| parent.join("ffprobe"))
-            .filter(|path| path.is_file())
-        {
-            return Some(sibling);
-        }
-    }
-    common::hidden_command("sh")
-        .args(["-c", "command -v ffprobe"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
-        .filter(|path| path.is_file())
+    // 与 `ffmpeg_bin` 共用 media-rtp 的探测逻辑：Windows 上文件名必须带 `.exe`，
+    // 且要覆盖 WinGet / Chocolatey / Program Files 等与 PATH 无关的安装位置。
+    media_rtp::ffprobe_bin().map(PathBuf::from)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1653,7 +1646,9 @@ mod tests {
         FfmpegRecordingFinalizer
             .finalize_media(&input_path, &output_path, &spec)
             .unwrap();
-        let probed = probe_recording_audio(&output_path).unwrap();
+        let probed = probe_recording_audio(&output_path)
+            .unwrap()
+            .expect("需要 ffprobe 才能校验成品音轨");
         assert_eq!(probed.codec_name, "aac");
         assert_eq!(probed.sample_rate_hz, Some(8_000));
 
@@ -1803,7 +1798,9 @@ mod tests {
             FfmpegRecordingFinalizer
                 .finalize_media(&input_path, &output_path, &spec)
                 .unwrap();
-            let probed = probe_recording_audio(&output_path).unwrap();
+            let probed = probe_recording_audio(&output_path)
+                .unwrap()
+                .expect("需要 ffprobe 才能校验成品音轨");
             assert_eq!(probed.codec_name, "aac");
             assert_eq!(probed.sample_rate_hz, Some(sample_rate_hz));
 
@@ -2012,7 +2009,9 @@ mod tests {
                 FfmpegRecordingFinalizer
                     .finalize_media(&input_path, &output_path, &spec)
                     .unwrap();
-                let audio_probe = probe_recording_audio(&output_path).unwrap();
+                let audio_probe = probe_recording_audio(&output_path)
+                    .unwrap()
+                    .expect("需要 ffprobe 才能校验成品音轨");
                 assert_eq!(audio_probe.codec_name, "aac");
                 assert_eq!(audio_probe.sample_rate_hz, Some(sample_rate_hz));
 

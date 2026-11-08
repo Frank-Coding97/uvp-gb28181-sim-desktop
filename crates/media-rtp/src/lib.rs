@@ -40,8 +40,9 @@ pub use pusher::{
 };
 pub use rtp::{build_rtcp_sr, RtpSender, SendStats, CLOCK_HZ, PT_PS};
 pub use source::{
-    ffmpeg_bin, frame_to_jpeg, list_camera_modes, list_live_sources, prepare_video_source,
-    start_shared_media, FileSource, Frame, LightSource, LiveAudioCodec, LiveAudioSource,
+    ffmpeg_bin, ffprobe_bin, frame_to_jpeg, list_camera_modes, list_live_sources,
+    prepare_video_source, start_shared_media, FileSource, Frame, LightSource, LiveAudioCodec,
+    LiveAudioSource,
     LiveAvDevice, LiveCameraMode, LiveScreenDevice, LiveSource, LiveSourceCatalog, LiveSourceSpec,
     LiveVideoCodec, LiveVideoProfile, MediaEvent, NoneSource, SharedMedia, SharedVideoSource,
     TimedAudioAu, TimedVideoAu, VideoSource,

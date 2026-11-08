@@ -94,7 +94,7 @@ pub fn ffmpeg_bin() -> Option<String> {
     // 装完 FFmpeg 后未重启编辑器，子进程继承的仍是旧环境，`common::hidden_command("ffmpeg")`
     // 就会失败——表现为摄像头列表为空且没有任何提示。这里显式枚举常见安装位置。
     #[cfg(windows)]
-    for path in windows_ffmpeg_candidates() {
+    for path in windows_tool_candidates("ffmpeg") {
         let s = path.to_string_lossy().into_owned();
         if path.is_file() && probe(&s) {
             return Some(s);
@@ -114,19 +114,95 @@ pub fn ffmpeg_bin() -> Option<String> {
     None
 }
 
-/// Windows 下 FFmpeg 的常见安装位置（与 PATH 无关）。
+/// 定位 ffprobe 可执行文件。
 ///
+/// 录像收尾后要用它校验成品音轨的编码与采样率，所以必须与 [`ffmpeg_bin`] 使用同一套
+/// 探测顺序。Windows 上文件名带 `.exe`：早期实现按 `ffmpeg.exe` 的同级 `ffprobe`
+/// （无扩展名）查找，永远不命中，表现为收尾阶段报"未找到 ffprobe，无法验证录像音轨"，
+/// 且成品 mp4 会被当作失败产物删除——即整段录像不可用。
+pub fn ffprobe_bin() -> Option<String> {
+    use std::path::PathBuf;
+    let probe = |bin: &str| {
+        common::hidden_command(bin)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let mut bundled = Vec::<PathBuf>::new();
+    // `UVP_FFPROBE_PATH` 为正式变量；`FFPROBE_BIN` 是旧版录像模块沿用的名字，保留兼容。
+    for key in ["UVP_FFPROBE_PATH", "FFPROBE_BIN"] {
+        if let Ok(path) = std::env::var(key) {
+            bundled.push(PathBuf::from(path));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let names: &[&str] = if cfg!(target_os = "windows") {
+                &["ffprobe.exe", "ffprobe"]
+            } else {
+                &["ffprobe", "ffprobe.exe"]
+            };
+            for name in names {
+                bundled.push(dir.join(name));
+                bundled.push(dir.join("resources").join(name));
+                bundled.push(dir.join("../resources").join(name));
+                bundled.push(dir.join("../Resources").join(name));
+            }
+        }
+    }
+    for path in bundled {
+        let s = path.to_string_lossy().into_owned();
+        if path.is_file() && probe(&s) {
+            return Some(s);
+        }
+    }
+    let path_names: &[&str] = if cfg!(target_os = "windows") {
+        &["ffprobe.exe", "ffprobe"]
+    } else {
+        &["ffprobe", "ffprobe.exe"]
+    };
+    for name in path_names {
+        if probe(name) {
+            return Some((*name).into());
+        }
+    }
+    // 与 `ffmpeg_bin` 同理：Windows 上 ffprobe 常常不在本进程继承的 PATH 里。
+    #[cfg(windows)]
+    for path in windows_tool_candidates("ffprobe") {
+        let s = path.to_string_lossy().into_owned();
+        if path.is_file() && probe(&s) {
+            return Some(s);
+        }
+    }
+    for p in [
+        "/opt/homebrew/bin/ffprobe", // Apple Silicon Homebrew
+        "/usr/local/bin/ffprobe",    // Intel Homebrew
+        "/opt/local/bin/ffprobe",    // MacPorts
+        "/usr/bin/ffprobe",          // Linux 系统包
+    ] {
+        if std::path::Path::new(p).exists() && probe(p) {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
+/// Windows 下 FFmpeg 套件（ffmpeg / ffprobe / ffplay）的常见安装位置（与 PATH 无关）。
+///
+/// `tool` 传 `ffmpeg` / `ffprobe` 等可执行文件名（不含扩展名）。
 /// 顺序按实际主流程度排列：WinGet 包目录 → Chocolatey → Program Files → 手工解压到 C:\ffmpeg。
-/// WinGet 的 `Links\ffmpeg.exe` 只是 0 字节别名，可能无法执行，所以真正的包目录也要列。
+/// WinGet 的 `Links\*.exe` 只是 0 字节别名，可能无法执行，所以真正的包目录也要列。
 #[cfg(windows)]
-fn windows_ffmpeg_candidates() -> Vec<std::path::PathBuf> {
+fn windows_tool_candidates(tool: &str) -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
 
+    let exe = format!("{tool}.exe");
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         let base = PathBuf::from(local);
-        candidates.push(base.join("Microsoft/WinGet/Links/ffmpeg.exe"));
+        candidates.push(base.join("Microsoft/WinGet/Links").join(&exe));
         let packages = base.join("Microsoft/WinGet/Packages");
         if let Ok(entries) = std::fs::read_dir(&packages) {
             for entry in entries.flatten() {
@@ -139,20 +215,20 @@ fn windows_ffmpeg_candidates() -> Vec<std::path::PathBuf> {
                     continue;
                 };
                 for version in versions.flatten() {
-                    candidates.push(version.path().join("bin").join("ffmpeg.exe"));
+                    candidates.push(version.path().join("bin").join(&exe));
                 }
             }
         }
     }
     if let Some(program_data) = std::env::var_os("ProgramData") {
-        candidates.push(PathBuf::from(program_data).join("chocolatey/bin/ffmpeg.exe"));
+        candidates.push(PathBuf::from(program_data).join("chocolatey/bin").join(&exe));
     }
     for key in ["ProgramFiles", "ProgramFiles(x86)"] {
         if let Some(dir) = std::env::var_os(key) {
-            candidates.push(PathBuf::from(dir).join("ffmpeg/bin/ffmpeg.exe"));
+            candidates.push(PathBuf::from(dir).join("ffmpeg/bin").join(&exe));
         }
     }
-    candidates.push(PathBuf::from(r"C:\ffmpeg\bin\ffmpeg.exe"));
+    candidates.push(PathBuf::from(r"C:\ffmpeg\bin").join(&exe));
     candidates
 }
 
@@ -1126,49 +1202,8 @@ fn looks_like_annexb(path: &std::path::Path) -> bool {
 }
 
 fn history_ffprobe_bin() -> Option<String> {
-    use std::path::PathBuf;
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(path) = std::env::var("FFPROBE_BIN") {
-        candidates.push(PathBuf::from(path));
-    }
-    if let Some(ffmpeg) = ffmpeg_bin() {
-        if let Some(parent) = std::path::Path::new(&ffmpeg).parent() {
-            candidates.push(parent.join(if cfg!(target_os = "windows") {
-                "ffprobe.exe"
-            } else {
-                "ffprobe"
-            }));
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            for name in if cfg!(target_os = "windows") {
-                ["ffprobe.exe", "ffprobe"]
-            } else {
-                ["ffprobe", "ffprobe.exe"]
-            } {
-                candidates.push(parent.join(name));
-                candidates.push(parent.join("resources").join(name));
-                candidates.push(parent.join("../Resources").join(name));
-            }
-        }
-    }
-    candidates.extend([
-        PathBuf::from("ffprobe"),
-        PathBuf::from("/opt/homebrew/bin/ffprobe"),
-        PathBuf::from("/usr/local/bin/ffprobe"),
-        PathBuf::from("/opt/local/bin/ffprobe"),
-        PathBuf::from("/usr/bin/ffprobe"),
-    ]);
-    candidates.into_iter().find_map(|candidate| {
-        let executable = candidate.to_string_lossy().into_owned();
-        common::hidden_command(&executable)
-            .arg("-version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|_| executable)
-    })
+    // 历史录像时间轴与录像收尾校验共用同一套探测逻辑，避免 Windows 下扩展名不一致。
+    ffprobe_bin()
 }
 
 fn run_history_ffprobe(path: &str, args: &[&str]) -> Result<serde_json::Value> {

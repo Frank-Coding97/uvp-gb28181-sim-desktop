@@ -2274,50 +2274,7 @@ fn tool_identity(path: &str) -> Result<String, String> {
 }
 
 fn ffprobe_bin() -> Option<String> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("UVP_FFPROBE_PATH") {
-        candidates.push(PathBuf::from(path));
-    }
-    if let Some(ffmpeg) = crate::source::ffmpeg_bin() {
-        let ffmpeg_path = Path::new(&ffmpeg);
-        if let Some(parent) = ffmpeg_path.parent() {
-            candidates.push(parent.join(if cfg!(target_os = "windows") {
-                "ffprobe.exe"
-            } else {
-                "ffprobe"
-            }));
-        }
-    }
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(parent) = executable.parent() {
-            for name in if cfg!(target_os = "windows") {
-                ["ffprobe.exe", "ffprobe"]
-            } else {
-                ["ffprobe", "ffprobe.exe"]
-            } {
-                candidates.push(parent.join(name));
-                candidates.push(parent.join("resources").join(name));
-                candidates.push(parent.join("../resources").join(name));
-                candidates.push(parent.join("../Resources").join(name));
-            }
-        }
-    }
-    candidates.push(PathBuf::from(if cfg!(target_os = "windows") {
-        "ffprobe.exe"
-    } else {
-        "ffprobe"
-    }));
-    candidates.extend([
-        PathBuf::from("/opt/homebrew/bin/ffprobe"),
-        PathBuf::from("/usr/local/bin/ffprobe"),
-        PathBuf::from("/opt/local/bin/ffprobe"),
-        PathBuf::from("/usr/bin/ffprobe"),
-    ]);
-    candidates.into_iter().find_map(|candidate| {
-        let output = common::hidden_command(&candidate).arg("-version").output().ok()?;
-        output
-            .status
-            .success()
-            .then(|| candidate.to_string_lossy().into_owned())
-    })
+    // 统一走 `source::ffprobe_bin`：Windows 下必须显式带 `.exe`，
+    // 三处各自实现曾因扩展名/候选顺序不一致而在 Windows 上全部落空。
+    crate::source::ffprobe_bin()
 }
