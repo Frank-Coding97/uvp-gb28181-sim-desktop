@@ -29,7 +29,11 @@ const contentHeading = headingStart >= 0 && headingEnd > headingStart
   ? source.slice(headingStart, headingEnd)
   : "";
 assert.ok(contentHeading, "应能定位到「模拟器有效配置」标题行");
-assert.match(contentHeading, /sticky: activeKey === 'media'/, "仅媒体页标题行启用冻结");
+assert.match(
+  contentHeading,
+  /sticky: activeKey === 'media' \|\| activeKey === 'device'/,
+  "媒体页与设备配置页标题行启用冻结，其余设置页保持原布局",
+);
 const mediaActions = contentHeading.match(/<div v-else class="content-actions">[\s\S]*?<\/div>/)?.[0] ?? "";
 assert.ok(mediaActions, "标题行右侧应有媒体页专属操作区");
 assert.match(mediaActions, />保存音视频设置<\/button>/, "保存按钮应位于标题行右侧操作区");
@@ -39,9 +43,18 @@ assert.match(
   "上移后保存按钮仍须保留锁定、配置与脏值三重禁用条件",
 );
 
+// ── 设备配置页沿用同一套冻结标题行 ───────────────────────────────────────
+// 回归背景：媒体页先做了「卡片内滚动 + 标题行冻结」，设备页当时未加 sticky，
+// 滚动后「恢复全部默认 / 保存有效设置」随内容一起滚走；现两页共用同一套头部样式。
+const deviceActions = contentHeading.match(/<div v-if="activeKey !== 'media'" class="content-actions">[\s\S]*?<\/div>/)?.[0] ?? "";
+assert.ok(deviceActions, "设备配置页应保留全量操作栏");
+assert.match(deviceActions, />恢复全部默认<\/button>/, "恢复默认按钮须随冻结标题行常驻");
+assert.match(deviceActions, />保存有效设置<\/button>/, "设备配置页保存按钮须随冻结标题行常驻");
+assert.match(deviceActions, /:disabled="locked \|\| !config"/, "设备配置页保存按钮禁用条件不得改动");
+
 // ── 标题行冻结 ───────────────────────────────────────────────────────────
 const stickyRule = source.match(/^\.content-heading\.sticky \{([^}]*)\}/m)?.[1] ?? "";
-assert.ok(stickyRule, "应存在媒体页标题行的 sticky 规则");
+assert.ok(stickyRule, "应存在冻结标题行的 sticky 规则");
 assert.match(stickyRule, /position:\s*sticky;/, "标题行必须 position:sticky");
 assert.match(stickyRule, /top:\s*0;/, "标题行必须吸附在滚动容器顶部");
 assert.match(stickyRule, /z-index:\s*\d+;/, "标题行必须盖在滚动内容之上");

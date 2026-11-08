@@ -520,7 +520,7 @@ function setBindMode(mode: BindMode) {
     </div>
 
     <main class="settings-main glass-card">
-        <div v-if="editableSection" class="content-heading" :class="{ sticky: activeKey === 'media' }">
+        <div v-if="editableSection" class="content-heading" :class="{ sticky: activeKey === 'media' || activeKey === 'device' }">
           <div class="content-context"><span class="content-icon">{{ activeSetting.icon }}</span>模拟器有效配置</div>
           <div v-if="activeKey !== 'media'" class="content-actions">
             <button v-if="activeKey === 'osd'" class="btn ghost" type="button" :disabled="locked" @click="resetOsdDraft">恢复 OSD 默认</button>
@@ -812,10 +812,10 @@ function setBindMode(mode: BindMode) {
 .content-context { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 13px; font-weight: 600; }
 .content-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: var(--accent-pale); color: var(--accent); font-size: 16px; }
 .content-actions { display: flex; flex: 0 0 auto; gap: 8px; }
-/* 媒体页把保存入口上移到标题行并冻结：.settings-main 是滚动容器，标题行 sticky 在
-   卡片内顶边，参数区滚动时右侧「保存音视频设置」始终可见。背景取卡片复合色并置顶，
+/* 媒体页与设备配置页把保存入口固定在标题行并冻结：.settings-main 是滚动容器，标题行
+   sticky 在卡片内顶边，参数区滚动时右侧保存按钮始终可见。背景取卡片复合色并置顶，
    避免下方内容透出来叠字；标题行铺满卡片宽度、顶部两角沿用卡片圆角、去掉悬浮投影，
-   冻结时仍是卡片头部而不是单独一条。仅媒体页加 .sticky，其余设置页保持原布局。 */
+   冻结时仍是卡片头部而不是单独一条。仅这两页加 .sticky，其余设置页保持原布局。 */
 .content-heading.sticky {
   position: sticky;
   top: 0;
