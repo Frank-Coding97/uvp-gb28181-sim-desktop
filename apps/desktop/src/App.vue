@@ -26,6 +26,7 @@ import WarningOutline from "@vicons/ionicons5/es/WarningOutline.js";
 import CalendarOutline from "@vicons/ionicons5/es/CalendarOutline.js";
 import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutline.js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { usePlatform } from "./platform";
 import type { GbVersion, SignalingEncoding } from "./platform";
 // 应用图标与应用包图标同源(app-icon.svg → tauri icon),侧边栏 logo 直接复用矢量图。
@@ -222,10 +223,53 @@ async function resetBrokenConfig() {
   }
 }
 
+// 媒体运行时自检:ffmpeg 缺失则主干媒体能力不可用;ffprobe 缺失只影响录像音轨校验。
+// 两者都在收尾/采集路径深处才报错,首屏先提示能省掉用户一次"点了没反应"的排查。
+interface MediaToolStatus { path: string | null; version: string | null; source: string; }
+interface MediaRuntimeStatus {
+  ffmpeg: MediaToolStatus;
+  ffprobe: MediaToolStatus;
+  ready: boolean;
+  verification_available: boolean;
+}
+const mediaRuntime = ref<MediaRuntimeStatus | null>(null);
+const mediaRuntimeDismissed = ref(false);
+const mediaRuntimeNotice = computed(() => {
+  const status = mediaRuntime.value;
+  if (!status) return null;
+  const detail = `ffmpeg: ${status.ffmpeg.path ?? "未找到"}${status.ffmpeg.version ? ` (${status.ffmpeg.version})` : ""}\n` +
+    `ffprobe: ${status.ffprobe.path ?? "未找到"}${status.ffprobe.version ? ` (${status.ffprobe.version})` : ""}`;
+  if (!status.ready) {
+    return {
+      level: "error" as const,
+      message: "未找到 ffmpeg：文件源转封装、摄像头/屏幕采集、抓拍与录像收尾均不可用。请安装 FFmpeg，或改用内嵌 ffmpeg 的安装包。",
+      detail,
+    };
+  }
+  if (!status.verification_available) {
+    return {
+      level: "warning" as const,
+      message: "未找到 ffprobe：录像仍可进行，但音轨编码与采样率不做校验。",
+      detail,
+    };
+  }
+  return null;
+});
+
+async function checkMediaRuntime() {
+  try {
+    mediaRuntime.value = await invoke<MediaRuntimeStatus>("media_runtime_status");
+  } catch {
+    // 自检是增强项:该命令不存在或调用失败时保持静默,不能影响应用启动。
+    mediaRuntime.value = null;
+  }
+}
+
 let unlisten: UnlistenFn | null = null;
 let unlistenErr: UnlistenFn | null = null;
 onMounted(async () => {
   if (isTauri) {
+    void checkMediaRuntime();
     try {
       await loadDesktopConfig();
     } catch {
@@ -425,6 +469,18 @@ const themeOverrides = {
                   {{ topMessage.text }}
                 </div>
               </transition>
+              <!-- 媒体运行时自检:首屏就告诉用户 ffmpeg/ffprobe 是否可用,
+                   而不是等点录像时才在收尾阶段报"未找到 ffprobe"。 -->
+              <div
+                v-if="mediaRuntimeNotice && !mediaRuntimeDismissed"
+                class="runtime-bar"
+                :class="mediaRuntimeNotice.level"
+              >
+                <span class="eb-icon">⚠</span>
+                <span class="eb-scope">媒体运行时</span>
+                <span class="eb-msg" :title="mediaRuntimeNotice.detail">{{ mediaRuntimeNotice.message }}</span>
+                <button class="eb-close" :class="mediaRuntimeNotice.level" @click="mediaRuntimeDismissed = true" title="关闭">✕</button>
+              </div>
               <!-- 全局错误条:后端运行时错误(如点播采集失败),所有页面可见,可关闭。 -->
               <div v-if="lastError" class="error-bar">
                 <span class="eb-icon">⚠</span>
@@ -547,6 +603,24 @@ const themeOverrides = {
 }
 .eb-close:hover { background: color-mix(in srgb, var(--error) 20%, transparent); }
 
+/* 媒体运行时自检条:默认告警色(缺 ffprobe),缺 ffmpeg 时为错误色。 */
+.runtime-bar {
+  flex-shrink: 0;
+  display: flex; align-items: center; gap: 10px;
+  margin: 8px 12px 0; padding: 9px 14px; border-radius: 10px;
+  font-size: 13px;
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+  color: var(--warning);
+}
+.runtime-bar.error {
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+  border-color: color-mix(in srgb, var(--error) 40%, transparent);
+  color: var(--error);
+}
+.runtime-bar .eb-close.warning { color: var(--warning); }
+.runtime-bar .eb-close.warning:hover { background: color-mix(in srgb, var(--warning) 20%, transparent); }
+
 .content { flex: 1; overflow: hidden; padding: 0 12px; min-height: 0; display: flex; flex-direction: column; }
 
 @media (max-width: 1120px) {
@@ -560,7 +634,7 @@ const themeOverrides = {
   .brand { padding-inline: 16px; }
   .plat-label, .chip:nth-child(3) { display: none; }
   .content { padding-inline: 10px; }
-  .topbar, .error-bar { margin-inline: 10px; }
+  .topbar, .error-bar, .runtime-bar { margin-inline: 10px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .fade-enter-active, .fade-leave-active { transition: none; }

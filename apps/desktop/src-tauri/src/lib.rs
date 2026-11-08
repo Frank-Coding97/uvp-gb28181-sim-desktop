@@ -3452,11 +3452,189 @@ async fn exchange_sip_provision(
     }
 }
 
+// ── 内置媒体运行时（ffmpeg / ffprobe）────────────────────
+
+/// 进程级缓存：启动期解析一次，避免每个 IPC 调用都起子进程探版本。
+static MEDIA_RUNTIME: OnceLock<MediaRuntimeStatus> = OnceLock::new();
+
+/// 媒体工具的运行期状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaToolStatus {
+    /// 解析到的绝对路径（或 PATH 中的命令名）；未解析到时为 `None`。
+    pub path: Option<String>,
+    /// `-version` 首行，便于在日志/自检面板里核对实际版本。
+    pub version: Option<String>,
+    /// `bundled`（安装包内嵌）/ `environment`（显式环境变量）/ `path`（系统 PATH）/ `missing`。
+    pub source: String,
+}
+
+impl MediaToolStatus {
+    fn missing() -> Self {
+        Self {
+            path: None,
+            version: None,
+            source: "missing".into(),
+        }
+    }
+}
+
+/// 媒体工具状态汇总，供启动自检与前端提示使用。
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaRuntimeStatus {
+    pub ffmpeg: MediaToolStatus,
+    pub ffprobe: MediaToolStatus,
+    /// 主干媒体能力是否可用（缺 ffmpeg 即不可用）。
+    pub ready: bool,
+    /// 录像音轨校验是否可用（缺 ffprobe 时录像仍可录，只是不做音轨核验）。
+    pub verification_available: bool,
+}
+
+fn media_tool_names(tool: &str) -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        vec![format!("{tool}.exe"), tool.to_string()]
+    } else {
+        vec![tool.to_string(), format!("{tool}.exe")]
+    }
+}
+
+/// 内嵌媒体工具的候选路径（按发布包布局枚举，不做跨目录猜测）。
+///
+/// 关键事实：Tauri 打包**保留相对路径**（`tauri_utils::resources::resource_relpath`），
+/// 因此 `bundle.resources` 里的 `runtime/ffmpeg/*` 会落在 `resources/runtime/ffmpeg/`
+/// 下，而不是 `resources/` 根。历史上只按「exe 同级 / resources 同级」查找，Windows
+/// 安装包明明内嵌了 ffmpeg 却找不到，录像收尾因此报「未找到 ffprobe」。
+fn media_tool_candidates(tool: &str) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            // macOS .app：可执行文件在 Contents/MacOS，资源在 Contents/Resources。
+            dirs.push(parent.to_path_buf());
+            dirs.push(parent.join("../Resources"));
+            // Tauri 资源目录（dev 下即 target/debug，发布下为 <install>/resources）。
+            dirs.push(parent.join("resources"));
+            dirs.push(parent.join("../resources"));
+            // Windows 打包脚本的内嵌布局。
+            dirs.push(parent.join("resources").join("runtime").join("ffmpeg"));
+            dirs.push(parent.join("runtime").join("ffmpeg"));
+        }
+    }
+    let names = media_tool_names(tool);
+    let mut candidates = Vec::new();
+    for dir in dirs {
+        for name in &names {
+            candidates.push(dir.join(name));
+        }
+    }
+    candidates
+}
+
+fn probe_media_tool(path: &std::path::Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let output = common::hidden_command(path).arg("-version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let first_line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    (!first_line.is_empty()).then_some(first_line)
+}
+
+/// 解析媒体工具：显式环境变量 → 内嵌资源 → media-rtp 的 PATH/常见安装位置探测。
+///
+/// 命中内嵌资源时把绝对路径写回环境变量，让 media-rtp 只认注入值，不再自行猜测
+/// 目录与扩展名——`ffprobe` 在 Windows 上因缺 `.exe` 找不到、进而整段录像被判失败的
+/// 事故，根因就是猜。
+fn resolve_media_tool(tool: &str, env_key: &str) -> MediaToolStatus {
+    if let Some(configured) = std::env::var_os(env_key).map(std::path::PathBuf::from) {
+        if let Some(version) = probe_media_tool(&configured) {
+            return MediaToolStatus {
+                path: Some(configured.to_string_lossy().into_owned()),
+                version: Some(version),
+                source: "environment".into(),
+            };
+        }
+    }
+    for candidate in media_tool_candidates(tool) {
+        if let Some(version) = probe_media_tool(&candidate) {
+            std::env::set_var(env_key, &candidate);
+            return MediaToolStatus {
+                path: Some(candidate.to_string_lossy().into_owned()),
+                version: Some(version),
+                source: "bundled".into(),
+            };
+        }
+    }
+    // 兜底：开发机把 ffmpeg 装在 PATH 或 WinGet/Chocolatey 目录里。
+    let fallback = if tool == "ffprobe" {
+        media_rtp::ffprobe_bin()
+    } else {
+        media_rtp::ffmpeg_bin()
+    };
+    match fallback {
+        Some(path) => {
+            let version = probe_media_tool(std::path::Path::new(&path));
+            MediaToolStatus {
+                path: Some(path),
+                version,
+                source: "path".into(),
+            }
+        }
+        None => MediaToolStatus::missing(),
+    }
+}
+
+/// 启动期解析并注入媒体工具路径；返回自检结果。
+///
+/// **必须在任何媒体调用之前执行**：media-rtp 侧只读环境变量，晚于首次调用注入就无效。
+/// 结果缓存在进程内，重复调用只读缓存，避免每次都起子进程跑 `-version`。
+fn install_media_tool_env() -> MediaRuntimeStatus {
+    if let Some(status) = MEDIA_RUNTIME.get() {
+        return status.clone();
+    }
+    let ffmpeg = resolve_media_tool("ffmpeg", "UVP_FFMPEG_PATH");
+    let ffprobe = resolve_media_tool("ffprobe", "UVP_FFPROBE_PATH");
+    let status = MediaRuntimeStatus {
+        ready: ffmpeg.path.is_some(),
+        verification_available: ffprobe.path.is_some(),
+        ffmpeg,
+        ffprobe,
+    };
+    match (&status.ffmpeg.path, &status.ffprobe.path) {
+        (Some(ffmpeg), Some(ffprobe)) => tracing::info!(
+            ffmpeg = %ffmpeg,
+            ffprobe = %ffprobe,
+            "媒体运行时已就绪"
+        ),
+        (Some(ffmpeg), None) => tracing::warn!(
+            ffmpeg = %ffmpeg,
+            "未找到 ffprobe：录像仍可进行，但跳过音轨编码/采样率校验"
+        ),
+        (None, _) => tracing::error!(
+            "未找到 ffmpeg：文件源转封装、摄像头/屏幕采集、快照与录像收尾均不可用"
+        ),
+    }
+    MEDIA_RUNTIME.get_or_init(|| status).clone()
+}
+
+/// 媒体运行时自检：前端在首屏据此提示，而不是等用户点录像才报错。
+#[tauri::command]
+fn media_runtime_status() -> MediaRuntimeStatus {
+    install_media_tool_env()
+}
+
 // ── 应用入口 ──────────────────────────────────────────────
 
 /// 初始化日志、注册命令、启动 Tauri 事件循环。
 pub fn run() {
     common::logging::init();
+    // 先于任何媒体调用注入内置 ffmpeg/ffprobe 的绝对路径。
+    install_media_tool_env();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
@@ -3582,6 +3760,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             engine_version,
             builtin_video_source,
+            media_runtime_status,
             list_local_ip_addresses,
             get_desktop_config,
             save_desktop_config,
