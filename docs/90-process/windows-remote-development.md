@@ -1,10 +1,10 @@
 ---
-title: Windows 52 远程开发工作区
+title: Windows 现场机远程开发工作区
 status: development-ready
-updated: 2026-09-14
+updated: 2026-11-08
 ---
 
-# Windows 52 远程开发
+# Windows 现场机远程开发
 
 ## 工作方式
 
@@ -12,8 +12,9 @@ Mac 负责编辑和代码审查，Windows 负责原生编译、测试、打包�
 也可以通过 SSH MCP 直接修改 Windows 工作区，但同一阶段只保留一个主要编辑位置。
 远程操作统一使用 SSH MCP；文件传输使用其 SFTP 工具。
 
-- SSH MCP 别名：`Windows 测试环境52`。
-- 主机：`192.168.10.52:22`；已验证账户：`mengfanlu`。
+- SSH MCP 别名：`<现场机别名>`。
+- 主机：`<现场机IP>:22`；已验证账户：`<现场机账户>`。
+  真实地址与账户不写入仓库，统一查本机 SSH 配置（`~/.workbuddy/skills/.../configs/servers.json` 或 `~/.ssh/config`）。
 - Windows 项目：`G:\code\uvp-gb28181-sim-desktop`。
 - Windows 分支：`codex/windows-development`。
 - 初始来源：Mac 的 `v3`，提交 `47679ba8a7403b49fffb7ce2176866c7fb16e39b`。
