@@ -796,40 +796,43 @@ function setBindMode(mode: BindMode) {
 </template>
 
 <style scoped>
-/* 与 theme.css 的 .page-wrap 同口径：父级 .content 是 overflow:hidden，
-   页面自身必须建立垂直滚动上下文，否则参数区超出视口会被直接裁掉且没有滚动条。
-   底部留白保证滚到底时最后一条提示不贴边。 */
-.settings-page { max-width: 1420px; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-bottom: 16px; }
-.settings-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
+/* 与 theme.css 的 .page-wrap 同口径：父级 .content 是 overflow:hidden。
+   滚动上下文放在 .settings-main 卡片内部：卡片靠 flex 撑满可用高度、始终留在视口内，
+   只有参数区滚动，卡片四角圆角与描边在任何滚动位置都完整保留；标题行是卡片内的
+   固定头，与参数区同属一张卡，不再像贴在页面上的独立横条。 */
+.settings-page { max-width: 1420px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding-bottom: 16px; }
+.settings-header { flex: 0 0 auto; display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .settings-header-meta { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .platform-summary { color: var(--text-secondary); }
 .lock-badge { padding: 5px 10px; border: 1px solid color-mix(in srgb, var(--success) 35%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--success) 10%, transparent); color: var(--success); }
 .lock-badge.running { border-color: color-mix(in srgb, var(--warning) 35%, transparent); background: color-mix(in srgb, var(--warning) 10%, transparent); color: var(--warning); }
-.settings-main { padding: 16px; }
+.settings-main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; padding: 0; }
 .section-label { color: var(--text-tertiary); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.content-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 2px 2px 17px; border-bottom: 1px solid var(--border-default); }
+.content-heading { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px 15px; border-bottom: 1px solid var(--border-default); }
 .content-context { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 13px; font-weight: 600; }
 .content-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: var(--accent-pale); color: var(--accent); font-size: 16px; }
 .content-actions { display: flex; flex: 0 0 auto; gap: 8px; }
-/* 媒体页把保存入口上移到标题行并冻结：.settings-page 是滚动容器，标题行 sticky 在
-   其顶部，参数区滚动时右侧「保存音视频设置」始终可见。背景取卡片复合色并置顶，
-   避免下方内容透出来叠字；仅媒体页加 .sticky，其余设置页保持原布局。 */
+/* 媒体页把保存入口上移到标题行并冻结：.settings-main 是滚动容器，标题行 sticky 在
+   卡片内顶边，参数区滚动时右侧「保存音视频设置」始终可见。背景取卡片复合色并置顶，
+   避免下方内容透出来叠字；标题行铺满卡片宽度、顶部两角沿用卡片圆角、去掉悬浮投影，
+   冻结时仍是卡片头部而不是单独一条。仅媒体页加 .sticky，其余设置页保持原布局。 */
 .content-heading.sticky {
   position: sticky;
   top: 0;
   z-index: 5;
   flex-direction: row;
   align-items: center;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
   background: color-mix(in srgb, #fff 50%, var(--bg-base));
-  box-shadow: 0 6px 14px rgba(16, 46, 98, .06);
+  box-shadow: none;
 }
 .btn { padding: 7px 14px; border: 1px solid var(--border-default); border-radius: 8px; cursor: pointer; font-size: 12px; }
 .btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
 .btn.ghost { background: rgba(255,255,255,.45); color: var(--text-secondary); }
 .btn:disabled, input:disabled, button:disabled { cursor: not-allowed; opacity: .55; }
-.feedback { margin-top: 14px; padding: 9px 12px; border-radius: 8px; background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); font-size: 12px; }
+.feedback { margin: 14px 16px 0; padding: 9px 12px; border-radius: 8px; background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); font-size: 12px; }
 .feedback.error { background: color-mix(in srgb, var(--error) 12%, transparent); color: var(--error); }
-.settings-section { display: flex; flex-direction: column; gap: 11px; padding-top: 18px; }
+.settings-section { display: flex; flex-direction: column; gap: 11px; padding: 18px 16px 16px; }
 .section-label { margin-top: 5px; }
 .segmented { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--border-default); border-radius: 9px; background: rgba(255,255,255,.42); }
 .segmented button { flex: 1; padding: 8px 12px; border: 0; border-radius: 7px; background: transparent; color: var(--text-secondary); cursor: pointer; }

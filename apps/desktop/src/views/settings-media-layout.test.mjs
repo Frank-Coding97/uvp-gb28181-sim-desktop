@@ -46,16 +46,34 @@ assert.match(stickyRule, /position:\s*sticky;/, "标题行必须 position:sticky
 assert.match(stickyRule, /top:\s*0;/, "标题行必须吸附在滚动容器顶部");
 assert.match(stickyRule, /z-index:\s*\d+;/, "标题行必须盖在滚动内容之上");
 assert.match(stickyRule, /background:/, "标题行必须有不透明背景，避免滚动内容透出叠字");
+assert.match(stickyRule, /border-radius:/, "冻结时标题行顶部两角须沿用卡片圆角");
+assert.match(stickyRule, /box-shadow:\s*none;/, "标题行不得带悬浮投影，避免看起来是独立区域");
 
-// ── 页面滚动边界 ─────────────────────────────────────────────────────────
+// ── 卡片内滚动与圆角保持 ─────────────────────────────────────────────────
+// 回归背景：原先 .settings-page 是滚动容器，卡片整体会滚出视口，sticky 标题行被钉成
+// 一条直角独立横条，卡片圆角在滚动时丢失；现滚动下沉到卡片内部，卡片始终留在视口内。
+const cardStyles = source.match(/^\.settings-main \{([^}]*)\}/m)?.[1] ?? "";
+assert.ok(cardStyles, "应存在设置卡片样式");
+assert.match(cardStyles, /overflow-y:\s*auto;/, "参数区滚动必须发生在卡片内部");
+assert.match(cardStyles, /overflow-x:\s*hidden;/, "卡片只保留垂直滚动，避免横向溢出");
+assert.match(cardStyles, /min-height:\s*0;/, "滚动容器需允许被父级 flex 压到视口高度");
+assert.match(cardStyles, /flex:\s*1 1 auto;/, "卡片须撑满可用高度，滚动时始终留在视口内");
+assert.match(cardStyles, /display:\s*flex;/, "卡片须建立纵向布局，标题行才能作为固定头");
+assert.match(cardStyles, /padding:\s*0;/, "卡片不再留内边距，标题行才能铺满宽度、与卡片同体");
+const headingStyles = source.match(/^\.content-heading \{([^}]*)\}/m)?.[1] ?? "";
+assert.match(headingStyles, /padding:\s*14px 16px 15px;/, "标题行铺满卡片宽度的同时保留左右内缩");
+const sectionStyles = source.match(/^\.settings-section \{([^}]*)\}/m)?.[1] ?? "";
+assert.match(sectionStyles, /padding:\s*18px 16px 16px;/, "参数区自行承担横向留白与底部呼吸空间");
+
+// ── 页面外层容器 ─────────────────────────────────────────────────────────
 // 回归背景：App.vue 的 .content 是 overflow:hidden，设置页原先没有自己的滚动上下文，
-// 窗口偏矮时底部提示条被直接裁掉，且不会出现垂直滚动条；现保存按钮已上移到冻结的标题行。
+// 窗口偏矮时底部提示条被直接裁掉；现滚动在卡片内完成，外层只负责高度传递。
 const pageStyles = source.match(/^\.settings-page \{([^}]*)\}/m)?.[1] ?? "";
 assert.ok(pageStyles, "应存在设置页根容器样式");
-assert.match(pageStyles, /overflow-y:\s*auto;/, "设置页必须可垂直滚动，不能裁切底部内容");
-assert.match(pageStyles, /overflow-x:\s*hidden;/, "设置页只保留垂直滚动，避免横向溢出");
+assert.match(pageStyles, /display:\s*flex;/, "页面须把可用高度传递给卡片");
+assert.match(pageStyles, /overflow:\s*hidden;/, "外层不应再产生第二条滚动轴");
 assert.match(pageStyles, /min-height:\s*0;/, "滚动容器需允许被父级 flex 压到视口高度");
-assert.match(pageStyles, /padding-bottom:\s*16px;/, "滚动到底需留出底部呼吸空间");
+assert.match(pageStyles, /padding-bottom:\s*16px;/, "卡片底部需留出呼吸空间");
 
 // ── 共用页头显隐 ─────────────────────────────────────────────────────────
 // 回归背景：媒体页内容顶部已有「模拟器有效配置」小节标题与「参数摘要」，
