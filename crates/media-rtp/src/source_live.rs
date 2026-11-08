@@ -5259,6 +5259,61 @@ mod tests {
         assert!(filter.contains("drawbox"), "{filter}");
     }
 
+    /// 生成的 -vf 必须能被真实 FFmpeg 执行：中文 drawtext、斜铺水印双链、
+    /// drawbox 遮挡、uyvy422→yuv420p 转换，以及 VideoToolbox 硬件编码。
+    /// 缺 drawtext 或中文字体时跳过(与 osd 模块的真实 FFmpeg 测试同策略)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macOS摄像头OSD滤镜链能被真实ffmpeg执行() {
+        let Some(ffmpeg) = crate::source::ffmpeg_bin() else {
+            return;
+        };
+        if !crate::osd::ffmpeg_supports_osd(&ffmpeg) {
+            return;
+        }
+        let Some(font) = crate::osd::font_file() else {
+            return;
+        };
+        let mut osd = macos_camera_osd(true);
+        osd.font = font;
+        let args = macos_camera_osd_args(Some(&osd));
+        let filter = macos_camera_vf(&args).to_owned();
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/osd-macos-camera-test.h264");
+        let status = common::hidden_command(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=640x480:rate=15",
+                "-vf",
+            ])
+            .arg(&filter)
+            .args([
+                "-c:v",
+                "h264_videotoolbox",
+                "-pix_fmt",
+                "nv12",
+                "-frames:v",
+                "3",
+                "-f",
+                "h264",
+                "-y",
+            ])
+            .arg(&out)
+            .output()
+            .expect("ffmpeg 应能启动");
+        assert!(
+            status.status.success(),
+            "{}\n{filter}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(out.metadata().map(|m| m.len() > 0).unwrap_or(false));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn 屏幕H265命令必须使用profile的输出节奏和关键帧周期() {
