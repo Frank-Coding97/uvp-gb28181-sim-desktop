@@ -994,6 +994,19 @@ onUnmounted(() => {
             <h2>视频采集预览</h2>
           </div>
           <div class="preview-head-actions">
+            <!-- 平台收流标识放在「采集中」左侧,不再压在视频画面上:
+                 本地预览无论是谁都照常出图,没有这层标识就分不清"平台在看"还是"只有本机在看"。
+                 视觉只保留绿点闪动 + LIVE;完整语义留给 aria-label/title。 -->
+            <div
+              v-if="platformWatching"
+              class="preview-watching"
+              role="status"
+              aria-label="平台正在观看"
+              :title="`${displayedProfile?.name ?? '平台'} 正在接收该设备的实时流`"
+            >
+              <i aria-hidden="true" />
+              <span aria-hidden="true">LIVE</span>
+            </div>
             <div class="preview-status" :class="previewEnabled ? previewState : 'off'"><i />{{ previewStateText }}</div>
             <n-button v-if="previewEnabled" size="tiny" quaternary @click="disablePreview">关闭预览</n-button>
           </div>
@@ -1020,19 +1033,6 @@ onUnmounted(() => {
               <n-button v-else-if="previewState === 'error' && captureState === 'ready'" size="small" type="primary" secondary @click="retryPreview">
                 重试预览
               </n-button>
-            </div>
-            <!-- 平台侧正在收流时在画面上打标:本地预览无论是谁都照常出图,
-                 没有这层标识就分不清"平台在看"还是"只有本机在看"。
-                 视觉只保留绿点闪动 + LIVE;完整语义留给 aria-label/title。 -->
-            <div
-              v-if="platformWatching"
-              class="preview-watching"
-              role="status"
-              aria-label="平台正在观看"
-              :title="`${displayedProfile?.name ?? '平台'} 正在接收该设备的实时流`"
-            >
-              <i aria-hidden="true" />
-              <span aria-hidden="true">LIVE</span>
             </div>
             <div class="preview-overlay bottom-row">
               <span>{{ sourceSummary }}</span>
@@ -1572,30 +1572,24 @@ onUnmounted(() => {
 .preview-overlay { position: absolute; z-index: 2; color: rgba(229, 238, 251, .78); font-family: "SF Mono", Menlo, monospace; font-size: 10px; }
 .bottom-row { right: 0; bottom: 0; left: 0; display: flex; justify-content: space-between; gap: 12px; padding: 9px 12px; background: linear-gradient(transparent, rgba(3, 10, 20, .78)); }
 .bottom-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 平台观看标识(LIVE):压在画面右上角,暗底 + 绿色光晕保证亮暗画面上都能看清;
-   闪烁点只在"正在看"时存在,元素出现/消失本身就是状态切换。
-   绿色沿用 #43d59d,与面板头部的播放状态色一致,不额外引入一套状态色。 */
+/* 平台观看标识(LIVE):放在预览面板头部「采集中」左侧,不再压在视频画面上;
+   浅底 + --success 绿字适配浅色面板,闪烁点只在"正在看"时存在,元素出现/消失本身就是状态切换。 */
 .preview-watching {
-  position: absolute;
-  top: 10px;
-  right: 12px;
-  z-index: 3;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 9px;
-  border: 1px solid rgba(67, 213, 157, .45);
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid rgba(8, 179, 136, .28);
   border-radius: 999px;
-  color: #d9fcee;
-  background: rgba(8, 26, 20, .62);
-  backdrop-filter: blur(6px);
+  color: var(--success);
+  background: rgba(8, 179, 136, .1);
   font-family: "SF Mono", Menlo, monospace;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: .08em;
   line-height: 1.2;
   white-space: nowrap;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
 }
 .preview-watching i {
   width: 6px;
