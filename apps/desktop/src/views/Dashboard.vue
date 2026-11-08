@@ -716,6 +716,23 @@ async function setMediaMode(mode: MediaMode) {
   syncLiveSource();
 }
 
+// 内置演示视频：首次进入且尚未选择来源时自动填入，界面直接落在「视频文件」模式。
+// 用户点文件名仍可换成自己的素材；切到摄像头/屏幕后由 syncLiveSource 接管。
+// 未打包素材（后端返回 null）时保持原交互，不把内置素材变成注册的前置条件。
+async function applyBuiltinVideoSource() {
+  if (!isTauri || deviceLive.value || form.value.video_source.trim()) return;
+  try {
+    const source = await invoke<string | null>("builtin_video_source");
+    if (source && !deviceLive.value && !form.value.video_source.trim()) {
+      form.value.video_source = source;
+      mediaMode.value = "file";
+      persistForm();
+    }
+  } catch {
+    // 后端未提供内置素材时忽略：仍由用户自行选择采集来源。
+  }
+}
+
 async function pickVideoFile() {
   if (!isTauri) {
     message.info("浏览器预览不能读取本机文件，请在桌面应用中选择");
@@ -886,6 +903,7 @@ onMounted(async () => {
   resetDraft();
   if (!isTauri) return;
   void startBroadcastAudio();
+  void applyBuiltinVideoSource();
   unlistenCaptureState = await listen<string>("capture_state", (event) => {
     captureState.value = event.payload as CaptureState;
     // 只恢复用户已开启的预览;默认不自动预览。

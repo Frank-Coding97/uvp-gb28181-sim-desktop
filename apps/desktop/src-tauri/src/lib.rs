@@ -637,6 +637,32 @@ fn resolve_writable_dir(
     Err(format!("没有可写的应用数据目录：{}", failures.join("; ")))
 }
 
+/// 内置演示视频（`resources/builtin-sample.mp4`）在运行期的绝对路径。
+///
+/// 发布包通过 `bundle.resources` 把它放到资源目录；`tauri dev` 下资源目录可能指到
+/// `target/debug`，未必已经复制，所以再回退到源码树里的同一份文件。找不到返回
+/// `None`，由调用方退回「未配置媒体源」的旧行为——内置素材不能变成启动硬依赖。
+fn resolve_builtin_video(app: &AppHandle) -> Option<std::path::PathBuf> {
+    const FILE_NAME: &str = "builtin-sample.mp4";
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().resource_dir() {
+        candidates.push(dir.join("resources").join(FILE_NAME));
+        candidates.push(dir.join(FILE_NAME));
+    }
+    candidates.push(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(FILE_NAME),
+    );
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 首页默认媒体源：内置演示视频的绝对路径（未打包素材时返回 `null`）。
+#[tauri::command]
+fn builtin_video_source(app: AppHandle) -> Option<String> {
+    resolve_builtin_video(&app).map(|path| path.to_string_lossy().into_owned())
+}
+
 /// 应用数据根目录：配置、录像、升级状态**三者共用**的一个真能写入的目录。
 ///
 /// 之所以要共用：2026-11-05 在装了企业 VDI/DLP 的开发机上，`app_data_dir()` 建目录
@@ -2154,6 +2180,12 @@ async fn start_device(
             .map_err(|error| format!("读取配置任务异常: {error}"))??
     };
     let mut resolved = persisted.resolve_start(input)?;
+    // 没有显式媒体源时用内置演示视频：装好即可注册推流，不必先在本机准备素材。
+    // 显式配置（含 live: 摄像头/屏幕）永远优先，用户清空来源仍沿用此默认。
+    if resolved.video_source.is_none() {
+        resolved.video_source =
+            resolve_builtin_video(&app).map(|path| path.to_string_lossy().into_owned());
+    }
     // 信令传输由 profile.transport 决定:UDP 走共享 socket,TCP 走共享连接池。
     // 两者都在下面按模式创建,不再在此处拦截 TCP。
     if let Some(source) = resolved.video_source.take() {
@@ -3507,6 +3539,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             engine_version,
+            builtin_video_source,
             list_local_ip_addresses,
             get_desktop_config,
             save_desktop_config,

@@ -40,6 +40,7 @@
 | `get_device_status` | — | `{ running: bool }` | 查设备运行态(页面切换后与引擎对账) | ✅ |
 | `fire_alarm` | `{ description: string }` | `string` | 主动上报一条报警 | ✅ |
 | `fire_position` | `{ longitude: number, latitude: number }` | `string` | 主动上报一条 GPS 位置 | ✅ |
+| `builtin_video_source` | — | `string \| null` | 内置演示视频(`resources/builtin-sample.mp4`)的绝对路径;首页默认媒体源,未打包素材时返回 null | ✅ |
 
 > 当前设备状态**只经 `device_state` 事件**推送(见 §3),没有同名查询命令。
 

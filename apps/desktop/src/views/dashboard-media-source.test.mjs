@@ -59,3 +59,16 @@ assert.doesNotMatch(
   /audio_codec|width|height|bitrate|video_codec|video_fps|keyframe_interval/,
   "首页实时源 URI 不应覆盖音视频配置页中的固定编码参数",
 );
+
+// 内置演示视频是首页默认媒体源：挂载时拉一次路径并落成「视频文件」模式。
+// 不能覆盖用户已选来源，也不能在设备运行中改写正在用的媒体源。
+const applyBuiltin = source.match(/async function applyBuiltinVideoSource\(\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+assert.match(
+  source,
+  /void applyBuiltinVideoSource\(\);/,
+  "首页挂载时应尝试启用内置演示视频",
+);
+assert.match(applyBuiltin, /invoke<string \| null>\("builtin_video_source"\)/, "内置视频路径应取自后端命令");
+assert.match(applyBuiltin, /form\.value\.video_source\.trim\(\)/, "已有媒体源时不应覆盖用户选择");
+assert.match(applyBuiltin, /deviceLive\.value/, "设备运行中不应改写媒体源");
+assert.match(applyBuiltin, /mediaMode\.value = "file"/, "填入内置视频后应切到视频文件模式");
