@@ -1021,7 +1021,6 @@ onUnmounted(() => {
                 重试预览
               </n-button>
             </div>
-            <div class="preview-overlay top-left"><i :class="{ on: previewState === 'playing' }" /> UVP-SIM</div>
             <!-- 平台侧正在收流时在画面上打标:本地预览无论是谁都照常出图,
                  没有这层标识就分不清"平台在看"还是"只有本机在看"。
                  视觉只保留绿点闪动 + LIVE;完整语义留给 aria-label/title。 -->
@@ -1571,14 +1570,11 @@ onUnmounted(() => {
 .preview-cover strong { color: #e4edf9; font-size: 14px; }
 .preview-cover span { max-width: 420px; font-size: 11px; }
 .preview-overlay { position: absolute; z-index: 2; color: rgba(229, 238, 251, .78); font-family: "SF Mono", Menlo, monospace; font-size: 10px; }
-.top-left { top: 11px; left: 12px; display: inline-flex; align-items: center; gap: 6px; }
-.top-left i { width: 6px; height: 6px; border-radius: 50%; background: rgba(229, 238, 251, .35); }
-.top-left i.on { background: #43d59d; }
 .bottom-row { right: 0; bottom: 0; left: 0; display: flex; justify-content: space-between; gap: 12px; padding: 9px 12px; background: linear-gradient(transparent, rgba(3, 10, 20, .78)); }
 .bottom-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 平台观看标识(LIVE):压在画面右上角,暗底 + 绿色光晕保证亮暗画面上都能看清;
    闪烁点只在"正在看"时存在,元素出现/消失本身就是状态切换。
-   绿色与画面左上角 UVP-SIM 的"出图中"点同色,不额外引入一套状态色。 */
+   绿色沿用 #43d59d,与面板头部的播放状态色一致,不额外引入一套状态色。 */
 .preview-watching {
   position: absolute;
   top: 10px;
