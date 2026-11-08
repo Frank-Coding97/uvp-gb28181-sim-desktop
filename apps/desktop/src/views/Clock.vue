@@ -253,7 +253,8 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.page { width: min(1180px, 100%); margin: 0 auto; display: grid; gap: 14px; align-content: start; }
+/* 页面宽度与全局 .page（theme.css）及其它页面保持一致，避免左右留白偏大 */
+.page { width: min(1480px, 100%); margin: 0 auto; display: grid; gap: 14px; align-content: start; }
 .page-header { align-items: flex-end; gap: 20px; }
 .head-actions { display: flex; gap: 8px; }
 .panel { padding: 18px; display: grid; gap: 16px; }
