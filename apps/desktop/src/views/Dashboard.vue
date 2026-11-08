@@ -1659,7 +1659,7 @@ onUnmounted(() => {
 .sip-profile-switcher { display: grid; grid-template-columns: minmax(0, 1fr) auto 28px; align-items: center; gap: 6px; margin-top: 8px; }
 /* 纵向留白比横向大一档：每行都是「标签 + 输入框」两段结构，行距太小会让上下两行粘在一起，
    而列宽本身已经够用，所以只放大 row-gap，column-gap 维持原值。 */
-.config-grid { display: grid; grid-template-columns: 1fr 1fr; row-gap: 15px; column-gap: 8px; margin-top: 12px; }
+.config-grid { display: grid; grid-template-columns: 1fr 1fr; row-gap: 22px; column-gap: 8px; margin-top: 14px; }
 .config-panel :deep(.n-input--disabled) {
   --n-text-color-disabled: var(--text-secondary) !important;
   --n-color-disabled: rgba(248, 250, 253, .9) !important;
@@ -1776,7 +1776,7 @@ onUnmounted(() => {
   .preview-panel, .config-panel { padding: 12px; }
   .preview-panel { gap: 7px; }
   .sip-profile-switcher { margin-top: 6px; }
-  .config-grid { row-gap: 9px; margin-top: 8px; }
+  .config-grid { row-gap: 14px; margin-top: 8px; }
   .primary-actions { margin-top: 7px; }
   .quick-actions { margin-top: 5px; }
 }
@@ -1785,7 +1785,7 @@ onUnmounted(() => {
   .preview-panel, .config-panel { padding: 10px; }
   .preview-panel { grid-template-rows: auto minmax(0, 1fr) auto auto; gap: 6px; }
   .sip-profile-switcher { margin-top: 5px; }
-  .config-grid { row-gap: 7px; margin-top: 7px; }
+  .config-grid { row-gap: 10px; margin-top: 7px; }
   .primary-actions { margin-top: 6px; }
   .quick-actions, .config-foot { margin-top: 5px; }
 }
