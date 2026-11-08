@@ -3,7 +3,8 @@
 //
 // 结构：左侧 3D 舞台（只表达设备姿态，不接视频流）+ 右侧四个一级分区控制台
 //（云台 / 定位 / 图像 / 设备）。一次只呈现一个分区，靠页签明确当前焦点。
-// 顶部保留两行全局状态条；平台命令默认只打角标，不自动把手操页切走。
+// 页头状态条已移除；平台命令写死为自动切页（等价于勾选框常开），
+// 设备状态由右侧控制台常驻条与舞台离线提示承载。
 // 视觉规格沿用桌面端重做结果（11~13px 正文、34px 按键、统一卡片），
 // 布局按视口宽高双向自适应：不够放时整页滚动，绝不把内容压进一屏再裁掉。
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
@@ -20,8 +21,9 @@ const { deviceLive, reconcile } = useDevice();
 const activeTab = ref<SimTab>("ptz");
 const tabBadges = ref<SimTab[]>([]);
 const showFov = ref(true);
-// 默认关闭：平台命令只给目标页打角标，绝不自动把手操页切走（旧版操作痛点）。
-const autoFollow = ref(false);
+// 页头复选框已移除，自动切页写死为开启：等价于该勾选框永久勾选，
+// 平台命令到来时直接切到目标分区；角标分支保留，日后若要恢复开关可零成本回退。
+const autoFollow = ref(true);
 
 const tabs: Array<{ key: SimTab; label: string; hint: string }> = [
   { key: "ptz", label: "云台", hint: "本机手操" },
@@ -157,7 +159,7 @@ watch(
   () => {
     const command = sim.lastCommand.value;
     if (!command) return;
-    // 平台命令不打断当前分区：默认只给目标页打角标，用户显式开启才自动跳页。
+    // 自动切页恒开：平台命令直接切到目标分区（页头开关已移除，行为写死）。
     const target = tabForSummary(command.summary);
     if (!target || target === activeTab.value) return;
     if (autoFollow.value) selectTab(target);
@@ -183,23 +185,6 @@ onUnmounted(() => {
 
 <template>
   <div class="sim-page">
-    <header class="page-header">
-      <div class="title-block">
-        <div class="page-title">模拟器中心</div>
-        <div class="page-sub">3D 设备姿态 + 平台控制回显；本页不主动控制平台</div>
-      </div>
-
-      <div class="header-right">
-        <label class="follow-toggle">
-          <input v-model="autoFollow" type="checkbox" />
-          平台命令自动切页
-        </label>
-        <span class="device-pill" :class="{ online: deviceLive }">
-          {{ deviceLive ? "设备运行中" : "设备未运行" }}
-        </span>
-      </div>
-    </header>
-
     <div class="sim-layout">
       <!-- 左：3D 舞台 -->
       <section class="glass-card stage-card">
@@ -316,7 +301,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <!-- 一级导航：四个页签互斥，未读命令只打角标，不自动切走当前分区 -->
+        <!-- 一级导航：四个页签互斥，平台命令自动切到目标分区 -->
         <div class="tab-row" role="tablist" aria-label="模拟器控制台分区">
           <button
             v-for="tab in tabs"
@@ -546,19 +531,6 @@ onUnmounted(() => {
 /* 与 theme.css 的 .page-wrap 同口径：内容超出视口时整页滚动。
    父级 .content 是 overflow:hidden，若此处不滚动，超出部分会被直接裁掉。 */
 .sim-page { width: min(1540px, 100%); margin: 0 auto; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; }
-.page-header {
-  display: grid;
-  grid-template-columns: minmax(280px, 1fr) auto;
-  align-items: center;
-  gap: 20px;
-  margin-bottom: 16px;
-}
-.header-right { display: flex; align-items: center; gap: 12px; }
-.follow-toggle { display: flex; align-items: center; gap: 5px; color: var(--text-tertiary); font-size: 11px; white-space: nowrap; cursor: pointer; }
-.follow-toggle input { accent-color: var(--accent); }
-.device-pill { padding: 6px 11px; border: 1px solid var(--border-default); border-radius: 999px; color: var(--text-tertiary); background: rgba(255, 255, 255, 0.48); font-size: 12px; white-space: nowrap; }
-.device-pill.online { border-color: rgba(24, 160, 88, 0.25); color: var(--success); background: rgba(24, 160, 88, 0.08); }
-
 /* 右栏 clamp(440px, 34%, 520px)：窄窗口优先保住手操宽度，宽窗口不无限膨胀。
    grid-template-rows:auto + flex:1 0 auto：行高先按内容撑开，视口更高时才拉伸铺满，
    不再是 minmax(0,1fr) 把三段硬压进一屏导致回显区被裁。 */
@@ -724,7 +696,6 @@ onUnmounted(() => {
    只给一行时控制台会落到隐式行，被父级 overflow:hidden 直接裁掉。
    单页内容此时用两列卡片铺满整行宽度，减少纵向滚动。 */
 @media (max-width: 1180px) {
-  .page-header { grid-template-columns: 1fr auto; }
   .sim-layout { grid-template-columns: 1fr; grid-template-rows: auto auto; min-height: 0; }
   .stage { min-height: 460px; }
   .console-body { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -735,8 +706,6 @@ onUnmounted(() => {
 @media (max-width: 720px) {
   .console-body { grid-template-columns: 1fr; }
   .tab-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .page-header { grid-template-columns: 1fr; }
-  .header-right { justify-content: space-between; }
 }
 
 /* 矮窗口（非全屏常见尺寸）：只收紧留白，不缩字号、不缩按键命中区域。 */

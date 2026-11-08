@@ -29,12 +29,19 @@ assert.match(panel, /<template v-else>/, "设备页需作为兜底分支");
 assert.match(panel, /<PtzPad @adjust="onPad" \/>/, "云台页需保留手操方盘");
 assert.ok(aside.indexOf('class="console-status"') < aside.indexOf('id="console-panel"'), "全局状态条必须常驻在单页内容之外");
 
-// ── 平台命令不打断当前分区 ───────────────────────────────────────────────
-assert.match(script, /const autoFollow = ref\(false\)/, "自动切页默认关闭，避免平台命令切走手操");
+// ── 平台命令自动切页写死开启 ─────────────────────────────────────────────
+assert.match(script, /const autoFollow = ref\(true\)/, "自动切页写死为勾选，等价于复选框永久开启");
 assert.match(script, /if \(!target \|\| target === activeTab\.value\) return;/, "同分区命令无需任何跳转或角标");
-assert.match(script, /if \(autoFollow\.value\) selectTab\(target\);/, "仅在用户显式开启时才自动跳页");
-assert.match(script, /tabBadges\.value = \[\.\.\.tabBadges\.value, target\]/, "未读命令改为给目标页打角标");
-assert.match(aside, /tabBadges\.includes\(tab\.key\)/, "页签需显示未读角标");
+assert.match(script, /if \(autoFollow\.value\) selectTab\(target\);/, "平台命令到来时直接切到目标分区");
+assert.match(script, /tabBadges\.value = \[\.\.\.tabBadges\.value, target\]/, "角标分支保留，便于日后恢复开关");
+assert.match(aside, /tabBadges\.includes\(tab\.key\)/, "页签角标渲染保留");
+
+// ── 顶部页头条整体移除 ───────────────────────────────────────────────────
+// 回归背景：页头里的「平台命令自动切页」复选框属于多余决策点，改为写死勾选后
+// 整条页头（标题 / 副标题 / 复选框 / 设备状态胶囊）一并删除，避免留下空行。
+assert.doesNotMatch(source, /class="page-header"/, "模拟器中心不再保留独立页头行");
+assert.doesNotMatch(source, /follow-toggle|<input v-model="autoFollow"/, "自动切页复选框不应再暴露给用户");
+assert.doesNotMatch(source, /class="device-pill"/, "设备状态胶囊随页头一并移除");
 
 // ── 保留下来的功能与视觉改进 ─────────────────────────────────────────────
 assert.match(aside, /@click="callPreset\(preset\)"/, "预置位仍应可本机调用");
