@@ -1,8 +1,10 @@
 <script setup lang="ts">
 // 桌面端「模拟器中心」。
 //
-// 结构：左侧 3D 舞台（只表达设备姿态，不接视频流）+ 右侧四页控制台。
-// 功能口径对齐移动端模拟中心：云台/定位/图像/设备；除云台页本机手操外全部只读回显。
+// 结构：左侧 3D 舞台（只表达设备姿态，不接视频流）+ 右侧三段式控制台
+//（常驻状态总览 / 常驻云台手操 / 分组只读回显）。
+// 功能口径对齐移动端模拟中心：云台/定位/图像/设备；除云台手操外全部只读回显。
+// 布局按视口宽高双向自适应：不够放时整页滚动，绝不把内容压进一屏再裁掉。
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import PtzCamera3D from "../components/PtzCamera3D.vue";
 import PtzPad from "../components/PtzPad.vue";
@@ -541,7 +543,9 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.sim-page { width: min(1540px, 100%); margin: 0 auto; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* 与 theme.css 的 .page-wrap 同口径：内容超出视口时整页滚动。
+   父级 .content 是 overflow:hidden，若此处不滚动，超出部分会被直接裁掉。 */
+.sim-page { width: min(1540px, 100%); margin: 0 auto; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; }
 .page-header {
   display: grid;
   grid-template-columns: minmax(280px, 1fr) auto;
@@ -555,7 +559,10 @@ onUnmounted(() => {
 .device-pill { padding: 6px 11px; border: 1px solid var(--border-default); border-radius: 999px; color: var(--text-tertiary); background: rgba(255, 255, 255, 0.48); font-size: 12px; white-space: nowrap; }
 .device-pill.online { border-color: rgba(24, 160, 88, 0.25); color: var(--success); background: rgba(24, 160, 88, 0.08); }
 
-.sim-layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(390px, 0.85fr); grid-template-rows: minmax(0, 1fr); gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
+/* 右栏 clamp(440px, 34%, 520px)：窄窗口优先保住手操宽度，宽窗口不无限膨胀。
+   grid-template-rows:auto + flex:1 0 auto：行高先按内容撑开，视口更高时才拉伸铺满，
+   不再是 minmax(0,1fr) 把三段硬压进一屏导致回显区被裁。 */
+.sim-layout { display: grid; grid-template-columns: minmax(0, 1fr) clamp(440px, 34%, 520px); grid-template-rows: auto; gap: 16px; align-items: stretch; flex: 1 0 auto; min-height: 0; }
 .stage-card { min-width: 0; padding: 14px; }
 .stage {
   position: relative;
@@ -624,7 +631,7 @@ onUnmounted(() => {
 .snapshot-flash { position: absolute; z-index: 8; inset: 0; background: #fff; animation: flash-out .18s ease-out forwards; pointer-events: none; }
 @keyframes flash-out { from { opacity: .82; } to { opacity: 0; } }
 
-.console { display: flex; min-width: 0; height: 100%; flex-direction: column; gap: 12px; padding: 14px; }
+.console { display: flex; min-width: 0; height: auto; flex-direction: column; gap: 12px; padding: 14px; }
 
 /* 右侧统一分区头：13px 标题 + 11px 说明，取代原先 8~10px 的小字堆叠。 */
 .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
@@ -683,7 +690,7 @@ onUnmounted(() => {
 .segment > button.active b { color: var(--accent); }
 .segment > button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .segment-badge { position: absolute; top: 6px; right: 8px; width: 6px; height: 6px; border-radius: 50%; background: var(--error); box-shadow: 0 0 6px rgba(229, 72, 92, .55); }
-.feedback-body { display: grid; align-content: start; gap: 8px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 3px; }
+.feedback-body { display: grid; align-content: start; gap: 8px; flex: 1; min-height: 0; max-height: clamp(220px, 32vh, 400px); overflow-y: auto; padding-right: 3px; }
 .feedback-body::-webkit-scrollbar { width: 5px; }
 .feedback-body::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(143,161,189,.28); }
 .info-card { padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 10px; background: var(--bg-surface); }
@@ -715,17 +722,46 @@ onUnmounted(() => {
 .upgrade-head strong { color: var(--text-primary); font: 700 12px "SF Mono", monospace; }
 .last-command { padding: 8px 10px; border-radius: 8px; color: var(--text-primary); background: var(--bg-base); font-size: 11px; line-height: 1.6; word-break: break-all; }
 
+/* 窄窗口改上下两行：必须显式写 grid-template-rows: auto auto，
+   只给一行时控制台会落到隐式行，被父级 overflow:hidden 直接裁掉。 */
 @media (max-width: 1180px) {
   .page-header { grid-template-columns: 1fr auto; }
-  .sim-layout { grid-template-columns: 1fr; }
-  .stage { min-height: 500px; }
-  .console { height: auto; }
-  .feedback-body { max-height: 50vh; }
+  .sim-layout { grid-template-columns: 1fr; grid-template-rows: auto auto; min-height: 0; }
+  .stage { min-height: 460px; }
+  .console {
+    display: grid;
+    grid-template-columns: minmax(280px, 0.85fr) minmax(0, 1.15fr);
+    align-items: start;
+    gap: 12px;
+  }
+  .overview { grid-row: 1; grid-column: 1 / -1; }
+  .control-section { grid-row: 2; grid-column: 1; }
+  .feedback { grid-row: 2; grid-column: 2; }
+  .ptz-workbench { grid-template-columns: 1fr; justify-items: center; }
+  .lens-stack { width: 100%; }
+  .feedback-body { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 360px; }
 }
 @media (max-width: 720px) {
+  .console { grid-template-columns: 1fr; }
+  .overview, .control-section, .feedback { grid-row: auto; grid-column: 1; }
+  .feedback-body { grid-template-columns: 1fr; }
   .ptz-workbench { grid-template-columns: 1fr; justify-items: center; }
   .lens-stack { width: 100%; }
   .page-header { grid-template-columns: 1fr; }
   .header-right { justify-content: space-between; }
+}
+
+/* 矮窗口（非全屏常见尺寸）：只收紧留白，不缩字号、不缩按键命中区域。 */
+@media (max-height: 820px) and (min-width: 1181px) {
+  .console { gap: 8px; padding: 10px; }
+  .overview { gap: 7px; padding: 8px 10px; }
+  .control-section { gap: 8px; }
+  .pose-strip { padding: 6px 4px; }
+  .lens-stack { gap: 6px; }
+  .lens-card { padding: 6px 9px; }
+  .ptz-status-bar { padding: 6px 10px; }
+  .feedback { gap: 8px; }
+  .feedback-body { max-height: 190px; }
+  .stage { min-height: 520px; }
 }
 </style>
