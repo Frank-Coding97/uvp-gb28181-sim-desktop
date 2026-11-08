@@ -89,8 +89,12 @@ assert.match(pageStyles, /min-height:\s*0;/, "滚动容器需允许被父级 fle
 assert.match(pageStyles, /padding-bottom:\s*16px;/, "卡片底部需留出呼吸空间");
 
 // ── 共用页头显隐 ─────────────────────────────────────────────────────────
-// 回归背景：媒体页内容顶部已有「模拟器有效配置」小节标题与「参数摘要」，
-// 共用页头（主标题 / 副标题 / 平台摘要 / 锁定徽标）在该页重复且挤占首屏，仅此页隐藏。
+// 回归背景：媒体页与设备配置页内容顶部都已有「模拟器有效配置」小节标题，
+// 共用页头（主标题 / 副标题 / 平台摘要 / 锁定徽标）重复且挤占首屏，两页一并隐藏。
 const headerTag = source.match(/<div[^>]*class="settings-header"[^>]*>/)?.[0] ?? "";
-assert.match(headerTag, /v-if="activeKey !== 'media'"/, "音视频配置页应隐藏共用页头");
-assert.match(source, /class="lock-badge"/, "其他设置页的锁定状态徽标不得一并删除");
+assert.match(
+  headerTag,
+  /v-if="activeKey !== 'media' && activeKey !== 'device'"/,
+  "媒体页与设备配置页应隐藏共用页头，其余设置页保留",
+);
+assert.match(source, /class="lock-badge"/, "其余设置页的锁定状态徽标不得一并删除");

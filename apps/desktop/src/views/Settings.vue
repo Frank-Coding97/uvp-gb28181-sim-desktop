@@ -508,7 +508,7 @@ function setBindMode(mode: BindMode) {
 
 <template>
   <div class="settings-page">
-    <div v-if="activeKey !== 'media'" class="settings-header">
+    <div v-if="activeKey !== 'media' && activeKey !== 'device'" class="settings-header">
       <div>
         <div class="page-title">{{ activeSetting.title }}</div>
         <div class="page-sub">{{ activeSetting.description }}</div>
