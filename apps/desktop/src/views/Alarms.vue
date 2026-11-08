@@ -193,16 +193,6 @@ onActivated(() => { void load(); });
 
 <template>
   <div class="page page-wrap">
-    <div class="page-header">
-      <div>
-        <div class="page-title">报警管理</div>
-        <div class="page-sub">按报警单上报事件（Alarm Notify）；已订阅 Event:Alarm 时走订阅对话，否则发独立 MESSAGE</div>
-      </div>
-      <div class="status-pill" :class="{ live: deviceState !== 'Disconnected' }">
-        <i />{{ deviceState === "Disconnected" ? "设备未启动" : `设备 ${deviceState}` }}
-      </div>
-    </div>
-
     <div class="layout">
       <section class="glass-card panel">
         <div class="panel-title">报警单</div>
@@ -308,9 +298,6 @@ onActivated(() => { void load(); });
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.status-pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 13px; border: 1px solid var(--border-default); border-radius: 999px; color: var(--text-secondary); background: rgba(255,255,255,.58); font-size: 12px; }
-.status-pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--text-tertiary); }
-.status-pill.live i { background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 14%, transparent); }
 .layout { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px; align-items: start; }
 .panel { padding: 18px; }
 .panel-title { color: var(--text-primary); font-size: 15px; font-weight: 700; }
