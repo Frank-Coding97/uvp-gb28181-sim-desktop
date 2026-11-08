@@ -14,7 +14,7 @@ test("目录管理提供搜索移动状态和 JSON 导入导出", () => {
   assert.match(view, /切换状态/);
   assert.match(view, /导入 JSON/);
   assert.match(view, /导出 JSON/);
-  assert.match(view, /最近平台查询/);
+  assert.doesNotMatch(view, /最近平台查询/, "平台查询状态不再占用目录管理页顶部横条");
 });
 
 test("目录通过 Rust 真相源持久化并校验", () => {

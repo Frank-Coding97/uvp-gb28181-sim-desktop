@@ -202,13 +202,13 @@ test("JSON 导入拒绝非法输入", () => {
 test("Channels.vue 承载移动端对齐后的关键能力", async () => {
   const view = await readFile(new URL("../Channels.vue", import.meta.url), "utf8");
   for (const keyword of [
-    "目录搜索", "移动节点", "切换状态", "导入 JSON", "导出 JSON", "最近平台查询",
+    "目录搜索", "移动节点", "切换状态", "导入 JSON", "导出 JSON",
     "当前通道名称", "克隆节点", "预览 NOTIFY", "复位到默认", "未保存", "批量新增",
     "保存*", "放弃修改", "标准业务分组", "解析预览",
   ]) {
     assert.ok(view.includes(keyword), `目录管理应包含「${keyword}」`);
   }
-  assert.match(view, /<div class="page-title">目录管理<\/div>/);
+  assert.doesNotMatch(view, /page-header|最近平台查询/, "目录管理页不再展示顶部标题横条与平台查询卡片");
 });
 
 test("草稿—保存模型：落盘点唯一、离开有保护、XML 预览命令已注册", async () => {

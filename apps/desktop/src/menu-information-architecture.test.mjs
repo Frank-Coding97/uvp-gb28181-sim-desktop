@@ -52,7 +52,7 @@ assert.match(settings, /参数摘要/, "音视频配置页应先展示当前参�
 assert.match(settings, /v-else-if="activeKey === 'about'"/, "配置未加载时不得误显示关于页面");
 assert.match(settings, /配置正在加载/, "配置未加载时必须显示明确的等待状态");
 
-assert.match(channels, /<div class="page-title">目录管理<\/div>/, "通道页面应统一命名为目录管理");
+assert.doesNotMatch(channels, /<div class="page-title">目录管理<\/div>/, "目录管理页顶部标题横条已移除");
 assert.match(channels, /当前通道名称/, "目录管理应承载当前通道配置");
 assert.match(system, /<div class="page-title">日志<\/div>/, "日志页面标题应与菜单一致");
 assert.match(system, /SIP 日志/, "日志页必须承载 SIP 信令日志");

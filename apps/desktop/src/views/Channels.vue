@@ -5,7 +5,7 @@
 // 只有点「保存*」才通过 Rust replace_catalog_tree 落盘 + 应用运行态 + 推增量 NOTIFY。
 // 数据模型仍为桌面端固定 7 字段（Rust CatalogNode），协议层零改动；
 // 与移动端 JSON 的字段/复合父差异由 catalog/catalog-model.ts 的适配层处理。
-import { computed, h, onActivated, onMounted, onUnmounted, ref, watch, type VNode } from "vue";
+import { computed, h, onMounted, ref, watch, type VNode } from "vue";
 import { onBeforeRouteLeave, useRouter } from "vue-router";
 import {
   NAlert, NButton, NDataTable, NDropdown, NForm, NFormItem, NInput, NModal,
@@ -13,7 +13,6 @@ import {
   type DataTableColumns, type DropdownOption,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useDevice } from "../device";
 import { previewCatalogXml, usePlatform, type CatalogNodeConfig } from "../platform";
 import {
@@ -25,12 +24,6 @@ import {
 } from "./catalog/catalog-model";
 
 type ChannelNode = CatalogNodeConfig;
-interface CatalogActivity {
-  target_id: string;
-  result_count: number;
-  packet_count: number;
-  updated_at_ms: number;
-}
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const message = useMessage();
@@ -44,14 +37,12 @@ const baseline = ref<ChannelNode[]>([]);
 /** 当前编辑中的草稿；所有 UI 操作只改它。 */
 const draft = ref<ChannelNode[]>([]);
 const savedAt = ref<number | null>(null);
-const activity = ref<CatalogActivity | null>(null);
 const busy = ref(false);
 const searchText = ref("");
 const showOnboarding = ref(true);
 const channelNameDraft = ref("");
 const forceLeave = ref(false);
 const pendingPath = ref<string | null>(null);
-let unlistenCommand: UnlistenFn | null = null;
 
 /** 固定键顺序比较，避免因对象属性插入顺序不同造成「假脏」。 */
 function stableTree(nodes: ChannelNode[]): string {
@@ -92,18 +83,6 @@ const setDraft = (nodes: ChannelNode[]) => { draft.value = nodes; };
 
 // ── 加载 / 保存 ──────────────────────────────────────────────────────────
 
-async function refreshActivity() {
-  if (!isTauri || !deviceLive.value) {
-    activity.value = null;
-    return;
-  }
-  try { activity.value = await invoke<CatalogActivity | null>("get_catalog_activity"); }
-  catch { activity.value = null; }
-}
-const activityTime = computed(() => activity.value
-  ? new Date(activity.value.updated_at_ms).toLocaleString("zh-CN", { hour12: false })
-  : "—");
-
 async function loadTree() {
   if (!isTauri) {
     const nodes = config.value?.catalog_tree ?? [];
@@ -115,7 +94,6 @@ async function loadTree() {
     const nodes = await invoke<ChannelNode[]>("get_catalog_tree");
     baseline.value = cloneTree(nodes);
     draft.value = cloneTree(nodes);
-    await refreshActivity();
   } catch (cause) {
     message.error(String(cause));
   }
@@ -538,29 +516,11 @@ watch(config, (value) => {
 
 onMounted(async () => {
   await loadTree();
-  if (!isTauri) return;
-  unlistenCommand = await listen<{ kind: string; summary: string }>("platform_command", (event) => {
-    if (event.payload.kind === "query" && event.payload.summary.includes("目录")) void refreshActivity();
-  });
 });
-onActivated(() => { void refreshActivity(); });
-onUnmounted(() => unlistenCommand?.());
 </script>
 
 <template>
   <div class="page page-wrap">
-    <div class="page-header">
-      <div>
-        <div class="page-title">目录管理</div>
-        <div class="page-sub">目录树以 Rust 持久化为真相；本页改动先进入草稿，点「保存*」才落盘并通知已订阅平台</div>
-      </div>
-      <div class="activity-card">
-        <span>最近平台查询</span>
-        <b>{{ activity ? `${activity.result_count} 条 / ${activity.packet_count} 包` : '暂无' }}</b>
-        <small>{{ activity ? `${activity.target_id} · ${activityTime}` : '注册后等待 Catalog Query' }}</small>
-      </div>
-    </div>
-
     <n-alert v-if="showOnboarding" type="info" closable class="onboarding" @close="showOnboarding = false">
       <template #header>目录管理使用提示</template>
       • 编辑、克隆、移动、模板与导入都只改草稿，点「保存*」才生效；离开页面会提示未保存的修改<br />
@@ -770,10 +730,6 @@ onUnmounted(() => unlistenCommand?.());
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.activity-card { min-width: 310px; padding: 11px 14px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.35); }
-.activity-card span, .activity-card small { display: block; color: var(--text-tertiary); font-size: 11px; }
-.activity-card b { display: block; margin: 3px 0; color: var(--text-primary); font-size: 14px; }
-.activity-card small { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .onboarding { margin-bottom: 14px; line-height: 1.8; }
 .channel-config { display: grid; grid-template-columns: minmax(180px,.8fr) minmax(180px,1fr) minmax(250px,1.25fr) auto; align-items: end; gap: 14px; margin-bottom: 16px; padding: 18px 20px; }
 .channel-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 12px; }
@@ -803,5 +759,5 @@ onUnmounted(() => unlistenCommand?.());
 :deep(.n-data-table .n-data-table-th) { border-bottom: 1px solid rgba(120,130,150,.12) !important; color: var(--text-secondary); background-color: rgba(120,130,150,.06) !important; font-weight: 600; }
 :deep(.n-data-table .n-data-table-td) { border-bottom: 1px solid rgba(120,130,150,.08) !important; }
 :deep(.n-data-table .n-data-table-tr:hover .n-data-table-td) { background-color: rgba(56,132,255,.05) !important; }
-@media (max-width: 1100px) { .page-header { flex-direction: column; }.activity-card { width: 100%; }.channel-config { grid-template-columns: repeat(2,minmax(0,1fr)); }.toolbar { flex-wrap: wrap; }.search { order: 3; width: 100%; flex-basis: 100%; } }
+@media (max-width: 1100px) { .channel-config { grid-template-columns: repeat(2,minmax(0,1fr)); }.toolbar { flex-wrap: wrap; }.search { order: 3; width: 100%; flex-basis: 100%; } }
 </style>
