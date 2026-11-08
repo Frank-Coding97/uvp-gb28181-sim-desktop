@@ -165,6 +165,7 @@ const presets = [
   { label: "100台", count: 100,  ramp: 20,  media: "A" },
   { label: "500台", count: 500,  ramp: 50,  media: "B" },
   { label: "1000台", count: 1000, ramp: 100, media: "B" },
+  { label: "10000台", count: 10000, ramp: 200, media: "B" },
 ] as const;
 function applyPreset(p: (typeof presets)[number]) {
   form.value.count = p.count;
@@ -921,13 +922,14 @@ onUnmounted(() => {
 }
 .config-summary b { color: var(--text-primary); font-weight: 700; }
 
-/* 快速预设 */
-.preset-row { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
-.preset-label { font-size: 11px; color: var(--text-tertiary); flex: 0 0 100%; margin-bottom: 1px; }
+/* 快速预设：5 档等宽排列，列宽收窄时也不换行 */
+.preset-row { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-bottom: 12px; }
+.preset-label { grid-column: 1 / -1; font-size: 11px; color: var(--text-tertiary); margin-bottom: 1px; }
 .preset-btn {
-  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border-default);
+  padding: 3px 0; border-radius: 999px; border: 1px solid var(--border-default);
   background: rgba(255,255,255,.5); color: var(--text-secondary);
-  font-size: 12px; font-weight: 600; cursor: pointer;
+  font-size: 11.5px; font-weight: 600; text-align: center; white-space: nowrap;
+  cursor: pointer;
   transition: all .15s;
 }
 .preset-btn:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: #fff; }
@@ -1048,6 +1050,8 @@ onUnmounted(() => {
 /* 响应式 */
 @media (max-width: 1220px) {
   .workspace { grid-template-columns: 280px minmax(0,1fr); }
+  /* 列宽 280px 时 5 档一行放不下「10000台」，改 3 列两行 */
+  .preset-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .metric-row { grid-template-columns: 110px repeat(3,1fr); }
 }
 @media (max-width: 980px) {
