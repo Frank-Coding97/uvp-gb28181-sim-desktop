@@ -315,10 +315,11 @@ const selectedScreen = ref<number | null>(null);
 const selectedAudio = ref<string>(liveSourceAudio(form.value.video_source));
 const isMacHost = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
 
+// 顺序即界面顺序：内置演示视频默认启用，所以「视频文件」放第一位。
 const mediaModes = [
+  { value: "file", label: "视频文件", icon: DocumentOutline },
   { value: "camera", label: "摄像头", icon: CameraOutline },
   { value: "screen", label: "屏幕", icon: DesktopOutline },
-  { value: "file", label: "视频文件", icon: DocumentOutline },
 ] as const;
 const signalingTransportOptions = [
   { label: "UDP", value: "UDP" },
@@ -1045,12 +1046,13 @@ onUnmounted(() => {
         </div>
 
         <div class="source-bar">
-          <div class="source-modes" aria-label="媒体来源">
+          <div class="source-modes" role="group" aria-label="媒体来源">
             <button
               v-for="item in mediaModes"
               :key="item.value"
               type="button"
               :class="{ active: mediaMode === item.value }"
+              :aria-pressed="mediaMode === item.value"
               :disabled="deviceLive"
               @click="setMediaMode(item.value)"
             >
@@ -1062,7 +1064,7 @@ onUnmounted(() => {
             <n-select
               v-if="mediaMode === 'camera'"
               v-model:value="selectedCamera"
-              size="small"
+              size="large"
               :options="cameraOptions"
               :loading="sourceLoading"
               :disabled="deviceLive"
@@ -1072,21 +1074,23 @@ onUnmounted(() => {
             <n-select
               v-else-if="mediaMode === 'screen'"
               v-model:value="selectedScreen"
-              size="small"
+              size="large"
               :options="screenOptions"
               :loading="sourceLoading"
               :disabled="deviceLive"
               placeholder="选择屏幕"
               @update:value="syncLiveSource"
             />
-            <button v-else-if="mediaMode === 'file'" type="button" class="file-source" :disabled="deviceLive" @click="pickVideoFile">
-              {{ sourceSummary }}
+            <button v-else-if="mediaMode === 'file'" type="button" class="file-source" :disabled="deviceLive" title="点击更换视频文件" @click="pickVideoFile">
+              <n-icon :component="DocumentOutline" class="file-source-icon" />
+              <span class="file-source-name">{{ sourceSummary }}</span>
+              <span v-if="!deviceLive" class="file-source-action">更换</span>
             </button>
           </div>
           <div v-if="mediaMode === 'camera' || mediaMode === 'screen'" class="source-picker audio-picker" :title="audioPickerHint">
             <n-select
               v-model:value="selectedAudio"
-              size="small"
+              size="large"
               :options="audioOptions"
               :loading="sourceLoading"
               :disabled="deviceLive || audioOptions.length <= 1"
@@ -1095,10 +1099,10 @@ onUnmounted(() => {
               @update:value="syncLiveSource"
             />
           </div>
-          <n-button quaternary circle size="small" :loading="sourceLoading" :disabled="deviceLive" title="刷新采集设备" @click="refreshSources()">
+          <n-button class="source-icon-button" tertiary circle size="large" :loading="sourceLoading" :disabled="deviceLive" title="刷新采集设备" @click="refreshSources()">
             <template #icon><n-icon><RefreshOutline /></n-icon></template>
           </n-button>
-          <n-button size="small" secondary :disabled="deviceLive || !form.video_source.startsWith('live:')" @click="probeSource">测试采集</n-button>
+          <n-button v-if="mediaMode === 'camera' || mediaMode === 'screen'" class="source-probe-button" size="large" secondary :disabled="deviceLive || !form.video_source.startsWith('live:')" @click="probeSource">测试采集</n-button>
         </div>
         <div v-if="mediaPreparation.phase !== 'idle'" class="media-preparation" :class="mediaPreparation.phase">
           <span v-if="mediaPreparation.phase === 'preparing'" class="preparation-spinner" aria-hidden="true" />
@@ -1613,13 +1617,32 @@ onUnmounted(() => {
   .preview-watching i { animation: none; }
 }
 
-.source-bar { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto auto; align-items: center; gap: 7px; min-width: 0; }
-.source-modes { display: inline-flex; gap: 3px; padding: 3px; border-radius: 6px; background: var(--bg-hover); }
-.source-modes button { height: 27px; display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; border: 0; border-radius: 4px; color: var(--text-tertiary); background: transparent; cursor: pointer; font-size: 10.5px; }
-.source-modes button.active { color: var(--accent); background: #fff; box-shadow: 0 1px 4px rgba(31, 55, 88, .1); }
-.source-modes button:disabled { cursor: not-allowed; opacity: .55; }
-.source-picker { min-width: 0; }
-.file-source { width: 100%; height: 30px; overflow: hidden; padding: 0 9px; border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-secondary); background: #fff; cursor: pointer; font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+/* 采集来源条：模式切换、来源选择、操作按钮统一按 40–42px 放大，避免这里比页面其他控件小一号。
+   宽度不够时整条换行，而不是把下拉框压成一条竖线。 */
+.source-bar { display: flex; align-items: center; gap: 10px; row-gap: 9px; min-width: 0; flex-wrap: wrap; }
+/* 分段控件：半透明底 + 内嵌白色高亮片，用细描边勾出边界 */
+.source-modes { flex: 0 0 auto; display: inline-flex; gap: 3px; padding: 4px; border: 1px solid var(--border-default); border-radius: 13px; background: rgba(255, 255, 255, .45); box-shadow: inset 0 1px 2px rgba(16, 46, 98, .05); }
+.source-modes button { height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 82px; padding: 0 12px; border: 0; border-radius: 9px; color: var(--text-secondary); background: transparent; cursor: pointer; font-family: inherit; font-size: 12.5px; font-weight: 500; line-height: 1; white-space: nowrap; transition: color var(--transition), background var(--transition), box-shadow var(--transition), transform var(--transition); }
+.source-modes button :deep(.n-icon) { font-size: 16px; }
+.source-modes button:hover:not(:disabled):not(.active) { color: var(--text-primary); background: rgba(56, 132, 255, .09); }
+.source-modes button.active { color: var(--accent-deep); background: #fff; font-weight: 600; box-shadow: 0 2px 8px rgba(16, 46, 98, .13), 0 0 0 1px rgba(56, 132, 255, .16); }
+.source-modes button:active:not(:disabled) { transform: scale(.97); }
+.source-modes button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.source-modes button:disabled { cursor: not-allowed; opacity: .5; }
+.source-picker { flex: 1 1 150px; min-width: 140px; }
+.source-picker.audio-picker { flex: 0 1 140px; min-width: 120px; }
+/* 视频文件行：图标 + 文件名 +「更换」提示，整块可点 */
+.file-source { width: 100%; height: 42px; display: flex; align-items: center; gap: 9px; overflow: hidden; padding: 0 13px; border: 1px solid var(--border-default); border-radius: 12px; color: var(--text-secondary); background: #fff; cursor: pointer; font-family: inherit; font-size: 12.5px; text-align: left; transition: border-color var(--transition), box-shadow var(--transition), color var(--transition); }
+.file-source:hover:not(:disabled) { border-color: var(--border-accent); color: var(--text-primary); box-shadow: 0 0 0 3px var(--accent-dim); }
+.file-source:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.file-source:disabled { cursor: not-allowed; color: var(--text-tertiary); background: rgba(248, 250, 253, .9); }
+.file-source-icon { flex: 0 0 auto; font-size: 17px; color: var(--accent); }
+.file-source:disabled .file-source-icon { color: var(--text-tertiary); }
+.file-source-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-source-action { flex: 0 0 auto; padding: 3px 9px; border-radius: 7px; color: var(--accent); background: var(--accent-dim); font-size: 11.5px; font-weight: 600; transition: background var(--transition); }
+.file-source:hover:not(:disabled) .file-source-action { background: rgba(56, 132, 255, .16); }
+.source-icon-button { flex: 0 0 auto; margin-left: auto; color: var(--text-secondary); }
+.source-probe-button { flex: 0 0 auto; font-weight: 600; }
 .source-feedback { overflow: hidden; color: var(--text-secondary); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .media-preparation { display: flex; align-items: center; gap: 7px; min-width: 0; min-height: 25px; padding: 4px 8px; border-radius: 6px; background: var(--accent-dim); color: var(--text-secondary); font-size: 10.5px; }
 .source-hint { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 25px; padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb, var(--warning) 12%, transparent); color: var(--warning); font-size: 10.5px; }
@@ -1740,7 +1763,10 @@ onUnmounted(() => {
   .home-workspace { grid-template-columns: minmax(0, 1fr) 330px; }
   .state-strip { grid-template-columns: 1fr 1.45fr 1fr 1fr; }
   .state-item:last-child { display: none; }
-  .source-modes button { padding-inline: 6px; }
+  .source-modes button { padding-inline: 10px; gap: 5px; font-size: 12px; }
+  .source-modes button :deep(.n-icon) { display: none; }
+  /* 窄面板下文件名比「更换」标签更重要，先让标签让位。 */
+  .file-source-action { display: none; }
 }
 @media (max-height: 680px) {
   .home-page { grid-template-rows: 54px minmax(0, 1fr); gap: 7px; }
