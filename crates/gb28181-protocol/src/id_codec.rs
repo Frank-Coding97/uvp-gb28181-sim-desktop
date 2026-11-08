@@ -428,14 +428,13 @@ pub fn catalog_template(
                 v.push(CatalogNode::new(
                     vid(i),
                     CatalogNodeType::VideoChannel,
-                    format!("通道-{i:02}"),
+                    format!("Uvp-Camera-{i}"),
                     &o,
                 ));
             }
             v
         }
-        "civil-3x2" => {
-            let mut v = vec![root()];
+        "civil-3x2" => {            let mut v = vec![root()];
             let g = group(1);
             v.push(CatalogNode::new(
                 &g,
@@ -451,12 +450,12 @@ pub fn catalog_template(
                     CatalogNode::new(&o, CatalogNodeType::VirtualOrg, format!("{area}区"), &g)
                         .with_civil_code(*civil),
                 );
-                for k in 1..=2 {
+                for _ in 1..=2 {
                     v.push(
                         CatalogNode::new(
                             vid(ch_seq),
                             CatalogNodeType::VideoChannel,
-                            format!("{area}-{k}号"),
+                            format!("Uvp-Camera-{ch_seq}"),
                             &o,
                         )
                         .with_civil_code(*civil),
@@ -497,20 +496,20 @@ pub fn catalog_template(
                 &outdoor,
             ));
             let mut ch_seq = 1u32;
-            for i in 1..=8 {
+            for _ in 1..=8 {
                 v.push(CatalogNode::new(
                     vid(ch_seq),
                     CatalogNodeType::VideoChannel,
-                    format!("室内-{i:02}"),
+                    format!("Uvp-Camera-{ch_seq}"),
                     &indoor_org,
                 ));
                 ch_seq += 1;
             }
-            for i in 1..=8 {
+            for _ in 1..=8 {
                 v.push(CatalogNode::new(
                     vid(ch_seq),
                     CatalogNodeType::VideoChannel,
-                    format!("室外-{i:02}"),
+                    format!("Uvp-Camera-{ch_seq}"),
                     &outdoor_org,
                 ));
                 ch_seq += 1;
@@ -553,15 +552,15 @@ pub fn catalog_template(
                 "教学楼一层",
                 &teaching,
             ));
-            for (seq, name, parent_id) in [
-                (1, "教学楼-入口", teaching.as_str()),
-                (2, "宿舍楼-大厅", dormitory.as_str()),
-                (3, "教学楼-一层走廊", classroom.as_str()),
+            for (seq, parent_id) in [
+                (1, teaching.as_str()),
+                (2, dormitory.as_str()),
+                (3, classroom.as_str()),
             ] {
                 v.push(CatalogNode::new(
                     vid(seq),
                     CatalogNodeType::VideoChannel,
-                    name,
+                    format!("Uvp-Camera-{seq}"),
                     parent_id,
                 ));
             }
@@ -570,12 +569,7 @@ pub fn catalog_template(
         // "single" 及未知:默认单设备 + 1 视频 + 1 报警。
         _ => vec![
             root(),
-            CatalogNode::new(
-                vid(1),
-                CatalogNodeType::VideoChannel,
-                format!("{device_name}-通道1"),
-                device_id,
-            ),
+            CatalogNode::new(vid(1), CatalogNodeType::VideoChannel, "Uvp-Camera-1", device_id),
             CatalogNode::new(
                 alarm(1),
                 CatalogNodeType::AlarmChannel,

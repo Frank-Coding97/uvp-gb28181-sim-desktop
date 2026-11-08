@@ -11,7 +11,12 @@
 // - 移动端用 "/" 表达的复合 ParentID 在桌面端不可表达，导入时取末段；
 // - 保存校验以 Rust validate_catalog_tree 为准，前端做同口径预检；
 // - 移动端的父子类型白名单用于「新增/移动」候选过滤，不作为保存硬约束，
-//   以保留桌面端既有的 nvr-8ch / large-16ch 等模板（通道挂 215 分组）。
+//   以保留桌面端既有的 nvr-8ch / large-16ch 等模板（通道挂 215 分组）；
+// - 例外：桌面端默认目录根是 设备(111)，若沿用移动端「设备 → 仅通道」的白名单，
+//   用户必须先应用「标准业务分组」模板才能建 215/216，入口过深。移动端数据层
+//   （CatalogTreeStore.isAllowedParent）本就允许 215 挂 Device/System、216 挂
+//   Device/System/215/216，Rust validate_catalog_tree 也不校验父子类型，
+//   因此设备根下放开 215/216，与 canMove 的候选口径保持一致。
 
 import type { CatalogNodeConfig } from "../../platform";
 
@@ -80,6 +85,33 @@ export function genChildId(domain: string, nodeType: CatalogNodeType, seq: numbe
 
 // ── 模板 ────────────────────────────────────────────────────────────────
 
+/** 视频通道默认名前缀：Uvp-Camera-序号。 */
+export const CHANNEL_NAME_PREFIX = "Uvp-Camera";
+
+/** 解析 `Uvp-Camera-N` 形式的序号；不是该前缀返回 null。 */
+function channelSeqOf(name: string, prefix: string): number | null {
+  const trimmed = name.trim();
+  const head = `${prefix}-`;
+  if (!trimmed.startsWith(head)) return null;
+  const tail = trimmed.slice(head.length);
+  return /^\d+$/.test(tail) ? Number(tail) : null;
+}
+
+/** 下一个可用通道序号：树内同前缀 `Uvp-Camera-N` 的最大 N + 1。 */
+export function nextChannelSeq(tree: CatalogNode[], prefix = CHANNEL_NAME_PREFIX): number {
+  let max = 0;
+  for (const node of tree) {
+    const seq = channelSeqOf(node.name, prefix);
+    if (seq !== null) max = Math.max(max, seq);
+  }
+  return max + 1;
+}
+
+/** 新增视频通道的默认名，如 Uvp-Camera-3。 */
+export function defaultChannelName(tree: CatalogNode[], prefix = CHANNEL_NAME_PREFIX): string {
+  return `${prefix}-${nextChannelSeq(tree, prefix)}`;
+}
+
 export interface TemplateContext {
   deviceId: string;
   deviceName: string;
@@ -108,7 +140,7 @@ function singleTemplate(ctx: TemplateContext): CatalogNode[] {
   const root = ctx.deviceId;
   return [
     makeNode(root, "Device", ctx.deviceName, root),
-    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", `${ctx.channelName || ctx.deviceName}-通道1`, root),
+    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", ctx.channelName || `${CHANNEL_NAME_PREFIX}-1`, root),
     makeNode(templateSeq(ctx, "AlarmChannel", 1), "AlarmChannel", `${ctx.deviceName}-报警`, root),
   ];
 }
@@ -116,12 +148,14 @@ function singleTemplate(ctx: TemplateContext): CatalogNode[] {
 function nvr8Template(ctx: TemplateContext): CatalogNode[] {
   const root = ctx.deviceId;
   const group = templateSeq(ctx, "BusinessGroup", 1);
+  const org = templateSeq(ctx, "VirtualOrg", 1);
   const nodes: CatalogNode[] = [
     makeNode(root, "Device", ctx.deviceName, root),
     makeNode(group, "BusinessGroup", "NVR-8", root),
+    makeNode(org, "VirtualOrg", "默认虚拟目录", group, { business_group_id: group }),
   ];
   for (let i = 1; i <= 8; i += 1) {
-    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", i), "VideoChannel", `通道-${String(i).padStart(2, "0")}`, group));
+    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", i), "VideoChannel", `${CHANNEL_NAME_PREFIX}-${i}`, org));
   }
   return nodes;
 }
@@ -138,7 +172,7 @@ function civil3x2Template(ctx: TemplateContext): CatalogNode[] {
       nodes.push(makeNode(
         templateSeq(ctx, "VideoChannel", channelSeq),
         "VideoChannel",
-        `${area}-${k}号`,
+        `${CHANNEL_NAME_PREFIX}-${channelSeq}`,
         org,
         { civil_code: civil },
       ));
@@ -152,18 +186,22 @@ function large16Template(ctx: TemplateContext): CatalogNode[] {
   const root = ctx.deviceId;
   const indoor = templateSeq(ctx, "BusinessGroup", 1);
   const outdoor = templateSeq(ctx, "BusinessGroup", 2);
+  const indoorOrg = templateSeq(ctx, "VirtualOrg", 1);
+  const outdoorOrg = templateSeq(ctx, "VirtualOrg", 2);
   const nodes: CatalogNode[] = [
     makeNode(root, "Device", ctx.deviceName, root),
     makeNode(indoor, "BusinessGroup", "室内监控", root),
     makeNode(outdoor, "BusinessGroup", "室外监控", root),
+    makeNode(indoorOrg, "VirtualOrg", "室内虚拟目录", indoor, { business_group_id: indoor }),
+    makeNode(outdoorOrg, "VirtualOrg", "室外虚拟目录", outdoor, { business_group_id: outdoor }),
   ];
   let channelSeq = 1;
   for (let i = 1; i <= 8; i += 1) {
-    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `室内-${String(i).padStart(2, "0")}`, indoor));
+    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `${CHANNEL_NAME_PREFIX}-${channelSeq}`, indoorOrg));
     channelSeq += 1;
   }
   for (let i = 1; i <= 8; i += 1) {
-    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `室外-${String(i).padStart(2, "0")}`, outdoor));
+    nodes.push(makeNode(templateSeq(ctx, "VideoChannel", channelSeq), "VideoChannel", `${CHANNEL_NAME_PREFIX}-${channelSeq}`, outdoorOrg));
     channelSeq += 1;
   }
   nodes.push(makeNode(templateSeq(ctx, "AlarmChannel", 1), "AlarmChannel", "总报警", root));
@@ -191,8 +229,8 @@ function standardBusinessGroupTemplate(ctx: TemplateContext): CatalogNode[] {
     makeNode(groupId, "BusinessGroup", "校园安防", systemId, { civil_code: civilCode }),
     makeNode(firstOrg, "VirtualOrg", "出入口", groupId, { business_group_id: groupId }),
     makeNode(nestedOrg, "VirtualOrg", "教学区域", firstOrg, { business_group_id: groupId }),
-    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", ctx.channelName || `${ctx.deviceName}-通道1`, firstOrg),
-    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", `${ctx.channelName || ctx.deviceName}-通道2`, nestedOrg),
+    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", ctx.channelName || `${CHANNEL_NAME_PREFIX}-1`, firstOrg),
+    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", `${CHANNEL_NAME_PREFIX}-2`, nestedOrg),
   ];
 }
 
@@ -215,9 +253,9 @@ function businessPlatformTemplate(ctx: TemplateContext): CatalogNode[] {
     makeNode(teaching, "VirtualOrg", "教学楼", group, orgAttrs),
     makeNode(dormitory, "VirtualOrg", "宿舍楼", group, orgAttrs),
     makeNode(classroom, "VirtualOrg", "教学楼一层", teaching, orgAttrs),
-    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", "教学楼-入口", teaching),
-    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", "宿舍楼-大厅", dormitory),
-    makeNode(templateSeq(ctx, "VideoChannel", 3), "VideoChannel", "教学楼-一层走廊", classroom),
+    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", `${CHANNEL_NAME_PREFIX}-1`, teaching),
+    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", `${CHANNEL_NAME_PREFIX}-2`, dormitory),
+    makeNode(templateSeq(ctx, "VideoChannel", 3), "VideoChannel", `${CHANNEL_NAME_PREFIX}-3`, classroom),
   ];
 }
 
@@ -323,15 +361,25 @@ export function canMove(node: CatalogNode, targetId: string, tree: CatalogNode[]
   }
 }
 
-/** 对齐移动端 AddChildDialog：按父节点类型限制可新增的子类型。 */
+/**
+ * 新增子节点可选类型。
+ *
+ * 与移动端 AddChildDialog 的差异只有一处：设备(111) 根下额外放开 215/216，
+ * 让「业务分组 / 虚拟组织」不必先套标准业务分组模板就能建（见文件头说明）。
+ * 通道排在前面，保持「新增节点」默认选中视频通道的既有习惯。
+ */
 export function allowedChildTypes(parent: CatalogNode | null): CatalogNodeType[] {
   switch (parent?.node_type) {
     case "System":
+      // 216 不直接挂 200：移动端保存校验在存在 System 根时要求 216 的父必须是 216，
+      // 直接挂 200 的树导回移动端会被判非法，因此保持「先建 215 再挂 216」。
       return ["BusinessGroup", "VideoChannel", "AlarmChannel"];
     case "BusinessGroup":
       return ["VirtualOrg"];
     case "VirtualOrg":
       return ["VirtualOrg", "VideoChannel", "AlarmChannel"];
+    case "Device":
+      return ["VideoChannel", "AlarmChannel", "BusinessGroup", "VirtualOrg"];
     default:
       return ["VideoChannel", "AlarmChannel"];
   }

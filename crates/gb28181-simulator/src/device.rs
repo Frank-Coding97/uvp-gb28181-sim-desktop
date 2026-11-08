@@ -6160,7 +6160,7 @@ y=0100000099\r\n";
         // 查询设备编码返回设备本身及其后代:根 + 业务分组 + 虚拟组织 + 8 视频通道。
         assert_eq!(xml.matches("<Item>").count(), 11);
         assert!(xml.contains("<Name>NVR-8</Name>"));
-        assert!(xml.contains("<Name>通道-01</Name>"));
+        assert!(xml.contains("<Name>Uvp-Camera-1</Name>"));
         assert!(xml.contains("<Parental>1</Parental>")); // 业务分组
         assert!(xml.contains("<Parental>0</Parental>")); // 视频通道
 

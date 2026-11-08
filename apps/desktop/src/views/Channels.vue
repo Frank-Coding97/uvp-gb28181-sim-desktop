@@ -8,18 +8,18 @@
 import { computed, h, onMounted, ref, watch, type VNode } from "vue";
 import { onBeforeRouteLeave, useRouter } from "vue-router";
 import {
-  NAlert, NButton, NDataTable, NDropdown, NForm, NFormItem, NInput, NModal,
+  NAlert, NButton, NDataTable, NForm, NFormItem, NInput, NModal,
   NSelect, NSpace, NTag, useDialog, useMessage,
-  type DataTableColumns, type DropdownOption,
+  type DataTableColumns,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { useDevice } from "../device";
 import { previewCatalogXml, usePlatform, type CatalogNodeConfig } from "../platform";
 import {
-  TYPE_LABELS, allowedChildTypes, attachCatalogNode, availableTemplates,
+  CHANNEL_NAME_PREFIX, TYPE_LABELS, allowedChildTypes, attachCatalogNode, availableTemplates,
   buildTreeRows, canMove, collectDescendants, countByType, decodeCatalogJson,
-  displayParent, encodeCatalogJson, filterTreeByQuery, humanizedAgo, isLeaf, isRoot,
-  makeNode, moveCatalogNode, nextSeqId, validateDraft,
+  defaultChannelName, displayParent, encodeCatalogJson, filterTreeByQuery, humanizedAgo,
+  isLeaf, isRoot, makeNode, moveCatalogNode, nextChannelSeq, nextSeqId, validateDraft,
   type CatalogTemplateDef, type DecodeResult, type JsonFlavor, type TreeRow,
 } from "./catalog/catalog-model";
 
@@ -66,7 +66,7 @@ const templateContext = computed(() => {
   return {
     deviceId,
     deviceName: config.value?.device.device_name || "演示设备",
-    channelName: channelNameDraft.value || config.value?.device.channel_name || "通道1",
+    channelName: channelNameDraft.value || config.value?.device.channel_name || `${CHANNEL_NAME_PREFIX}-1`,
     domain: active.value?.server_domain || deviceId.slice(0, 10) || "3402000000",
     gbVersion: (active.value?.gb_version ?? "V2022") as "V2016" | "V2022",
   };
@@ -172,9 +172,26 @@ function openAdd(parent: ChannelNode | null = null) {
   addParentId.value = target?.id ?? null;
   const options = allowedChildTypes(target);
   addType.value = options[0] ?? "VideoChannel";
-  addName.value = "新节点";
+  addNameTouched.value = false;
+  addName.value = defaultAddName(addType.value);
   addCountText.value = "1";
   showAdd.value = true;
+}
+
+/** 新增对话框的默认名：视频通道走 Uvp-Camera-序号，其它类型沿用「新节点」。 */
+function defaultAddName(type: ChannelNode["node_type"]): string {
+  return type === "VideoChannel" ? defaultChannelName(draft.value) : "新节点";
+}
+
+/** 切换类型时，若用户还没手动改过名称，就跟着换默认名，避免业务分组叫成 Uvp-Camera-3。 */
+function onAddTypeChange(value: string) {
+  addType.value = value as ChannelNode["node_type"];
+  if (!addNameTouched.value) addName.value = defaultAddName(addType.value);
+}
+
+function onAddNameInput(value: string) {
+  addName.value = String(value ?? "");
+  addNameTouched.value = true;
 }
 
 function confirmAdd() {
@@ -184,6 +201,15 @@ function confirmAdd() {
     : 1;
   const ids = new Set(draft.value.map((node) => node.id));
   const created: ChannelNode[] = [];
+  // 视频通道统一 `Uvp-Camera-序号`：沿用输入里的序号往后递增，没写序号就接着树里最大值。
+  let videoPrefix = "";
+  let videoSeqStart = 0;
+  if (addType.value === "VideoChannel") {
+    const typed = addName.value.trim();
+    const matched = /^(.*?)-(\d+)$/.exec(typed);
+    videoPrefix = matched?.[1] || typed || CHANNEL_NAME_PREFIX;
+    videoSeqStart = matched ? Number(matched[2]) : nextChannelSeq(draft.value, videoPrefix);
+  }
   for (let i = 0; i < count; i += 1) {
     let id = nextSeqId(domain.value, [...draft.value, ...created], addType.value);
     while (ids.has(id)) {
@@ -191,9 +217,11 @@ function confirmAdd() {
       id = `${id.slice(0, 13)}${String(tail).padStart(7, "0")}`;
     }
     ids.add(id);
-    const name = count > 1
-      ? `${addName.value.trim() || TYPE_LABELS[addType.value]}-${String(i + 1).padStart(3, "0")}`
-      : (addName.value.trim() || TYPE_LABELS[addType.value]);
+    const name = addType.value === "VideoChannel"
+      ? `${videoPrefix}-${videoSeqStart + i}`
+      : count > 1
+        ? `${addName.value.trim() || TYPE_LABELS[addType.value]}-${String(i + 1).padStart(3, "0")}`
+        : (addName.value.trim() || TYPE_LABELS[addType.value]);
     let node = makeNode(id, addType.value, name, parent?.id ?? id);
     if (parent) node = attachCatalogNode(node, parent);
     created.push(node);
@@ -286,6 +314,7 @@ const showAdd = ref(false);
 const addParentId = ref<string | null>(null);
 const addType = ref<ChannelNode["node_type"]>("VideoChannel");
 const addName = ref("新节点");
+const addNameTouched = ref(false);
 const addCountText = ref("1");
 const showMove = ref(false);
 const movingId = ref<string | null>(null);
@@ -322,22 +351,6 @@ const templateCards = computed(() => availableTemplates(gbVersion.value).map((tp
   id: tpl.id, title: tpl.title, description: tpl.description, origin: tpl.origin,
   nodeCount: tpl.build(templateContext.value).length, def: tpl,
 })));
-const moreOptions: DropdownOption[] = [
-  { label: "应用模板", key: "template" },
-  { label: "导入 JSON", key: "import" },
-  { label: "导出 JSON", key: "export" },
-  { label: "复位到默认", key: "reset" },
-];
-
-function onMoreSelect(key: string | number) {
-  switch (String(key)) {
-    case "template": showTemplate.value = true; break;
-    case "import": openImport(); break;
-    case "export": openExport(); break;
-    case "reset": showResetConfirm.value = true; break;
-    default: break;
-  }
-}
 
 function openExport() {
   jsonMode.value = "export";
@@ -473,6 +486,20 @@ const ACTION_PALETTE = {
   toggle: "#e89320", // --warning
 } as const;
 
+/**
+ * 工具栏配色：与表格内操作按钮同一套语义，读写/导入导出/破坏性动作各自有色。
+ * 保存仍用实心主色（唯一落盘动作，需要最强视觉权重）；复位是破坏性动作取危险色。
+ */
+const TOOLBAR_PALETTE = {
+  refresh: "#5b6b82",     // 中性灰蓝：只读刷新
+  add: "#08b388",         // --success：新增
+  template: "#7a6cff",    // --violet：套模板
+  importJson: "#00b9d6",  // --cyan：数据入
+  exportJson: "#3884ff",  // --accent：数据出
+  preview: "#e89320",     // --warning：预览报文
+  reset: "#e5484d",       // --danger：复位默认
+} as const;
+
 /** secondary 走淡彩底 + 彩色文字，浅色玻璃主题下比实心色块更易读。 */
 function coloredButton(label: string, color: string, onClick: () => void, disabled = false): VNode {
   return h(NButton, {
@@ -483,7 +510,8 @@ function coloredButton(label: string, color: string, onClick: () => void, disabl
 function actionButtons(row: ChannelNode): VNode[] {
   const buttons: Array<VNode | null> = [
     coloredButton("编辑字段", ACTION_PALETTE.edit, () => openEdit(row)),
-    !isLeaf(row) && !isRoot(row)
+    // 根节点也要能加子节点：业务分组/虚拟组织就是挂在根下面的容器。
+    !isLeaf(row)
       ? coloredButton("新增子节点", ACTION_PALETTE.add, () => openAdd(row))
       : null,
     !isRoot(row)
@@ -537,7 +565,8 @@ onMounted(async () => {
     <n-alert v-if="showOnboarding" type="info" closable class="onboarding" @close="showOnboarding = false">
       <template #header>目录管理使用提示</template>
       • 编辑、克隆、移动、模板与导入都只改草稿，点「保存*」才生效；离开页面会提示未保存的修改<br />
-      • 标准业务分组场景：系统 → 分组 → 虚拟组织 → 通道；仅 GB/T 28181-2022 可用<br />
+      • 业务分组(215)、虚拟组织(216) 可直接在设备根下新增；虚拟组织可多级嵌套，通道挂在虚拟组织或根下<br />
+      • 需要 GB/T 28181-2022 附录 J 的「系统 → 分组 → 组织」结构时，用工具栏「应用模板」<br />
       • 移动端与桌面端 JSON 可互导；扩展字段与复合 ParentID 会在导入时给出提示
     </n-alert>
 
@@ -559,13 +588,14 @@ onMounted(async () => {
 
     <div class="glass-card panel">
       <div class="toolbar">
-        <n-input v-model:value="searchText" clearable class="search" placeholder="目录搜索：名称、ID、区划码、分组、类型" />
-        <n-button @click="reloadTree">刷新</n-button>
-        <n-button type="info" @click="openAdd()">新增节点</n-button>
-        <n-button @click="openXmlPreview">预览 NOTIFY</n-button>
-        <n-dropdown trigger="click" :options="moreOptions" @select="onMoreSelect">
-          <n-button>更多 ···</n-button>
-        </n-dropdown>
+        <n-input v-model:value="searchText" clearable class="search" placeholder="搜索名称 / ID / 区划码" />
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.refresh" @click="reloadTree">刷新</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.add" @click="openAdd()">新增节点</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.template" @click="showTemplate = true">应用模板</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.importJson" @click="openImport">导入 JSON</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.exportJson" @click="openExport">导出 JSON</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.preview" @click="openXmlPreview">预览 NOTIFY</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.reset" @click="showResetConfirm = true">复位默认</n-button>
         <n-button type="primary" :loading="busy" :disabled="!isDirty" @click="saveDraft">
           {{ isDirty ? "保存*" : "保存" }}
         </n-button>
@@ -580,7 +610,7 @@ onMounted(async () => {
         :columns="columns" :data="treeRows" :bordered="false" size="small"
         :scroll-x="1500" :row-key="(row: TreeRow) => row.id" default-expand-all
       />
-      <div v-if="draft.length === 0" class="empty">目录为空，请在「更多」中应用模板或导入 JSON</div>
+      <div v-if="draft.length === 0" class="empty">目录为空，请点工具栏「应用模板」或「导入 JSON」</div>
     </div>
 
     <!-- 节点字段编辑（对齐移动端 NodeEditorSheet：ID/类型只读，父关系走移动对话框） -->
@@ -627,14 +657,20 @@ onMounted(async () => {
         </n-form-item>
         <n-form-item label="类型">
           <n-select :value="addType" :options="addTypeOptions"
-            @update:value="(v: string) => addType = v as ChannelNode['node_type']" />
+            @update:value="(v: string) => onAddTypeChange(v)" />
         </n-form-item>
-        <n-form-item label="名称"><n-input v-model:value="addName" /></n-form-item>
+        <n-form-item label="名称">
+          <n-input :value="addName" @update:value="(v: string) => onAddNameInput(v)" />
+        </n-form-item>
         <n-form-item v-if="addBatch" label="数量（1-50）">
           <n-input :value="addCountText"
             @update:value="(v: string) => addCountText = String(v ?? '').replace(/\D/g, '').slice(0, 2)" />
         </n-form-item>
-        <div class="hint">批量新增（1-50）按 name-001 顺序命名；国标 ID 由域编码 + 类型码 + 下一个可用序号自动生成。</div>
+        <div class="hint">
+          层级：设备(111)/系统(200) → 业务分组(215) → 虚拟组织(216) → 通道(132/134)。业务分组按业务归口，
+          虚拟组织可多级嵌套；容器类型下继续点「新增子节点」往下挂。
+        </div>
+        <div class="hint">批量新增（1-50）按名称序号递增（如 Uvp-Camera-1、Uvp-Camera-2）；国标 ID 由域编码 + 类型码 + 下一个可用序号自动生成。</div>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -750,8 +786,8 @@ onMounted(async () => {
 .section-title { color: var(--text-primary); font-size: 16px; font-weight: 600; }
 .section-hint { margin-top: 4px; color: var(--text-tertiary); font-size: 12px; }
 .panel { padding: 20px; }
-.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.search { min-width: 280px; flex: 1; }
+.toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.search { width: 220px; flex: 0 0 220px; }
 .summary { margin: 12px 0 10px; color: var(--text-tertiary); font-size: 12px; }
 .dirty { color: #d97706; font-weight: 600; }
 .clean { color: #16a34a; }

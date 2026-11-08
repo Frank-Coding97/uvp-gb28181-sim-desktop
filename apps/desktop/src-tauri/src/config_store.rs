@@ -614,7 +614,7 @@ impl Default for DesktopConfigV2 {
                 model: "Desktop-Sim".into(),
                 firmware: "0.1.2".into(),
                 hardware_version: String::new(),
-                channel_name: "Camera-1".into(),
+                channel_name: "Uvp-Camera-1".into(),
                 location: "lobby".into(),
                 camera_type: "ptz_dome".into(),
                 register_expires_secs: 3_600,

@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   ALL_TYPES,
   CATALOG_TEMPLATES,
+  CHANNEL_NAME_PREFIX,
   TYPE_CODES,
   allowedChildTypes,
   attachCatalogNode,
@@ -13,6 +14,7 @@ import {
   collectDescendants,
   countByType,
   decodeCatalogJson,
+  defaultChannelName,
   displayParent,
   encodeCatalogJson,
   filterTreeByQuery,
@@ -20,6 +22,7 @@ import {
   isRoot,
   makeNode,
   moveCatalogNode,
+  nextChannelSeq,
   nextSeqId,
   validateDraft,
 } from "./catalog-model.ts";
@@ -58,8 +61,8 @@ test("6 个模板全部能通过保存预检，且节点 ID 无重复", () => {
     assert.equal(new Set(nodes.map((n) => n.id)).size, nodes.length, `${tpl.id} 不应有重复 ID`);
   }
   assert.equal(byId(CATALOG_TEMPLATES, "single").build(CTX).length, 3);
-  assert.equal(byId(CATALOG_TEMPLATES, "nvr-8ch").build(CTX).length, 10);
-  assert.equal(byId(CATALOG_TEMPLATES, "large-16ch").build(CTX).length, 20);
+  assert.equal(byId(CATALOG_TEMPLATES, "nvr-8ch").build(CTX).length, 11);
+  assert.equal(byId(CATALOG_TEMPLATES, "large-16ch").build(CTX).length, 22);
   const standard = byId(CATALOG_TEMPLATES, "standard-business-group").build(CTX);
   assert.equal(standard[0].node_type, "System");
   assert.equal(standard[0].id.slice(10, 13), "200");
@@ -73,7 +76,8 @@ test("business-platform 模板与 Rust catalog_template 同构：215 → 216(含
   const root = tree[0];
   const group = tree.find((n) => n.node_type === "BusinessGroup");
   const [teaching, dormitory, classroom] = ["教学楼", "宿舍楼", "教学楼一层"].map((name) => tree.find((n) => n.name === name));
-  const [entry, hall, corridor] = ["教学楼-入口", "宿舍楼-大厅", "教学楼-一层走廊"].map((name) => tree.find((n) => n.name === name));
+  const channels = tree.filter((n) => n.node_type === "VideoChannel");
+  const [entry, hall, corridor] = channels;
 
   assert.equal(root.node_type, "Device");
   assert.equal(isRoot(root), true);
@@ -93,14 +97,57 @@ test("business-platform 模板与 Rust catalog_template 同构：215 → 216(含
   assert.equal(entry.parent_id, teaching.id);
   assert.equal(hall.parent_id, dormitory.id);
   assert.equal(corridor.parent_id, classroom.id);
+  assert.deepEqual(channels.map((n) => n.name), ["Uvp-Camera-1", "Uvp-Camera-2", "Uvp-Camera-3"], "通道名遵循统一命名契约");
   assert.deepEqual(collectDescendants(group.id, tree).size, 6, "分组下共 6 个后代节点");
 });
 
-test("新增子节点类型按父节点限制，与移动端 AddChildDialog 一致", () => {
+test("视频通道默认名统一为 Uvp-Camera-序号", () => {
+  const unnamed = { ...CTX, channelName: "" };
+  for (const tpl of CATALOG_TEMPLATES) {
+    const channels = tpl.build(unnamed).filter((node) => node.node_type === "VideoChannel");
+    assert.ok(channels.length > 0, `${tpl.id} 应至少有一个视频通道`);
+    assert.deepEqual(
+      channels.map((node) => node.name),
+      channels.map((_, index) => `${CHANNEL_NAME_PREFIX}-${index + 1}`),
+      `${tpl.id} 的通道名应为 Uvp-Camera-1..N，序号连续`,
+    );
+  }
+  // 单设备与标准模板的首个通道沿用设备配置里的通道名，未配置时才回退默认名。
+  assert.equal(byId(CATALOG_TEMPLATES, "single").build(CTX)[1].name, CTX.channelName);
+  assert.equal(byId(CATALOG_TEMPLATES, "single").build(unnamed)[1].name, "Uvp-Camera-1");
+
+  assert.equal(CHANNEL_NAME_PREFIX, "Uvp-Camera");
+  assert.equal(nextChannelSeq([]), 1);
+  assert.equal(defaultChannelName([]), "Uvp-Camera-1");
+  const used = [makeNode("a", "VideoChannel", "Uvp-Camera-7", "r"), makeNode("b", "VideoChannel", "大门", "r")];
+  assert.equal(nextChannelSeq(used), 8, "只统计同前缀的序号，手工命名不参与");
+  assert.equal(defaultChannelName(used), "Uvp-Camera-8");
+});
+
+test("新增子节点类型按父节点限制，设备根下放开 215/216", () => {
   assert.deepEqual(allowedChildTypes(makeNode("r", "System", "系统", "r")), ["BusinessGroup", "VideoChannel", "AlarmChannel"]);
   assert.deepEqual(allowedChildTypes(makeNode("g", "BusinessGroup", "分组", "r")), ["VirtualOrg"]);
   assert.deepEqual(allowedChildTypes(makeNode("o", "VirtualOrg", "组织", "g")), ["VirtualOrg", "VideoChannel", "AlarmChannel"]);
+  assert.deepEqual(
+    allowedChildTypes(makeNode("d", "Device", "设备", "d")),
+    ["VideoChannel", "AlarmChannel", "BusinessGroup", "VirtualOrg"],
+    "设备根可直接建业务分组与虚拟组织，无需先套标准业务分组模板",
+  );
   assert.deepEqual(allowedChildTypes(null), ["VideoChannel", "AlarmChannel"]);
+});
+
+test("设备根下新增的 215/216 能通过草稿校验并保持父关系", () => {
+  const [root, ch1, alarm] = byId(CATALOG_TEMPLATES, "single").build(CTX);
+  const group = attachCatalogNode(makeNode(genChildId(CTX.domain, "BusinessGroup", 1), "BusinessGroup", "门禁", root.id), root);
+  const org = attachCatalogNode(makeNode(genChildId(CTX.domain, "VirtualOrg", 1), "VirtualOrg", "A 栋", root.id), root);
+  const nested = attachCatalogNode(makeNode(genChildId(CTX.domain, "VirtualOrg", 2), "VirtualOrg", "A 栋 1F", org.id), org);
+  const tree = [root, ch1, alarm, group, org, nested];
+  assert.equal(group.business_group_id, null, "215 挂设备根时不带 BusinessGroupID");
+  assert.equal(org.business_group_id, null, "216 挂设备根且无 215 时 BusinessGroupID 为空");
+  assert.deepEqual(validateDraft(tree), [], "设备根下的 215/216 结构应通过校验");
+  assert.equal(displayParent(org, tree), root.id);
+  assert.equal(displayParent(nested, tree), org.id);
+  assert.ok(collectDescendants(org.id, tree).has(nested.id));
 });
 
 test("canMove：根不可动、叶子不可作父、不可移入自身子树、按类型限制目标", () => {
@@ -232,12 +279,14 @@ test("JSON 导入拒绝非法输入", () => {
 test("Channels.vue 承载移动端对齐后的关键能力", async () => {
   const view = await readFile(new URL("../Channels.vue", import.meta.url), "utf8");
   for (const keyword of [
-    "目录搜索", "移动节点", "切换状态", "导入 JSON", "导出 JSON",
-    "当前通道名称", "克隆节点", "预览 NOTIFY", "复位到默认", "未保存", "批量新增",
+    "搜索名称", "移动节点", "切换状态", "导入 JSON", "导出 JSON",
+    "当前通道名称", "克隆节点", "预览 NOTIFY", "复位默认", "未保存", "批量新增",
     "保存*", "放弃修改", "标准业务分组", "解析预览",
   ]) {
     assert.ok(view.includes(keyword), `目录管理应包含「${keyword}」`);
   }
+  // 工具栏四项操作平铺，不再收进「更多」下拉。
+  assert.doesNotMatch(view, /n-dropdown|更多 ···/, "应用模板/导入/导出/复位应直接可见");
   assert.doesNotMatch(view, /page-header|最近平台查询/, "目录管理页不再展示顶部标题横条与平台查询卡片");
 });
 
