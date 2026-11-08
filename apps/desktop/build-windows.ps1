@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$FfmpegBin = $env:FFMPEG_BIN,
   [string]$FfprobeBin = $env:FFPROBE_BIN
 )
@@ -41,6 +41,21 @@ $CapabilityReport = Join-Path $DesktopDir "..\..\target\release\preview-ffmpeg-c
 Copy-Item -Force -LiteralPath $FfmpegBin -Destination $StagedFfmpeg
 Copy-Item -Force -LiteralPath $FfprobeBin -Destination $StagedFfprobe
 
+# shared 构建的 ffmpeg 依赖同目录 DLL（avcodec-60.dll / avformat-60.dll 等）。
+# 只拷两个 exe 的话，用户机上 ffmpeg 会因缺 DLL 直接起不来——而包内自检只会报
+# "ffmpeg 未就绪"，看不出是缺文件。静态构建（gpl-static）没有 DLL，这段自然空转。
+$StagedDlls = @()
+$DllSource = Split-Path -Parent $FfmpegBin
+$SiblingDlls = @(Get-ChildItem -LiteralPath $DllSource -Filter "*.dll" -File -ErrorAction SilentlyContinue)
+foreach ($dll in $SiblingDlls) {
+  $dest = Join-Path $RuntimeDir $dll.Name
+  Copy-Item -Force -LiteralPath $dll.FullName -Destination $dest
+  $StagedDlls += $dest
+}
+if ($StagedDlls.Count -gt 0) {
+  Write-Host "检测到 shared 构建的 FFmpeg，已随包内嵌 $($StagedDlls.Count) 个依赖 DLL。"
+}
+
 $version = (& $StagedFfmpeg -version 2>$null | Select-Object -First 1)
 $probeVersion = (& $StagedFfprobe -version 2>$null | Select-Object -First 1)
 if ([string]::IsNullOrWhiteSpace($probeVersion)) {
@@ -68,6 +83,12 @@ try {
 finally {
   Pop-Location
   Remove-Item -Force -ErrorAction SilentlyContinue $StagedFfmpeg, $StagedFfprobe
+  if ($StagedDlls.Count -gt 0) {
+    Remove-Item -Force -ErrorAction SilentlyContinue $StagedDlls
+  }
 }
 
-Write-Host "Windows 安装包已生成；ffmpeg.exe 与 ffprobe.exe 已作为应用资源内嵌（resources\runtime\ffmpeg\）。"
+# 收尾提示：把「有没有带 DLL」说清楚，免得下一轮误判包内 ffmpeg 是完整的。
+$dllNote = ""
+if ($StagedDlls.Count -gt 0) { $dllNote = "，另含 $($StagedDlls.Count) 个依赖 DLL" }
+Write-Host "Windows 安装包已生成；ffmpeg.exe 与 ffprobe.exe 已作为应用资源内嵌（resources\runtime\ffmpeg\${dllNote}）。"
