@@ -929,6 +929,23 @@ fn ensure_audio_encoder(ffmpeg: &str, codec: LiveAudioCodec) -> Result<()> {
     }
 }
 
+/// 摄像头采集是否需要在编码前把画面水平翻正。
+///
+/// 笔记本内置摄像头在 DirectShow 上普遍输出自拍镜像画面（自己举右手，画面里
+/// 看起来是左手），直接推给平台会让平台侧看到的左右方向和现场相反 —— 对模拟
+/// 真实 GB28181 摄像机来说是错的。因此默认翻正；外接摄像机本身方向已正常时，
+/// 可用 `UVP_CAMERA_MIRROR=0` 关闭。
+#[cfg(windows)]
+fn camera_mirror_enabled() -> bool {
+    let Ok(value) = std::env::var("UVP_CAMERA_MIRROR") else {
+        return true;
+    };
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn enumerate_avfoundation(ffmpeg: &str) -> Result<(Vec<LiveAvDevice>, Vec<LiveAvDevice>)> {
     let output = common::hidden_command(ffmpeg)
@@ -1992,6 +2009,13 @@ impl LiveSource {
         let mut camera_args =
             camera_command_args_for_profile(video_index, audio_index, &profile, input_mode);
         #[cfg(windows)]
+        let mirror = camera_mirror_enabled();
+        #[cfg(windows)]
+        tracing::info!(
+            mirror,
+            "摄像头采集是否做水平翻转修正(UVP_CAMERA_MIRROR=0 可关闭)"
+        );
+        #[cfg(windows)]
         let mut camera_args = windows_capture::command_args(
             // Logitech C925e's PnP moniker can fail DirectShow pin
             // negotiation while the friendly name succeeds in Windows Camera.
@@ -2007,6 +2031,7 @@ impl LiveSource {
             (input_mode.width, input_mode.height),
             &input_mode.input_args,
             osd_burn_in.as_ref(),
+            mirror,
         );
         let stop_flag = Arc::new(AtomicBool::new(false));
         let mut timing_video_stats_reader: Option<Box<dyn Read + Send>> = None;

@@ -11,6 +11,9 @@ pub(super) fn command_args(
     mode_args: &[String],
     // 需要烧进码流的 OSD；None 时滤镜与原来完全一致。
     osd: Option<&crate::osd::OsdBurnIn>,
+    // 采集端是否做一次水平翻转。笔记本内置摄像头在 DirectShow 上普遍输出
+    // 自拍镜像画面，直接推给平台会让左右方向与实际相反；这里统一翻正。
+    mirror: bool,
 ) -> Vec<String> {
     // Use the Windows capture graph clock. Redirected cameras can report a
     // device clock that lags the microphone clock; keep actual capture timing
@@ -45,11 +48,16 @@ pub(super) fn command_args(
     // 摄像头不支持配置的输出分辨率时(如 720p 摄像头配 1080p 档位),
     // 先按比例缩放再用黑边补齐,而不是把 720p 原始帧直接推给平台:
     // 平台的 SDP/目录里声明的是 profile 尺寸,实际帧也必须一致。
-    let base = if input_size != (profile.width, profile.height) {
-        scale_pad_filter(profile.width, profile.height)
-    } else {
-        String::new()
-    };
+    //
+    // 翻转必须排在 OSD 之前:drawtext 画在这种已经翻正的画面上,字幕才不会是反字。
+    let mut chain: Vec<String> = Vec::new();
+    if mirror {
+        chain.push("hflip".to_string());
+    }
+    if input_size != (profile.width, profile.height) {
+        chain.push(scale_pad_filter(profile.width, profile.height));
+    }
+    let base = chain.join(",");
     // OSD 必须画在缩放之后，坐标才对应输出分辨率。
     let filter = match osd {
         Some(osd) => osd.graph(&base, profile.width, profile.height),
@@ -130,6 +138,7 @@ mod tests {
             (1920, 1080),
             &mode,
             None,
+            false,
         );
         for pair in [
             ["-f", "dshow"],
@@ -163,6 +172,7 @@ mod tests {
             (1920, 1080),
             &[],
             None,
+            false,
         );
         assert!(args
             .windows(2)
@@ -181,7 +191,7 @@ mod tests {
     fn 选中硬件编码器时替换编码参数且输出尾部不变() {
         let mut nvenc = profile(LiveVideoCodec::H264);
         nvenc.encoder = crate::encoder::EncoderBackend::Nvenc;
-        let args = command_args("camera", None, &nvenc, (1920, 1080), &[], None);
+        let args = command_args("camera", None, &nvenc, (1920, 1080), &[], None, false);
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
         assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "nv12"]));
         assert!(args
@@ -213,6 +223,7 @@ mod tests {
             (1280, 720),
             &mode,
             None,
+            false,
         );
         let filter = args
             .windows(2)
@@ -254,6 +265,7 @@ mod tests {
             (1280, 720),
             &[],
             Some(&osd),
+            false,
         );
         let filter = args
             .windows(2)
@@ -270,7 +282,55 @@ mod tests {
             (1920, 1080),
             &[],
             Some(&osd),
+            false,
         );
         assert!(same.windows(2).any(|pair| pair[0] == "-vf" && pair[1].starts_with("null,drawtext")));
+    }
+
+    #[test]
+    fn 摄像头默认水平翻转且翻转排在缩放与osd之前() {
+        // 只在尺寸一致且无 OSD 时，翻转是唯一滤镜，不会顺手引入缩放。
+        let plain = command_args("camera", None, &profile(LiveVideoCodec::H264), (1920, 1080), &[], None, true);
+        assert!(
+            plain.windows(2).any(|pair| pair == ["-vf", "hflip"]),
+            "{plain:?}"
+        );
+
+        // 需要缩放时必须先翻转再缩放，避免滤镜顺序漂移。
+        let scaled = command_args("camera", None, &profile(LiveVideoCodec::H264), (1280, 720), &[], None, true);
+        let chain = scaled
+            .windows(2)
+            .find(|pair| pair[0] == "-vf")
+            .map(|pair| pair[1].as_str())
+            .expect("mirror needs a filter");
+        assert!(chain.starts_with("hflip,scale=1920:1080"), "{chain}");
+        assert!(chain.find("hflip").unwrap() < chain.find("scale=").unwrap(), "{chain}");
+
+        // 翻转必须在 drawtext 之前，否则烧进画面的时间水印会变成反字。
+        use crate::osd::*;
+        let osd = OsdBurnIn {
+            overlay: OsdOverlay {
+                base_width: 1920,
+                base_height: 1080,
+                time: Some(OsdTime {
+                    anchor: OsdAnchor::Pixel { x: 10, y: 10 },
+                    format: OsdTimeFormat::Dash,
+                    style: OsdLayer::default(),
+                }),
+                texts: vec![],
+                watermark: None,
+                mask_base: (1920, 1080),
+                masks: vec![],
+            },
+            font: "C:/f.ttc".into(),
+        };
+        let with_osd = command_args("camera", None, &profile(LiveVideoCodec::H264), (1920, 1080), &[], Some(&osd), true);
+        let chain = with_osd
+            .windows(2)
+            .find(|pair| pair[0] == "-vf")
+            .map(|pair| pair[1].as_str())
+            .expect("mirror + osd needs a filter");
+        assert!(chain.starts_with("hflip,"), "{chain}");
+        assert!(chain.find("hflip").unwrap() < chain.find("drawtext").unwrap(), "{chain}");
     }
 }
