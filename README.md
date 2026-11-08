@@ -172,12 +172,14 @@
 
 <a href="docs/screenshots/catalog.png"><img src="docs/screenshots/catalog.png" alt="目录管理：国标目录树、通道类型与父节点、模板套用与导入导出" width="100%"/></a>
 
-> 截图取自开发环境，平台 IP、设备编号与端口已替换为示例值，注册密码保持隐藏。点击图片可查看原图。
+<a href="docs/screenshots/recordings.png"><img src="docs/screenshots/recordings.png" alt="录像中心：录像状态、已完成录像列表与本地回放入口" width="100%"/></a>
+
+> 截图取自开发环境，平台 IP、设备编号、端口与本机路径已替换为示例值，注册密码保持隐藏。点击图片可查看原图。
 
 <!--
 其余页面截图待补：图片统一放 docs/screenshots/，命名用小写英文 + 连字符，宽屏图压到
-1600px 宽 / 500KB 以内；敏感字段（IP、20 位设备编号、口令）需先脱敏。
-待补命名：stress-test / device-settings / recordings / sip-trace。
+1600px 宽 / 500KB 以内；敏感字段（IP、20 位设备编号、口令、本机绝对路径）需先脱敏。
+待补命名：stress-test / device-settings / sip-trace。
 素材到位后按两列网格排布，每张用 <a href="原图"><img src="..." width="100%"/></a> 包一层以便点开看原图。
 -->
 
