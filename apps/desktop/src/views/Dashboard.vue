@@ -22,6 +22,7 @@ import {
   TrashOutline,
   VideocamOutline,
   VolumeHighOutline,
+  VolumeMuteOutline,
   WarningOutline,
 } from "@vicons/ionicons5";
 import { persistForm, useDevice } from "../device";
@@ -136,6 +137,19 @@ const {
   unlock: unlockBroadcastAudio,
   start: startBroadcastAudio,
 } = useBroadcastAudio();
+
+/** 对讲会话的技术细节：胶囊上只留「对讲中」三个字，通道/传输/端口/包数收进 title 与读屏文案。 */
+const broadcastDetail = computed(() => {
+  const snapshot = broadcastState.value;
+  return [
+    `通道 ${snapshot.channel_id?.slice(-6) || "----"}`,
+    snapshot.transport,
+    `本地端口 ${snapshot.local_port ?? "—"}`,
+    `${broadcastPackets.value} 包`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+});
 
 const editing = ref(false);
 const saving = ref(false);
@@ -1007,6 +1021,21 @@ onUnmounted(() => {
               <i aria-hidden="true" />
               <span aria-hidden="true">LIVE</span>
             </div>
+            <!-- 对讲中标识与 LIVE 并排:两者都是"这一路流此刻在做什么"的状态胶囊,
+                 统一放在面板头部比原先塞进右侧配置面板更易扫读;技术细节收进 title。 -->
+            <div v-if="broadcastState.active" class="preview-talking" :class="{ muted: broadcastMuted }" :title="broadcastDetail">
+              <button
+                type="button"
+                class="talking-mute"
+                :aria-pressed="broadcastMuted"
+                :aria-label="broadcastMuted ? '恢复对讲声音' : '静音对讲声音'"
+                :title="broadcastMuted ? '恢复对讲声音' : '静音对讲声音'"
+                @click="broadcastMuted = !broadcastMuted"
+              >
+                <n-icon aria-hidden="true"><VolumeMuteOutline v-if="broadcastMuted" /><VolumeHighOutline v-else /></n-icon>
+              </button>
+              <span class="talking-text" role="status" aria-label="设备正在对讲">对讲中</span>
+            </div>
             <div class="preview-status" :class="previewEnabled ? previewState : 'off'"><i />{{ previewStateText }}</div>
             <n-button v-if="previewEnabled" size="small" type="error" secondary @click="disablePreview">关闭预览</n-button>
           </div>
@@ -1320,22 +1349,6 @@ onUnmounted(() => {
           </n-button>
         </div>
 
-        <div v-if="broadcastState.active" class="broadcast-indicator" role="status">
-          <n-icon class="broadcast-icon"><VolumeHighOutline /></n-icon>
-          <div class="broadcast-text">
-            <strong>对讲中</strong>
-            <span>
-              通道 {{ broadcastState.channel_id?.slice(-6) || "----" }}
-              · {{ broadcastState.transport }}
-              · 本地 {{ broadcastState.local_port }}
-              · {{ broadcastPackets }} 包
-            </span>
-          </div>
-          <n-button size="tiny" secondary @click="broadcastMuted = !broadcastMuted">
-            {{ broadcastMuted ? "恢复声音" : "静音" }}
-          </n-button>
-        </div>
-
         <div class="quick-actions" aria-label="快捷业务">
           <button type="button" class="quick-card action" :class="{ active: recordingPhase === 'recording' }" title="打开录像中心" @click="router.push('/recordings')">
             <n-icon><VideocamOutline /></n-icon>
@@ -1540,7 +1553,8 @@ onUnmounted(() => {
 .panel-kicker { display: block; color: var(--accent); font-size: 9px; font-weight: 750; }
 .panel-head h2 { margin: 1px 0 0; color: var(--text-primary); font-size: 16px; font-weight: 720; }
 .preview-status { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 11px; }
-.preview-head-actions { display: inline-flex; align-items: center; gap: 8px; }
+/* LIVE / 对讲中两个胶囊 + 采集状态 + 「关闭预览」按钮同排,窄宽度时整组换行而不是把状态文字压扁。 */
+.preview-head-actions { display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; row-gap: 6px; min-width: 0; }
 .preview-status.off i { background: var(--text-secondary); opacity: .5; }
 .preview-enable { position: relative; margin-top: 4px; }
 .preview-status.playing i { background: var(--success); }
@@ -1696,20 +1710,44 @@ onUnmounted(() => {
 .host-port-cell { display: grid; gap: 5px; min-width: 0; }
 .host-port-cell > span { color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
 .primary-actions { display: grid; grid-template-columns: minmax(0, 1fr); margin-top: 10px; }
-.broadcast-indicator {
-  display: flex;
+/* 对讲中标识:与 LIVE 同款的胶囊,紧邻其后排布。
+   横向尺寸压到与 LIVE 一致(22px 高、10px 字),静音按钮缩成 18px 圆形图标,
+   通道/传输/端口/包数这些长文案改为 title,避免把预览面板头部撑成两行。 */
+.preview-talking {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 7px;
-  padding: 6px 9px;
-  border: 1px solid color-mix(in srgb, var(--accent-primary, #2f7cf6) 45%, transparent);
-  border-radius: 8px;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px 0 3px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary, #2f7cf6) 34%, transparent);
+  border-radius: 999px;
+  color: var(--accent-primary, #2f7cf6);
   background: color-mix(in srgb, var(--accent-primary, #2f7cf6) 10%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  line-height: 1.2;
+  white-space: nowrap;
 }
-.broadcast-icon { flex: 0 0 auto; color: var(--accent-primary, #2f7cf6); }
-.broadcast-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.broadcast-text strong { font-size: 12px; }
-.broadcast-text span { font-size: 11px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-talking.muted { border-color: var(--border-default); color: var(--text-secondary); background: rgba(248, 250, 253, .9); }
+.talking-mute {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background var(--transition);
+}
+.talking-mute:hover { background: color-mix(in srgb, currentColor 16%, transparent); }
+.talking-mute:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; }
+.talking-text { padding-right: 1px; }
 .quick-actions { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; margin-top: 7px; }
 .quick-card {
   position: relative;

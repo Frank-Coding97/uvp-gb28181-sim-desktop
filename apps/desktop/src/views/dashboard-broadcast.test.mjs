@@ -43,3 +43,22 @@ assert.match(source, /broadcastState\.active/, "应在首页显示对讲中状�
 assert.match(audio, /listen<BroadcastAudioPayload>\("broadcast_audio"/, "composable 应监听设备侧 PCM 事件");
 assert.match(audio, /createBufferSource|createBuffer\(/, "composable 应用 Web Audio 播放 PCM");
 assert.match(toggleRegistration ?? "", /unlockBroadcastAudio\(\)/, "注册点击应解锁 Web Audio 自动播放");
+
+// 对讲中标识的位置：必须与 LIVE 并排在预览面板头部，而不是留在右侧配置面板里单独占一行。
+const headActions = source.match(/<div class="preview-head-actions">([\s\S]*?)<div class="preview-slot">/)?.[1];
+assert.ok(headActions, "应存在预览面板头部操作区");
+assert.match(
+  headActions,
+  /class="preview-watching"[\s\S]*class="preview-talking"/,
+  "对讲中标识应紧跟在 LIVE 之后，同一行显示",
+);
+assert.match(headActions, /v-if="broadcastState\.active"/, "对讲中标识仍应绑定对讲会话状态");
+assert.match(headActions, /:title="broadcastDetail"/, "通道/传输/端口/包数应收进 title，不占胶囊正文");
+assert.match(
+  headActions,
+  /class="talking-mute"[\s\S]*aria-pressed="broadcastMuted"[\s\S]*broadcastMuted = !broadcastMuted/,
+  "静音开关应保留在胶囊内",
+);
+assert.ok(!/class="broadcast-indicator"/.test(source), "对讲中标识不应再留在右侧配置面板");
+assert.match(source, /\.preview-talking \{[^}]*height: 22px;/, "对讲中胶囊应与 LIVE 同高");
+assert.match(source, /\.preview-head-actions \{[^}]*flex-wrap: wrap;/, "头部操作区应允许整组换行，避免挤压状态文字");
