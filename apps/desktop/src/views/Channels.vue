@@ -464,21 +464,34 @@ const summary = computed(() => `共 ${draft.value.length} 节点 · 视频 ${cou
   + ` · 报警 ${countByType(draft.value, "AlarmChannel")} · 分组 ${countByType(draft.value, "BusinessGroup")}`
   + ` · 虚拟组织 ${countByType(draft.value, "VirtualOrg")}`);
 
+/** 操作按钮配色：取主题设计令牌，按动作语义区分，避免一排按钮全是灰色。 */
+const ACTION_PALETTE = {
+  edit: "#3884ff",   // --accent
+  add: "#08b388",    // --success
+  clone: "#7a6cff",  // --violet
+  move: "#00b9d6",   // --cyan
+  toggle: "#e89320", // --warning
+} as const;
+
+/** secondary 走淡彩底 + 彩色文字，浅色玻璃主题下比实心色块更易读。 */
+function coloredButton(label: string, color: string, onClick: () => void, disabled = false): VNode {
+  return h(NButton, {
+    size: "tiny", type: "primary", secondary: true, color, disabled, onClick,
+  }, { default: () => label });
+}
+
 function actionButtons(row: ChannelNode): VNode[] {
   const buttons: Array<VNode | null> = [
-    h(NButton, { size: "tiny", onClick: () => openEdit(row) }, { default: () => "编辑字段" }),
+    coloredButton("编辑字段", ACTION_PALETTE.edit, () => openEdit(row)),
     !isLeaf(row) && !isRoot(row)
-      ? h(NButton, { size: "tiny", onClick: () => openAdd(row) }, { default: () => "新增子节点" })
+      ? coloredButton("新增子节点", ACTION_PALETTE.add, () => openAdd(row))
       : null,
     !isRoot(row)
-      ? h(NButton, { size: "tiny", onClick: () => cloneNode(row) }, { default: () => "克隆节点" })
+      ? coloredButton("克隆节点", ACTION_PALETTE.clone, () => cloneNode(row))
       : null,
-    h(NButton, {
-      size: "tiny", disabled: isRoot(row) || candidatesFor(row).length === 0,
-      onClick: () => openMove(row),
-    }, { default: () => "移动节点" }),
-    h(NButton, { size: "tiny", disabled: !isLeaf(row), onClick: () => toggleStatus(row) },
-      { default: () => "切换状态" }),
+    coloredButton("移动节点", ACTION_PALETTE.move, () => openMove(row),
+      isRoot(row) || candidatesFor(row).length === 0),
+    coloredButton("切换状态", ACTION_PALETTE.toggle, () => toggleStatus(row), !isLeaf(row)),
     h(NButton, { size: "tiny", type: "error", disabled: isRoot(row), onClick: () => removeNode(row) },
       { default: () => "删除" }),
   ];

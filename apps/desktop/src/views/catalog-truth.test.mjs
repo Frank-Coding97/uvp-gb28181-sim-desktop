@@ -17,6 +17,15 @@ test("目录管理提供搜索移动状态和 JSON 导入导出", () => {
   assert.doesNotMatch(view, /最近平台查询/, "平台查询状态不再占用目录管理页顶部横条");
 });
 
+test("操作按钮按语义分配互不相同的主题色", () => {
+  const palette = view.match(/const ACTION_PALETTE = \{([\s\S]*?)\} as const;/)?.[1] ?? "";
+  const colors = [...palette.matchAll(/#[0-9a-fA-F]{6}/g)].map((match) => match[0]);
+  assert.equal(colors.length, 5, "五个操作色应集中定义在 ACTION_PALETTE");
+  assert.equal(new Set(colors).size, colors.length, "操作色不得重复");
+  assert.match(view, /secondary: true, color, disabled/, "彩色按钮应使用淡彩底而非实心色块");
+  assert.match(view, /type: "error", disabled: isRoot\(row\)/, "删除保留危险色");
+});
+
 test("固定列遮罩不透明，横向滚动时状态列不会透出遮挡操作按钮", () => {
   assert.match(view, /title: "状态", key: "status", width: 88/, "状态列需留足在线/离线标签宽度");
   assert.match(view, /title: "操作", key: "actions", width: 460, fixed: "right"/, "操作列需容纳六个按钮且固定在右侧");
