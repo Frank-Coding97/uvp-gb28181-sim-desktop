@@ -74,11 +74,31 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CapabilityReport)
 } | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 -Path $CapabilityReport
 Write-Host "FFmpeg/ffprobe 能力报告已生成：$CapabilityReport"
 
+# `--config` 对数组是**整体替换**，不是追加：必须把内置演示视频一并列回，
+# 否则 runtime/ffmpeg/* 会把 resources/builtin-camera.mp4 挤出交付包。
+#
+# ⛔ 不能写成内联 JSON 字符串：Windows 上 PowerShell → npm.cmd → node 这三层会把双引号吃光，
+#    tauri 收到的是 {bundle:{resources:[...]}}，直接报
+#    `key must be a string at line 1 column 2`，构建根本没开始（2026-11-08 在 52 上实测）。
+#    改成写临时 JSON 文件再传路径，绕开所有引号问题。
+# ⛔ 必须用 File.WriteAllText（UTF-8 无 BOM）。PS 5.1 的 Set-Content -Encoding UTF8 会写 BOM，
+#    serde_json 见到 BOM 会报 "expected value"。
+$BundleConfig = Join-Path $env:TEMP "uvp-desktop-bundle-config.json"
+$BundleConfigJson = @{
+  bundle = @{
+    resources = @("resources/builtin-camera.mp4", "runtime/ffmpeg/*")
+  }
+} | ConvertTo-Json -Depth 5
+[System.IO.File]::WriteAllText($BundleConfig, $BundleConfigJson)
+
 try {
   Push-Location $DesktopDir
-  # `--config` 对数组是**整体替换**，不是追加：必须把内置演示视频一并列回，
-  # 否则 runtime/ffmpeg/* 会把 resources/builtin-camera.mp4 挤出交付包。
-  npm run tauri build -- --bundles nsis,msi --config '{"bundle":{"resources":["resources/builtin-camera.mp4","runtime/ffmpeg/*"]}}'
+  npm run tauri build -- --bundles nsis,msi --config $BundleConfig
+  # ⛔ 原生命令失败不会让 PowerShell 抛异常（$ErrorActionPreference 管不到），
+  #    必须自己看退出码，否则「构建失败」会被后面的「已生成」误报成成功。
+  if ($LASTEXITCODE -ne 0) {
+    throw "tauri build 失败（exit $LASTEXITCODE），安装包未生成。"
+  }
 }
 finally {
   Pop-Location
