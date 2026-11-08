@@ -193,13 +193,6 @@ onActivated(() => { void load(); });
 
 <template>
   <div class="page page-wrap">
-    <div class="page-header">
-      <div>
-        <div class="page-title">报警管理</div>
-        <div class="page-sub">组 Alarm 报文并发送，右侧核对平台应答与发送路径</div>
-      </div>
-    </div>
-
     <div class="layout">
       <section class="glass-card panel">
         <div class="panel-head">
@@ -318,8 +311,7 @@ onActivated(() => { void load(); });
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.layout { display: grid; grid-template-columns: minmax(0, 640px) minmax(0, 1fr); gap: 18px; align-items: stretch; }
-.panel { display: flex; flex-direction: column; padding: 18px; }
+.layout { display: grid; grid-template-columns: minmax(0, 640px) minmax(0, 1fr); gap: 18px; align-items: stretch; }.panel { display: flex; flex-direction: column; padding: 18px; }
 .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .panel-title { color: var(--text-primary); font-size: 15px; font-weight: 700; }
 .panel-title small { margin-left: 6px; color: var(--text-tertiary); font-size: 11px; font-weight: 500; }
@@ -339,7 +331,7 @@ onActivated(() => { void load(); });
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border-default); }
 .reset-btn { margin-left: auto; }
 .hint { margin-top: 12px; color: var(--text-tertiary); font-size: 10.5px; line-height: 1.6; }
-.history-panel { min-height: 452px; max-height: 640px; }
+.history-panel { min-height: 452px; max-height: 560px; }
 .history-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .history-actions { display: flex; gap: 6px; }
 .empty-wrap { flex: 1; display: grid; place-items: center; min-height: 280px; padding: 24px 0; }
@@ -356,6 +348,7 @@ onActivated(() => { void load(); });
 .row-meta .err { color: var(--error); }
 .xml-card { width: min(880px, 92vw); }
 .xml { margin: 0; padding: 12px; border-radius: 10px; background: #071424; color: #cfe0f7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6; overflow: auto; max-height: 60vh; }
+@media (max-width: 1360px) { .layout { grid-template-columns: minmax(0, 560px) minmax(0, 1fr); } }
 @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } .history-panel { min-height: 360px; } }
 @media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } .field.span-2 { grid-column: auto; } .reset-btn { margin-left: 0; } }
 </style>
