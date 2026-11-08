@@ -711,44 +711,51 @@ function setBindMode(mode: BindMode) {
             <template v-else>未找到中文字体，OSD 不会烧进码流；可设置环境变量 UVP_OSD_FONT 指定字体文件。</template>
           </div>
 
-          <div class="section-label">预览（{{ osdPreviewSize.width }}×{{ osdPreviewSize.height }}，本地默认布局）</div>
-          <div class="osd-preview" :style="{ aspectRatio: `${osdPreviewSize.width} / ${osdPreviewSize.height}` }">
-            <div v-if="osdDraft.watermark.enabled && osdDraft.watermark.text.trim()" class="osd-watermark">
-              <span v-for="tile in osdWatermarkTiles" :key="tile" :style="{ ...osdTextStyle(osdDraft.watermark), opacity: 0.28 }">{{ osdDraft.watermark.text }}</span>
+          <div class="osd-layout">
+            <div class="osd-pane osd-preview-pane">
+              <div class="section-label">预览（{{ osdPreviewSize.width }}×{{ osdPreviewSize.height }}，本地默认布局）</div>
+              <div class="osd-preview" :style="{ aspectRatio: `${osdPreviewSize.width} / ${osdPreviewSize.height}` }">
+                <div v-if="osdDraft.watermark.enabled && osdDraft.watermark.text.trim()" class="osd-watermark">
+                  <span v-for="tile in osdWatermarkTiles" :key="tile" :style="{ ...osdTextStyle(osdDraft.watermark), opacity: 0.28 }">{{ osdDraft.watermark.text }}</span>
+                </div>
+                <span v-if="osdDraft.timestamp.enabled" class="osd-time" :style="osdTextStyle(osdDraft.timestamp)">{{ formatOsdTime(osdNow) }}</span>
+                <span v-if="osdDraft.channel_name.enabled" class="osd-channel" :style="osdTextStyle(osdDraft.channel_name)">{{ osdChannelName }}</span>
+              </div>
             </div>
-            <span v-if="osdDraft.timestamp.enabled" class="osd-time" :style="osdTextStyle(osdDraft.timestamp)">{{ formatOsdTime(osdNow) }}</span>
-            <span v-if="osdDraft.channel_name.enabled" class="osd-channel" :style="osdTextStyle(osdDraft.channel_name)">{{ osdChannelName }}</span>
-          </div>
 
-          <div v-for="layer in osdLayers" :key="layer.key" class="osd-layer">
-            <div class="osd-layer-head">
-              <label class="osd-switch">
-                <input v-model="osdDraft[layer.key].enabled" type="checkbox" :disabled="locked" />
-                <strong>{{ layer.label }}</strong>
-              </label>
-              <small>{{ layer.hint }}</small>
-            </div>
-            <div class="field-grid osd-fields">
-              <label v-if="layer.key === 'watermark'" class="field osd-text">
-                <span>水印文字（≤{{ OSD_TEXT_MAX_CHARS }} 字）</span>
-                <input v-model="osdDraft.watermark.text" :maxlength="OSD_TEXT_MAX_CHARS" :disabled="locked" placeholder="例如：内部测试" />
-              </label>
-              <label class="field">
-                <span>字号</span>
-                <select v-model="osdDraft[layer.key].size" :disabled="locked">
-                  <option v-for="option in OSD_SIZE_OPTIONS" :key="option.value" :value="option.value">
-                    {{ option.label }}（{{ osdPixelSize(option.value, osdPreviewSize.height) }}px）
-                  </option>
-                </select>
-              </label>
-              <label class="field">
-                <span>填充色</span>
-                <input v-model="osdDraft[layer.key].fill_color" type="color" :disabled="locked" />
-              </label>
-              <label class="field">
-                <span>描边色</span>
-                <input v-model="osdDraft[layer.key].outline_color" type="color" :disabled="locked" />
-              </label>
+            <div class="osd-pane osd-config-pane">
+              <div class="section-label">图层配置</div>
+              <div v-for="layer in osdLayers" :key="layer.key" class="osd-layer">
+                <div class="osd-layer-head">
+                  <label class="osd-switch">
+                    <input v-model="osdDraft[layer.key].enabled" type="checkbox" :disabled="locked" />
+                    <strong>{{ layer.label }}</strong>
+                  </label>
+                  <small>{{ layer.hint }}</small>
+                </div>
+                <div class="field-grid osd-fields">
+                  <label v-if="layer.key === 'watermark'" class="field osd-text">
+                    <span>水印文字（≤{{ OSD_TEXT_MAX_CHARS }} 字）</span>
+                    <input v-model="osdDraft.watermark.text" :maxlength="OSD_TEXT_MAX_CHARS" :disabled="locked" placeholder="例如：内部测试" />
+                  </label>
+                  <label class="field">
+                    <span>字号</span>
+                    <select v-model="osdDraft[layer.key].size" :disabled="locked">
+                      <option v-for="option in OSD_SIZE_OPTIONS" :key="option.value" :value="option.value">
+                        {{ option.label }}（{{ osdPixelSize(option.value, osdPreviewSize.height) }}px）
+                      </option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>填充色</span>
+                    <input v-model="osdDraft[layer.key].fill_color" type="color" :disabled="locked" />
+                  </label>
+                  <label class="field">
+                    <span>描边色</span>
+                    <input v-model="osdDraft[layer.key].outline_color" type="color" :disabled="locked" />
+                  </label>
+                </div>
+              </div>
             </div>
           </div>
           <div class="osd-footnote">{{ osdDirty ? "有未保存修改" : "已保存" }} · 修改在下次启动设备时生效</div>
@@ -905,7 +912,12 @@ function setBindMode(mode: BindMode) {
 @media (max-width: 680px) { .field-grid.two, .network-options, .about-grid, .media-codec-grid { grid-template-columns: 1fr; } .media-presets { grid-template-columns: 1fr 1fr; } .content-heading { align-items: flex-start; flex-direction: column; } .media-summary-card { align-items: flex-start; flex-direction: column; gap: 9px; } }
 .osd-scope { padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 9px; background: rgba(255,255,255,.55); color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
 .osd-scope.warn { border-color: #e6a23c; background: #fdf6ec; color: #a8661c; }
-.osd-preview { position: relative; width: 100%; max-width: 640px; overflow: hidden; container-type: size; border-radius: 10px; background: linear-gradient(135deg, #3a4a5c, #1e2833); font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }
+/* OSD 预览与图层配置左右并排：配置沉在预览底部时，改参数要反复上下滚动对照画面。
+   两列 grid 让预览与配置同屏；minmax(0, …) 防止预览的 aspect-ratio 撑破列宽，
+   配置列给 300px 下限保证三个字段栅格不被压垮。 */
+.osd-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(300px, 1fr); gap: 14px; align-items: start; }
+.osd-pane { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.osd-preview { position: relative; width: 100%; overflow: hidden; container-type: size; border-radius: 10px; background: linear-gradient(135deg, #3a4a5c, #1e2833); font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }
 .osd-time { position: absolute; top: 0.6cqh; left: 0.4cqw; white-space: nowrap; }
 .osd-channel { position: absolute; top: 0.6cqh; right: 0.4cqw; white-space: nowrap; }
 .osd-watermark { position: absolute; inset: -40%; display: flex; flex-wrap: wrap; align-content: space-around; justify-content: space-around; gap: 8cqh 6cqw; transform: rotate(-30deg); pointer-events: none; }
@@ -918,4 +930,7 @@ function setBindMode(mode: BindMode) {
 .osd-fields .osd-text { grid-column: 1 / -1; }
 .field input[type="color"] { padding: 2px 4px; cursor: pointer; }
 .osd-footnote { color: var(--text-tertiary); font-size: 11px; }
+/* 窄视口回退为单列：预览在上、配置在下，避免配置列被压到 300px 以下；
+   单列时恢复预览 640px 上限，画面不会被无限拉大。此规则须排在 .osd-layout 之后。 */
+@media (max-width: 980px) { .osd-layout { grid-template-columns: 1fr; } .osd-preview { max-width: 640px; } }
 </style>

@@ -113,3 +113,37 @@ assert.match(
 );
 assert.match(source, /class="lock-badge"/, "关于页的锁定状态徽标不得一并删除");
 assert.match(source, /class="settings-section about-section"/, "关于页内容区仍须存在");
+
+// ── OSD 预览与图层配置左右分栏 ───────────────────────────────────────────
+// 回归背景：OSD 参数区原先是「预览在上、三个图层配置依次堆在预览底部」，
+// 调字号 / 颜色时要反复上下滚动对照画面；现改为预览在左、配置在右同屏。
+const osdSection = source.match(/<section v-else-if="activeKey === 'osd' && osdDraft"[\s\S]*?<\/section>/)?.[0] ?? "";
+assert.ok(osdSection, "应存在 OSD 水印配置区块");
+const layoutBlock = osdSection.match(/<div class="osd-layout">([\s\S]*?)<div class="osd-footnote">/)?.[1] ?? "";
+assert.ok(layoutBlock, "预览与配置须由同一个分栏容器包裹");
+const previewPaneAt = layoutBlock.indexOf('class="osd-pane osd-preview-pane"');
+const configPaneAt = layoutBlock.indexOf('class="osd-pane osd-config-pane"');
+assert.ok(previewPaneAt >= 0 && configPaneAt > previewPaneAt, "预览列在前、配置列在后，配置位于预览右侧");
+const previewPane = layoutBlock.slice(previewPaneAt, configPaneAt);
+assert.match(previewPane, /class="osd-preview"/, "左列须仍是预览画面");
+const configPane = layoutBlock.slice(configPaneAt);
+assert.match(configPane, /v-for="layer in osdLayers"/, "三个图层配置须整体落在右列");
+assert.match(configPane, />图层配置</, "右列须有独立小标题与预览标题对齐");
+assert.match(osdSection, /class="osd-scope"/, "生效范围说明保持在分栏之外、顶部全宽");
+assert.match(osdSection, /class="osd-footnote"/, "底部状态提示保持在分栏之外");
+
+const osdLayoutStyles = source.match(/^\.osd-layout \{([^}]*)\}/m)?.[1] ?? "";
+assert.ok(osdLayoutStyles, "应存在 OSD 分栏样式");
+assert.match(osdLayoutStyles, /display:\s*grid;/, "分栏须使用 grid");
+assert.match(
+  osdLayoutStyles,
+  /grid-template-columns:\s*minmax\(0, 1\.1fr\) minmax\(300px, 1fr\);/,
+  "须为两列，且配置列有 300px 下限避免字段栅格被压垮",
+);
+assert.match(osdLayoutStyles, /align-items:\s*start;/, "两列顶部对齐，不拉伸预览");
+const osdNarrowRule = source.match(/@media \(max-width: 980px\) \{ \.osd-layout \{([^}]*)\}/)?.[1] ?? "";
+assert.match(osdNarrowRule, /grid-template-columns:\s*1fr;/, "窄视口须回退为单列");
+assert.ok(
+  source.indexOf(".osd-layout { grid-template-columns: 1fr; }") > source.indexOf(".osd-layout { display: grid;"),
+  "窄屏回退规则须排在基础两列规则之后，否则同特异性下会被覆盖",
+);
