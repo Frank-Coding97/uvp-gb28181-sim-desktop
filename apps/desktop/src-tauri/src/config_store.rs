@@ -615,7 +615,7 @@ impl Default for DesktopConfigV2 {
                 channel_name: "Camera-1".into(),
                 location: String::new(),
                 camera_type: String::new(),
-                register_expires_secs: 86_400,
+                register_expires_secs: 3_600,
                 heartbeat_interval_secs: 60,
                 heartbeat_fail_threshold: 3,
             },
@@ -868,7 +868,7 @@ mod tests {
         assert!(!json.contains("authorization"));
         assert_eq!(config.profiles[0].password, "");
         assert_eq!(config.schema_version, 2);
-        assert_eq!(config.device.register_expires_secs, 86_400);
+        assert_eq!(config.device.register_expires_secs, 3_600);
     }
 
     #[test]
