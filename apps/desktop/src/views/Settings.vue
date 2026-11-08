@@ -520,12 +520,15 @@ function setBindMode(mode: BindMode) {
     </div>
 
     <main class="settings-main glass-card">
-        <div v-if="editableSection" class="content-heading">
+        <div v-if="editableSection" class="content-heading" :class="{ sticky: activeKey === 'media' }">
           <div class="content-context"><span class="content-icon">{{ activeSetting.icon }}</span>模拟器有效配置</div>
           <div v-if="activeKey !== 'media'" class="content-actions">
             <button v-if="activeKey === 'osd'" class="btn ghost" type="button" :disabled="locked" @click="resetOsdDraft">恢复 OSD 默认</button>
             <button v-else class="btn ghost" type="button" :disabled="locked" @click="resetCurrent">恢复全部默认</button>
             <button class="btn primary" type="button" :disabled="locked || !config" @click="saveCurrent">保存有效设置</button>
+          </div>
+          <div v-else class="content-actions">
+            <button class="btn primary" type="button" :disabled="locked || !config || !mediaDirty" @click="saveCurrent">保存音视频设置</button>
           </div>
         </div>
 
@@ -692,10 +695,7 @@ function setBindMode(mode: BindMode) {
             </label>
           </div>
           <div v-if="cameraCapabilityNote" class="info-note camera-capability-note">{{ cameraCapabilityNote }}</div>
-          <div class="info-note">保存后，下次启动设备时生效；运行中请先注销后修改。</div>
-          <div class="media-save-row">
-            <button class="btn primary" type="button" :disabled="locked || !config || !mediaDirty" @click="saveCurrent">保存音视频设置</button>
-          </div>
+          <div class="info-note">保存后，下次启动设备时生效；运行中请先注销后修改。修改后请点击顶部标题行右侧的「保存音视频设置」。</div>
         </section>
 
         <section v-else-if="activeKey === 'osd' && osdDraft" class="settings-section osd-section">
@@ -798,7 +798,7 @@ function setBindMode(mode: BindMode) {
 <style scoped>
 /* 与 theme.css 的 .page-wrap 同口径：父级 .content 是 overflow:hidden，
    页面自身必须建立垂直滚动上下文，否则参数区超出视口会被直接裁掉且没有滚动条。
-   底部留白保证滚到底时提示条与「保存音视频设置」按钮不贴边。 */
+   底部留白保证滚到底时最后一条提示不贴边。 */
 .settings-page { max-width: 1420px; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-bottom: 16px; }
 .settings-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .settings-header-meta { display: flex; align-items: center; gap: 10px; font-size: 12px; }
@@ -811,6 +811,18 @@ function setBindMode(mode: BindMode) {
 .content-context { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 13px; font-weight: 600; }
 .content-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: var(--accent-pale); color: var(--accent); font-size: 16px; }
 .content-actions { display: flex; flex: 0 0 auto; gap: 8px; }
+/* 媒体页把保存入口上移到标题行并冻结：.settings-page 是滚动容器，标题行 sticky 在
+   其顶部，参数区滚动时右侧「保存音视频设置」始终可见。背景取卡片复合色并置顶，
+   避免下方内容透出来叠字；仅媒体页加 .sticky，其余设置页保持原布局。 */
+.content-heading.sticky {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  flex-direction: row;
+  align-items: center;
+  background: color-mix(in srgb, #fff 50%, var(--bg-base));
+  box-shadow: 0 6px 14px rgba(16, 46, 98, .06);
+}
 .btn { padding: 7px 14px; border: 1px solid var(--border-default); border-radius: 8px; cursor: pointer; font-size: 12px; }
 .btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
 .btn.ghost { background: rgba(255,255,255,.45); color: var(--text-secondary); }
@@ -863,7 +875,6 @@ function setBindMode(mode: BindMode) {
 .media-advanced-toggle small { overflow: hidden; color: var(--text-tertiary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .media-advanced-toggle b { color: var(--accent); font-size: 16px; }
 .media-advanced-fields { padding: 12px; border: 1px solid var(--border-subtle); border-radius: 9px; background: rgba(255,255,255,.28); }
-.media-save-row { display: flex; justify-content: flex-end; padding-top: 2px; }
 .network-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .network-option { display: flex; align-items: center; gap: 10px; padding: 14px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.4); color: var(--text-primary); cursor: pointer; }
 .network-option.selected { border-color: var(--accent); background: var(--accent-dim); }
