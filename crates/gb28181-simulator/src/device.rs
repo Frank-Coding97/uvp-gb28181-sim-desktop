@@ -1697,7 +1697,8 @@ impl DeviceSimulator {
         let _ = self.local_addr.set((host.to_string(), port));
     }
 
-    /// 载入一个内置目录模板(single/nvr-8ch/civil-3x2/large-16ch),替换现有目录树(FR-34)。
+    /// 载入一个内置目录模板(single/nvr-8ch/civil-3x2/large-16ch/business-platform),
+    /// 替换现有目录树(FR-34)。business-platform 用于模拟下级平台业务分组。
     pub fn load_catalog_template(&self, template: &str) {
         let tree = gb28181_protocol::id_codec::catalog_template(
             template,
@@ -1785,13 +1786,14 @@ impl DeviceSimulator {
 
     /// 返回可发布的完整目录节点。根设备节点(parent==self)不作为订阅通道项。
     fn catalog_publishable(&self) -> Vec<gb28181_protocol::id_codec::CatalogNode> {
-        use gb28181_protocol::id_codec::catalog_business_group_id;
+        use gb28181_protocol::id_codec::{catalog_business_group_id, catalog_parent_id};
         let tree = self.effective_catalog_tree();
         tree.iter()
             .filter(|node| node.id != node.parent_id)
             .map(|node| {
                 let mut item = node.clone();
                 item.business_group_id = catalog_business_group_id(&tree, node);
+                item.parent_id = catalog_parent_id(&tree, node).unwrap_or_default();
                 item
             })
             .collect()
@@ -2430,7 +2432,7 @@ impl DeviceSimulator {
                 name: node.name.clone(),
                 civil_code: node.civil_code.clone(),
                 parental: Some(node.node_type.parental()),
-                parent_id: Some(node.parent_id.clone()),
+                parent_id: (!node.parent_id.is_empty()).then(|| node.parent_id.clone()),
                 business_group_id: node.business_group_id.clone(),
                 event: "ON".into(),
                 status: node.status.clone(),
@@ -3308,7 +3310,7 @@ impl DeviceSimulator {
         query: &gb28181_protocol::manscdp::Query,
     ) -> Result<Vec<String>> {
         use gb28181_protocol::{
-            id_codec::{catalog_business_group_id, select_catalog_nodes},
+            id_codec::{catalog_business_group_id, catalog_parent_id, select_catalog_nodes},
             manscdp::CatalogItem,
         };
         let tree = self.effective_catalog_tree();
@@ -3325,10 +3327,8 @@ impl DeviceSimulator {
                 // 设备级安装位置：同一台设备下的目录项共用，未配置时 None 不输出。
                 address: self.config.device_info.installation_address.clone(),
                 parental: Some(node.node_type.parental()),
-                parent_id: (node.id != node.parent_id).then(|| node.parent_id.clone()),
-                business_group_id: is_2022
-                    .then(|| catalog_business_group_id(&tree, node))
-                    .flatten(),
+                parent_id: catalog_parent_id(&tree, node),
+                business_group_id: catalog_business_group_id(&tree, node),
                 status: node.status.clone(),
                 security_level_code: is_2022.then(|| "A".to_string()),
                 ip_address: None,
@@ -5905,7 +5905,7 @@ y=0100000099\r\n";
             .await
             .unwrap();
 
-        while item_count < 10 {
+        while item_count < 11 {
             let packet = tokio::time::timeout(std::time::Duration::from_secs(1), responses.recv())
                 .await
                 .expect("后续 Catalog Response 超时")
@@ -5915,7 +5915,7 @@ y=0100000099\r\n";
             };
             let body = builder::decode_xml_body(&request.body, sim.config().signaling_encoding);
             assert!(body.contains("<SN>1000</SN>"));
-            assert!(body.contains("<SumNum>10</SumNum>"));
+            assert!(body.contains("<SumNum>11</SumNum>"));
             item_count += body.matches("<Item>").count();
             packet_count += 1;
             platform_tp
@@ -5927,7 +5927,7 @@ y=0100000099\r\n";
                 .unwrap();
         }
 
-        assert_eq!(item_count, 10);
+        assert_eq!(item_count, 11);
         assert!(packet_count > 1);
         assert!(answer_task.await.unwrap().unwrap());
     }
@@ -6157,8 +6157,8 @@ y=0100000099\r\n";
         };
         let packets = sim.handle_query_packets(&q).unwrap();
         let xml = packets.join("");
-        // 查询设备编码返回设备本身及其后代:根 + 业务分组 + 8 视频通道。
-        assert_eq!(xml.matches("<Item>").count(), 10);
+        // 查询设备编码返回设备本身及其后代:根 + 业务分组 + 虚拟组织 + 8 视频通道。
+        assert_eq!(xml.matches("<Item>").count(), 11);
         assert!(xml.contains("<Name>NVR-8</Name>"));
         assert!(xml.contains("<Name>通道-01</Name>"));
         assert!(xml.contains("<Parental>1</Parental>")); // 业务分组
@@ -6203,21 +6203,174 @@ y=0100000099\r\n";
         };
         let packets = sim.handle_query_packets(&q).unwrap();
         assert!(packets.len() > 1);
-        assert!(packets.iter().all(|xml| xml.contains("<SumNum>9</SumNum>")));
+        assert!(
+            packets
+                .iter()
+                .all(|xml| xml.contains("<SumNum>10</SumNum>"))
+        );
         assert_eq!(
             packets
                 .iter()
                 .map(|xml| xml.matches("<Item>").count())
                 .sum::<usize>(),
-            9
+            10
         );
-        assert!(packets
-            .iter()
-            .all(|xml| !xml.contains(&sim.config().device_info.device_name)));
+        assert!(
+            packets
+                .iter()
+                .all(|xml| !xml.contains(&sim.config().device_info.device_name))
+        );
         let activity = sim.catalog_activity().unwrap();
         assert_eq!(activity.target_id, group.id);
-        assert_eq!(activity.result_count, 9);
+        assert_eq!(activity.result_count, 10);
         assert_eq!(activity.packet_count, packets.len());
+    }
+
+    #[test]
+    fn 下级平台业务目录查询在两版本映射分组与父节点() {
+        use gb28181_protocol::id_codec::CatalogNodeType;
+
+        for version in [common::GbVersion::V2016, common::GbVersion::V2022] {
+            let mut cfg = test_cfg("127.0.0.1", 5060);
+            cfg.gb_version = version;
+            let sim = DeviceSimulator::new(cfg);
+            sim.load_catalog_template("business-platform");
+            let tree = sim.catalog_tree();
+            let root_id = sim.config().device_id.to_string();
+            let group = tree
+                .iter()
+                .find(|node| node.node_type == CatalogNodeType::BusinessGroup)
+                .unwrap();
+            let top_org = tree
+                .iter()
+                .find(|node| {
+                    node.node_type == CatalogNodeType::VirtualOrg && node.parent_id == group.id
+                })
+                .unwrap();
+            let nested_org = tree
+                .iter()
+                .find(|node| {
+                    node.node_type == CatalogNodeType::VirtualOrg && node.parent_id == top_org.id
+                })
+                .unwrap();
+            let channel = tree
+                .iter()
+                .find(|node| {
+                    node.node_type == CatalogNodeType::VideoChannel
+                        && node.parent_id == nested_org.id
+                })
+                .unwrap();
+            let query = gb28181_protocol::manscdp::Query {
+                cmd_type: "Catalog".into(),
+                sn: 117,
+                device_id: root_id.clone(),
+                interval: None,
+                group_id: None,
+                config_type: None,
+                start_time: None,
+                end_time: None,
+                record_type: None,
+                indistinct_query: None,
+                stream_number: None,
+            };
+            let xml = sim.handle_query_packets(&query).unwrap().join("");
+            let item_for = |id: &str| {
+                xml.split("<Item>")
+                    .skip(1)
+                    .find(|item| item.contains(&format!("<DeviceID>{id}</DeviceID>")))
+                    .unwrap()
+                    .split("</Item>")
+                    .next()
+                    .unwrap()
+            };
+            let group_item = item_for(&group.id);
+            let top_org_item = item_for(&top_org.id);
+            let nested_org_item = item_for(&nested_org.id);
+            let channel_item = item_for(&channel.id);
+
+            assert!(group_item.contains(&format!("<ParentID>{root_id}</ParentID>")));
+            assert!(!top_org_item.contains("<ParentID>"));
+            assert!(
+                top_org_item.contains(&format!("<BusinessGroupID>{}</BusinessGroupID>", group.id))
+            );
+            assert!(nested_org_item.contains(&format!("<ParentID>{}</ParentID>", top_org.id)));
+            assert!(
+                nested_org_item
+                    .contains(&format!("<BusinessGroupID>{}</BusinessGroupID>", group.id))
+            );
+            assert!(
+                channel_item.contains(&format!("<ParentID>{root_id}/{}</ParentID>", nested_org.id))
+            );
+            assert!(
+                channel_item.contains(&format!("<BusinessGroupID>{}</BusinessGroupID>", group.id))
+            );
+            if version == common::GbVersion::V2016 {
+                assert!(!channel_item.contains("<SecurityLevelCode>"));
+            }
+        }
+    }
+
+    #[test]
+    fn 下级平台业务目录全量通知使用与查询相同的目录映射() {
+        use gb28181_protocol::id_codec::CatalogNodeType;
+
+        let sim = DeviceSimulator::new(test_cfg("127.0.0.1", 5060));
+        sim.load_catalog_template("business-platform");
+        let tree = sim.catalog_tree();
+        let root_id = sim.config().device_id.to_string();
+        let group = tree
+            .iter()
+            .find(|node| node.node_type == CatalogNodeType::BusinessGroup)
+            .unwrap();
+        let top_org = tree
+            .iter()
+            .find(|node| {
+                node.node_type == CatalogNodeType::VirtualOrg && node.parent_id == group.id
+            })
+            .unwrap();
+        let nested_org = tree
+            .iter()
+            .find(|node| {
+                node.node_type == CatalogNodeType::VirtualOrg && node.parent_id == top_org.id
+            })
+            .unwrap();
+        let channel = tree
+            .iter()
+            .find(|node| {
+                node.node_type == CatalogNodeType::VideoChannel && node.parent_id == nested_org.id
+            })
+            .unwrap();
+        let publishable = sim.catalog_publishable();
+        let wire_node = |id: &str| publishable.iter().find(|node| node.id == id).unwrap();
+
+        assert_eq!(wire_node(&top_org.id).parent_id, "");
+        assert_eq!(
+            wire_node(&top_org.id).business_group_id.as_deref(),
+            Some(group.id.as_str())
+        );
+        assert_eq!(
+            wire_node(&channel.id).parent_id,
+            format!("{root_id}/{}", nested_org.id)
+        );
+        assert_eq!(
+            wire_node(&channel.id).business_group_id.as_deref(),
+            Some(group.id.as_str())
+        );
+
+        let snapshot = gb28181_protocol::manscdp::CatalogSnapshot::from_nodes(publishable);
+        let changes = gb28181_protocol::manscdp::CatalogSnapshot::from_nodes(Vec::<
+            gb28181_protocol::id_codec::CatalogNode,
+        >::new())
+        .diff(&snapshot);
+        let notify_xml = gb28181_protocol::manscdp::CatalogNotify::new(&root_id, 118, changes)
+            .to_xml()
+            .unwrap();
+        assert!(!notify_xml.contains(&format!(
+            "<DeviceID>{}</DeviceID><Name>{}</Name><CivilCode>",
+            top_org.id, top_org.name
+        )));
+        assert!(notify_xml.contains(&format!("<ParentID>{root_id}/{}</ParentID>", nested_org.id)));
+        assert!(notify_xml.contains(&format!("<BusinessGroupID>{}</BusinessGroupID>", group.id)));
     }
 
     #[test]
@@ -6248,7 +6401,7 @@ y=0100000099\r\n";
             };
 
             let packets = sim.handle_query_packets(&q).unwrap();
-            assert!(packets.len() > 1, "10 个目录项不应继续塞进一个 UDP MESSAGE");
+            assert!(packets.len() > 1, "11 个目录项不应继续塞进一个 UDP MESSAGE");
 
             let mut item_count = 0usize;
             for xml in &packets {
@@ -6260,7 +6413,7 @@ y=0100000099\r\n";
                     MAX_BODY_BYTES
                 );
                 assert!(xml.contains("<SN>99</SN>"));
-                assert!(xml.contains("<SumNum>10</SumNum>"));
+                assert!(xml.contains("<SumNum>11</SumNum>"));
                 item_count += xml.matches("<Item>").count();
 
                 let request = builder::message_xml(
@@ -6279,10 +6432,10 @@ y=0100000099\r\n";
                     MAX_UDP_PAYLOAD_BYTES
                 );
             }
-            assert_eq!(item_count, 10);
+            assert_eq!(item_count, 11);
 
             let activity = sim.catalog_activity().unwrap();
-            assert_eq!(activity.result_count, 10);
+            assert_eq!(activity.result_count, 11);
             assert_eq!(activity.packet_count, packets.len());
         }
     }
@@ -6332,7 +6485,7 @@ y=0100000099\r\n";
                 name: node.name.clone(),
                 civil_code: node.civil_code.clone(),
                 parental: Some(node.node_type.parental()),
-                parent_id: Some(node.parent_id.clone()),
+                parent_id: (!node.parent_id.is_empty()).then(|| node.parent_id.clone()),
                 business_group_id: node.business_group_id.clone(),
                 event: "ON".into(),
                 status: node.status.clone(),
@@ -6663,10 +6816,7 @@ y=0100000099\r\n";
         let mut h = Headers::new();
         h.set("Call-ID", call_id);
         h.set("CSeq", "1 SUBSCRIBE");
-        h.set(
-            "From",
-            "<sip:34020000002000000001@34020000002000000001>;tag=plat9",
-        );
+        h.set("From", "<sip:34020000002000000001@34020000002000000001>;tag=plat9");
         h.set("To", "<sip:34020000001320000001@34020000002000000001>");
         h.set("Event", "PTZPosition");
         h.set("Expires", "3600");
@@ -6793,7 +6943,10 @@ y=0100000099\r\n";
         let mut h = Headers::new();
         h.set("Call-ID", "ctl-msg-1");
         h.set("CSeq", "2 MESSAGE");
-        h.set("From", "<sip:34020000002000000001@34020000002000000001>;tag=plat9");
+        h.set(
+            "From",
+            "<sip:34020000002000000001@34020000002000000001>;tag=plat9",
+        );
         let incoming = sip_core::Incoming {
             message: SipMessage::Request(Request {
                 method: Method::Message,

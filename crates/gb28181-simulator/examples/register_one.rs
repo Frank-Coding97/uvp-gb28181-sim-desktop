@@ -8,6 +8,7 @@
 //! SERVER_DOMAIN=34020000002000000001 \
 //! SERVER_ID=34020000002000000001 \
 //! DEVICE_ID=34020000001320000001 PASSWORD=change-me \
+//! CATALOG_TEMPLATE=business-platform GB_VERSION=2022 \
 //! UVP_SIM_UPGRADE_STATE_DIR=/tmp/uvp-sim-upgrade \
 //! cargo run -p gb28181-simulator --example register_one
 //! ```
@@ -107,6 +108,12 @@ async fn main() {
     tracing::info!(%local_ip, local_port, "本端信令地址");
 
     let sim = Arc::new(DeviceSimulator::new(cfg));
+    if let Ok(template) = std::env::var("CATALOG_TEMPLATE") {
+        if !template.trim().is_empty() {
+            tracing::info!(template = %template, "载入 Catalog 目录模板");
+            sim.load_catalog_template(template.trim());
+        }
+    }
 
     // 可选:ALARM_AFTER_SECS 秒后主动上报一条报警(联调 FR-9 用)。
     if let Some(secs) = std::env::var("ALARM_AFTER_SECS")

@@ -49,6 +49,10 @@
 ### 3.5 目录查询(FR-5)
 - 收到 Catalog 查询(MESSAGE) → 回 200 OK + 异步 MESSAGE 携 Catalog 响应 XML,列出本设备的通道。
 - 支持 GB-2022 全字段。见 `40-protocol/manscdp.md#catalog`。
+- 桌面模拟器目录管理提供「下级平台业务目录（215/216）」模板，生成业务分组、顶层及嵌套虚拟组织和视频通道，用于联调业务目录解析与通道归属过滤。
+- 该模板用于验证 Catalog 树结构；真实下级平台应以 200 类型联网系统 ID 作为 Catalog 根。单设备 `register_one` 示例以设备 ID 为根，不代表完整的平台级联网系统身份。
+- 桌面模拟器目录管理提供「下级平台业务目录（215/216）」模板，生成业务分组、顶层及嵌套虚拟组织和视频通道，用于联调业务目录解析与通道归属过滤。
+- 该模板验证 Catalog 树结构；真实下级平台应以 200 类型联网系统 ID 作为 Catalog 根。单设备 `register_one` 示例以设备 ID 为根，不代表完整的平台级联网系统身份。
 
 ### 3.6 设备信息/状态(FR-6)
 - DeviceInfo 查询 → 回设备厂商/型号/固件/通道数等。
@@ -124,3 +128,7 @@ cargo run -p gb28181-simulator --example register_one
 ```
 
 预期:控制台日志出现"注册成功",WVP「国标设备」列表中该设备变为**在线**,并周期收到心跳。
+
+业务目录模板可通过 `CATALOG_TEMPLATE=business-platform` 加载；查看两版本报文时分别设置 `GB_VERSION=2016` 或 `GB_VERSION=2022`。
+
+业务目录模板可通过 `CATALOG_TEMPLATE=business-platform` 加载；查看两版本报文时分别设置 `GB_VERSION=2016` 或 `GB_VERSION=2022`。

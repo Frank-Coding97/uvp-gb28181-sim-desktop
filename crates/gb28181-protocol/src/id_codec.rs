@@ -325,12 +325,46 @@ pub fn catalog_business_group_id(tree: &[CatalogNode], node: &CatalogNode) -> Op
     None
 }
 
+/// 返回目录项在线路上的 ParentID。
+///
+/// 业务分组下第一层虚拟组织通过 BusinessGroupID 关联，不重复输出 ParentID；
+/// 视频资源属于虚拟组织时，按标准用“父设备/虚拟组织”表示双重归属。
+pub fn catalog_parent_id(tree: &[CatalogNode], node: &CatalogNode) -> Option<String> {
+    if node.id == node.parent_id {
+        return None;
+    }
+    let by_id: std::collections::HashMap<&str, &CatalogNode> =
+        tree.iter().map(|item| (item.id.as_str(), item)).collect();
+    let parent = by_id.get(node.parent_id.as_str()).copied()?;
+    match node.node_type {
+        CatalogNodeType::VirtualOrg => {
+            (parent.node_type == CatalogNodeType::VirtualOrg).then(|| parent.id.clone())
+        }
+        _ if parent.node_type == CatalogNodeType::VirtualOrg => {
+            let mut current = parent;
+            let mut visited = std::collections::HashSet::new();
+            while current.id != current.parent_id && visited.insert(current.id.as_str()) {
+                current = *by_id.get(current.parent_id.as_str())?;
+                if matches!(
+                    current.node_type,
+                    CatalogNodeType::Device | CatalogNodeType::System
+                ) {
+                    return Some(format!("{}/{}", current.id, parent.id));
+                }
+            }
+            None
+        }
+        _ => Some(parent.id.clone()),
+    }
+}
+
 /// 内置目录模板。据上游 CatalogTreeStore.templates 核对(single/nvr-8ch/civil-3x2/large-16ch)。
 ///
 /// - `single`:根设备 + 1 视频通道 + 1 报警通道。
-/// - `nvr-8ch`:根 + 业务分组 NVR-8 + 8 视频通道。
-/// - `civil-3x2`:根 + 3 虚拟组织(浦东/黄浦/徐汇)各 2 通道,演示 CivilCode。
-/// - `large-16ch`:根 + 室内/室外 2 分组各 8 通道 + 1 报警通道挂根。
+/// - `nvr-8ch`:根 + 业务分组 + 虚拟组织 + 8 视频通道。
+/// - `civil-3x2`:根 + 业务分组 + 3 虚拟组织(浦东/黄浦/徐汇)各 2 通道,演示 CivilCode。
+/// - `large-16ch`:根 + 室内/室外 2 业务分组各含虚拟组织和 8 通道 + 1 报警通道挂根。
+/// - `business-platform`:下级平台业务树,含 1 业务分组、嵌套虚拟组织和 3 视频通道。
 ///
 /// 返回节点列表(首个为根设备);`domain` 取前 10 位作 ID 前缀。
 pub fn catalog_template(
@@ -383,30 +417,39 @@ pub fn catalog_template(
                 "NVR-8",
                 device_id,
             ));
+            let o = org(1);
+            v.push(CatalogNode::new(
+                &o,
+                CatalogNodeType::VirtualOrg,
+                "默认虚拟目录",
+                &g,
+            ));
             for i in 1..=8 {
                 v.push(CatalogNode::new(
                     vid(i),
                     CatalogNodeType::VideoChannel,
                     format!("通道-{i:02}"),
-                    &g,
+                    &o,
                 ));
             }
             v
         }
         "civil-3x2" => {
             let mut v = vec![root()];
+            let g = group(1);
+            v.push(CatalogNode::new(
+                &g,
+                CatalogNodeType::BusinessGroup,
+                "跨区划业务分组",
+                device_id,
+            ));
             let areas = [("浦东", "310115"), ("黄浦", "310101"), ("徐汇", "310104")];
             let mut ch_seq = 1u32;
             for (idx, (area, civil)) in areas.iter().enumerate() {
                 let o = org(idx as u32 + 1);
                 v.push(
-                    CatalogNode::new(
-                        &o,
-                        CatalogNodeType::VirtualOrg,
-                        format!("{area}区"),
-                        device_id,
-                    )
-                    .with_civil_code(*civil),
+                    CatalogNode::new(&o, CatalogNodeType::VirtualOrg, format!("{area}区"), &g)
+                        .with_civil_code(*civil),
                 );
                 for k in 1..=2 {
                     v.push(
@@ -439,13 +482,27 @@ pub fn catalog_template(
                 "室外监控",
                 device_id,
             ));
+            let indoor_org = org(1);
+            let outdoor_org = org(2);
+            v.push(CatalogNode::new(
+                &indoor_org,
+                CatalogNodeType::VirtualOrg,
+                "室内虚拟目录",
+                &indoor,
+            ));
+            v.push(CatalogNode::new(
+                &outdoor_org,
+                CatalogNodeType::VirtualOrg,
+                "室外虚拟目录",
+                &outdoor,
+            ));
             let mut ch_seq = 1u32;
             for i in 1..=8 {
                 v.push(CatalogNode::new(
                     vid(ch_seq),
                     CatalogNodeType::VideoChannel,
                     format!("室内-{i:02}"),
-                    &indoor,
+                    &indoor_org,
                 ));
                 ch_seq += 1;
             }
@@ -454,7 +511,7 @@ pub fn catalog_template(
                     vid(ch_seq),
                     CatalogNodeType::VideoChannel,
                     format!("室外-{i:02}"),
-                    &outdoor,
+                    &outdoor_org,
                 ));
                 ch_seq += 1;
             }
@@ -464,6 +521,50 @@ pub fn catalog_template(
                 "总报警",
                 device_id,
             ));
+            v
+        }
+        "business-platform" | "downstream-business" => {
+            let mut v = vec![root()];
+            let g = group(1);
+            v.push(CatalogNode::new(
+                &g,
+                CatalogNodeType::BusinessGroup,
+                "校园安防",
+                device_id,
+            ));
+            let teaching = org(1);
+            let dormitory = org(2);
+            let classroom = org(3);
+            v.push(CatalogNode::new(
+                &teaching,
+                CatalogNodeType::VirtualOrg,
+                "教学楼",
+                &g,
+            ));
+            v.push(CatalogNode::new(
+                &dormitory,
+                CatalogNodeType::VirtualOrg,
+                "宿舍楼",
+                &g,
+            ));
+            v.push(CatalogNode::new(
+                &classroom,
+                CatalogNodeType::VirtualOrg,
+                "教学楼一层",
+                &teaching,
+            ));
+            for (seq, name, parent_id) in [
+                (1, "教学楼-入口", teaching.as_str()),
+                (2, "宿舍楼-大厅", dormitory.as_str()),
+                (3, "教学楼-一层走廊", classroom.as_str()),
+            ] {
+                v.push(CatalogNode::new(
+                    vid(seq),
+                    CatalogNodeType::VideoChannel,
+                    name,
+                    parent_id,
+                ));
+            }
             v
         }
         // "single" 及未知:默认单设备 + 1 视频 + 1 报警。
@@ -521,12 +622,18 @@ mod tests {
     fn 目录目标只返回目标及其后代() {
         let tree = catalog_template("large-16ch", "34020000001110000001", "Cam", "3402000000");
         let indoor = tree.iter().find(|node| node.name == "室内监控").unwrap();
-        let selected = select_catalog_nodes(&tree, &indoor.id);
-        assert_eq!(selected.len(), 9);
-        assert_eq!(selected[0].id, indoor.id);
-        assert!(selected
+        let indoor_org = tree
             .iter()
-            .all(|node| node.id == indoor.id || node.parent_id == indoor.id));
+            .find(|node| {
+                node.node_type == CatalogNodeType::VirtualOrg && node.parent_id == indoor.id
+            })
+            .unwrap();
+        let selected = select_catalog_nodes(&tree, &indoor.id);
+        assert_eq!(selected.len(), 10);
+        assert_eq!(selected[0].id, indoor.id);
+        assert!(selected.iter().all(|node| node.id == indoor.id
+            || node.parent_id == indoor.id
+            || node.parent_id == indoor_org.id));
         assert!(select_catalog_nodes(&tree, "99999999999999999999").is_empty());
     }
 
@@ -593,6 +700,59 @@ mod tests {
     }
 
     #[test]
+    fn 业务目录目录项映射父节点和所属分组() {
+        let tree = catalog_template(
+            "business-platform",
+            "34020000001110000001",
+            "下级平台",
+            "3402000000",
+        );
+        let root = &tree[0];
+        let group = tree
+            .iter()
+            .find(|node| node.node_type == CatalogNodeType::BusinessGroup)
+            .unwrap();
+        let top_org = tree
+            .iter()
+            .find(|node| {
+                node.node_type == CatalogNodeType::VirtualOrg && node.parent_id == group.id
+            })
+            .unwrap();
+        let nested_org = tree
+            .iter()
+            .find(|node| {
+                node.node_type == CatalogNodeType::VirtualOrg && node.parent_id == top_org.id
+            })
+            .unwrap();
+        let channel = tree
+            .iter()
+            .find(|node| {
+                node.node_type == CatalogNodeType::VideoChannel && node.parent_id == nested_org.id
+            })
+            .unwrap();
+
+        assert_eq!(catalog_parent_id(&tree, root), None);
+        assert_eq!(catalog_parent_id(&tree, group), Some(root.id.clone()));
+        assert_eq!(catalog_parent_id(&tree, top_org), None);
+        assert_eq!(
+            catalog_parent_id(&tree, nested_org),
+            Some(top_org.id.clone())
+        );
+        assert_eq!(
+            catalog_parent_id(&tree, channel),
+            Some(format!("{}/{}", root.id, nested_org.id))
+        );
+        assert_eq!(
+            catalog_business_group_id(&tree, top_org),
+            Some(group.id.clone())
+        );
+        assert_eq!(
+            catalog_business_group_id(&tree, channel),
+            Some(group.id.clone())
+        );
+    }
+
+    #[test]
     fn 模板节点数与结构() {
         let dom = "3402000000";
         let single = catalog_template("single", "34020000001110000001", "Cam", dom);
@@ -600,8 +760,12 @@ mod tests {
         assert_eq!(single[0].node_type, CatalogNodeType::Device);
 
         let nvr = catalog_template("nvr-8ch", "34020000001110000001", "Cam", dom);
-        assert_eq!(nvr.len(), 10); // 根 + 分组 + 8 通道
+        assert_eq!(nvr.len(), 11); // 根 + 分组 + 虚拟组织 + 8 通道
         assert_eq!(nvr[1].node_type, CatalogNodeType::BusinessGroup);
+        assert!(
+            nvr.iter()
+                .any(|node| node.node_type == CatalogNodeType::VirtualOrg)
+        );
         assert!(
             nvr.iter()
                 .filter(|n| n.node_type == CatalogNodeType::VideoChannel)
@@ -610,14 +774,95 @@ mod tests {
         );
 
         let civil = catalog_template("civil-3x2", "34020000001110000001", "Cam", dom);
-        assert_eq!(civil.len(), 10); // 根 + 3 组织 + 6 通道
-        assert_eq!(civil[1].civil_code.as_deref(), Some("310115"));
+        assert_eq!(civil.len(), 11); // 根 + 业务分组 + 3 组织 + 6 通道
+        assert_eq!(civil[2].civil_code.as_deref(), Some("310115"));
 
         let large = catalog_template("large-16ch", "34020000001110000001", "Cam", dom);
-        assert_eq!(large.len(), 20); // 根 + 2 分组 + 16 通道 + 1 报警
-        assert!(large
+        assert_eq!(large.len(), 22); // 根 + 2 分组 + 2 虚拟组织 + 16 通道 + 1 报警
+        assert!(
+            large
+                .iter()
+                .any(|n| n.node_type == CatalogNodeType::AlarmChannel)
+        );
+
+        let business = catalog_template("business-platform", "34020000001110000001", "Cam", dom);
+        assert_eq!(business.len(), 8); // 根 + 分组 + 3 虚拟组织 + 3 通道
+    }
+
+    #[test]
+    fn 下级平台业务模板包含业务分组嵌套虚拟目录和通道() {
+        let tree = catalog_template(
+            "downstream-business",
+            "34020000001110000001",
+            "下级平台",
+            "3402000000",
+        );
+        let group = tree
             .iter()
-            .any(|n| n.node_type == CatalogNodeType::AlarmChannel));
+            .find(|node| node.node_type == CatalogNodeType::BusinessGroup)
+            .expect("应包含业务分组");
+        let virtual_orgs: Vec<_> = tree
+            .iter()
+            .filter(|node| node.node_type == CatalogNodeType::VirtualOrg)
+            .collect();
+        assert!(virtual_orgs.len() >= 3, "模板应演示嵌套虚拟组织");
+        assert!(
+            tree.iter()
+                .any(|node| node.node_type == CatalogNodeType::VideoChannel)
+        );
+        assert!(virtual_orgs.iter().all(|node| {
+            catalog_business_group_id(&tree, node).as_deref() == Some(group.id.as_str())
+        }));
+
+        let nested_org = virtual_orgs
+            .iter()
+            .find(|node| {
+                tree.iter().any(|parent| {
+                    parent.id == node.parent_id && parent.node_type == CatalogNodeType::VirtualOrg
+                })
+            })
+            .expect("应包含嵌套虚拟组织");
+        let channel = tree
+            .iter()
+            .find(|node| {
+                node.node_type == CatalogNodeType::VideoChannel && node.parent_id == nested_org.id
+            })
+            .expect("嵌套虚拟组织下应有视频通道");
+        assert_eq!(
+            catalog_business_group_id(&tree, channel),
+            Some(group.id.clone())
+        );
+
+        for template in ["nvr-8ch", "civil-3x2", "large-16ch"] {
+            let existing =
+                catalog_template(template, "34020000001110000001", "下级平台", "3402000000");
+            for group in existing
+                .iter()
+                .filter(|node| node.node_type == CatalogNodeType::BusinessGroup)
+            {
+                assert!(
+                    existing.iter().any(|org| {
+                        org.node_type == CatalogNodeType::VirtualOrg && org.parent_id == group.id
+                    }),
+                    "{template} 的业务分组必须包含虚拟组织"
+                );
+                assert!(
+                    !existing.iter().any(|channel| {
+                        matches!(
+                            channel.node_type,
+                            CatalogNodeType::VideoChannel | CatalogNodeType::AlarmChannel
+                        ) && channel.parent_id == group.id
+                    }),
+                    "{template} 的通道不能直接挂在业务分组下"
+                );
+            }
+            for org in existing
+                .iter()
+                .filter(|node| node.node_type == CatalogNodeType::VirtualOrg)
+            {
+                assert!(catalog_business_group_id(&existing, org).is_some());
+            }
+        }
     }
 
     #[test]
