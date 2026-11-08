@@ -496,12 +496,12 @@ const columns: DataTableColumns<TreeRow> = [
   { title: "父节点", key: "parent_id", width: 150, render: (row) => parentName(row) },
   { title: "区划码", key: "civil_code", width: 88, render: (row) => row.civil_code ?? "—" },
   {
-    title: "状态", key: "status", width: 72,
+    title: "状态", key: "status", width: 88,
     render: (row) => h(NTag, { size: "small", type: row.status === "ON" ? "success" : "error", bordered: false },
       { default: () => row.status === "ON" ? "在线" : "离线" }),
   },
   {
-    title: "操作", key: "actions", width: 400, fixed: "right",
+    title: "操作", key: "actions", width: 460, fixed: "right",
     render: (row) => h(NSpace, { size: 4, wrap: false }, { default: () => actionButtons(row) }),
   },
 ];
@@ -759,5 +759,10 @@ onMounted(async () => {
 :deep(.n-data-table .n-data-table-th) { border-bottom: 1px solid rgba(120,130,150,.12) !important; color: var(--text-secondary); background-color: rgba(120,130,150,.06) !important; font-weight: 600; }
 :deep(.n-data-table .n-data-table-td) { border-bottom: 1px solid rgba(120,130,150,.08) !important; }
 :deep(.n-data-table .n-data-table-tr:hover .n-data-table-td) { background-color: rgba(56,132,255,.05) !important; }
+/* 「操作」列是 fixed-right 的 sticky 浮层，必须有不透明背景遮住横向滚动时经过
+   其下方的普通列，否则「状态」的在线/离线标签与表头文字会透上来造成重叠。 */
+:deep(.n-data-table .n-data-table-th--fixed-right) { background-color: #eef5fd !important; }
+:deep(.n-data-table .n-data-table-td--fixed-right),
+:deep(.n-data-table .n-data-table-tr:hover .n-data-table-td--fixed-right) { background-color: #f5f9fd !important; }
 @media (max-width: 1100px) { .channel-config { grid-template-columns: repeat(2,minmax(0,1fr)); }.toolbar { flex-wrap: wrap; }.search { order: 3; width: 100%; flex-basis: 100%; } }
 </style>
