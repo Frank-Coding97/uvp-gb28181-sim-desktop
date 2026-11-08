@@ -1,6 +1,6 @@
 //! SIP Digest 认证(MD5)。
 //!
-//! 实现 docs/40-protocol/sip.md#digest:解析 401 的 `WWW-Authenticate` 挑战,
+//! Digest 鉴权:解析 401 的 `WWW-Authenticate` 挑战,
 //! 计算 `response = MD5(HA1:nonce:HA2)`,构造 `Authorization` 头值。
 //! GB28181 用 MD5、qop 通常缺省(不带 qop 的经典算法),此处按经典 RFC 2617 实现。
 

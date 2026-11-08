@@ -29,7 +29,7 @@
 | UI↔引擎 | Tauri IPC 命令 + 事件流 |
 | 媒体转封装 | 发布包内置 FFmpeg(开发环境可用 PATH/`FFMPEG_BIN` 覆盖) |
 
-> 压测报告当前导出为最终指标快照 JSON;时序指标落 SQLite 为规划中(见 `docs/20-architecture/data-model.md`)。
+> 压测报告当前导出为最终指标快照 JSON;时序指标落 SQLite 为规划中。
 
 设计原则：**协议与压测逻辑全部在 Rust 引擎，UI 只负责展示与操作**。引擎可独立于 UI 运行（未来支持 CLI 与多 Agent 分布式压测）。
 
@@ -51,7 +51,6 @@ uvp-gb28181-desktop/
 │   ├── media-rtp/          # RTP / PS 封装 / 码流推送
 │   ├── scenario/           # 压测场景模型与解析（TOML）
 │   └── stress-engine/      # 压测调度 + 指标采集 + 对外服务
-├── docs/                   # 架构 / GB28181 / 路线图
 ├── assets/media/           # 内置测试码流
 └── examples/               # 示例场景与配置
 ```
@@ -85,18 +84,6 @@ npm run tauri dev
 > 访达(Finder)+ AppleScript 摆窗口,**这一步依赖图形桌面**——在 SSH 远程 / CI / 无桌面会话下会
 > 失败,导致整个打包中断。本脚本改用系统底层命令 `hdiutil` 打一个**朴素但可靠**的 dmg(无花哨
 > 布局,拖拽安装),绕开该限制。有图形桌面时也可正常用 `npm run tauri build`。
-
----
-
-## 文档
-
-完整文档见 [`docs/`](docs/)(文档中心 + 文档先行约定)。常用入口:
-
-- [产品愿景](docs/00-product/vision.md) · [需求清单 FR/NFR](docs/00-product/requirements.md)
-- [功能规格:设备模拟](docs/10-functional/device-simulation.md) · [压力测试](docs/10-functional/stress-testing.md)
-- [架构总览](docs/20-architecture/overview.md) · [UI↔引擎 API 契约](docs/20-architecture/api-contract.md) · [数据模型](docs/20-architecture/data-model.md)
-- [各 crate 规格](docs/30-crates/) · [协议规格](docs/40-protocol/)
-- [路线图与并发分工](docs/90-process/roadmap.md) · [编码规范](docs/90-process/coding-standards.md) · [测试策略](docs/90-process/testing-strategy.md)
 
 ---
 

@@ -1,7 +1,7 @@
 //! 压测场景:批量生成设备配置的策略。
 //!
-//! 实现 docs/10-functional/stress-testing.md §1:从基础配置生成 N 个设备,
-//! ID 递增,分档设置媒体强度。M3 实现 LinearScenario(连续 ID),支持 TOML 配置。
+//! 从基础配置生成 N 个设备,ID 递增,分档设置媒体强度。
+//! LinearScenario 按连续 ID 生成,场景参数走 TOML 配置。
 
 use common::{DeviceId, GbVersion, Result, Transport};
 use gb28181_simulator::{ChannelConfig, DeviceConfig, DeviceInfo};
@@ -98,7 +98,7 @@ pub struct DeviceInfoTemplate {
     pub hardware_version: Option<String>,
 }
 
-/// 媒体档(对应压测强度,docs/10-functional/stress-testing.md#2)。
+/// 媒体档(对应压测强度)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MediaProfile {
     /// A 档:空媒体,不推流(仅信令)。默认档。

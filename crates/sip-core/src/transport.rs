@@ -1,9 +1,9 @@
 //! SIP 传输层。
 //!
-//! 实现 docs/30-crates/sip-core.md §transport。M1 提供 UDP 传输,采用
+//! M1 提供 UDP 传输,采用
 //! **共享 socket + 按 Call-ID 路由分发** 的模型:一个 socket 承载多台虚拟设备的
 //! 收发,收到的响应按 Call-ID 投递到对应设备的接收队列。这是压测万级设备的关键
-//! (避免每设备一个 socket 耗尽端口/FD,见 docs/10-functional/stress-testing.md#42)。
+//! (避免每设备一个 socket 耗尽端口/FD)。
 
 use std::net::SocketAddr;
 use std::sync::Arc;

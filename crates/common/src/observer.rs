@@ -118,7 +118,7 @@ pub enum DeviceEvent {
     },
 }
 
-/// 失败归因(与 docs/20-architecture/data-model.md#4 对齐)。
+/// 失败归因。
 #[derive(Debug, Clone, Copy)]
 pub enum FailureKind {
     /// 事务超时无响应。

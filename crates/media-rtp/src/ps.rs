@@ -1,6 +1,6 @@
 //! PS(Program Stream)封装。
 //!
-//! 实现 docs/40-protocol/media-ps-rtp.md 的 PS 层:把一帧 H.264 访问单元封成
+//! PS 层:把一帧 H.264 访问单元封成
 //! Program Stream。每帧输出 = Pack Header (+ 关键帧带 System Header + PSM) + PES。
 //! 时间戳基于 90kHz。这是能被主流国标平台(WVP 等)解析的最小可用封装。
 

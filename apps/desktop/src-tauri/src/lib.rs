@@ -1,6 +1,6 @@
 //! Tauri 桌面端后端库。
 //!
-//! 按 docs/20-architecture/api-contract.md 注册 IPC 命令。
+//! 注册 IPC 命令。
 //! 第一阶段内嵌 stress-engine；后续可拆为独立进程。
 
 use std::sync::{

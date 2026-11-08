@@ -1,6 +1,6 @@
 //! GB28181 SIP 请求构造。
 //!
-//! 按 docs/40-protocol/sip.md 构造设备侧发出的 REGISTER 与 MESSAGE(Keepalive)请求。
+//! 构造设备侧发出的 REGISTER 与 MESSAGE(Keepalive)请求。
 //! 头字段(Via/From/To/Contact/CSeq/Call-ID/Max-Forwards/Expires)按 GB28181 惯例填充。
 
 use sip_core::{Headers, Method, Request};

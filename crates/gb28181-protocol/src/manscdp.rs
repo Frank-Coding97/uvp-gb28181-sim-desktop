@@ -1,6 +1,6 @@
 //! MANSCDP XML 消息编解码。
 //!
-//! 实现 docs/40-protocol/manscdp.md。M1 覆盖 Keepalive(心跳 Notify);
+//! M1 覆盖 Keepalive(心跳 Notify);
 //! M2 补充 Catalog / DeviceInfo / DeviceStatus 查询解析与应答。用 quick-xml + serde。
 
 use common::{Error, Result};

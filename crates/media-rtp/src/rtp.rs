@@ -1,6 +1,6 @@
 //! RTP 打包与发送。
 //!
-//! 实现 docs/40-protocol/media-ps-rtp.md 的 RTP 层:RFC 3550 的 12 字节头 +
+//! RTP 层:RFC 3550 的 12 字节头 +
 //! 载荷,SSRC/序号/时间戳管理,UDP 发送与发送量统计(供压测指标)。
 //! PS 流负载类型固定 96,时钟 90kHz。TCP(RFC 4571)在后续补充。
 

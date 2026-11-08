@@ -1,6 +1,6 @@
 //! 视频源抽象(可插拔)。
 //!
-//! 对应压测三档媒体强度(docs/10-functional/stress-testing.md#2):
+//! 对应压测三档媒体强度:
 //! - `NoneSource`:空媒体(不产帧)—— A 档
 //! - `LightSource`:合成低码率伪包 —— B 档(测 RTP 通道/带宽,内容不要求可解码)
 //! - `FileSource`:H.264 文件循环 —— C 档 / 单设备联调

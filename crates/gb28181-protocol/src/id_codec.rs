@@ -1,6 +1,6 @@
 //! 国标 20 位 ID 编解码。
 //!
-//! 实现 docs/40-protocol/manscdp.md#id-编码:20 位 = 中心编码(8) + 行业(2) +
+//! 20 位 = 中心编码(8) + 行业(2) +
 //! 类型(3) + 序号(7)。压测批量生成设备 ID 时按序号递增(FR-20)。
 
 use common::{DeviceId, Error, Result};

@@ -1,6 +1,6 @@
 //! 单设备仿真:设备配置 + 注册/心跳状态机。
 //!
-//! 实现 docs/10-functional/device-simulation.md §3.1(注册+Digest)、§3.2(心跳)。
+//! 注册+Digest 鉴权、心跳保活。
 //! 注册闭环:REGISTER(无鉴权)→ 平台 401 挑战 → REGISTER(带 Authorization)→ 200 OK。
 //! 注册成功后按 `heartbeat_interval_secs` 周期发送 Keepalive。
 
@@ -237,7 +237,7 @@ fn record_heartbeat_failure(failures: &mut u32, threshold: u32) -> bool {
     *failures >= threshold.max(1)
 }
 
-/// 设备状态(与 docs/10-functional/device-simulation.md#2、UI DTO 对齐)。
+/// 设备状态(与 UI DTO 对齐)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceState {
     /// 离线。
@@ -4945,7 +4945,7 @@ impl DeviceSimulator {
     /// 运行设备:注册 → 启动入站应答(OPTIONS)→ 周期心跳,直到 `shutdown` 完成。
     ///
     /// 心跳连续失败 `max_hb_fail` 次判定掉线,触发重注册(指数退避 backoff→2×,上限 backoff_max)。
-    /// 这是设备"保持在线"的主循环(docs/10-functional/device-simulation.md §3.2/§3.3)。
+    /// 这是设备"保持在线"的主循环(心跳保活与掉线重注册)。
     pub async fn run(
         self: Arc<Self>,
         transport: Arc<SipTransport>,

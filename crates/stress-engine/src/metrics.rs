@@ -34,7 +34,7 @@ pub struct Metrics {
     pub alarm_reported: AtomicU64,
 }
 
-/// 失败归因分类(对应 docs/20-architecture/data-model.md#4)。
+/// 失败归因分类。
 #[derive(Debug, Clone, Copy)]
 pub enum FailureKind {
     Timeout,
