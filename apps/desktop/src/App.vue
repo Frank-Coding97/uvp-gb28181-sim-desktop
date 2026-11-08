@@ -39,6 +39,8 @@ import { startNotificationCenter, stopNotificationCenter } from "./notification-
 const route = useRoute();
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const router = useRouter();
+// 构建期注入（见 vite.config.ts），与 Tauri 打包用的版本号同源。
+const appVersion = __APP_VERSION__;
 
 function icon(comp: any) {
   return () => h(NIcon, null, { default: () => h(comp) });
@@ -402,7 +404,7 @@ const themeOverrides = {
                 :indent="18"
                 @update:value="onMenuSelect"
               />
-              <div class="sidebar-footer">v0.1.2 · UVP</div>
+              <div class="sidebar-footer">v{{ appVersion }} · UVP</div>
             </aside>
 
             <!-- 主区 -->

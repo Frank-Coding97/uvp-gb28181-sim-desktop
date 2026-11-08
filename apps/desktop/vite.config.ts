@@ -1,5 +1,9 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+// 版本号唯一真源：tauri.conf.json（Tauri 打包实际读它，产物文件名、安装器版本、
+// .app 版本都来自这里）。前端不再硬编码，由构建期注入 __APP_VERSION__，
+// 避免出现「tag 是新的、包是旧的、界面显示的又是第三个值」。
+import tauriConf from "./src-tauri/tauri.conf.json";
 
 // Tauri 期望前端跑在固定端口;开发时 Vite 提供热更新,由 Tauri 加载该地址。
 //
@@ -10,6 +14,10 @@ import vue from "@vitejs/plugin-vue";
 // document 停在 about:blank、readyState 卡在 interactive，手动刷新都不一定好。
 // 固定 IPv4 后两端完全一致，不再有解析/回落。
 export default defineConfig({
+  // 应用版本号，UI 各处统一引用 __APP_VERSION__，不再各自写死。
+  define: {
+    __APP_VERSION__: JSON.stringify(tauriConf.version),
+  },
   plugins: [
     vue(),
     {

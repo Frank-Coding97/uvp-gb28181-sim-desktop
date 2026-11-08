@@ -65,6 +65,9 @@ type SettingKey = "device" | "media" | "osd" | "network" | "about";
 
 const props = defineProps<{ section: SettingKey }>();
 
+// 构建期注入（见 vite.config.ts），与安装包版本号同源，不要改成硬编码。
+const appVersion = __APP_VERSION__;
+
 const settings = [
   { key: "device" as const, icon: "◈", title: "设备配置", description: "设备身份、注册周期与出厂信息" },
   { key: "media" as const, icon: "◉", title: "音视频配置", description: "画质预设、视频编码与音频参数" },
@@ -792,7 +795,7 @@ function setBindMode(mode: BindMode) {
 
         <section v-else-if="activeKey === 'about'" class="settings-section about-section">
           <div class="about-hero"><div class="about-logo">UVP</div><div><h2>GB28181 Sim</h2><p>国标设备模拟 · 压力测试</p></div></div>
-          <div class="about-grid"><div><span>版本</span><strong>v0.1.2</strong></div><div><span>协议</span><strong>GB/T 28181-2016 / 2022</strong></div><div><span>桌面框架</span><strong>Tauri 2 + Vue 3</strong></div><div><span>配置真相源</span><strong>Rust ConfigStore</strong></div></div>
+          <div class="about-grid"><div><span>版本</span><strong>v{{ appVersion }}</strong></div><div><span>协议</span><strong>GB/T 28181-2016 / 2022</strong></div><div><span>桌面框架</span><strong>Tauri 2 + Vue 3</strong></div><div><span>配置真相源</span><strong>Rust ConfigStore</strong></div></div>
         </section>
         <section v-else class="settings-section loading-section">
           <strong>配置正在加载</strong>
