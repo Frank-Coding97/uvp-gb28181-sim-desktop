@@ -5,7 +5,12 @@
 
 $ErrorActionPreference = "Stop"
 $DesktopDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RuntimeDir = Join-Path $DesktopDir "runtime\ffmpeg"
+# ⛔ 必须是 src-tauri\runtime\ffmpeg，不是 desktop\runtime\ffmpeg。
+#    `bundle.resources` 的路径基准是 tauri.conf.json 所在目录（src-tauri），
+#    放在上级目录时 `runtime/ffmpeg/*` 匹配不到任何文件，tauri-build 直接报
+#    `glob pattern runtime/ffmpeg/* path not found or didn't match any files.` 并中断编译
+#    （2026-11-08 在 52 上实测，前端已构建完，卡在 Rust 编译阶段）。
+$RuntimeDir = Join-Path $DesktopDir "src-tauri\runtime\ffmpeg"
 
 # ffmpeg：主干媒体能力（容器转封装、摄像头/屏幕采集、快照、录像收尾）。
 if ([string]::IsNullOrWhiteSpace($FfmpegBin)) {
