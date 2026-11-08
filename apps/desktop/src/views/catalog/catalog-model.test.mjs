@@ -17,6 +17,7 @@ import {
   encodeCatalogJson,
   filterTreeByQuery,
   genChildId,
+  isRoot,
   makeNode,
   moveCatalogNode,
   nextSeqId,
@@ -41,16 +42,16 @@ test("ID 生成与 Rust gen_child_id / 移动端 IdEncoder 同口径", () => {
   assert.equal(ALL_TYPES.length, 7);
 });
 
-test("模板集合：移动端 2 个 + 桌面端扩展 3 个，标准业务分组仅 2022", () => {
-  assert.equal(CATALOG_TEMPLATES.length, 5);
-  assert.deepEqual(availableTemplates("V2016").map((t) => t.id), ["single", "nvr-8ch", "civil-3x2", "large-16ch"]);
+test("模板集合：移动端 2 个 + 桌面端扩展 4 个，标准业务分组仅 2022", () => {
+  assert.equal(CATALOG_TEMPLATES.length, 6);
+  assert.deepEqual(availableTemplates("V2016").map((t) => t.id), ["single", "nvr-8ch", "civil-3x2", "large-16ch", "business-platform"]);
   assert.deepEqual(availableTemplates("V2022").map((t) => t.id), [
-    "single", "standard-business-group", "nvr-8ch", "civil-3x2", "large-16ch",
+    "single", "standard-business-group", "nvr-8ch", "civil-3x2", "large-16ch", "business-platform",
   ]);
   assert.equal(availableTemplates("V2022").filter((t) => t.origin === "mobile").length, 2);
 });
 
-test("5 个模板全部能通过保存预检，且节点 ID 无重复", () => {
+test("6 个模板全部能通过保存预检，且节点 ID 无重复", () => {
   for (const tpl of CATALOG_TEMPLATES) {
     const nodes = tpl.build(CTX);
     assert.deepEqual(validateDraft(nodes), [], `${tpl.id} 模板应通过校验`);
@@ -64,6 +65,35 @@ test("5 个模板全部能通过保存预检，且节点 ID 无重复", () => {
   assert.equal(standard[0].id.slice(10, 13), "200");
   assert.equal(countByType(standard, "VirtualOrg"), 2);
   assert.ok(standard.filter((n) => n.node_type === "VirtualOrg").every((n) => n.business_group_id));
+});
+
+test("business-platform 模板与 Rust catalog_template 同构：215 → 216(含嵌套) → 通道归属", () => {
+  const tree = byId(CATALOG_TEMPLATES, "business-platform").build(CTX);
+  assert.equal(tree.length, 8, "根 + 1 分组 + 3 虚拟组织 + 3 通道");
+  const root = tree[0];
+  const group = tree.find((n) => n.node_type === "BusinessGroup");
+  const [teaching, dormitory, classroom] = ["教学楼", "宿舍楼", "教学楼一层"].map((name) => tree.find((n) => n.name === name));
+  const [entry, hall, corridor] = ["教学楼-入口", "宿舍楼-大厅", "教学楼-一层走廊"].map((name) => tree.find((n) => n.name === name));
+
+  assert.equal(root.node_type, "Device");
+  assert.equal(isRoot(root), true);
+  assert.equal(group.node_type, "BusinessGroup");
+  assert.equal(group.parent_id, root.id);
+  assert.deepEqual(tree.filter((n) => n.node_type === "VirtualOrg").map((n) => n.id.slice(10, 13)), ["216", "216", "216"]);
+  assert.deepEqual(tree.filter((n) => n.node_type === "VideoChannel").map((n) => n.id.slice(10, 13)), ["132", "132", "132"]);
+
+  // 215 下两个顶层组织，第三个组织嵌在「教学楼」下（与 Rust 侧一致）。
+  assert.equal(teaching.parent_id, group.id);
+  assert.equal(dormitory.parent_id, group.id);
+  assert.equal(classroom.parent_id, teaching.id);
+  // 216 必须挂在业务分组上（业务分组归属可追溯）。
+  for (const org of [teaching, dormitory, classroom]) {
+    assert.equal(org.business_group_id, group.id, `${org.name} 应归属业务分组`);
+  }
+  assert.equal(entry.parent_id, teaching.id);
+  assert.equal(hall.parent_id, dormitory.id);
+  assert.equal(corridor.parent_id, classroom.id);
+  assert.deepEqual(collectDescendants(group.id, tree).size, 6, "分组下共 6 个后代节点");
 });
 
 test("新增子节点类型按父节点限制，与移动端 AddChildDialog 一致", () => {

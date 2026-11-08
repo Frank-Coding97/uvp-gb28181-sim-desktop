@@ -196,6 +196,31 @@ function standardBusinessGroupTemplate(ctx: TemplateContext): CatalogNode[] {
   ];
 }
 
+/**
+ * 下级平台业务目录（215/216）：与 Rust `id_codec::catalog_template("business-platform")` 同款结构。
+ *
+ * 设备根 → 业务分组(215) → 两个顶层虚拟组织(216) + 一个嵌在「教学楼」下的二级虚拟组织(216)，
+ * 三条通道分别归属各自虚拟组织。用于联调业务目录解析与「通道按归属过滤」。
+ */
+function businessPlatformTemplate(ctx: TemplateContext): CatalogNode[] {
+  const root = ctx.deviceId;
+  const group = templateSeq(ctx, "BusinessGroup", 1);
+  const teaching = templateSeq(ctx, "VirtualOrg", 1);
+  const dormitory = templateSeq(ctx, "VirtualOrg", 2);
+  const classroom = templateSeq(ctx, "VirtualOrg", 3);
+  const orgAttrs = { business_group_id: group };
+  return [
+    makeNode(root, "Device", ctx.deviceName, root),
+    makeNode(group, "BusinessGroup", "校园安防", root),
+    makeNode(teaching, "VirtualOrg", "教学楼", group, orgAttrs),
+    makeNode(dormitory, "VirtualOrg", "宿舍楼", group, orgAttrs),
+    makeNode(classroom, "VirtualOrg", "教学楼一层", teaching, orgAttrs),
+    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", "教学楼-入口", teaching),
+    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", "宿舍楼-大厅", dormitory),
+    makeNode(templateSeq(ctx, "VideoChannel", 3), "VideoChannel", "教学楼-一层走廊", classroom),
+  ];
+}
+
 export const CATALOG_TEMPLATES: CatalogTemplateDef[] = [
   {
     id: "single",
@@ -231,6 +256,13 @@ export const CATALOG_TEMPLATES: CatalogTemplateDef[] = [
     description: "室内/室外两个业务分组各 8 通道 + 1 报警通道。桌面端扩展。",
     origin: "desktop",
     build: large16Template,
+  },
+  {
+    id: "business-platform",
+    title: "下级平台业务目录（215/216）",
+    description: "业务分组 + 嵌套虚拟组织 + 3 通道，用于联调目录层级与通道归属。桌面端扩展。",
+    origin: "desktop",
+    build: businessPlatformTemplate,
   },
 ];
 
