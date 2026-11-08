@@ -166,12 +166,13 @@
 
 ## 界面一览
 
-<!--
-应用截图区（素材到位后用下面这段替换本注释，图片统一放 docs/screenshots/）。
-命名用小写英文 + 连字符；宽屏截图建议压到 1600px 宽 / 500KB 以内，避免仓库膨胀；
-截图里的平台 IP、设备编号、认证口令需先脱敏。
+<a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="首页：运行状态、SIP 接入配置与本地预览" width="100%"/></a>
 
-<a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="首页：运行状态总览与平台连接" width="100%"/></a>
+> 截图取自开发环境，平台 IP、设备编号与端口已替换为示例值，注册密码保持隐藏。点击图片可查看原图。
+
+<!--
+其余页面截图待补：图片统一放 docs/screenshots/，命名用小写英文 + 连字符，宽屏图压到
+1600px 宽 / 500KB 以内；敏感字段（IP、20 位设备编号、口令）需先脱敏。素材到位后启用下面这段两列网格：
 
 <table>
 <tr>
@@ -187,8 +188,6 @@
 <td align="center"><b>录像中心</b><br/><a href="docs/screenshots/recordings.png"><img src="docs/screenshots/recordings.png" alt="录像中心" width="100%"/></a></td>
 </tr>
 </table>
-
-> 截图取自开发环境，图中设备编码、IP 地址与口令均已脱敏。点击图片可查看原图。
 -->
 
 | 菜单 | 用途 |
