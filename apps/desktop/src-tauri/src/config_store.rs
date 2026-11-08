@@ -496,10 +496,12 @@ pub struct DeviceSettings {
     #[serde(default)]
     pub hardware_version: String,
     pub channel_name: String,
-    /// 安装位置（目录 Item 的 `<Address>`）。空串表示未设置，旧配置缺省为空。
+    /// 安装位置（目录 Item 的 `<Address>`）。空串表示未设置；缺字段的旧配置回落空串，
+    /// 全新安装默认 `lobby`（大厅）。
     #[serde(default)]
     pub location: String,
-    /// 摄像头类型（DeviceInfo 应答的 `<DeviceType>`）。空串表示未设置，旧配置缺省为空。
+    /// 摄像头类型（DeviceInfo 应答的 `<DeviceType>`）。空串表示未设置；缺字段的旧配置回落空串，
+    /// 全新安装默认 `ptz_dome`（球机）。
     #[serde(default)]
     pub camera_type: String,
     pub register_expires_secs: u32,
@@ -613,8 +615,8 @@ impl Default for DesktopConfigV2 {
                 firmware: "0.1.2".into(),
                 hardware_version: String::new(),
                 channel_name: "Camera-1".into(),
-                location: String::new(),
-                camera_type: String::new(),
+                location: "lobby".into(),
+                camera_type: "ptz_dome".into(),
                 register_expires_secs: 3_600,
                 heartbeat_interval_secs: 60,
                 heartbeat_fail_threshold: 3,
@@ -869,6 +871,8 @@ mod tests {
         assert_eq!(config.profiles[0].password, "");
         assert_eq!(config.schema_version, 2);
         assert_eq!(config.device.register_expires_secs, 3_600);
+        assert_eq!(config.device.location, "lobby");
+        assert_eq!(config.device.camera_type, "ptz_dome");
     }
 
     #[test]
