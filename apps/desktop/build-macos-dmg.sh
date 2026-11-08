@@ -4,11 +4,15 @@
 # 用法：在 apps/desktop 目录运行 ./build-macos-dmg.sh
 # 环境变量：
 #   BUNDLE_FFMPEG=auto|1     默认 1；发布包必须内嵌 FFmpeg
-#   FFMPEG_BIN=/path/ffmpeg  指定要内嵌的 FFmpeg
+#   FFMPEG_BIN=/path/ffmpeg  指定要内嵌的 FFmpeg（不指定时优先挑带 OSD 能力的）
+#   FFPROBE_BIN=/path/ffprobe 指定配套 ffprobe；不指定时按 ffmpeg 同目录推断
+#   REQUIRE_OSD_FFMPEG=1     缺 drawtext/drawbox 时直接失败，供 CI 防止静默降级
 #   APPLE_SIGNING_IDENTITY   正式签名身份；未设置时使用 ad-hoc 签名“-”
 #   APPLE_NOTARY_PROFILE     可选的 notarytool Keychain profile；设置后提交并装订 DMG
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+. "$SCRIPT_DIR/../../scripts/select-ffmpeg-macos.sh"
 
 # rustup 安装的 cargo 在非交互 shell 中可能不在 PATH。
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
@@ -23,23 +27,6 @@ BUNDLE_SCRIPT="../../scripts/bundle-ffmpeg-macos.sh"
 CAPABILITY_SCRIPT="../../scripts/check-ffmpeg-capabilities.sh"
 SWIFT_BUNDLE_SCRIPT="../../scripts/bundle-swift-runtime-macos.sh"
 SIGN_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
-
-find_ffmpeg() {
-  if [ -n "${FFMPEG_BIN:-}" ] && [ -x "$FFMPEG_BIN" ]; then
-    printf '%s\n' "$FFMPEG_BIN"
-    return
-  fi
-  if command -v ffmpeg >/dev/null 2>&1; then
-    command -v ffmpeg
-    return
-  fi
-  for candidate in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg /opt/local/bin/ffmpeg; do
-    if [ -x "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-}
 
 echo "==> 1/4 构建 .app（Tauri app bundle）"
 npm run tauri build -- --bundles app
@@ -59,14 +46,26 @@ echo "==> 2/4 内嵌 ScreenCaptureKit 所需 Swift runtime"
 echo "==> 3/4 处理 FFmpeg 运行时"
 case "$BUNDLE_MODE" in
   auto|1|true|yes)
-    FFMPEG_SOURCE="$(find_ffmpeg || true)"
+    if [ -n "${FFMPEG_BIN:-}" ] && [ ! -x "$FFMPEG_BIN" ]; then
+      echo "错误：FFMPEG_BIN 指定的 FFmpeg 不可执行：$FFMPEG_BIN" >&2
+      exit 1
+    fi
+    FFMPEG_SOURCE="$(uvp_find_ffmpeg || true)"
     if [ -z "$FFMPEG_SOURCE" ]; then
       echo "错误：发布包必须内嵌 FFmpeg，但当前构建机未找到。请安装构建依赖或设置 FFMPEG_BIN。" >&2
       exit 1
-    else
-      "$CAPABILITY_SCRIPT" "$FFMPEG_SOURCE" "../../target/release/preview-ffmpeg-capabilities.json" "videotoolbox"
-      "$BUNDLE_SCRIPT" "$APP_DIR" "$SIGN_IDENTITY" "$FFMPEG_SOURCE"
     fi
+    uvp_check_osd_capability "$FFMPEG_SOURCE"
+    FFPROBE_SOURCE="$(uvp_find_ffprobe "$FFMPEG_SOURCE" || true)"
+    if [ -z "$FFPROBE_SOURCE" ]; then
+      echo "错误：未找到与 $FFMPEG_SOURCE 配套的 ffprobe，请设置 FFPROBE_BIN。" >&2
+      exit 1
+    fi
+    echo "内嵌 FFmpeg:  $FFMPEG_SOURCE"
+    echo "内嵌 ffprobe: $FFPROBE_SOURCE"
+    FFPROBE_BIN="$FFPROBE_SOURCE" "$CAPABILITY_SCRIPT" "$FFMPEG_SOURCE" \
+      "../../target/release/preview-ffmpeg-capabilities.json" "videotoolbox"
+    "$BUNDLE_SCRIPT" "$APP_DIR" "$SIGN_IDENTITY" "$FFMPEG_SOURCE" "$FFPROBE_SOURCE"
     ;;
   0|false|no)
     echo "错误：禁止生成不含 FFmpeg 的用户发布包（BUNDLE_FFMPEG=$BUNDLE_MODE）。" >&2

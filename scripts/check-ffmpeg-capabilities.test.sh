@@ -103,14 +103,20 @@ FFPROBE_BIN="$FFPROBE_BIN" "$BUNDLE_SCRIPT" "$APP" - "$FFMPEG_BIN" "$FFPROBE_BIN
 echo "[T01] probe bundled tools with the same synthetic media matrix"
 FFPROBE_BIN="$APP/Contents/MacOS/ffprobe" "$CHECK_SCRIPT" \
   "$APP/Contents/MacOS/ffmpeg" "$TMP_DIR/bundled-capabilities.json" videotoolbox >"$TMP_DIR/bundled-probe.stdout"
-python3 - "$TMP_DIR/bundled-capabilities.json" <<'PY'
+python3 - "$TMP_DIR/bundled-capabilities.json" "$REPORT" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     report = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    source = json.load(handle)
 assert report["overall_status"] == "passed", report
 assert all(item["encoded"] and item["decoded"] for item in report["probes"].values()), report
+# 内嵌不能把 OSD 能力弄丢：源 ffmpeg 带 drawtext/drawbox 时，包内必须同样具备。
+assert report["osd_filters"] == source["osd_filters"], (source["osd_filters"], report["osd_filters"])
+if all(source["osd_filters"].values()):
+    assert all(report["osd_filters"].values()), report["osd_filters"]
 PY
 
 for tool in ffmpeg ffprobe; do

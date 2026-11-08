@@ -13,22 +13,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/select-ffmpeg-macos.sh"
 APP_ENTITLEMENTS="$SCRIPT_DIR/../apps/desktop/src-tauri/Entitlements.plist"
 /usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.camera' "$APP_ENTITLEMENTS" | grep -qx true
 
 APP_INPUT="${1:?需要主 app 路径}"
 IDENTITY="${2:?需要签名身份(security find-identity 里的哈希或名称)}"
 APP="$(cd "$(dirname "$APP_INPUT")" && pwd)/$(basename "$APP_INPUT")"
-SRC_FFMPEG_INPUT="${3:-$(command -v ffmpeg || echo /opt/homebrew/bin/ffmpeg)}"
+SRC_FFMPEG_INPUT="${3:-$(uvp_find_ffmpeg || echo /opt/homebrew/bin/ffmpeg)}"
 SRC_FFMPEG="$(cd "$(dirname "$SRC_FFMPEG_INPUT")" && pwd)/$(basename "$SRC_FFMPEG_INPUT")"
 if [ -n "${4:-}" ]; then
   SRC_FFPROBE_INPUT="$4"
-elif [ -n "${FFPROBE_BIN:-}" ]; then
-  SRC_FFPROBE_INPUT="$FFPROBE_BIN"
-elif [ -x "$(dirname "$SRC_FFMPEG_INPUT")/ffprobe" ]; then
-  SRC_FFPROBE_INPUT="$(dirname "$SRC_FFMPEG_INPUT")/ffprobe"
 else
-  SRC_FFPROBE_INPUT="$(command -v ffprobe || echo /opt/homebrew/bin/ffprobe)"
+  # 与源 ffmpeg 配套：ffmpeg-osd 对应 ffprobe-osd，避免混用不同版本。
+  SRC_FFPROBE_INPUT="$(uvp_find_ffprobe "$SRC_FFMPEG_INPUT" || echo /opt/homebrew/bin/ffprobe)"
 fi
 SRC_FFPROBE="$(cd "$(dirname "$SRC_FFPROBE_INPUT")" && pwd)/$(basename "$SRC_FFPROBE_INPUT")"
 
@@ -69,20 +67,34 @@ chmod +w "$FPBIN"
 # 递归收集非系统依赖库(otool),拷进 Frameworks 并重写 install_name 为 @rpath。
 # 兼容 macOS 自带 bash 3.2:用换行分隔的字符串做去重,不用关联数组。
 DONE_LIST=""
+SOURCE_DIRS=""
 collect() {
   local bin="$1"
   local deps
   deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | awk '{print $1}' \
          | grep -vE '^/usr/lib/|^/System/' || true)
-  local d name
+  local d name srcdir
   for d in $deps; do
     name=$(basename "$d")
+    case "$d" in
+      @rpath/*|@loader_path/*|@executable_path/*)
+        # 已是相对引用，无需改写。绝不能据此写入 DONE_LIST：它不是可拷贝的
+        # 源文件路径，若先遇到它，后面带绝对路径的同名引用会被去重跳过，
+        # 产出「签名通过但 dyld 一启动就崩」的坏包(libggml-base 踩过)。
+        continue
+        ;;
+    esac
     install_name_tool -change "$d" "@rpath/$name" "$bin" 2>/dev/null || true
     case "$DONE_LIST" in
       *"|$name|"*) : ;;
       *)
-        DONE_LIST="$DONE_LIST|$name|"
         if [ -f "$d" ]; then
+          DONE_LIST="$DONE_LIST|$name|"
+          srcdir="$(dirname "$d")"
+          case "$SOURCE_DIRS" in
+            *"|$srcdir|"*) : ;;
+            *) SOURCE_DIRS="$SOURCE_DIRS|$srcdir|" ;;
+          esac
           cp "$d" "$LIBDIR/$name"
           chmod +w "$LIBDIR/$name"
           install_name_tool -id "@rpath/$name" "$LIBDIR/$name" 2>/dev/null || true
@@ -94,6 +106,59 @@ collect() {
 }
 collect "$FFBIN"
 collect "$FPBIN"
+
+# 签名前校验所有 @rpath 引用都有对应文件。系统 keg 的 dylib 常用 @rpath 引用同伴，
+# 漏拷时包照样能通过 codesign，但用户一启动就 dyld 崩溃，必须在这里拦下。
+missing_rpath_libs() {
+  {
+    otool -L "$FFBIN" 2>/dev/null
+    otool -L "$FPBIN" 2>/dev/null
+    while IFS= read -r -d '' lib; do
+      otool -L "$lib" 2>/dev/null
+    done < <(find "$LIBDIR" -type f -name '*.dylib' -print0)
+  } | awk '{print $1}' | grep '^@rpath/' | sed 's|.*/||' | sort -u |
+    while IFS= read -r name; do
+      [ -f "$LIBDIR/$name" ] || printf '%s\n' "$name"
+    done
+}
+# 有些库只被同伴库用 @rpath 引用、不在 ffmpeg 的直接依赖里(如 libjxl_cms)，
+# 从已收集的源目录按文件名回填，再重新扫描直到补齐或无法继续。
+resolve_rpath_libs() {
+  local name dir progress rounds=0
+  local -a dirs
+  while [ -n "$MISSING_LIBS" ] && [ "$rounds" -lt 10 ]; do
+    rounds=$((rounds + 1))
+    progress=0
+    IFS='|' read -r -a dirs <<<"$SOURCE_DIRS"
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      if [ -f "$LIBDIR/$name" ]; then continue; fi
+      for dir in "${dirs[@]}"; do
+        [ -n "$dir" ] || continue
+        if [ -f "$dir/$name" ]; then
+          cp "$dir/$name" "$LIBDIR/$name"
+          chmod +w "$LIBDIR/$name"
+          install_name_tool -id "@rpath/$name" "$LIBDIR/$name" 2>/dev/null || true
+          collect "$LIBDIR/$name"
+          progress=1
+          break
+        fi
+      done
+    done <<<"$MISSING_LIBS"
+    [ "$progress" -eq 1 ] || break
+    MISSING_LIBS="$(missing_rpath_libs || true)"
+  done
+}
+MISSING_LIBS="$(missing_rpath_libs || true)"
+if [ -n "$MISSING_LIBS" ]; then
+  resolve_rpath_libs
+fi
+MISSING_LIBS="$(missing_rpath_libs || true)"
+if [ -n "$MISSING_LIBS" ]; then
+  echo "[ffmpeg-bundle] 缺少以下动态库，拒绝产出能签名却启动即崩的坏包:" >&2
+  echo "$MISSING_LIBS" >&2
+  exit 1
+fi
 
 # ffmpeg/ffprobe 从 Contents/MacOS 找 Contents/Frameworks 的库。
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$FFBIN" 2>/dev/null || true
