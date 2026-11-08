@@ -28,6 +28,8 @@ import InformationCircleOutline from "@vicons/ionicons5/es/InformationCircleOutl
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { usePlatform } from "./platform";
 import type { GbVersion, SignalingEncoding } from "./platform";
+// 应用图标与应用包图标同源(app-icon.svg → tauri icon),侧边栏 logo 直接复用矢量图。
+import appIconUrl from "./assets/app-icon.svg?url";
 import { effective, normalizeForVersion, optionsFor, parseEncoding } from "./signaling-charset.mjs";
 import { useDevice } from "./device";
 import NotificationBell from "./components/NotificationBell.vue";
@@ -341,7 +343,9 @@ const themeOverrides = {
             <!-- 侧边栏 -->
             <aside class="sidebar">
               <div class="brand">
-                <div class="brand-logo">UVP</div>
+                <div class="brand-logo">
+                  <img :src="appIconUrl" alt="UVP" />
+                </div>
                 <div>
                   <div class="brand-title">GB28181 Sim</div>
                   <div class="brand-sub">国标设备模拟 · 压测</div>
@@ -456,12 +460,16 @@ const themeOverrides = {
 }
 .brand { display: flex; align-items: center; gap: 12px; padding: 20px 20px 18px; }
 .brand-logo {
-  width: 38px; height: 38px; border-radius: 10px;
+  width: 38px; height: 38px; border-radius: 10px; flex: 0 0 auto;
+  overflow: hidden;
+  /* 渐变底色作 img 加载前的兜底，避免闪白 */
   background: linear-gradient(135deg, #3884ff, #1e63dc);
-  color: #fff; font-weight: 700; font-size: 13px; letter-spacing: 0.5px;
   display: flex; align-items: center; justify-content: center;
   box-shadow: 0 4px 12px var(--accent-glow);
 }
+/* 图标 SVG 画布四周有 3.9% 透明留白(40/1024)，放大 1/0.9219 使可见圆角方块
+   正好 38px，与改动前的尺寸、位置完全一致，不影响 .brand 布局。 */
+.brand-logo img { width: 41.22px; height: 41.22px; display: block; }
 .brand-title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
 .brand-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
 .sidebar-footer {
