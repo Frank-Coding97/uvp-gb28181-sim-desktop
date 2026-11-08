@@ -155,7 +155,7 @@ onActivated(() => { void load(); });
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page-wrap">
     <div class="page-header">
       <div>
         <div class="page-title">录像计划</div>
@@ -269,9 +269,6 @@ onActivated(() => { void load(); });
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin: 18px 2px 20px; }
-.page-title { color: var(--text-primary); font-size: 24px; font-weight: 750; }
-.page-sub { margin-top: 6px; color: var(--text-tertiary); font-size: 13px; }
 .header-actions { display: flex; align-items: center; gap: 12px; }
 .stat { color: var(--text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 18px; align-items: start; }

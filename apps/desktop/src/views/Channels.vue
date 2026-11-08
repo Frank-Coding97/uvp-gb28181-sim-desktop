@@ -327,7 +327,7 @@ onUnmounted(() => unlistenCommand?.());
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page-wrap">
     <div class="page-header">
       <div>
         <div class="page-title">目录管理</div>
@@ -418,9 +418,6 @@ onUnmounted(() => unlistenCommand?.());
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
-.page-title { color: var(--text-primary); font-size: 24px; font-weight: 700; }
-.page-sub { margin-top: 6px; color: var(--text-tertiary); font-size: 13px; }
 .activity-card { min-width: 310px; padding: 11px 14px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.35); }
 .activity-card span, .activity-card small { display: block; color: var(--text-tertiary); font-size: 11px; }
 .activity-card b { display: block; margin: 3px 0; color: var(--text-primary); font-size: 14px; }

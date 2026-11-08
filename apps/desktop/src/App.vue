@@ -260,10 +260,71 @@ const themeOverrides = {
     primaryColor: "#3884ff",
     primaryColorHover: "#5a9bff",
     primaryColorPressed: "#1e63dc",
+    primaryColorSuppl: "#3884ff",
     borderRadius: "8px",
+    borderRadiusSmall: "6px",
     fontSize: "13px",
+    fontSizeMedium: "13px",
+    fontSizeSmall: "12px",
+    heightMedium: "34px",
+    heightSmall: "28px",
+    lineHeight: "1.5",
+  },
+  Button: {
+    borderRadiusMedium: "8px",
+    borderRadiusSmall: "6px",
+    fontSizeMedium: "13px",
+    fontSizeSmall: "12px",
+    heightMedium: "34px",
+    heightSmall: "28px",
+    paddingMedium: "0 16px",
+    paddingSmall: "0 12px",
+  },
+  Input: {
+    borderRadius: "8px",
+    heightMedium: "34px",
+    heightSmall: "28px",
+    fontSizeMedium: "13px",
+    fontSizeSmall: "12px",
+    color: "rgba(255,255,255,0.65)",
+    colorFocus: "rgba(255,255,255,0.85)",
+    border: "1px solid rgba(120,160,210,0.3)",
+    borderFocus: "1px solid #3884ff",
+    borderHover: "1px solid rgba(56,132,255,0.5)",
+    boxShadowFocus: "0 0 0 2px rgba(56,132,255,0.15)",
+  },
+  InputNumber: {
+    borderRadius: "8px",
+    heightMedium: "34px",
+    heightSmall: "28px",
+    fontSizeMedium: "13px",
+    fontSizeSmall: "12px",
+    color: "rgba(255,255,255,0.65)",
+    border: "1px solid rgba(120,160,210,0.3)",
+  },
+  Select: {
+    borderRadius: "8px",
+    heightMedium: "34px",
+    heightSmall: "28px",
+    fontSizeMedium: "13px",
+    fontSizeSmall: "12px",
+    peers: {
+      InternalSelectMenu: { borderRadius: "10px" },
+    },
+  },
+  Switch: {
+    railColorActive: "#3884ff",
+  },
+  Tag: {
+    borderRadius: "6px",
   },
   Card: { color: "rgba(255,255,255,0.5)", borderRadius: "16px" },
+  Form: {
+    labelFontSizeTopMedium: "11.5px",
+    labelTextColor: "#8fa1bd",
+    feedbackFontSizeMedium: "11px",
+    blankHeightMedium: "34px",
+  },
 };
 </script>
 
@@ -475,7 +536,7 @@ const themeOverrides = {
 }
 .eb-close:hover { background: color-mix(in srgb, var(--error) 20%, transparent); }
 
-.content { flex: 1; overflow-y: auto; padding: 4px 28px 28px; }
+.content { flex: 1; overflow: hidden; padding: 0 12px; min-height: 0; display: flex; flex-direction: column; }
 
 @media (max-width: 1120px) {
   .topbar { padding: 0 16px; }
@@ -487,7 +548,7 @@ const themeOverrides = {
   .sidebar { width: 188px; }
   .brand { padding-inline: 16px; }
   .plat-label, .chip:nth-child(3) { display: none; }
-  .content { padding-inline: 20px; }
+  .content { padding-inline: 10px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .fade-enter-active, .fade-leave-active { transition: none; }

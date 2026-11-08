@@ -193,7 +193,7 @@ onUnmounted(() => { unlistenLog?.(); unlistenTrace?.(); unlistenCommand?.(); });
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page-wrap">
     <div class="page-header">
       <div class="page-title">日志</div>
       <div class="page-sub">集中查看完整 SIP 报文、系统运行日志和平台命令，不因切换业务页面而清空</div>
@@ -278,9 +278,6 @@ onUnmounted(() => { unlistenLog?.(); unlistenTrace?.(); unlistenCommand?.(); });
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.page-header { margin-bottom: 18px; }
-.page-title { color: var(--text-primary); font-size: 24px; font-weight: 750; }
-.page-sub { margin-top: 6px; color: var(--text-tertiary); font-size: 13px; }
 .panel { padding: 18px; }
 .tabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--border-default); }
 .tabs button { position: relative; padding: 9px 14px 11px; border: 0; color: var(--text-secondary); background: transparent; cursor: pointer; font-size: 13px; }

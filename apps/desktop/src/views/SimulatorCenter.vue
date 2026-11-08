@@ -229,6 +229,8 @@ onUnmounted(() => {
             :pan="pose.pan"
             :tilt="pose.tilt"
             :zoom="pose.zoom"
+            :focus="pose.focus"
+            :iris="pose.iris"
             :zoom-max="20"
             :active="sim.ptzActive.value"
             :seeking="sim.seeking.value"
@@ -299,25 +301,38 @@ onUnmounted(() => {
         <div class="console-body">
           <!-- 云台 -->
           <template v-if="activeTab === 'ptz'">
-            <div class="readout-row">
-              <div><span>水平</span><b>{{ pose.pan.toFixed(0) }}°</b></div>
-              <div><span>俯仰</span><b>{{ pose.tilt.toFixed(0) }}°</b></div>
-              <div><span>变焦</span><b>{{ pose.zoom.toFixed(1) }}×</b></div>
+            <div class="pose-strip">
+              <div class="pose-item">
+                <span>水平</span>
+                <b>{{ pose.pan.toFixed(0) }}°</b>
+              </div>
+              <div class="pose-divider" />
+              <div class="pose-item">
+                <span>俯仰</span>
+                <b>{{ pose.tilt.toFixed(0) }}°</b>
+              </div>
+              <div class="pose-divider" />
+              <div class="pose-item">
+                <span>变焦</span>
+                <b>{{ pose.zoom.toFixed(1) }}×</b>
+              </div>
             </div>
 
             <div class="ptz-workbench">
-              <div class="control-card zoom-card">
-                <div class="card-label">变焦</div>
-                <div class="big-readout">{{ pose.zoom.toFixed(1) }}<small>×</small></div>
-                <div class="key-row">
-                  <HoldKey label="−" aria-label="缩小" @trigger="onZoom(-1, $event)" />
-                  <HoldKey label="+" aria-label="放大" @trigger="onZoom(1, $event)" />
+              <div class="ptz-left">
+                <div class="control-card zoom-card">
+                  <div class="card-label">变焦</div>
+                  <div class="big-readout">{{ pose.zoom.toFixed(1) }}<small>×</small></div>
+                  <div class="key-row">
+                    <HoldKey label="−" aria-label="缩小" @trigger="onZoom(-1, $event)" />
+                    <HoldKey label="+" aria-label="放大" @trigger="onZoom(1, $event)" />
+                  </div>
                 </div>
               </div>
 
               <PtzPad @adjust="onPad" />
 
-              <div class="lens-column">
+              <div class="ptz-right lens-column">
                 <div class="control-card lens-card">
                   <div class="lens-head"><span>光圈</span><b>{{ pct(pose.iris) }}%</b></div>
                   <div class="meter"><i :style="{ width: `${pct(pose.iris)}%` }" /></div>
@@ -337,13 +352,13 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <div class="mini-grid">
-              <div><span>方向</span><b>{{ sim.directionText.value }}</b></div>
-              <div><span>速度</span><b>{{ sim.speedText.value }}</b></div>
-              <div><span>状态</span><b :class="{ hot: sim.ptzActive.value || sim.seeking.value }">{{ sim.headline.value.text }}</b></div>
-              <div><span>手操</span><b>{{ sim.localPushing.value ? "本机调整中" : "待命" }}</b></div>
+            <div class="ptz-status-bar">
+              <span class="ptz-status-item"><i class="ptz-status-dot" :class="{ hot: sim.ptzActive.value || sim.seeking.value }" />{{ sim.headline.value.text }}</span>
+              <span class="ptz-status-sep" />
+              <span class="ptz-status-item">{{ sim.directionText.value !== '—' ? sim.directionText.value : '待命' }}</span>
+              <span class="ptz-status-sep" />
+              <span class="ptz-status-item">{{ sim.localPushing.value ? "本机调整中" : "平台控制" }}</span>
             </div>
-            <p class="hint-line">本机手操只改变模拟设备姿态，不向平台发 SIP；平台命令仍从左侧事件流进入。</p>
           </template>
 
           <!-- 定位 -->
@@ -532,7 +547,7 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.sim-page { width: min(1540px, 100%); margin: 0 auto; }
+.sim-page { width: min(1540px, 100%); margin: 0 auto; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .page-header {
   display: grid;
   grid-template-columns: minmax(280px, 1fr) auto auto;
@@ -540,8 +555,6 @@ onUnmounted(() => {
   gap: 20px;
   margin-bottom: 16px;
 }
-.page-title { color: var(--text-primary); font-size: 24px; font-weight: 760; letter-spacing: -.02em; }
-.page-sub { margin-top: 5px; color: var(--text-tertiary); font-size: 12px; }
 .headline {
   display: flex;
   align-items: center;
@@ -562,7 +575,7 @@ onUnmounted(() => {
 .device-pill { padding: 6px 11px; border: 1px solid var(--border-default); border-radius: 999px; color: var(--text-tertiary); background: rgba(255, 255, 255, 0.48); font-size: 12px; white-space: nowrap; }
 .device-pill.online { border-color: rgba(24, 160, 88, 0.25); color: var(--success); background: rgba(24, 160, 88, 0.08); }
 
-.sim-layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(390px, 0.85fr); gap: 16px; align-items: stretch; }
+.sim-layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(390px, 0.85fr); grid-template-rows: minmax(0, 1fr); gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
 .stage-card { min-width: 0; padding: 14px; }
 .stage {
   position: relative;
@@ -631,7 +644,7 @@ onUnmounted(() => {
 .snapshot-flash { position: absolute; z-index: 8; inset: 0; background: #fff; animation: flash-out .18s ease-out forwards; pointer-events: none; }
 @keyframes flash-out { from { opacity: .82; } to { opacity: 0; } }
 
-.console { display: flex; min-width: 0; height: 676px; flex-direction: column; padding: 14px; }
+.console { display: flex; min-width: 0; height: 100%; flex-direction: column; padding: 14px; }
 .console-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .panel-title { color: var(--text-primary); font-size: 13px; font-weight: 750; }
 .panel-sub { margin-top: 4px; color: var(--text-tertiary); font-size: 10px; }
@@ -648,13 +661,19 @@ onUnmounted(() => {
 .console-body::-webkit-scrollbar { width: 5px; }
 .console-body::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(143,161,189,.28); }
 
-.readout-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 8px; border-radius: 9px; background: var(--bg-base); }
-.readout-row > div { display: grid; gap: 2px; justify-items: center; }
-.readout-row span { color: var(--text-tertiary); font-size: 9px; }
-.readout-row b { color: var(--text-primary); font: 700 18px "SF Mono", monospace; }
-.ptz-workbench { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 10px; margin-top: 10px; }
+/* 姿态读数条 */
+.pose-strip { display: flex; align-items: center; gap: 0; margin-top: 2px; padding: 10px 4px; border-radius: 10px; background: var(--bg-base); }
+.pose-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.pose-item span { color: var(--text-tertiary); font-size: 9px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.pose-item b { color: var(--text-primary); font: 700 20px "SF Mono", monospace; letter-spacing: -.02em; }
+.pose-divider { width: 1px; height: 32px; background: var(--border-default); flex-shrink: 0; }
+
+/* 云台工作台 */
+.ptz-workbench { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 10px; margin-top: 10px; }
+.ptz-left { display: flex; align-items: center; justify-content: flex-end; }
+.ptz-right { }
 .control-card { padding: 9px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.34); }
-.zoom-card { display: grid; justify-items: center; gap: 7px; }
+.zoom-card { display: grid; justify-items: center; gap: 7px; min-width: 72px; }
 .card-label { color: var(--text-tertiary); font-size: 10px; font-weight: 650; }
 .big-readout { color: var(--text-primary); font: 750 22px "SF Mono", monospace; }
 .big-readout small { color: var(--text-tertiary); font-size: 11px; }
@@ -665,11 +684,12 @@ onUnmounted(() => {
 .lens-head b { color: var(--text-primary); font: 650 11px "SF Mono", monospace; }
 .meter { height: 3px; overflow: hidden; border-radius: 99px; background: var(--border-default); }
 .meter i { display: block; height: 100%; border-radius: 99px; background: var(--accent); transition: width .15s ease; }
-.mini-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
-.mini-grid > div { padding: 7px 9px; border: 1px solid var(--border-default); border-radius: 8px; background: rgba(255,255,255,.28); }
-.mini-grid span { display: block; margin-bottom: 3px; color: var(--text-tertiary); font-size: 9px; }
-.mini-grid b { color: var(--text-primary); font-size: 11px; }
-.mini-grid b.hot { color: var(--accent); }
+/* 云台状态条 */
+.ptz-status-bar { display: flex; align-items: center; gap: 0; margin-top: 10px; padding: 7px 10px; border-radius: 8px; background: var(--bg-base); font-size: 10.5px; }
+.ptz-status-item { flex: 1; display: flex; align-items: center; justify-content: center; gap: 5px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ptz-status-dot { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: var(--text-tertiary); opacity: .5; transition: background .2s, opacity .2s; }
+.ptz-status-dot.hot { background: var(--accent); opacity: 1; }
+.ptz-status-sep { width: 1px; height: 14px; background: var(--border-default); flex-shrink: 0; }
 .hint-line { margin: 9px 0 0; color: var(--text-tertiary); font-size: 9px; line-height: 1.6; }
 
 .block { margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--border-default); }
@@ -742,8 +762,8 @@ onUnmounted(() => {
   .headline { grid-column: 1 / -1; grid-row: 2; justify-self: start; }
   .sim-layout { grid-template-columns: 1fr; }
   .stage { min-height: 500px; }
-  .console { height: auto; min-height: 620px; }
-  .console-body { max-height: 620px; }
+  .console { height: auto; }
+  .console-body { max-height: 60vh; }
 }
 @media (max-width: 720px) {
   .ptz-workbench { grid-template-columns: 1fr; justify-items: center; }

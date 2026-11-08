@@ -265,7 +265,7 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
 </template>
 
 <style scoped>
-.recording-page { height: 100%; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 12px; }
+.recording-page { flex: 1; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 12px; }
 .page-head { display: flex; align-items: end; justify-content: space-between; gap: 20px; }
 .eyebrow, .player-title small { color: var(--accent); font: 650 10px/1.2 "SF Mono", monospace; letter-spacing: .14em; }
 h1 { margin: 4px 0 2px; color: var(--text-primary); font-size: 25px; } h2 { margin: 4px 0 0; font-size: 15px; }

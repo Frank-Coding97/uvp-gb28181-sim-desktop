@@ -192,7 +192,7 @@ onActivated(() => { void load(); });
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page-wrap">
     <div class="page-header">
       <div>
         <div class="page-title">报警管理</div>
@@ -308,9 +308,6 @@ onActivated(() => { void load(); });
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin: 18px 2px 20px; }
-.page-title { color: var(--text-primary); font-size: 24px; font-weight: 750; }
-.page-sub { margin-top: 6px; color: var(--text-tertiary); font-size: 13px; }
 .status-pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 13px; border: 1px solid var(--border-default); border-radius: 999px; color: var(--text-secondary); background: rgba(255,255,255,.58); font-size: 12px; }
 .status-pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--text-tertiary); }
 .status-pill.live i { background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 14%, transparent); }

@@ -1484,10 +1484,9 @@ onUnmounted(() => {
 .provision-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
 .home-page {
-  width: min(1440px, 100%);
-  height: 100%;
+  width: 100%;
+  flex: 1;
   min-height: 0;
-  margin: 0 auto;
   display: grid;
   grid-template-rows: 62px minmax(0, 1fr);
   gap: 10px;
@@ -1517,6 +1516,7 @@ onUnmounted(() => {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.45fr) minmax(345px, .8fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px;
 }
 .preview-panel, .config-panel {
@@ -1528,7 +1528,7 @@ onUnmounted(() => {
   background: rgba(255, 255, 255, .62);
   box-shadow: 0 8px 24px rgba(32, 51, 79, .06);
 }
-.preview-panel { display: grid; grid-template-rows: 42px minmax(0, 1fr) 40px auto; gap: 9px; }
+.preview-panel { display: grid; grid-template-rows: 42px minmax(0, 1fr) auto auto; gap: 9px; }
 .config-panel {
   display: flex;
   flex-direction: column;
@@ -1656,7 +1656,9 @@ onUnmounted(() => {
 /* 三列固定:名称输入/下拉 + 「粘贴接入」文字按钮 + 新增图标按钮。
    列数必须与实际子元素数一致,否则多出来的元素会掉到下一行。 */
 .sip-profile-switcher { display: grid; grid-template-columns: minmax(0, 1fr) auto 28px; align-items: center; gap: 6px; margin-top: 8px; }
-.config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+/* 纵向留白比横向大一档：每行都是「标签 + 输入框」两段结构，行距太小会让上下两行粘在一起，
+   而列宽本身已经够用，所以只放大 row-gap，column-gap 维持原值。 */
+.config-grid { display: grid; grid-template-columns: 1fr 1fr; row-gap: 15px; column-gap: 8px; margin-top: 12px; }
 .config-panel :deep(.n-input--disabled) {
   --n-text-color-disabled: var(--text-secondary) !important;
   --n-color-disabled: rgba(248, 250, 253, .9) !important;
@@ -1667,7 +1669,7 @@ onUnmounted(() => {
   --n-color-disabled: rgba(248, 250, 253, .9) !important;
   --n-arrow-color-disabled: var(--text-tertiary) !important;
 }
-.field { display: grid; gap: 3px; min-width: 0; }
+.field { display: grid; gap: 5px; min-width: 0; }
 .field.wide { grid-column: 1 / -1; }
 .field > span { color: var(--text-tertiary); font-size: 10px; }
 .transport-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; }
@@ -1700,7 +1702,7 @@ onUnmounted(() => {
 /* 端口固定列 78px 时五位端口贴着输入框边框,再加一行标题又显得比地址框窄一截,
    放到 96px:既容得下 65535,也留出与地址框一致的左右留白。 */
 .host-port { display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 6px; align-items: end; }
-.host-port-cell { display: grid; gap: 3px; min-width: 0; }
+.host-port-cell { display: grid; gap: 5px; min-width: 0; }
 .host-port-cell > span { color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
 .primary-actions { display: grid; grid-template-columns: minmax(0, 1fr); margin-top: 10px; }
 .broadcast-indicator {
@@ -1768,10 +1770,19 @@ onUnmounted(() => {
   /* 窄面板下文件名比「更换」标签更重要，先让标签让位。 */
   .file-source-action { display: none; }
 }
+@media (max-height: 820px) {
+  .home-page { grid-template-rows: 56px minmax(0, 1fr); gap: 8px; }
+  .preview-panel, .config-panel { padding: 12px; }
+  .preview-panel { gap: 7px; }
+  .sip-profile-switcher { margin-top: 6px; }
+  .config-grid { gap: 6px; margin-top: 7px; }
+  .primary-actions { margin-top: 7px; }
+  .quick-actions { margin-top: 5px; }
+}
 @media (max-height: 680px) {
   .home-page { grid-template-rows: 54px minmax(0, 1fr); gap: 7px; }
   .preview-panel, .config-panel { padding: 10px; }
-  .preview-panel { grid-template-rows: 36px minmax(0, 1fr) 36px auto; gap: 6px; }
+  .preview-panel { grid-template-rows: auto minmax(0, 1fr) auto auto; gap: 6px; }
   .sip-profile-switcher { margin-top: 5px; }
   .config-grid { gap: 5px; margin-top: 6px; }
   .primary-actions { margin-top: 6px; }

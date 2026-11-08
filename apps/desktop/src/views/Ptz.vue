@@ -212,7 +212,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page-wrap">
     <div class="page-header">
       <div>
         <div class="page-title">云台控制</div>
@@ -271,9 +271,7 @@ onUnmounted(() => {
 
 <style scoped>
 .page { width: min(1480px, 100%); margin: 0 auto; }
-.page-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
-.page-title { color: var(--text-primary); font-size: 24px; font-weight: 750; }
-.page-sub { margin-top: 6px; color: var(--text-tertiary); font-size: 13px; }
+.page-header { align-items: center; }
 .device-pill { padding: 6px 11px; border: 1px solid var(--border-default); border-radius: 999px; color: var(--text-tertiary); background: rgba(255,255,255,.48); font-size: 12px; }
 .device-pill.online { border-color: rgba(24,160,88,.25); color: var(--success); background: rgba(24,160,88,.08); }
 .ptz-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, .72fr); gap: 16px; min-height: 620px; }

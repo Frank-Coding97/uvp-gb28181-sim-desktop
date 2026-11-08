@@ -60,6 +60,54 @@ body {
   -webkit-backdrop-filter: var(--blur-light);
 }
 
+/* ── 页面容器 ──────────────────────────────────────────────────────────────
+   .page-wrap  : 可滚动页面容器，靠父 flex 撑满高度，不写死 calc(100vh - 48px)。
+   .page       : 内容宽度约束 + 水平居中，不含 padding（由 .page-wrap 或 .content 给）。
+   .page-header: 页面标题行，标题 + 右侧操作区并排。
+   .page-title : 页面主标题。
+   .page-sub   : 标题下方描述文字。
+   ─────────────────────────────────────────────────────────────────────── */
+.page-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px 0 16px;
+  box-sizing: border-box;
+}
+
+.page {
+  width: min(1480px, 100%);
+  margin: 0 auto;
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 16px 0 20px;
+}
+
+.page-title {
+  color: var(--text-primary);
+  font-size: 22px;
+  font-weight: 750;
+}
+
+.page-sub {
+  margin-top: 5px;
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+@media (max-height: 820px) {
+  .page-wrap { padding-top: 8px; padding-bottom: 10px; }
+  .page-header { margin-bottom: 14px; }
+  .page-title { font-size: 20px; }
+}
+
 /* 基础可用性：统一盒模型、键盘焦点、滚动条和动态偏好。 */
 *,
 *::before,

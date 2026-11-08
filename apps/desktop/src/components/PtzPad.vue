@@ -78,29 +78,31 @@ onUnmounted(stop);
 <style scoped>
 .ptz-pad {
   display: grid;
-  grid-template-columns: repeat(3, 38px);
-  gap: 4px;
-  padding: 5px;
+  grid-template-columns: repeat(3, 44px);
+  gap: 5px;
+  padding: 6px;
   width: max-content;
   border: 1px solid var(--border-default);
-  border-radius: 13px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.42);
+  box-shadow: 0 2px 10px rgba(16, 46, 98, .06);
 }
 .pad-key {
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 1px solid var(--border-default);
-  border-radius: 8px;
+  border-radius: 9px;
   color: var(--text-primary);
   background: var(--bg-elevated);
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 650;
   cursor: pointer;
   touch-action: none;
   user-select: none;
-  transition: background .12s ease, border-color .12s ease, color .12s ease;
+  transition: background .12s ease, border-color .12s ease, color .12s ease, box-shadow .12s ease;
+  box-shadow: 0 1px 3px rgba(16, 46, 98, .07);
 }
 .pad-key:hover:not(:disabled) {
   border-color: var(--border-accent);
@@ -114,21 +116,21 @@ onUnmounted(stop);
 .pad-key:disabled { cursor: not-allowed; opacity: .5; }
 .pad-center {
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   place-items: center;
 }
 .pad-center i {
   position: absolute;
-  width: 17px;
-  height: 17px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   background: var(--accent-pale);
 }
 .pad-center b {
   position: absolute;
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--accent);
 }

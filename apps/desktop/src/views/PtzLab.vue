@@ -8,6 +8,8 @@ import PtzCamera3D from "../components/PtzCamera3D.vue";
 const pan = ref(-36);
 const tilt = ref(14);
 const zoom = ref(3.2);
+const focus = ref(0.5);
+const iris = ref(0.5);
 const active = ref(false);
 const guarded = ref(false);
 const showFovCone = ref(true);
@@ -109,6 +111,8 @@ onUnmounted(() => {
             :pan="pan"
             :tilt="tilt"
             :zoom="zoom"
+            :focus="focus"
+            :iris="iris"
             :active="active"
             :seeking="cruising"
             :show-fov="showFovCone"
@@ -129,6 +133,14 @@ onUnmounted(() => {
       <label>
         <span>变倍 <b>{{ zoom.toFixed(1) }}×</b></span>
         <input v-model.number="zoom" type="range" min="1" max="20" step="0.1" />
+      </label>
+      <label>
+        <span>聚焦 <b>{{ (focus * 100).toFixed(0) }}%</b></span>
+        <input v-model.number="focus" type="range" min="0" max="1" step="0.01" />
+      </label>
+      <label>
+        <span>光圈 <b>{{ (iris * 100).toFixed(0) }}%</b></span>
+        <input v-model.number="iris" type="range" min="0" max="1" step="0.01" />
       </label>
       <div class="preset-row">
         <button @click="recallPreset(1)">预置位 1</button>
@@ -274,7 +286,7 @@ button.on {
 }
 .controls {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  grid-template-columns: repeat(5, minmax(0, 1fr)) auto;
   gap: 18px;
   align-items: end;
   margin-top: 16px;

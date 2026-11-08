@@ -8,6 +8,7 @@ import {
   onUnmounted,
   ref,
   shallowRef,
+  watch,
 } from "vue";
 import {
   NButton,
@@ -140,6 +141,93 @@ const successRate = computed(() =>
   latest.value ? `${(latest.value.register_success_rate * 100).toFixed(1)}%` : "—",
 );
 
+// 注册成功率百分比数字，用于进度环
+const successRateNum = computed(() =>
+  latest.value ? latest.value.register_success_rate * 100 : 0,
+);
+// SVG 进度环描边长
+const RING_R = 32;
+const RING_C = 2 * Math.PI * RING_R;
+const ringDash = computed(() => {
+  const pct = Math.min(successRateNum.value, 100) / 100;
+  return `${(RING_C * pct).toFixed(1)} ${RING_C}`;
+});
+const ringColor = computed(() => {
+  const v = successRateNum.value;
+  if (v >= 90) return "var(--success)";
+  if (v >= 60) return "var(--warning)";
+  return "var(--error)";
+});
+
+// ── 快速预设 ──────────────────────────────────────────────
+const presets = [
+  { label: "10台", count: 10,   ramp: 0,   media: "A" },
+  { label: "100台", count: 100,  ramp: 20,  media: "A" },
+  { label: "500台", count: 500,  ramp: 50,  media: "B" },
+  { label: "1000台", count: 1000, ramp: 100, media: "B" },
+] as const;
+function applyPreset(p: (typeof presets)[number]) {
+  form.value.count = p.count;
+  form.value.ramp_per_second = p.ramp;
+  form.value.media_profile = p.media;
+}
+
+// 配置面板折叠（运行时自动折叠，可手动展开）
+const configCollapsed = ref(false);
+watch(running, (v) => { if (v) configCollapsed.value = true; });
+
+// ── 运行计时 ──────────────────────────────────────────────
+const elapsedMs = ref(0);
+let elapsedStart = 0;
+let elapsedTimer: number | undefined;
+const elapsedStr = computed(() => {
+  const s = Math.floor(elapsedMs.value / 1000);
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  return `${h}:${m}:${ss}`;
+});
+watch(running, (v) => {
+  if (v) {
+    elapsedStart = Date.now() - elapsedMs.value;
+    elapsedTimer = window.setInterval(() => {
+      elapsedMs.value = Date.now() - elapsedStart;
+    }, 1000);
+  } else {
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = undefined; }
+  }
+});
+
+// ── TPS（10 秒滑动窗口）──────────────────────────────────
+let tpsSamples: { t: number; n: number }[] = [];
+const tps = ref(0);
+function updateTps(succeeded: number) {
+  const now = Date.now();
+  tpsSamples.push({ t: now, n: succeeded });
+  tpsSamples = tpsSamples.filter((s) => now - s.t < 10_000);
+  if (tpsSamples.length >= 2) {
+    const dt = (tpsSamples.at(-1)!.t - tpsSamples[0].t) / 1000;
+    const dn = tpsSamples.at(-1)!.n - tpsSamples[0].n;
+    tps.value = dt > 0 ? Math.round(dn / dt) : 0;
+  }
+}
+
+// ── 设备点阵 ─────────────────────────────────────────────
+const MAX_DOTS = 300;
+type DotState = "idle" | "ok" | "failed";
+const dotGrid = computed((): DotState[] => {
+  const total = Math.max(form.value.count, 1);
+  const succeeded = latest.value?.register_succeeded ?? 0;
+  const failed    = latest.value?.register_failed    ?? 0;
+  const n = Math.min(total, MAX_DOTS);
+  return Array.from({ length: n }, (_, i) => {
+    const idx = Math.floor((i / n) * total);
+    if (idx < failed)    return "failed";
+    if (idx < succeeded) return "ok";
+    return "idle";
+  });
+});
+
 function tomlString(value: string): string {
   return JSON.stringify(value);
 }
@@ -214,6 +302,10 @@ function resetSeries() {
   times.length = 0;
   regRates.length = 0;
   hbFails.length = 0;
+  activeStreamsHistory.length = 0;
+  tpsSamples = [];
+  tps.value = 0;
+  elapsedMs.value = 0;
   latest.value = null;
   hasReport.value = false;
   updateChart();
@@ -239,7 +331,6 @@ async function startStress() {
       positionInterval: form.value.position_enabled ? form.value.position_interval : 0,
       alarmInterval: form.value.alarm_enabled ? form.value.alarm_interval : 0,
     });
-    // IPC 成功只表示启动请求已提交；以后台真实状态为准，避免覆盖瞬时失败事件。
     const state = await reconcile();
     if (state?.running) {
       message.success(result);
@@ -320,6 +411,7 @@ const MAX_POINTS = 60;
 const times: string[] = [];
 const regRates: number[] = [];
 const hbFails: number[] = [];
+const activeStreamsHistory: number[] = [];
 const chartEl = ref<HTMLElement | null>(null);
 const chart = shallowRef<ECharts | null>(null);
 let resizeObserver: ResizeObserver | null = null;
@@ -328,17 +420,24 @@ function pushPoint(snapshot: MetricsSnapshot) {
   times.push(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
   regRates.push(Number((snapshot.register_success_rate * 100).toFixed(1)));
   hbFails.push(snapshot.heartbeat_failed);
+  activeStreamsHistory.push(snapshot.active_streams);
   if (times.length > MAX_POINTS) {
     times.shift();
     regRates.shift();
     hbFails.shift();
+    activeStreamsHistory.shift();
   }
+  updateTps(snapshot.register_succeeded);
 }
 
 function updateChart() {
   chart.value?.setOption({
     xAxis: { data: [...times] },
-    series: [{ data: [...regRates] }, { data: [...hbFails] }],
+    series: [
+      { data: [...regRates] },
+      { data: [...hbFails] },
+      { data: [...activeStreamsHistory] },
+    ],
   });
 }
 
@@ -347,29 +446,35 @@ function initChart() {
   const instance = init(chartEl.value, undefined, { renderer: "canvas" });
   instance.setOption({
     animationDuration: 300,
-    color: ["#3884ff", "#e89320"],
-    tooltip: { trigger: "axis", backgroundColor: "rgba(14,39,71,.92)", borderWidth: 0, textStyle: { color: "#fff" } },
-    legend: { right: 4, top: 0, textStyle: { color: "#627797" } },
-    grid: { left: 44, right: 48, top: 46, bottom: 28 },
+    color: ["#3884ff", "#e89320", "#08b388"],
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(14,39,71,.94)",
+      borderWidth: 0,
+      borderRadius: 10,
+      textStyle: { color: "#e8f0fc", fontSize: 12 },
+    },
+    legend: { right: 8, top: 0, textStyle: { color: "#627797", fontSize: 12 } },
+    grid: { left: 46, right: 54, top: 44, bottom: 28 },
     xAxis: {
       type: "category",
       boundaryGap: false,
       data: [],
-      axisLine: { lineStyle: { color: "rgba(76,99,133,.2)" } },
-      axisLabel: { color: "#8fa1bd" },
+      axisLine: { lineStyle: { color: "rgba(76,99,133,.15)" } },
+      axisLabel: { color: "#8fa1bd", fontSize: 11 },
     },
     yAxis: [
       {
         type: "value",
         min: 0,
         max: 100,
-        axisLabel: { formatter: "{value}%", color: "#8fa1bd" },
-        splitLine: { lineStyle: { color: "rgba(76,99,133,.08)" } },
+        axisLabel: { formatter: "{value}%", color: "#8fa1bd", fontSize: 11 },
+        splitLine: { lineStyle: { color: "rgba(76,99,133,.07)" } },
       },
       {
         type: "value",
         min: 0,
-        axisLabel: { color: "#8fa1bd" },
+        axisLabel: { color: "#8fa1bd", fontSize: 11 },
         splitLine: { show: false },
       },
     ],
@@ -380,7 +485,17 @@ function initChart() {
         yAxisIndex: 0,
         smooth: true,
         showSymbol: false,
-        areaStyle: { color: "rgba(56,132,255,.10)" },
+        lineStyle: { width: 2 },
+        areaStyle: {
+          color: {
+            type: "linear",
+            x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: "rgba(56,132,255,.20)" },
+              { offset: 1, color: "rgba(56,132,255,.01)" },
+            ],
+          },
+        },
         data: [],
       },
       {
@@ -389,6 +504,26 @@ function initChart() {
         yAxisIndex: 1,
         smooth: true,
         showSymbol: false,
+        lineStyle: { width: 2, type: "dashed" },
+        data: [],
+      },
+      {
+        name: "活跃流",
+        type: "line",
+        yAxisIndex: 1,
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { width: 2 },
+        areaStyle: {
+          color: {
+            type: "linear",
+            x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: "rgba(8,179,136,.18)" },
+              { offset: 1, color: "rgba(8,179,136,.01)" },
+            ],
+          },
+        },
         data: [],
       },
     ],
@@ -412,14 +547,12 @@ onMounted(async () => {
   });
   unlistenState = await listen<StressState>("stress_state", (event) => {
     const state = event.payload;
-    // run_id 单调递增：即使当前空闲，也拒绝旧运行的迟到 running 事件。
     if (state.run_id < lastSeenRunId) return;
     if (state.running && currentRunId.value === null && state.run_id === lastSeenRunId) return;
     if (currentRunId.value !== null && currentRunId.value !== state.run_id) {
       if (state.run_id < currentRunId.value) return;
     }
 
-    // 已接受的生命周期事件使所有在途 reconcile 响应失效。
     reconcileSequence += 1;
     if (state.run_id > lastSeenRunId) lastSeenRunId = state.run_id;
     if (state.running) currentRunId.value = state.run_id;
@@ -460,232 +593,505 @@ onUnmounted(() => {
   unlistenState?.();
   resizeObserver?.disconnect();
   chart.value?.dispose();
+  if (elapsedTimer) clearInterval(elapsedTimer);
 });
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page-wrap">
+
+    <!-- ── 顶部标题栏 ── -->
     <header class="page-header">
-      <div>
+      <div class="header-left">
         <div class="eyebrow">LOAD TESTING</div>
-        <h1>压力测试工作台</h1>
-        <p>批量模拟注册、心跳、媒体与主动上报，实时观察上级平台承载能力。</p>
+        <h1>压力测试</h1>
+        <p>批量注册 · 心跳 · 媒体 · 主动上报，实时观测平台承载能力</p>
       </div>
-      <div class="header-actions">
-        <div class="status-chip" :class="statusTone">
+      <div class="header-right">
+        <div class="status-pill" :class="statusTone">
           <span class="status-dot" />
-          {{ statusText }}
+          <span>{{ statusText }}</span>
         </div>
-        <n-button size="small" secondary :disabled="!hasReport" @click="exportReport">导出脱敏报告</n-button>
+        <n-button size="small" secondary :disabled="!hasReport" @click="exportReport">导出报告</n-button>
       </div>
     </header>
 
-    <section class="glass-card panel config-panel">
-      <div class="panel-head">
-        <div>
-          <div class="panel-title">场景配置</div>
-          <div class="panel-sub">{{ platformLabel }}</div>
-        </div>
-        <n-tag size="small" round :bordered="false" type="info">上限 10,000 台</n-tag>
+    <!-- ── 运行横幅 ── -->
+    <transition name="slide-banner">
+      <div v-if="running" class="run-banner">
+        <span class="rb-pulse" />
+        <span class="rb-text">{{ statusText }}</span>
+        <span class="rb-sep">·</span>
+        <span class="rb-stat">运行 <b>{{ elapsedStr }}</b></span>
+        <span class="rb-sep">·</span>
+        <span class="rb-stat">TPS <b>{{ tps }}</b> reg/s</span>
+        <span class="rb-platform">{{ platformLabel }}</span>
       </div>
+    </transition>
 
-      <n-form :model="form" label-placement="top" :disabled="running || starting">
-        <div class="form-grid">
-          <n-form-item label="起始设备 ID" class="span-2">
-            <n-input v-model:value="form.base_device_id" maxlength="20" placeholder="20 位国标设备编号" />
-          </n-form-item>
-          <n-form-item label="设备数量">
-            <n-input-number v-model:value="form.count" :min="1" :max="10000" style="width: 100%" />
-          </n-form-item>
-          <n-form-item label="爬坡速率（台/秒）">
-            <n-input-number v-model:value="form.ramp_per_second" :min="0" :max="1000" style="width: 100%" />
-          </n-form-item>
-          <n-form-item label="协议版本">
-            <n-select v-model:value="form.gb_version" :options="versionOptions" />
-          </n-form-item>
-          <n-form-item label="心跳间隔（秒）">
-            <n-input-number v-model:value="form.heartbeat_interval" :min="1" :max="600" style="width: 100%" />
-          </n-form-item>
-          <n-form-item label="每设备通道数">
-            <n-input-number v-model:value="form.channels_per_device" :min="1" :max="8" style="width: 100%" />
-          </n-form-item>
-          <n-form-item label="推流设备占比">
-            <n-input-number v-model:value="form.active_ratio" :min="0" :max="100" :format="(v: number | null) => `${v ?? 0}%`" style="width: 100%" />
-          </n-form-item>
-          <n-form-item label="媒体档位">
-            <n-select v-model:value="form.media_profile" :options="mediaOptions" />
-          </n-form-item>
-          <n-form-item v-if="form.media_profile === 'B'" label="伪流码率（kbps）">
-            <n-input-number v-model:value="form.bitrate_kbps" :min="64" :max="8192" style="width: 100%" />
-          </n-form-item>
-          <n-form-item v-if="form.media_profile === 'C'" label="视频源文件" class="span-2">
-            <n-input-group>
-              <n-input v-model:value="form.video_source" placeholder="H.264/H.265 裸流或 MP4 等容器" />
-              <n-button type="primary" ghost @click="pickVideoSource">选择文件</n-button>
-            </n-input-group>
-          </n-form-item>
-        </div>
+    <!-- ── 主体：左配置 / 右监控 ── -->
+    <div class="workspace">
 
-        <div class="section-divider">
-          <span>主动上报施压</span>
-          <small>0 表示关闭；启用后每台设备按周期向平台上报</small>
-        </div>
-        <div class="report-grid">
-          <div class="report-option">
+      <!-- 左：配置面板 -->
+      <aside class="config-col">
+        <div class="glass-card config-card">
+
+          <!-- 卡片头 + 折叠切换 -->
+          <div class="card-head" @click="running && (configCollapsed = !configCollapsed)" :class="{ clickable: running }">
             <div>
-              <b>移动位置</b>
-              <span>MobilePosition</span>
+              <div class="card-title">场景配置</div>
+              <div class="card-sub">{{ platformLabel }}</div>
             </div>
-            <n-switch v-model:value="form.position_enabled" />
-            <n-input-number v-model:value="form.position_interval" :min="1" :max="600" :disabled="!form.position_enabled" size="small" />
-            <em>秒/次</em>
+            <div class="head-right">
+              <n-tag size="small" round :bordered="false" type="info">上限 10,000 台</n-tag>
+              <span v-if="running" class="collapse-toggle">{{ configCollapsed ? '▸ 展开' : '▾ 收起' }}</span>
+            </div>
           </div>
-          <div class="report-option">
+
+          <!-- 运行时折叠摘要 -->
+          <transition name="fade">
+            <div v-if="running && configCollapsed" class="config-summary">
+              <span><b>{{ form.count }}</b> 台</span>
+              <span>爬坡 <b>{{ form.ramp_per_second }}</b>/s</span>
+              <span>档位 <b>{{ form.media_profile }}</b></span>
+              <span>{{ form.gb_version }}</span>
+            </div>
+          </transition>
+
+          <!-- 完整配置表单 -->
+          <transition name="expand">
+            <div v-show="!running || !configCollapsed">
+              <!-- 快速预设 -->
+              <div class="preset-row">
+                <span class="preset-label">快速预设</span>
+                <button
+                  v-for="p in presets"
+                  :key="p.label"
+                  class="preset-btn"
+                  :disabled="running || starting"
+                  @click="applyPreset(p)"
+                >{{ p.label }}</button>
+              </div>
+
+              <n-form :model="form" label-placement="top" :disabled="running || starting">
+                <!-- 基础参数 -->
+                <div class="section-label">基础参数</div>
+                <div class="form-grid">
+                  <n-form-item label="起始设备 ID" class="span-2">
+                    <n-input v-model:value="form.base_device_id" maxlength="20" placeholder="20 位国标设备编号" />
+                  </n-form-item>
+                  <n-form-item label="设备数量">
+                    <n-input-number v-model:value="form.count" :min="1" :max="10000" style="width:100%" />
+                  </n-form-item>
+                  <n-form-item label="爬坡速率（台/秒）">
+                    <n-input-number v-model:value="form.ramp_per_second" :min="0" :max="1000" style="width:100%" />
+                  </n-form-item>
+                  <n-form-item label="协议版本">
+                    <n-select v-model:value="form.gb_version" :options="versionOptions" />
+                  </n-form-item>
+                  <n-form-item label="心跳间隔（秒）">
+                    <n-input-number v-model:value="form.heartbeat_interval" :min="1" :max="600" style="width:100%" />
+                  </n-form-item>
+                  <n-form-item label="每设备通道数">
+                    <n-input-number v-model:value="form.channels_per_device" :min="1" :max="8" style="width:100%" />
+                  </n-form-item>
+                  <n-form-item label="推流占比（%）">
+                    <n-input-number
+                      v-model:value="form.active_ratio" :min="0" :max="100"
+                      :format="(v: number | null) => `${v ?? 0}%`"
+                      style="width:100%"
+                    />
+                  </n-form-item>
+                </div>
+
+                <!-- 媒体档位 -->
+                <div class="section-label">媒体档位</div>
+                <div class="form-grid">
+                  <n-form-item label="档位" class="span-2">
+                    <n-select v-model:value="form.media_profile" :options="mediaOptions" />
+                  </n-form-item>
+                  <n-form-item v-if="form.media_profile === 'B'" label="伪流码率（kbps）" class="span-2">
+                    <n-input-number v-model:value="form.bitrate_kbps" :min="64" :max="8192" style="width:100%" />
+                  </n-form-item>
+                  <n-form-item v-if="form.media_profile === 'C'" label="视频源文件" class="span-2">
+                    <n-input-group>
+                      <n-input v-model:value="form.video_source" placeholder="H.264/H.265 裸流或 MP4 容器" />
+                      <n-button type="primary" ghost @click="pickVideoSource">选择</n-button>
+                    </n-input-group>
+                  </n-form-item>
+                </div>
+
+                <!-- 主动上报 -->
+                <div class="section-label">主动上报施压</div>
+                <div class="report-grid">
+                  <div class="report-row">
+                    <div class="rr-info">
+                      <b>移动位置</b><small>MobilePosition</small>
+                    </div>
+                    <n-switch v-model:value="form.position_enabled" size="small" />
+                    <div class="rr-interval" :class="{ disabled: !form.position_enabled }">
+                      <n-input-number v-model:value="form.position_interval" :min="1" :max="600" :disabled="!form.position_enabled" size="small" style="width:72px" />
+                      <span>秒/次</span>
+                    </div>
+                  </div>
+                  <div class="report-row">
+                    <div class="rr-info">
+                      <b>报警事件</b><small>Alarm</small>
+                    </div>
+                    <n-switch v-model:value="form.alarm_enabled" size="small" />
+                    <div class="rr-interval" :class="{ disabled: !form.alarm_enabled }">
+                      <n-input-number v-model:value="form.alarm_interval" :min="1" :max="600" :disabled="!form.alarm_enabled" size="small" style="width:72px" />
+                      <span>秒/次</span>
+                    </div>
+                  </div>
+                </div>
+              </n-form>
+
+              <!-- 操作按钮 -->
+              <div class="action-row">
+                <n-button type="primary" size="large" style="flex:1" :loading="starting" :disabled="running || stopping || stopPending" @click="startStress">
+                  启动压测
+                </n-button>
+                <n-button type="error" secondary size="large" style="flex:1" :loading="stopPending" :disabled="!running || starting || stopping" @click="stopStress">
+                  停止压测
+                </n-button>
+              </div>
+              <p class="action-hint">配置经后端语义校验 · 报告自动隐藏认证密码</p>
+            </div>
+          </transition>
+        </div>
+      </aside>
+
+      <!-- 右：监控面板 -->
+      <div class="monitor-col">
+
+        <!-- 核心指标行 -->
+        <div class="metric-row">
+          <!-- 注册成功率进度环 -->
+          <div class="glass-card kpi-ring">
+            <div class="ring-wrap">
+              <svg class="ring-svg" viewBox="0 0 80 80" aria-hidden="true">
+                <circle cx="40" cy="40" r="32" class="ring-track" />
+                <circle cx="40" cy="40" r="32" class="ring-fill" :stroke="ringColor" :stroke-dasharray="ringDash" />
+              </svg>
+              <div class="ring-center">
+                <strong>{{ successRate }}</strong>
+                <span>注册成功率</span>
+              </div>
+            </div>
+            <div class="kpi-sub">{{ latest?.register_succeeded ?? 0 }} / {{ latest?.register_attempted ?? 0 }}</div>
+          </div>
+
+          <!-- 活跃流 -->
+          <div class="glass-card kpi-tile">
+            <span class="kpi-label">活跃流</span>
+            <strong class="kpi-val" :class="{ positive: (latest?.active_streams ?? 0) > 0 }">
+              {{ latest?.active_streams ?? 0 }}
+            </strong>
+            <span class="kpi-hint">RTP 推流会话</span>
+          </div>
+
+          <!-- 心跳成功 -->
+          <div class="glass-card kpi-tile">
+            <span class="kpi-label">心跳成功</span>
+            <strong class="kpi-val">{{ latest?.heartbeat_succeeded ?? 0 }}</strong>
+            <span class="kpi-hint" :class="{ warn: (latest?.heartbeat_failed ?? 0) > 0 }">
+              失败 {{ latest?.heartbeat_failed ?? 0 }}
+            </span>
+          </div>
+
+          <!-- TPS + 运行时长 -->
+          <div class="glass-card kpi-tile tps-tile">
+            <span class="kpi-label">注册速率</span>
+            <strong class="kpi-val">{{ tps }}<small> /s</small></strong>
+            <span class="kpi-hint mono">{{ elapsedStr }}</span>
+          </div>
+        </div>
+
+        <!-- 设备点阵 -->
+        <div class="glass-card dot-card">
+          <div class="dot-head">
+            <span class="card-title">设备注册进度</span>
+            <div class="dot-legend">
+              <span><i class="dot-i ok"/>已注册</span>
+              <span><i class="dot-i failed"/>失败</span>
+              <span><i class="dot-i idle"/>待注册</span>
+              <span class="dot-count-label">{{ latest?.register_succeeded ?? 0 }} / {{ form.count }} 台</span>
+            </div>
+          </div>
+          <div class="dot-grid" :class="{ active: running }">
+            <span
+              v-for="(state, i) in dotGrid"
+              :key="i"
+              class="dot-cell"
+              :class="state"
+            />
+          </div>
+          <!-- 整体进度条 -->
+          <div class="reg-progress-bar">
+            <div
+              class="reg-progress-fill"
+              :style="{ width: `${Math.min((latest?.register_succeeded ?? 0) / Math.max(form.count, 1) * 100, 100)}%`, background: ringColor }"
+            />
+          </div>
+        </div>
+
+        <!-- 趋势图 -->
+        <div class="glass-card chart-card">
+          <div class="chart-head">
             <div>
-              <b>报警事件</b>
-              <span>Alarm</span>
+              <div class="card-title">实时趋势</div>
+              <div class="card-sub">最近 60 个采样点</div>
             </div>
-            <n-switch v-model:value="form.alarm_enabled" />
-            <n-input-number v-model:value="form.alarm_interval" :min="1" :max="600" :disabled="!form.alarm_enabled" size="small" />
-            <em>秒/次</em>
+            <span class="live-badge" :class="{ on: running }">
+              <span v-if="running" class="live-pulse" />
+              {{ running ? "LIVE" : "PAUSED" }}
+            </span>
+          </div>
+          <div ref="chartEl" class="chart" />
+        </div>
+
+        <!-- 失败归因 -->
+        <div class="glass-card failure-card">
+          <div class="failure-header">
+            <span class="card-title">失败归因</span>
+            <span class="failure-total-num">{{ latest?.register_failed ?? 0 }} 次注册失败</span>
+          </div>
+          <div class="stacked-bar">
+            <div class="sb-seg timeout" :style="{ flex: latest?.fail_timeout ?? 0 }" :title="`超时 ${latest?.fail_timeout ?? 0}`" />
+            <div class="sb-seg rejected" :style="{ flex: latest?.fail_rejected ?? 0 }" :title="`拒绝 ${latest?.fail_rejected ?? 0}`" />
+            <div class="sb-seg other" :style="{ flex: latest?.fail_other ?? 0 }" :title="`其它 ${latest?.fail_other ?? 0}`" />
+            <div v-if="!latest?.register_failed" class="sb-empty" />
+          </div>
+          <div class="failure-legend">
+            <div><i class="dot timeout"/>事务超时<b>{{ latest?.fail_timeout ?? 0 }}</b></div>
+            <div><i class="dot rejected"/>平台拒绝<b>{{ latest?.fail_rejected ?? 0 }}</b></div>
+            <div><i class="dot other"/>其它<b>{{ latest?.fail_other ?? 0 }}</b></div>
+            <div class="fl-extra"><i class="dot-i ok"/>上报 {{ (latest?.position_reported ?? 0) + (latest?.alarm_reported ?? 0) }} 次</div>
           </div>
         </div>
-      </n-form>
 
-      <div class="action-row">
-        <n-button type="primary" size="large" :loading="starting" :disabled="running || stopping || stopPending" @click="startStress">
-          启动压测
-        </n-button>
-        <n-button type="error" secondary size="large" :loading="stopPending" :disabled="!running || starting || stopping" @click="stopStress">
-          停止压测
-        </n-button>
-        <span>配置会先经过后端语义校验，报告自动隐藏认证密码。</span>
-      </div>
-    </section>
-
-    <section class="metric-grid">
-      <div class="glass-card metric primary">
-        <span>注册成功率</span>
-        <strong>{{ successRate }}</strong>
-        <small>{{ latest?.register_succeeded ?? 0 }} / {{ latest?.register_attempted ?? 0 }} 次</small>
-      </div>
-      <div class="glass-card metric">
-        <span>当前活跃流</span>
-        <strong>{{ latest?.active_streams ?? 0 }}</strong>
-        <small>实时 RTP 会话</small>
-      </div>
-      <div class="glass-card metric">
-        <span>心跳成功</span>
-        <strong>{{ latest?.heartbeat_succeeded ?? 0 }}</strong>
-        <small>失败 {{ latest?.heartbeat_failed ?? 0 }} 次</small>
-      </div>
-      <div class="glass-card metric">
-        <span>主动上报</span>
-        <strong>{{ (latest?.position_reported ?? 0) + (latest?.alarm_reported ?? 0) }}</strong>
-        <small>位置 {{ latest?.position_reported ?? 0 }} · 报警 {{ latest?.alarm_reported ?? 0 }}</small>
-      </div>
-    </section>
-
-    <section class="monitor-grid">
-      <div class="glass-card panel chart-panel">
-        <div class="panel-head compact">
-          <div>
-            <div class="panel-title">实时趋势</div>
-            <div class="panel-sub">最近 60 个采样点</div>
-          </div>
-          <span class="live-indicator" :class="{ on: running }">{{ running ? "LIVE" : "PAUSED" }}</span>
-        </div>
-        <div ref="chartEl" class="chart" />
-      </div>
-
-      <div class="glass-card panel failure-panel">
-        <div class="panel-title">失败归因</div>
-        <div class="failure-total">{{ latest?.register_failed ?? 0 }}</div>
-        <div class="failure-caption">注册失败总数</div>
-        <div class="failure-list">
-          <div><span><i class="timeout" />事务超时</span><b>{{ latest?.fail_timeout ?? 0 }}</b></div>
-          <div><span><i class="rejected" />平台拒绝</span><b>{{ latest?.fail_rejected ?? 0 }}</b></div>
-          <div><span><i class="other" />网络或其它</span><b>{{ latest?.fail_other ?? 0 }}</b></div>
-        </div>
-      </div>
-    </section>
+      </div><!-- /monitor-col -->
+    </div><!-- /workspace -->
   </div>
 </template>
 
 <style scoped>
-.page { width: min(1320px, 100%); margin: 0 auto; }
-.page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin: 18px 0 22px; }
-.eyebrow { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: 1.8px; }
-h1 { margin: 5px 0 0; color: var(--text-primary); font-size: clamp(24px, 2.5vw, 32px); letter-spacing: -0.6px; }
-.page-header p { margin: 8px 0 0; color: var(--text-tertiary); font-size: 13px; line-height: 1.6; }
-.header-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
-.status-chip { display: inline-flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 13px; border: 1px solid var(--border-default); border-radius: 999px; background: rgba(255,255,255,.55); color: var(--text-secondary); font-size: 12px; font-weight: 650; }
-.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); }
-.status-chip.running { color: var(--success); border-color: rgba(8,179,136,.25); background: rgba(8,179,136,.08); }
-.status-chip.running .status-dot { background: var(--success); box-shadow: 0 0 0 4px rgba(8,179,136,.12); animation: pulse 1.8s infinite; }
-.status-chip.busy { color: var(--warning); }
-.status-chip.busy .status-dot { background: var(--warning); }
-.notice { margin-bottom: 16px; border-radius: var(--radius-md); }
-.panel { padding: 22px 24px; }
-.config-panel { margin-bottom: 18px; }
-.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
-.panel-head.compact { margin-bottom: 4px; }
-.panel-title { color: var(--text-primary); font-size: 14px; font-weight: 750; }
-.panel-sub { margin-top: 4px; color: var(--text-tertiary); font-size: 11.5px; }
-.form-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); column-gap: 18px; }
+/* ── 页面骨架 ── */
+.page { width: min(1440px, 100%); margin: 0 auto; display: flex; flex-direction: column; overflow: hidden; }
+
+.page-header {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 16px; padding: 10px 0 8px; flex-shrink: 0;
+}
+.eyebrow { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: 1.8px; }
+h1 { margin: 3px 0 0; color: var(--text-primary); font-size: 22px; letter-spacing: -.4px; font-weight: 800; }
+.page-header p { margin: 3px 0 0; color: var(--text-tertiary); font-size: 12px; }
+.header-right { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+
+/* 状态胶囊 */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 5px 14px; border-radius: 999px;
+  border: 1px solid var(--border-default);
+  background: rgba(255,255,255,.55);
+  font-size: 12px; font-weight: 650; color: var(--text-secondary);
+}
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); flex: 0 0 auto; }
+.status-pill.running { color: var(--success); border-color: rgba(8,179,136,.28); background: rgba(8,179,136,.07); }
+.status-pill.running .status-dot { background: var(--success); animation: pulse 1.8s infinite; box-shadow: 0 0 0 4px rgba(8,179,136,.12); }
+.status-pill.busy { color: var(--warning); }
+.status-pill.busy .status-dot { background: var(--warning); }
+
+/* 运行横幅 */
+.run-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 14px; border-radius: var(--radius-sm);
+  background: rgba(8,179,136,.07); border: 1px solid rgba(8,179,136,.2);
+  margin-bottom: 8px; font-size: 12px; flex-shrink: 0;
+}
+.rb-pulse { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--success); animation: pulse 1.8s infinite; box-shadow: 0 0 0 4px rgba(8,179,136,.12); }
+.rb-text { font-weight: 700; color: var(--success); }
+.rb-sep { color: var(--text-tertiary); }
+.rb-stat { color: var(--text-secondary); }
+.rb-stat b { color: var(--text-primary); font-weight: 700; font-variant-numeric: tabular-nums; }
+.rb-platform { margin-left: auto; color: var(--text-tertiary); font-size: 11.5px; }
+
+.slide-banner-enter-active, .slide-banner-leave-active { transition: all .25s cubic-bezier(.4,0,.2,1); }
+.slide-banner-enter-from, .slide-banner-leave-to { opacity: 0; transform: translateY(-5px); }
+.fade-enter-active, .fade-leave-active { transition: opacity .2s; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* ── 主体布局 ── */
+.workspace { display: grid; grid-template-columns: 320px minmax(0,1fr); gap: 12px; align-items: start; flex: 1; min-height: 0; overflow: hidden; }
+
+/* ── 配置面板 ── */
+.config-col { height: 100%; overflow-y: auto; overflow-x: hidden; }
+.config-card { padding: 14px 16px; }
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.card-head.clickable { cursor: pointer; user-select: none; }
+.card-head.clickable:hover .card-title { color: var(--accent); }
+.card-title { font-size: 13.5px; font-weight: 750; color: var(--text-primary); transition: color .15s; }
+.card-sub { margin-top: 3px; font-size: 11.5px; color: var(--text-tertiary); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.head-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.collapse-toggle { font-size: 11px; color: var(--accent); cursor: pointer; }
+
+/* 折叠摘要 */
+.config-summary {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 12px;
+  background: rgba(56,132,255,.05); border-radius: var(--radius-sm);
+  border: 1px solid rgba(56,132,255,.12);
+  font-size: 12px; color: var(--text-secondary);
+}
+.config-summary b { color: var(--text-primary); font-weight: 700; }
+
+/* 快速预设 */
+.preset-row { display: flex; align-items: center; gap: 7px; margin-bottom: 12px; flex-wrap: wrap; }
+.preset-label { font-size: 11px; color: var(--text-tertiary); flex: 0 0 auto; }
+.preset-btn {
+  padding: 3px 12px; border-radius: 999px; border: 1px solid var(--border-default);
+  background: rgba(255,255,255,.5); color: var(--text-secondary);
+  font-size: 12px; font-weight: 600; cursor: pointer;
+  transition: all .15s;
+}
+.preset-btn:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: #fff; }
+.preset-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+.section-label {
+  font-size: 10.5px; font-weight: 700; color: var(--accent);
+  letter-spacing: .9px; text-transform: uppercase;
+  margin: 12px 0 2px; padding-bottom: 5px;
+  border-bottom: 1px solid var(--border-default);
+}
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; }
 .span-2 { grid-column: span 2; }
-.section-divider { display: flex; align-items: baseline; gap: 12px; margin: 3px 0 12px; padding-top: 15px; border-top: 1px solid var(--border-default); }
-.section-divider span { color: var(--text-secondary); font-size: 12.5px; font-weight: 700; }
-.section-divider small { color: var(--text-tertiary); font-size: 11.5px; }
-.report-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.report-option { display: grid; grid-template-columns: minmax(120px, 1fr) auto 100px auto; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: rgba(255,255,255,.32); }
-.report-option div { display: flex; flex-direction: column; gap: 2px; }
-.report-option b { color: var(--text-primary); font-size: 12.5px; }
-.report-option span, .report-option em { color: var(--text-tertiary); font-size: 11px; font-style: normal; }
-.action-row { display: flex; align-items: center; gap: 10px; margin-top: 20px; }
-.action-row span { margin-left: auto; color: var(--text-tertiary); font-size: 11.5px; }
-.metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
-.metric { position: relative; overflow: hidden; padding: 18px 20px; }
-.metric::after { content: ""; position: absolute; width: 84px; height: 84px; right: -30px; top: -35px; border-radius: 50%; background: var(--accent-dim); }
-.metric.primary { border-color: rgba(56,132,255,.28); background: linear-gradient(145deg, rgba(255,255,255,.72), rgba(217,231,255,.46)); }
-.metric > span { display: block; color: var(--text-tertiary); font-size: 11.5px; }
-.metric strong { display: block; margin-top: 7px; color: var(--text-primary); font-size: 27px; line-height: 1; font-variant-numeric: tabular-nums; }
-.metric.primary strong { color: var(--accent-deep); }
-.metric small { display: block; margin-top: 8px; color: var(--text-tertiary); font-size: 11px; }
-.monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 18px; }
-.chart-panel { min-width: 0; }
-.chart { width: 100%; height: 300px; }
-.live-indicator { padding: 3px 8px; border-radius: 5px; background: rgba(143,161,189,.12); color: var(--text-tertiary); font: 700 10px/1.4 "SF Mono", Menlo, monospace; letter-spacing: .7px; }
-.live-indicator.on { background: rgba(8,179,136,.10); color: var(--success); }
-.failure-panel { display: flex; flex-direction: column; }
-.failure-total { margin-top: 24px; color: var(--text-primary); font-size: 40px; font-weight: 750; line-height: 1; }
-.failure-caption { margin-top: 5px; color: var(--text-tertiary); font-size: 11.5px; }
-.failure-list { display: flex; flex-direction: column; gap: 13px; margin-top: auto; padding-top: 30px; }
-.failure-list > div { display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); font-size: 12px; }
-.failure-list span { display: inline-flex; align-items: center; gap: 8px; }
-.failure-list i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); }
-.failure-list i.timeout { background: var(--warning); }
-.failure-list i.rejected { background: var(--error); }
-.failure-list i.other { background: var(--violet); }
-.failure-list b { color: var(--text-primary); font-size: 14px; font-variant-numeric: tabular-nums; }
+
+/* 主动上报 */
+.report-grid { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
+.report-row { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border-radius: var(--radius-sm); background: rgba(255,255,255,.32); border: 1px solid var(--border-default); }
+.rr-info { flex: 1; display: flex; flex-direction: column; gap: 1px; }
+.rr-info b { font-size: 12.5px; color: var(--text-primary); font-weight: 600; }
+.rr-info small { font-size: 10.5px; color: var(--text-tertiary); }
+.rr-interval { display: flex; align-items: center; gap: 5px; transition: opacity .2s; }
+.rr-interval.disabled { opacity: .3; pointer-events: none; }
+.rr-interval span { font-size: 11px; color: var(--text-tertiary); }
+
+/* 操作行 */
+.action-row { display: flex; gap: 10px; margin-top: 16px; }
+.action-hint { margin: 7px 0 0; font-size: 10.5px; color: var(--text-tertiary); text-align: center; }
+
+/* ── 监控列 ── */
+.monitor-col { display: flex; flex-direction: column; gap: 8px; height: 100%; overflow-y: auto; overflow-x: hidden; }
+
+/* 指标行 */
+.metric-row { display: grid; grid-template-columns: 120px repeat(3, 1fr); gap: 8px; flex-shrink: 0; }
+
+/* 进度环 */
+.kpi-ring { padding: 10px 10px; display: flex; flex-direction: column; align-items: center; gap: 5px; }
+.ring-wrap { position: relative; width: 80px; height: 80px; flex: 0 0 auto; }
+.ring-svg { width: 80px; height: 80px; transform: rotate(-90deg); display: block; }
+.ring-track { fill: none; stroke: rgba(56,132,255,.1); stroke-width: 6; }
+.ring-fill { fill: none; stroke-width: 6; stroke-linecap: round; transition: stroke-dasharray .5s, stroke .4s; }
+.ring-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; }
+.ring-center strong { font-size: 14px; font-weight: 800; color: var(--text-primary); line-height: 1; }
+.ring-center span { font-size: 8.5px; color: var(--text-tertiary); white-space: nowrap; }
+.kpi-sub { font-size: 10px; color: var(--text-tertiary); }
+
+/* KPI 卡片 */
+.kpi-tile { padding: 10px 14px; display: flex; flex-direction: column; position: relative; overflow: hidden; }
+.kpi-tile::after { content: ""; position: absolute; width: 56px; height: 56px; right: -18px; top: -22px; border-radius: 50%; background: var(--accent-dim); }
+.kpi-label { font-size: 10.5px; color: var(--text-tertiary); }
+.kpi-val { font-size: 24px; font-weight: 800; color: var(--text-primary); line-height: 1.1; margin: 4px 0 4px; font-variant-numeric: tabular-nums; transition: color .3s; }
+.kpi-val.positive { color: var(--success); }
+.kpi-val small { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.kpi-hint { font-size: 10px; color: var(--text-tertiary); }
+.kpi-hint.warn { color: var(--warning); }
+.kpi-hint.mono { font-family: "SF Mono", Menlo, monospace; font-size: 11px; letter-spacing: .3px; color: var(--text-secondary); }
+
+/* ── 设备点阵 ── */
+.dot-card { padding: 10px 14px; }
+.dot-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; flex-wrap: wrap; gap: 5px; }
+.dot-legend { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dot-legend span { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-tertiary); }
+.dot-count-label { font-size: 11.5px; font-weight: 600; color: var(--text-secondary); margin-left: 4px; font-variant-numeric: tabular-nums; }
+.dot-i { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+.dot-i.ok { background: var(--success); }
+.dot-i.failed { background: var(--error); }
+.dot-i.idle { background: rgba(143,161,189,.3); }
+
+.dot-grid {
+  display: flex; flex-wrap: wrap; gap: 3px;
+  margin-bottom: 10px;
+}
+.dot-cell {
+  width: 8px; height: 8px; border-radius: 2px; flex: 0 0 auto;
+  transition: background .4s;
+}
+.dot-cell.idle    { background: rgba(143,161,189,.25); }
+.dot-cell.ok      { background: var(--success); }
+.dot-cell.failed  { background: var(--error); }
+.dot-grid.active .dot-cell.ok { animation: dot-appear .3s ease-out; }
+
+/* 注册进度条 */
+.reg-progress-bar { height: 4px; border-radius: 999px; background: rgba(76,99,133,.1); overflow: hidden; }
+.reg-progress-fill { height: 100%; border-radius: 999px; transition: width .6s cubic-bezier(.4,0,.2,1), background .4s; min-width: 0; }
+
+/* 趋势图 */
+.chart-card { padding: 10px 14px; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.chart-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 4px; flex-shrink: 0; }
+.chart { width: 100%; flex: 1; min-height: 160px; }
+.live-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 6px; background: rgba(143,161,189,.1); color: var(--text-tertiary); font: 700 10px/1.5 "SF Mono", Menlo, monospace; letter-spacing: .7px; }
+.live-badge.on { background: rgba(8,179,136,.1); color: var(--success); }
+.live-pulse { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; background: currentColor; animation: pulse 1.5s infinite; }
+
+/* 失败归因 */
+.failure-card { padding: 10px 14px; flex-shrink: 0; }
+.failure-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.failure-total-num { font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.stacked-bar { display: flex; height: 9px; border-radius: 999px; overflow: hidden; background: rgba(76,99,133,.08); margin-bottom: 10px; }
+.sb-seg { min-width: 0; transition: flex .4s; }
+.sb-seg.timeout  { background: var(--warning); }
+.sb-seg.rejected { background: var(--error); }
+.sb-seg.other    { background: var(--violet); }
+.sb-empty { flex: 1; }
+.failure-legend { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+.failure-legend > div { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-secondary); }
+.failure-legend b { color: var(--text-primary); font-weight: 700; margin-left: 3px; font-variant-numeric: tabular-nums; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+.dot.timeout  { background: var(--warning); }
+.dot.rejected { background: var(--error); }
+.dot.other    { background: var(--violet); }
+.fl-extra { margin-left: auto; font-size: 11px; color: var(--text-tertiary); }
+
+/* 动画 */
 @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(8,179,136,0); } }
-@media (max-width: 1120px) {
-  .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .metric-grid { grid-template-columns: repeat(2, 1fr); }
+@keyframes dot-appear { from { opacity: 0; transform: scale(.5); } to { opacity: 1; transform: scale(1); } }
+
+/* 响应式 */
+@media (max-width: 1220px) {
+  .workspace { grid-template-columns: 280px minmax(0,1fr); }
+  .metric-row { grid-template-columns: 110px repeat(3,1fr); }
 }
-@media (max-width: 820px) {
-  .page-header { flex-direction: column; }
-  .header-actions { width: 100%; justify-content: space-between; }
-  .report-grid, .monitor-grid { grid-template-columns: 1fr; }
-  .failure-list { margin-top: 0; }
+@media (max-width: 980px) {
+  .workspace { grid-template-columns: 1fr; overflow: visible; }
+  .config-col, .monitor-col { height: auto; overflow: visible; }
+  .metric-row { grid-template-columns: repeat(2,1fr); }
+  .kpi-ring { grid-column: span 2; flex-direction: row; padding: 10px 14px; gap: 14px; justify-content: flex-start; align-items: center; }
+  .kpi-sub { margin-top: 0; }
 }
-@media (max-width: 620px) {
-  .panel { padding: 18px; }
-  .form-grid, .metric-grid { grid-template-columns: 1fr; }
+@media (max-width: 640px) {
+  .metric-row { grid-template-columns: 1fr 1fr; }
+  .kpi-ring { grid-column: span 2; }
+  .form-grid { grid-template-columns: 1fr; }
   .span-2 { grid-column: span 1; }
-  .report-option { grid-template-columns: 1fr auto; }
-  .report-option :deep(.n-input-number), .report-option em { display: none; }
-  .action-row { align-items: stretch; flex-direction: column; }
-  .action-row span { margin-left: 0; }
+  .failure-legend { flex-direction: column; gap: 8px; }
+  .fl-extra { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .slide-banner-enter-active, .slide-banner-leave-active,
+  .fade-enter-active, .fade-leave-active { transition: none; }
+  .status-pill.running .status-dot, .rb-pulse, .live-pulse { animation: none; }
+  .dot-grid.active .dot-cell.ok { animation: none; }
 }
 </style>

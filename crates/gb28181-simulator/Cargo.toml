@@ -21,3 +21,6 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+common    = { path = "../common" }
+sip-core  = { path = "../sip-core" }
+media-rtp = { path = "../media-rtp" }

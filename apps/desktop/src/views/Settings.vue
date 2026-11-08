@@ -774,10 +774,8 @@ function setBindMode(mode: BindMode) {
 </template>
 
 <style scoped>
-.settings-page { max-width: 1420px; min-height: 100%; }
+.settings-page { max-width: 1420px; flex: 1; min-height: 0; }
 .settings-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
-.page-title { color: var(--text-primary); font-size: 24px; font-weight: 750; }
-.page-sub { margin-top: 5px; color: var(--text-tertiary); font-size: 13px; }
 .settings-header-meta { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .platform-summary { color: var(--text-secondary); }
 .lock-badge { padding: 5px 10px; border: 1px solid color-mix(in srgb, var(--success) 35%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--success) 10%, transparent); color: var(--success); }

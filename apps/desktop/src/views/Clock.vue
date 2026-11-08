@@ -146,7 +146,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page-wrap">
     <header class="page-header">
       <div>
         <div class="page-title">设备校时</div>
@@ -253,10 +253,8 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.page { display: grid; gap: 14px; width: min(1180px, 100%); margin: 0 auto; }
-.page-header { display: flex; align-items: end; justify-content: space-between; gap: 20px; }
-.page-title { color: var(--text-primary); font-size: 25px; font-weight: 750; }
-.page-sub { margin-top: 6px; max-width: 720px; color: var(--text-tertiary); font-size: 13px; line-height: 1.6; }
+.page { width: min(1180px, 100%); margin: 0 auto; display: grid; gap: 14px; align-content: start; }
+.page-header { align-items: flex-end; gap: 20px; }
 .head-actions { display: flex; gap: 8px; }
 .panel { padding: 18px; display: grid; gap: 16px; }
 .panel-head { display: flex; align-items: start; justify-content: space-between; gap: 16px; }

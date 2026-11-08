@@ -20,6 +20,10 @@ const props = withDefaults(defineProps<{
   pan: number;
   tilt: number;
   zoom: number;
+  /** 聚焦 0..1：0 = 最近对焦距离，1 = 无穷远（按屈光度线性映射）。 */
+  focus?: number;
+  /** 光圈 0..1：0 = 最小孔径，1 = 全开。 */
+  iris?: number;
   active?: boolean;
   seeking?: boolean;
   online?: boolean;
@@ -27,6 +31,8 @@ const props = withDefaults(defineProps<{
   zoomMax?: number;
   interactive?: boolean;
 }>(), {
+  focus: 0.5,
+  iris: 0.5,
   active: false,
   seeking: false,
   online: true,
@@ -47,6 +53,12 @@ const BALL_OFFSET = -0.7;         // 俯仰轴相对回转面的偏移
 const BALL_R = 0.42;
 const WINDOW_ANGLE = 0.95;         // 光学窗开口半角（rad）
 const WINDOW_BACK_Z = 0.15;        // 光学窗内底板深度
+const FOCUS_NEAR = 0.4;            // 最近对焦距离（世界单位）
+const FOCAL_PLANE_MAX = 7;         // 焦平面超过该距离不画（视为接近无穷远）
+const DOF_BASE = 0.55;             // 景深半宽基准（屈光度）
+const IRIS_OUTER = 0.098;
+const IRIS_MIN = 0.012;
+const IRIS_MAX = 0.086;
 const DEFAULT_VIEW = new THREE.Vector3(3.2, 2.3, 4.2);
 const VIEW_TARGET = new THREE.Vector3(0, 1.12, 0);
 
@@ -75,12 +87,22 @@ let aimDot: THREE.Mesh | null = null;
 let statusLed: THREE.MeshStandardMaterial | null = null;
 let pointerMat: THREE.MeshStandardMaterial | null = null;
 let irMat: THREE.MeshStandardMaterial | null = null;
+let focusRing: THREE.Mesh | null = null;
+let zoomRing: THREE.Mesh | null = null;
+let irisBlades: THREE.Mesh | null = null;
+let irisInner = -1;
+let focalPlane: THREE.LineLoop | null = null;
+let dofNear: THREE.LineLoop | null = null;
+let dofFar: THREE.LineLoop | null = null;
+let aimMat: THREE.MeshBasicMaterial | null = null;
 
 // 临界阻尼弹簧：value 跟随 target，velocity 自然衰减，无超调。
 interface Spring { value: number; velocity: number; }
 const panSpring: Spring = { value: 0, velocity: 0 };
 const tiltSpring: Spring = { value: 0, velocity: 0 };
 const zoomSpring: Spring = { value: 0, velocity: 0 }; // log(zoom)
+const focusSpring: Spring = { value: 0.5, velocity: 0 };
+const irisSpring: Spring = { value: 0.5, velocity: 0 };
 const SPRING_OMEGA = 11;
 
 function stepSpring(spring: Spring, target: number, dt: number): boolean {
@@ -108,6 +130,10 @@ function unwrapPan(target: number, current: number): number {
 
 function clampTilt(value: number): number {
   return THREE.MathUtils.clamp(value, -90, 90);
+}
+
+function clamp01(value: number): number {
+  return THREE.MathUtils.clamp(Number.isFinite(value) ? value : 0.5, 0, 1);
 }
 
 function logZoom(value: number): number {
@@ -478,18 +504,59 @@ function buildTiltBall(m: Materials): void {
   const tube = mesh(lensGroup, new THREE.CylinderGeometry(0.112, 0.118, 0.12, 48), m.black);
   tube.rotation.x = Math.PI / 2;
   tube.position.z = -0.06;
-  const grip = mesh(lensGroup, new THREE.CylinderGeometry(0.119, 0.119, 0.03, 48, 1, true), m.rubber, false);
-  grip.rotation.x = Math.PI / 2;
-  grip.position.z = -0.08;
+
+  // 变焦环（前，白刻线）+ 对焦环（后，琥珀刻线）：转角对应 zoom / focus。
+  const ringGeo = new THREE.CylinderGeometry(0.121, 0.121, 0.026, 64, 1, true);
+  zoomRing = mesh(lensGroup, ringGeo, createRingMaterial("#d8e2ec"), false);
+  zoomRing.rotation.x = Math.PI / 2;
+  zoomRing.position.z = -0.03;
+  focusRing = mesh(lensGroup, ringGeo, createRingMaterial("#ffc65c"), false);
+  focusRing.rotation.x = Math.PI / 2;
+  focusRing.position.z = -0.085;
+
   const frontRing = mesh(lensGroup, new THREE.TorusGeometry(0.106, 0.01, 10, 48), m.steel, false);
   frontRing.position.z = 0;
   const front = mesh(lensGroup, new THREE.CircleGeometry(0.1, 48), m.lensGlass, false);
   front.position.z = -0.004;
-  const pupil = mesh(lensGroup, new THREE.CircleGeometry(0.05, 40), new THREE.MeshBasicMaterial({ color: 0x010306 }), false);
-  pupil.position.z = -0.003;
-  const glint = mesh(lensGroup, new THREE.CircleGeometry(0.014, 16), new THREE.MeshBasicMaterial({ color: 0xcfeaff }), false);
-  glint.position.set(-0.035, 0.035, -0.002);
+  const pupil = mesh(lensGroup, new THREE.CircleGeometry(0.09, 40), new THREE.MeshBasicMaterial({ color: 0x010306 }), false);
+  pupil.position.z = -0.0035;
+
+  // 光圈叶片：六边形开口，开口半径随 iris 变化。
+  irisBlades = mesh(lensGroup, new THREE.RingGeometry(0.05, IRIS_OUTER, 6, 1), new THREE.MeshStandardMaterial({
+    color: 0x6b7682, metalness: 0.75, roughness: 0.35, side: THREE.DoubleSide,
+  }), false);
+  irisBlades.position.z = -0.003;
+
+  const glint = mesh(lensGroup, new THREE.CircleGeometry(0.014, 16), new THREE.MeshBasicMaterial({
+    color: 0xcfeaff, transparent: true, opacity: 0.85,
+  }), false);
+  glint.position.set(-0.04, 0.04, -0.002);
 }
+
+function createRingMaterial(markColor: string): THREE.MeshStandardMaterial {
+  // 贴图 U = 圆周方向：深色滚花底 + 一条刻线，转起来能看出转角。
+  const texture = canvasTexture(512, 32, (ctx) => {
+    ctx.fillStyle = "#15181c";
+    ctx.fillRect(0, 0, 512, 32);
+    ctx.fillStyle = "#2a2f36";
+    for (let x = 0; x < 512; x += 8) ctx.fillRect(x, 0, 4, 32);
+    ctx.fillStyle = markColor;
+    ctx.fillRect(250, 0, 12, 32);
+  });
+  return new THREE.MeshStandardMaterial({ map: texture, metalness: 0, roughness: 0.85, side: THREE.DoubleSide });
+}
+
+function setIrisAperture(iris: number): void {
+  if (!irisBlades) return;
+  const inner = THREE.MathUtils.lerp(IRIS_MIN, IRIS_MAX, iris);
+  // 叶片收缩时整体略转，模拟真实光圈的旋入。
+  irisBlades.rotation.z = Math.PI / 6 + (1 - iris) * 0.6;
+  if (Math.abs(inner - irisInner) < 0.0004) return;
+  irisInner = inner;
+  irisBlades.geometry.dispose();
+  irisBlades.geometry = new THREE.RingGeometry(inner, IRIS_OUTER, 6, 1);
+}
+
 function halfFov(zoom: number): { h: number; v: number } {
   const wideH = THREE.MathUtils.degToRad(WIDE_HFOV_DEG / 2);
   const h = Math.atan(Math.tan(wideH) / Math.max(1, zoom));
@@ -535,6 +602,49 @@ function buildFov(): void {
   fovGroup.add(lines);
 }
 
+function unitSquare(color: number, opacity: number, dashed: boolean): THREE.LineLoop {
+  // 单位矩形 (±1, ±1, 1)：放进 fovGroup 后整体缩放 k，即距离 k·FOV_LENGTH 处的视场截面。
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute([-1, -1, 1, 1, -1, 1, 1, 1, 1, -1, 1, 1], 3));
+  const material = dashed
+    ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, depthWrite: false, dashSize: 0.08, gapSize: 0.06 })
+    : new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthWrite: false });
+  const loop = new THREE.LineLoop(geo, material);
+  if (dashed) loop.computeLineDistances();
+  loop.renderOrder = 4;
+  return loop;
+}
+
+function buildFocusPlanes(): void {
+  if (!fovGroup) return;
+  // 焦平面（琥珀实线）+ 景深前后界（虚线）：聚焦移动焦平面，光圈和变倍改变景深宽度。
+  focalPlane = unitSquare(0xffc65c, 0.95, false);
+  dofNear = unitSquare(0xffc65c, 0.45, true);
+  dofFar = unitSquare(0xffc65c, 0.45, true);
+  fovGroup.add(focalPlane, dofNear, dofFar);
+}
+
+interface FocusState { distance: number; near: number; far: number; }
+
+/** 聚焦/光圈/变倍 → 焦距离与景深前后界（世界单位，Infinity 表示无穷远）。 */
+function focusState(focus: number, iris: number, zoom: number): FocusState {
+  const diopter = (1 - focus) / FOCUS_NEAR;
+  // 景深半宽（屈光度）：光圈越小越宽，焦距越长越窄（物理上 ~1/f²，用 zoom^1.6 让变化柔和些）。
+  const half = (DOF_BASE * (0.25 + 1.75 * (1 - iris))) / Math.pow(Math.max(1, zoom), 1.6);
+  return {
+    distance: diopter <= 1e-4 ? Infinity : 1 / diopter,
+    near: 1 / (diopter + half),
+    far: diopter - half <= 1e-4 ? Infinity : 1 / (diopter - half),
+  };
+}
+
+function placeSlice(loop: THREE.LineLoop | null, distance: number, visible: boolean): void {
+  if (!loop) return;
+  const show = visible && Number.isFinite(distance) && distance <= FOCAL_PLANE_MAX;
+  loop.visible = show;
+  if (show) loop.scale.setScalar(distance / FOV_LENGTH);
+}
+
 function buildFootprint(root: THREE.Object3D): void {
   // 地面视场投影：四条角射线与地面求交，每帧更新顶点。
   const geo = new THREE.BufferGeometry();
@@ -556,9 +666,8 @@ function buildFootprint(root: THREE.Object3D): void {
   footprintOutline.frustumCulled = false;
   root.add(footprintOutline);
 
-  aimDot = new THREE.Mesh(new THREE.RingGeometry(0.035, 0.06, 32), new THREE.MeshBasicMaterial({
-    color: 0xbfe0ff, transparent: true, opacity: 0.9, depthWrite: false,
-  }));
+  aimMat = new THREE.MeshBasicMaterial({ color: 0xbfe0ff, transparent: true, opacity: 0.9, depthWrite: false });
+  aimDot = new THREE.Mesh(new THREE.RingGeometry(0.035, 0.06, 32), aimMat);
   aimDot.rotation.x = -Math.PI / 2;
   aimDot.renderOrder = 2;
   root.add(aimDot);
@@ -583,7 +692,7 @@ function groundHit(localX: number, localY: number, out: THREE.Vector3): boolean 
 }
 
 const hitPoint = new THREE.Vector3();
-function updateFov(zoom: number): void {
+function updateFov(zoom: number, focus: number, iris: number): void {
   const { h, v } = halfFov(zoom);
   const visible = props.showFov && props.online;
   const hot = props.active || props.seeking;
@@ -591,8 +700,14 @@ function updateFov(zoom: number): void {
     fovGroup.visible = visible;
     fovGroup.scale.set(Math.tan(h) * FOV_LENGTH, Math.tan(v) * FOV_LENGTH, FOV_LENGTH);
   }
-  if (fovFill) fovFill.opacity = hot ? 0.11 : 0.07;
-  if (fovLine) fovLine.opacity = hot ? 0.7 : 0.45;
+  // 光圈 = 进光量：视场锥亮度随光圈开合变化。
+  if (fovFill) fovFill.opacity = (hot ? 0.11 : 0.075) * (0.35 + iris * 0.9);
+  if (fovLine) fovLine.opacity = (hot ? 0.7 : 0.45) * (0.6 + iris * 0.5);
+
+  const dof = focusState(focus, iris, zoom);
+  placeSlice(focalPlane, dof.distance, true);
+  placeSlice(dofNear, dof.near, true);
+  placeSlice(dofFar, dof.far, true);
 
   if (!footprint || !footprintOutline || !aimDot) return;
   const tx = Math.tan(h);
@@ -616,7 +731,20 @@ function updateFov(zoom: number): void {
 
   const aim = visible && groundHit(0, 0, hitPoint);
   aimDot.visible = aim;
-  if (aim) aimDot.position.set(hitPoint.x, 0.005, hitPoint.z);
+  if (!aim || !lensGroup) return;
+  aimDot.position.set(hitPoint.x, 0.005, hitPoint.z);
+  // 瞄准点落在景深内：琥珀色实心环；失焦：变暗并放大成弥散圆。
+  lensGroup.getWorldPosition(tmpOrigin);
+  const range = tmpOrigin.distanceTo(hitPoint);
+  const sharp = range >= dof.near && range <= dof.far;
+  const focusDiopter = Number.isFinite(dof.distance) ? 1 / dof.distance : 0;
+  const blur = sharp ? 0 : Math.min(1, Math.abs(1 / range - focusDiopter) * 0.9);
+  aimDot.scale.setScalar(1 + blur * 2.2);
+  if (aimMat) {
+    aimMat.color.setHex(sharp ? 0xffc65c : 0x9fb8d4);
+    aimMat.opacity = sharp ? 0.95 : 0.85 - blur * 0.55;
+  }
+  (footprintOutline.material as THREE.LineBasicMaterial).opacity = sharp ? 0.9 : 0.4;
 }
 function buildScene(): void {
   const element = host.value;
@@ -679,6 +807,7 @@ function buildScene(): void {
   buildPanHead(scene, materials);
   buildTiltBall(materials);
   buildFov();
+  buildFocusPlanes();
   buildFootprint(scene);
 
   controls = new OrbitControls(viewCamera, renderer.domElement);
@@ -696,6 +825,8 @@ function buildScene(): void {
   panSpring.value = props.pan;
   tiltSpring.value = clampTilt(props.tilt);
   zoomSpring.value = logZoom(props.zoom);
+  focusSpring.value = clamp01(props.focus);
+  irisSpring.value = clamp01(props.iris);
   applyPose();
 
   resizeObserver = new ResizeObserver(resize);
@@ -708,10 +839,16 @@ function applyPose(): void {
   panGroup.rotation.y = -THREE.MathUtils.degToRad(panSpring.value);
   tiltGroup.rotation.x = -THREE.MathUtils.degToRad(tiltSpring.value);
   const zoom = Math.exp(zoomSpring.value);
-  const progress = zoomSpring.value / Math.log(props.zoomMax);
-  lensGroup.position.z = WINDOW_BACK_Z + 0.07 + THREE.MathUtils.clamp(progress, 0, 1) * 0.065;
+  const progress = THREE.MathUtils.clamp(zoomSpring.value / Math.log(props.zoomMax), 0, 1);
+  const focus = clamp01(focusSpring.value);
+  const iris = clamp01(irisSpring.value);
+  lensGroup.position.z = WINDOW_BACK_Z + 0.07 + progress * 0.065;
+  // 变焦环 / 对焦环绕光轴（环的局部 Y）转动，全行程约 300°。
+  if (zoomRing) zoomRing.rotation.y = progress * Math.PI * 1.65;
+  if (focusRing) focusRing.rotation.y = -focus * Math.PI * 1.65;
+  setIrisAperture(iris);
   panGroup.updateMatrixWorld(true);
-  updateFov(zoom);
+  updateFov(zoom, focus, iris);
 }
 
 function updateIndicators(time: number): boolean {
@@ -746,6 +883,8 @@ function frame(time: number): void {
   let moving = stepSpring(panSpring, panTarget, dt);
   moving = stepSpring(tiltSpring, clampTilt(props.tilt), dt) || moving;
   moving = stepSpring(zoomSpring, logZoom(props.zoom), dt) || moving;
+  moving = stepSpring(focusSpring, clamp01(props.focus), dt) || moving;
+  moving = stepSpring(irisSpring, clamp01(props.iris), dt) || moving;
   applyPose();
   const pulsing = updateIndicators(time);
   const orbiting = controls?.update() ?? false;
@@ -843,6 +982,10 @@ function disposeScene(): void {
   footprint = null;
   footprintOutline = null;
   aimDot = null;
+  aimMat = null;
+  focusRing = zoomRing = irisBlades = null;
+  irisInner = -1;
+  focalPlane = dofNear = dofFar = null;
   fovFill = null;
   fovLine = null;
   statusLed = pointerMat = irMat = null;
@@ -852,7 +995,7 @@ function disposeScene(): void {
 const hint = computed(() => (props.interactive ? "拖拽旋转视角 · 滚轮缩放 · 双击复位" : ""));
 
 watch(
-  () => [props.pan, props.tilt, props.zoom, props.active, props.seeking, props.online, props.showFov] as const,
+  () => [props.pan, props.tilt, props.zoom, props.focus, props.iris, props.active, props.seeking, props.online, props.showFov] as const,
   requestRender,
 );
 watch(() => props.interactive, (value) => {
