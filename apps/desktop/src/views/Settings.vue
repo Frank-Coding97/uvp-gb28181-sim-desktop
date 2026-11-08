@@ -706,7 +706,7 @@ function setBindMode(mode: BindMode) {
           <div class="osd-scope" :class="{ warn: osdCapability && !osdBurnable }">
             <template v-if="!osdCapability">正在检测 FFmpeg 与字体…</template>
             <template v-else-if="osdBurnable">
-              Windows 摄像头 / 屏幕实时采集：烧进推流、录像与本地预览画面。文件回放、压测：不重新编码，画面中不带 OSD。
+              Windows 摄像头 / 屏幕、macOS 摄像头实时采集：烧进推流、录像与本地预览画面。macOS 屏幕采集、文件回放、压测：画面中不带 OSD。
               平台下发 OSDConfig 后，时间与文字的位置、开关以平台为准，样式沿用此处设置；平台 PictureMask 开启时叠加黑色遮挡。
             </template>
             <template v-else-if="!osdCapability.ffmpeg">未找到 FFmpeg，OSD 无法烧进码流。</template>

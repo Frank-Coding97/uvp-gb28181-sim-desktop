@@ -1,7 +1,8 @@
 //! OSD 水印：本地样式配置模型 + FFmpeg 滤镜生成。
 //!
-//! 只有经 FFmpeg 实时编码的采集路径(Windows 摄像头/屏幕)会把 OSD 烧进码流；
-//! 文件循环与压测不重新编码，画面中不带 OSD。
+//! 只有经 FFmpeg 实时编码的采集路径(Windows 摄像头/屏幕、macOS 摄像头)会把
+//! OSD 烧进码流；macOS 屏幕走 ScreenCaptureKit + OpenH264，文件循环与压测
+//! 不重新编码，画面中不带 OSD。
 //!
 //! 样式规则对齐移动端(uvp-gb28181-sim `OsdTextPass`/`IosOsdLayout`)：
 //! - 字号 = max(16, 画面高 × 0.035/0.050/0.070)

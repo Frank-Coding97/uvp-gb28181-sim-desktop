@@ -1787,8 +1787,9 @@ impl LiveSource {
 
     /// 同 [`Self::capture_with_profile`]，并把 OSD 烧进编码前的画面。
     ///
-    /// 仅 Windows 的 FFmpeg 摄像头/屏幕路径支持；其他平台或 FFmpeg 缺少
-    /// drawtext 时忽略 OSD，采集照常启动。
+    /// Windows 摄像头/屏幕与 macOS 摄像头在 FFmpeg 编码前烧录；macOS 屏幕
+    /// 走 ScreenCaptureKit + OpenH264，没有滤镜链，暂不烧录。FFmpeg 缺少
+    /// drawtext 或找不到中文字体时忽略 OSD，采集照常启动。
     pub fn capture_with_profile_osd(
         uri: &str,
         profile: MediaProfile,
@@ -1997,17 +1998,20 @@ impl LiveSource {
                 "摄像头不支持配置的输出分辨率，已按最接近的受支持尺寸采集并缩放补齐"
             );
         }
-        #[cfg(windows)]
+        // Windows 摄像头/屏幕与 macOS 摄像头都走 FFmpeg 编码，可以在编码前挂
+        // drawtext/drawbox 滤镜；能力不足时 resolve 返回 None，采集照常启动。
+        #[cfg(any(target_os = "macos", windows))]
         let osd_burn_in = osd.and_then(|overlay| crate::osd::OsdBurnIn::resolve(&ffmpeg, overlay));
-        #[cfg(target_os = "macos")]
-        if osd.is_some() {
-            tracing::warn!("macOS 摄像头采集暂不支持 OSD 烧录，画面中不带 OSD");
-        }
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let mut command = common::hidden_command(&ffmpeg);
         #[cfg(target_os = "macos")]
-        let mut camera_args =
-            camera_command_args_for_profile(video_index, audio_index, &profile, input_mode);
+        let mut camera_args = camera_command_args_for_profile(
+            video_index,
+            audio_index,
+            &profile,
+            input_mode,
+            osd_burn_in.as_ref(),
+        );
         #[cfg(windows)]
         let mirror = camera_mirror_enabled();
         #[cfg(windows)]
@@ -3657,7 +3661,7 @@ fn camera_command_args_for_test(
         height: profile.height,
         fps: f64::from(camera_input_fps(fps)),
     };
-    camera_command_args_for_profile(video_index, audio_index, &profile, input_mode)
+    camera_command_args_for_profile(video_index, audio_index, &profile, input_mode, None)
 }
 
 #[cfg(target_os = "macos")]
@@ -3666,6 +3670,7 @@ fn camera_command_args_for_profile(
     audio_index: Option<u32>,
     profile: &LiveCaptureProfile,
     input_mode: camera_modes::CameraInputMode,
+    osd: Option<&crate::osd::OsdBurnIn>,
 ) -> Vec<String> {
     let input_fps = input_mode.fps;
     let input = audio_index.map_or_else(
@@ -3679,6 +3684,17 @@ fn camera_command_args_for_profile(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
         profile.width, profile.height, profile.width, profile.height
     );
+    // avfoundation 输出 uyvy422，而 drawtext/drawbox 只吃 yuv420p 系列。
+    // 有 OSD 时先转格式，再画在缩放之后，坐标才对应输出分辨率；无 OSD 时
+    // 滤镜链与原来逐字一致，不引入额外的整帧转换。
+    let filter = match osd {
+        Some(osd) => osd.graph(
+            &format!("{output_size},format=yuv420p"),
+            profile.width,
+            profile.height,
+        ),
+        None => output_size,
+    };
     let mut args = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
@@ -3715,7 +3731,7 @@ fn camera_command_args_for_profile(
         "-map".into(),
         "0:v:0".into(),
         "-vf".into(),
-        output_size,
+        filter,
         cfr_args[0].into(),
         cfr_args[1].into(),
         cfr_args[2].into(),
@@ -5105,6 +5121,7 @@ mod tests {
                 height: 1440,
                 fps: 29.970030,
             },
+            None,
         );
         assert!(args
             .windows(2)
@@ -5120,6 +5137,126 @@ mod tests {
         assert!(command.contains("-r 15 -fps_mode cfr"));
         assert!(command.contains("-c:v hevc_videotoolbox"));
         assert!(command.ends_with("-f hevc -flush_packets 1 pipe:1"));
+    }
+
+    /// macOS 摄像头 OSD 回归夹具：时间 + 斜铺水印(可选) + 一个黑色遮挡。
+    #[cfg(target_os = "macos")]
+    fn macos_camera_osd(watermark: bool) -> crate::osd::OsdBurnIn {
+        use crate::osd::*;
+        OsdBurnIn {
+            overlay: OsdOverlay {
+                base_width: 640,
+                base_height: 480,
+                time: Some(OsdTime {
+                    anchor: OsdAnchor::Pixel { x: 10, y: 10 },
+                    format: OsdTimeFormat::Dash,
+                    style: OsdLayer::default(),
+                }),
+                texts: vec![],
+                watermark: watermark.then(|| OsdText {
+                    text: "内部测试".into(),
+                    anchor: OsdAnchor::TopRight,
+                    style: OsdLayer::default(),
+                }),
+                mask_base: (640, 480),
+                masks: vec![OsdRect {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 40,
+                }],
+            },
+            font: "/tmp/uvp-osd-test.ttc".into(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_camera_osd_args(osd: Option<&crate::osd::OsdBurnIn>) -> Vec<String> {
+        let profile = LiveCaptureProfile {
+            width: 640,
+            height: 480,
+            video_fps: 15,
+            bitrate_kbps: 600,
+            keyframe_interval_seconds: 4,
+            video_codec: LiveVideoCodec::H264,
+            audio_codec: LiveAudioCodec::Aac,
+            audio_sample_rate_hz: 8_000,
+            encoder: crate::encoder::EncoderBackend::VideoToolbox,
+        };
+        camera_command_args_for_profile(
+            0,
+            None,
+            &profile,
+            camera_modes::CameraInputMode {
+                width: 1920,
+                height: 1440,
+                fps: 29.970030,
+            },
+            osd,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_camera_vf(args: &[String]) -> &str {
+        let index = args
+            .iter()
+            .position(|arg| arg == "-vf")
+            .expect("camera command needs -vf");
+        &args[index + 1]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macOS摄像头OSD画在缩放与格式转换之后且编码之前() {
+        let osd = macos_camera_osd(false);
+        let with = macos_camera_osd_args(Some(&osd));
+        let without = macos_camera_osd_args(None);
+        let filter = macos_camera_vf(&with);
+
+        let scale = filter.find("scale=640:480").expect("scale first");
+        let format_yuv = filter.find("format=yuv420p").expect("uyvy422 -> yuv420p");
+        let draw = filter.find("drawtext").expect("time OSD");
+        let mask = filter.find("drawbox").expect("mask OSD");
+        assert!(scale < format_yuv, "{filter}");
+        assert!(format_yuv < draw, "{filter}");
+        assert!(draw < mask, "{filter}");
+        let vf = with.iter().position(|arg| arg == "-vf").unwrap();
+        let codec = with.iter().position(|arg| arg == "-c:v").unwrap();
+        assert!(vf < codec, "OSD 滤镜必须在编码器之前");
+
+        // 挂 OSD 只改 -vf 一个参数；采集/编码/输出参数逐字不变。
+        let mut stripped_with = with.clone();
+        let mut stripped_without = without.clone();
+        stripped_with[vf + 1] = "<vf>".into();
+        let without_vf = stripped_without
+            .iter()
+            .position(|arg| arg == "-vf")
+            .unwrap();
+        stripped_without[without_vf + 1] = "<vf>".into();
+        assert_eq!(stripped_with, stripped_without);
+        // 无 OSD 时仍是原来的 scale/pad 链，不引入额外的整帧格式转换。
+        assert_eq!(
+            macos_camera_vf(&without),
+            "scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macOS摄像头斜铺水印使用双链overlay且仍在缩放之后() {
+        let osd = macos_camera_osd(true);
+        let args = macos_camera_osd_args(Some(&osd));
+        let filter = macos_camera_vf(&args);
+        assert!(
+            filter.contains("[osdbase][osdwm]overlay=0:0:eof_action=repeat"),
+            "{filter}"
+        );
+        assert!(
+            filter.find("scale=640:480").unwrap() < filter.find("[osdbase]").unwrap(),
+            "{filter}"
+        );
+        assert!(filter.contains("drawtext"), "{filter}");
+        assert!(filter.contains("drawbox"), "{filter}");
     }
 
     #[cfg(target_os = "macos")]
