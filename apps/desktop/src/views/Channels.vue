@@ -457,6 +457,20 @@ const ACTION_PALETTE = {
   toggle: "#e89320", // --warning
 } as const;
 
+/**
+ * 工具栏配色：与表格内操作按钮同一套语义，读写/导入导出/破坏性动作各自有色。
+ * 保存仍用实心主色（唯一落盘动作，需要最强视觉权重）；复位是破坏性动作取危险色。
+ */
+const TOOLBAR_PALETTE = {
+  refresh: "#5b6b82",     // 中性灰蓝：只读刷新
+  add: "#08b388",         // --success：新增
+  template: "#7a6cff",    // --violet：套模板
+  importJson: "#00b9d6",  // --cyan：数据入
+  exportJson: "#3884ff",  // --accent：数据出
+  preview: "#e89320",     // --warning：预览报文
+  reset: "#e5484d",       // --danger：复位默认
+} as const;
+
 /** secondary 走淡彩底 + 彩色文字，浅色玻璃主题下比实心色块更易读。 */
 function coloredButton(label: string, color: string, onClick: () => void, disabled = false): VNode {
   return h(NButton, {
@@ -546,13 +560,13 @@ onMounted(async () => {
     <div class="glass-card panel">
       <div class="toolbar">
         <n-input v-model:value="searchText" clearable class="search" placeholder="搜索名称 / ID / 区划码" />
-        <n-button @click="reloadTree">刷新</n-button>
-        <n-button type="info" @click="openAdd()">新增节点</n-button>
-        <n-button @click="showTemplate = true">应用模板</n-button>
-        <n-button @click="openImport">导入 JSON</n-button>
-        <n-button @click="openExport">导出 JSON</n-button>
-        <n-button @click="openXmlPreview">预览 NOTIFY</n-button>
-        <n-button @click="showResetConfirm = true">复位默认</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.refresh" @click="reloadTree">刷新</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.add" @click="openAdd()">新增节点</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.template" @click="showTemplate = true">应用模板</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.importJson" @click="openImport">导入 JSON</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.exportJson" @click="openExport">导出 JSON</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.preview" @click="openXmlPreview">预览 NOTIFY</n-button>
+        <n-button secondary type="primary" :color="TOOLBAR_PALETTE.reset" @click="showResetConfirm = true">复位默认</n-button>
         <n-button type="primary" :loading="busy" :disabled="!isDirty" @click="saveDraft">
           {{ isDirty ? "保存*" : "保存" }}
         </n-button>
