@@ -97,6 +97,27 @@ cat >"$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
+# 复现完整出包流程：build-macos-dmg.sh 的第 2 步会先内嵌 Swift runtime，
+# 其中 libswift_Concurrency.dylib 引用系统的 @rpath/libswiftCore.dylib
+# (在 dyld shared cache 里，不该内嵌)。第 3 步的 ffmpeg 内嵌脚本若把
+# Frameworks 里所有 dylib 都拿去校验，就会误报「缺少 libswiftCore.dylib」
+# 并中断出包 —— 2026-11-08 实际踩过，这里放一个同构夹具防回归。
+mkdir -p "$APP/Contents/Frameworks"
+SWIFT_STUB="$APP/Contents/Frameworks/libswift_Concurrency.dylib"
+printf 'void uvp_swift_runtime_stub(void) {}\n' >"$TMP_DIR/swiftstub.c"
+if ! command -v clang >/dev/null 2>&1; then
+  fail "缺少 clang，无法构造 Swift runtime 夹具"
+fi
+clang -dynamiclib -o "$SWIFT_STUB" "$TMP_DIR/swiftstub.c" 2>"$TMP_DIR/clang.stderr" \
+  || { cat "$TMP_DIR/clang.stderr" >&2; fail "无法构造 Swift runtime 夹具"; }
+STUB_DEP="$(otool -L "$SWIFT_STUB" | tail -n +3 | head -1 | awk '{print $1}')"
+[ -n "$STUB_DEP" ] || fail "Swift runtime 夹具没有可改写的依赖"
+install_name_tool -change "$STUB_DEP" "@rpath/libswiftCore.dylib" "$SWIFT_STUB" \
+  || fail "无法给夹具注入 @rpath/libswiftCore.dylib"
+otool -L "$SWIFT_STUB" | grep -q '@rpath/libswiftCore.dylib' \
+  || fail "夹具未包含目标引用"
+echo "[T01] 预置 Swift runtime 夹具(引用 @rpath/libswiftCore.dylib)"
+
 echo "[T01] bundle ffmpeg + ffprobe into temporary app"
 FFPROBE_BIN="$FFPROBE_BIN" "$BUNDLE_SCRIPT" "$APP" - "$FFMPEG_BIN" "$FFPROBE_BIN" >"$TMP_DIR/bundle.stdout"
 

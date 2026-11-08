@@ -68,6 +68,7 @@ chmod +w "$FPBIN"
 # 兼容 macOS 自带 bash 3.2:用换行分隔的字符串做去重,不用关联数组。
 DONE_LIST=""
 SOURCE_DIRS=""
+COPIED_LIST=""   # 本脚本这次真正拷进 Frameworks 的库名，签名前校验只认这些
 collect() {
   local bin="$1"
   local deps
@@ -90,6 +91,7 @@ collect() {
       *)
         if [ -f "$d" ]; then
           DONE_LIST="$DONE_LIST|$name|"
+          COPIED_LIST="$COPIED_LIST|$name|"
           srcdir="$(dirname "$d")"
           case "$SOURCE_DIRS" in
             *"|$srcdir|"*) : ;;
@@ -107,15 +109,24 @@ collect() {
 collect "$FFBIN"
 collect "$FPBIN"
 
-# 签名前校验所有 @rpath 引用都有对应文件。系统 keg 的 dylib 常用 @rpath 引用同伴，
-# 漏拷时包照样能通过 codesign，但用户一启动就 dyld 崩溃，必须在这里拦下。
+# 签名前校验本次内嵌涉及的 @rpath 引用都有对应文件。系统 keg 的 dylib 常用
+# @rpath 引用同伴，漏拷时包照样能通过 codesign，但用户一启动就 dyld 崩溃，必须拦下。
+# ⚠️ 只扫 ffmpeg/ffprobe 与「本脚本这次拷进来的库」：完整出包时 Frameworks 里
+# 还有上一步 Swift runtime 放的 dylib(如 libswift_Concurrency)，它引用的
+# @rpath/libswiftCore.dylib 由系统 dyld shared cache 提供、本就不该内嵌；
+# 一起扫会把别的步骤的产物误判成缺失，导致 build-macos-dmg.sh 中途退出。
+# 漏拷第三方依赖仍会被端到端测试拦下(包内 ffmpeg 一启动就 dyld 崩)。
 missing_rpath_libs() {
   {
     otool -L "$FFBIN" 2>/dev/null
     otool -L "$FPBIN" 2>/dev/null
-    while IFS= read -r -d '' lib; do
-      otool -L "$lib" 2>/dev/null
-    done < <(find "$LIBDIR" -type f -name '*.dylib' -print0)
+    local name
+    local -a names
+    IFS='|' read -r -a names <<<"$COPIED_LIST"
+    for name in "${names[@]}"; do
+      [ -n "$name" ] || continue
+      [ -f "$LIBDIR/$name" ] && otool -L "$LIBDIR/$name" 2>/dev/null
+    done
   } | awk '{print $1}' | grep '^@rpath/' | sed 's|.*/||' | sort -u |
     while IFS= read -r name; do
       [ -f "$LIBDIR/$name" ] || printf '%s\n' "$name"
@@ -138,6 +149,7 @@ resolve_rpath_libs() {
         if [ -f "$dir/$name" ]; then
           cp "$dir/$name" "$LIBDIR/$name"
           chmod +w "$LIBDIR/$name"
+          COPIED_LIST="$COPIED_LIST|$name|"
           install_name_tool -id "@rpath/$name" "$LIBDIR/$name" 2>/dev/null || true
           collect "$LIBDIR/$name"
           progress=1
