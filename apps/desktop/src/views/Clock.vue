@@ -146,30 +146,24 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="page page-wrap">
-    <header class="page-header">
-      <div>
-        <div class="page-title">设备校时</div>
-        <div class="page-sub">
-          逻辑协议时钟的平台基准、本机时钟与偏移。只影响设备上报的时间戳，不修改操作系统时间。
+  <div class="page clock-page">
+    <main class="glass-card clock-card">
+      <div class="clock-head">
+        <div class="clock-head-copy">
+          <div class="clock-head-title">当前校时状态</div>
+          <div class="clock-head-sub">优先级：NTP 生效期间不覆盖偏移；NTP 失败时回退到最近一次 SIP Date。</div>
+        </div>
+        <div class="clock-head-actions">
+          <n-tag :type="sourceType" round>{{ sourceLabel }}</n-tag>
+          <n-button secondary :loading="loading" @click="load()">刷新</n-button>
+          <n-button type="primary" :loading="probing" :disabled="!isTauri" @click="probe">立即校时</n-button>
         </div>
       </div>
-      <div class="head-actions">
-        <n-button secondary :loading="loading" @click="load()">刷新</n-button>
-        <n-button type="primary" :loading="probing" :disabled="!isTauri" @click="probe">立即校时</n-button>
-      </div>
-    </header>
 
-    <section class="glass-card panel">
-      <div class="panel-head">
-        <div>
-          <h2>当前校时状态</h2>
-          <p>优先级：NTP 生效期间不覆盖偏移；NTP 失败时回退到最近一次 SIP Date。</p>
-        </div>
-        <n-tag :type="sourceType" round>{{ sourceLabel }}</n-tag>
-      </div>
+      <section class="clock-section">
+        <div class="clock-note">逻辑协议时钟的平台基准、本机时钟与偏移。只影响设备上报的时间戳，不修改操作系统时间。</div>
 
-      <div class="stat-grid">
+        <div class="stat-grid">
         <div class="stat">
           <small>设备对外时间（校时后）</small>
           <strong class="mono">{{ fmtTime(platformNowMs) }}</strong>
@@ -208,16 +202,16 @@ onUnmounted(() => {
         <b>最近一次失败</b>
         <span>{{ state.clock.last_error }}</span>
       </div>
-    </section>
+      </section>
 
-    <section class="glass-card panel">
-      <div class="panel-head">
-        <div>
-          <h2>NTP 校时</h2>
-          <p>默认关闭；关闭或查询失败时按注册 200 OK 的 SIP Date 校时。设备运行中修改会立即重启刷新任务。</p>
+      <section class="clock-section">
+        <div class="clock-section-head">
+          <div>
+            <h2>NTP 校时</h2>
+            <p>默认关闭；关闭或查询失败时按注册 200 OK 的 SIP Date 校时。设备运行中修改会立即重启刷新任务。</p>
+          </div>
+          <n-switch v-model:value="draft.ntp_enabled" :disabled="!isTauri" />
         </div>
-        <n-switch v-model:value="draft.ntp_enabled" :disabled="!isTauri" />
-      </div>
 
       <div class="form-grid">
         <label class="field">
@@ -248,19 +242,29 @@ onUnmounted(() => {
           <n-button type="primary" :loading="saving" :disabled="!dirty || !isTauri" @click="save">保存配置</n-button>
         </div>
       </footer>
-    </section>
+      </section>
+    </main>
   </div>
 </template>
 
 <style scoped>
-/* 页面宽度与全局 .page（theme.css）及其它页面保持一致，避免左右留白偏大 */
-.page { width: min(1480px, 100%); margin: 0 auto; display: grid; gap: 14px; align-content: start; }
-.page-header { align-items: flex-end; gap: 20px; }
-.head-actions { display: flex; gap: 8px; }
-.panel { padding: 18px; display: grid; gap: 16px; }
-.panel-head { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
-.panel-head h2 { margin: 0; color: var(--text-primary); font-size: 16px; }
-.panel-head p { margin: 6px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+/* 页面宽度与全局 .page（theme.css）保持一致；与设置页同口径：滚动下沉到主卡片内部，
+   卡片靠 flex 撑满可用高度、始终留在视口内，四角圆角在任意滚动位置都完整保留。 */
+.page { width: min(1480px, 100%); margin: 0 auto; }
+.clock-page { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding-bottom: 16px; box-sizing: border-box; }
+.clock-card { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; padding: 0; }
+/* 冻结头部：铺满卡片宽度、顶部两角沿用卡片圆角、去掉悬浮投影，是卡片头部而非独立横条。 */
+.clock-head { position: sticky; top: 0; z-index: 5; flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px 15px; border-bottom: 1px solid var(--border-default); border-radius: var(--radius-lg) var(--radius-lg) 0 0; background: color-mix(in srgb, #fff 50%, var(--bg-base)); box-shadow: none; }
+.clock-head-copy { min-width: 0; }
+.clock-head-title { color: var(--text-secondary); font-size: 13px; font-weight: 600; }
+.clock-head-sub { margin-top: 4px; color: var(--text-tertiary); font-size: 11px; line-height: 1.5; }
+.clock-head-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.clock-section { display: grid; gap: 16px; padding: 18px 16px 16px; }
+.clock-section + .clock-section { border-top: 1px solid var(--border-default); }
+.clock-note { color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+.clock-section-head { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.clock-section-head h2 { margin: 0; color: var(--text-primary); font-size: 16px; }
+.clock-section-head p { margin: 6px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
 .stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .stat { min-width: 0; padding: 12px 14px; border: 1px solid var(--border-subtle); border-radius: 10px; background: rgba(255, 255, 255, .55); }
 .stat small { display: block; color: var(--text-tertiary); font-size: 11px; }
@@ -284,4 +288,5 @@ onUnmounted(() => {
   .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }
 }
+@media (max-width: 680px) { .clock-head { align-items: flex-start; flex-direction: column; } }
 </style>
