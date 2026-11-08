@@ -168,26 +168,15 @@
 
 <a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="首页：运行状态、SIP 接入配置与本地预览" width="100%"/></a>
 
+<a href="docs/screenshots/simulator-center.png"><img src="docs/screenshots/simulator-center.png" alt="模拟器中心：三维云台拟态摇杆、方向与变倍控制" width="100%"/></a>
+
 > 截图取自开发环境，平台 IP、设备编号与端口已替换为示例值，注册密码保持隐藏。点击图片可查看原图。
 
 <!--
 其余页面截图待补：图片统一放 docs/screenshots/，命名用小写英文 + 连字符，宽屏图压到
-1600px 宽 / 500KB 以内；敏感字段（IP、20 位设备编号、口令）需先脱敏。素材到位后启用下面这段两列网格：
-
-<table>
-<tr>
-<td align="center" width="50%"><b>模拟器中心</b><br/><a href="docs/screenshots/simulator-center.png"><img src="docs/screenshots/simulator-center.png" alt="模拟器中心" width="100%"/></a></td>
-<td align="center" width="50%"><b>压力测试</b><br/><a href="docs/screenshots/stress-test.png"><img src="docs/screenshots/stress-test.png" alt="压力测试：场景编排与实时指标" width="100%"/></a></td>
-</tr>
-<tr>
-<td align="center"><b>目录管理</b><br/><a href="docs/screenshots/catalog.png"><img src="docs/screenshots/catalog.png" alt="目录管理" width="100%"/></a></td>
-<td align="center"><b>设备配置</b><br/><a href="docs/screenshots/device-settings.png"><img src="docs/screenshots/device-settings.png" alt="设备配置" width="100%"/></a></td>
-</tr>
-<tr>
-<td align="center"><b>SIP 信令追踪</b><br/><a href="docs/screenshots/sip-trace.png"><img src="docs/screenshots/sip-trace.png" alt="SIP 信令追踪与日志" width="100%"/></a></td>
-<td align="center"><b>录像中心</b><br/><a href="docs/screenshots/recordings.png"><img src="docs/screenshots/recordings.png" alt="录像中心" width="100%"/></a></td>
-</tr>
-</table>
+1600px 宽 / 500KB 以内；敏感字段（IP、20 位设备编号、口令）需先脱敏。
+待补命名：stress-test / catalog / device-settings / recordings / sip-trace。
+素材到位后按两列网格排布，每张用 <a href="原图"><img src="..." width="100%"/></a> 包一层以便点开看原图。
 -->
 
 | 菜单 | 用途 |
