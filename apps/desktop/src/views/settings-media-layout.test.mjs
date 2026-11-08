@@ -28,3 +28,10 @@ assert.match(pageStyles, /overflow-y:\s*auto;/, "设置页必须可垂直滚动�
 assert.match(pageStyles, /overflow-x:\s*hidden;/, "设置页只保留垂直滚动，避免横向溢出");
 assert.match(pageStyles, /min-height:\s*0;/, "滚动容器需允许被父级 flex 压到视口高度");
 assert.match(pageStyles, /padding-bottom:\s*16px;/, "滚动到底需留出底部呼吸空间");
+
+// ── 共用页头显隐 ─────────────────────────────────────────────────────────
+// 回归背景：媒体页内容顶部已有「模拟器有效配置」小节标题与「参数摘要」，
+// 共用页头（主标题 / 副标题 / 平台摘要 / 锁定徽标）在该页重复且挤占首屏，仅此页隐藏。
+const headerTag = source.match(/<div[^>]*class="settings-header"[^>]*>/)?.[0] ?? "";
+assert.match(headerTag, /v-if="activeKey !== 'media'"/, "音视频配置页应隐藏共用页头");
+assert.match(source, /class="lock-badge"/, "其他设置页的锁定状态徽标不得一并删除");
