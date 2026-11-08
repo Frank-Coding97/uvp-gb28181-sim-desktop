@@ -244,10 +244,10 @@ function clearWeek() {
   };
 }
 
-function clearDay() {
-  const days = draft.value.week.days.map((day, index) =>
-    index === activeDay.value ? { segments: [] } : day,
-  );
+/** 清空某一天的时段；不带参数时作用于当前选中天（精确时段面板里的「清空当天」）。 */
+function clearDay(day: number = activeDay.value) {
+  activeDay.value = day;
+  const days = draft.value.week.days.map((item, index) => (index === day ? { segments: [] } : item));
   draft.value = { ...draft.value, week: { days } };
 }
 
@@ -455,8 +455,18 @@ onDeactivated(() => {
             />
             <div v-if="state?.weekday === day" class="now-line" :style="{ left: nowPercent }" aria-hidden="true" />
           </div>
-          <div class="day-sum" :class="{ muted: !weekStats[day].count }">
-            {{ weekStats[day].count ? `${weekStats[day].count} 段 · ${fmtDuration(weekStats[day].minutes)}` : "未配置" }}
+          <div class="day-end">
+            <span class="day-sum" :class="{ muted: !weekStats[day].count }">
+              {{ weekStats[day].count ? `${weekStats[day].count} 段 · ${fmtDuration(weekStats[day].minutes)}` : "未配置" }}
+            </span>
+            <button
+              class="day-clear"
+              type="button"
+              :disabled="!weekStats[day].count"
+              :title="`清空周${label}的录像时段`"
+              :aria-label="`清空周${label}的录像时段`"
+              @click.stop="clearDay(day)"
+            >清空</button>
           </div>
         </div>
       </div>
@@ -488,7 +498,7 @@ onDeactivated(() => {
           <span class="label">点表格任意一天，这里会切换到那天的时段</span>
           <div class="segment-actions">
             <n-button size="tiny" secondary :disabled="activeSegments.length >= MAX_SEGMENTS_PER_DAY" @click="addBlock">添加时段</n-button>
-            <n-button size="tiny" quaternary :disabled="!activeSegments.length" @click="clearDay">清空当天</n-button>
+            <n-button size="tiny" quaternary :disabled="!activeSegments.length" @click="clearDay()">清空当天</n-button>
             <n-button size="tiny" quaternary :disabled="!activeSegments.length" @click="copyToAllDays">复制到全周</n-button>
           </div>
         </div>
@@ -609,7 +619,7 @@ onDeactivated(() => {
 /* 刻度与所有行共用同一套列定义与 gap，时间轴才不会相对格子漂移。 */
 .schedule { user-select: none; -webkit-user-select: none; }
 .axis-row, .day-row {
-  display: grid; grid-template-columns: 84px minmax(0, 1fr) 108px; gap: 10px; align-items: center;
+  display: grid; grid-template-columns: 84px minmax(0, 1fr) 142px; gap: 10px; align-items: center;
 }
 .axis-row { margin-bottom: 6px; }
 .axis-ticks {
@@ -618,7 +628,8 @@ onDeactivated(() => {
 }
 .axis-ticks > span { white-space: nowrap; }
 .axis-end { position: absolute; right: 0; top: 0; }
-.axis-sum { text-align: right; color: var(--text-secondary); font-size: 10px; }
+/* 「时长」标题让开行尾清空按钮的宽度，压在数字上方而不是压在按钮上方。 */
+.axis-sum { padding-right: 40px; text-align: right; color: var(--text-secondary); font-size: 10px; }
 
 .day-row { margin-bottom: 5px; }
 .day-row.today .day-name { color: var(--accent-deep); }
@@ -670,8 +681,19 @@ onDeactivated(() => {
   content: ""; position: absolute; top: -4px; left: 50%; transform: translateX(-50%);
   border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid var(--warning);
 }
+/* 行尾：时长与「清空」并排，清空默认压低存在感，悬停该行才提亮。 */
+.day-end { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
 .day-sum { color: var(--text-secondary); font-size: 11px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .day-sum.muted { color: var(--text-tertiary); }
+.day-clear {
+  flex: 0 0 auto; padding: 2px 6px; border: 1px solid var(--border-default); border-radius: 6px;
+  background: rgba(255, 255, 255, 0.75); color: var(--text-secondary);
+  font-size: 10px; line-height: 1.4; cursor: pointer; opacity: 0.55;
+  transition: opacity var(--transition), border-color var(--transition), color var(--transition);
+}
+.day-row:hover .day-clear, .day-clear:focus-visible { opacity: 1; }
+.day-clear:hover { border-color: var(--error); color: var(--error); }
+.day-clear:disabled, .day-row:hover .day-clear:disabled { opacity: 0.25; cursor: default; border-color: var(--border-subtle); color: var(--text-tertiary); }
 
 .plan-foot {
   display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
@@ -749,14 +771,15 @@ onDeactivated(() => {
   .strip-items { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 1080px) {
-  .axis-row, .day-row { grid-template-columns: 70px minmax(0, 1fr) 92px; gap: 7px; }
+  .axis-row, .day-row { grid-template-columns: 70px minmax(0, 1fr) 126px; gap: 7px; }
+  .axis-sum { padding-right: 38px; }
   .cell { height: 30px; }
 }
 @media (max-width: 720px) {
   .page { padding-inline: 8px; }
   .plan-card { padding: 14px 12px; }
   .axis-row, .day-row { grid-template-columns: 54px minmax(0, 1fr) 0; gap: 5px; }
-  .day-sum, .axis-sum { display: none; }
+  .day-end, .day-sum, .axis-sum { display: none; }
   .cell { height: 26px; }
   .strip-items { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .plan-foot { flex-direction: column; align-items: stretch; }
