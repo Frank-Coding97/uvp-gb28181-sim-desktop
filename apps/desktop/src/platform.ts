@@ -10,6 +10,7 @@ import {
 } from "./media-profile.ts";
 import type { RecordPlanSettings } from "./record-plan.mjs";
 import { effective, parseEncoding } from "./signaling-charset.mjs";
+import { CAMERA_TYPE_OPTIONS, DEVICE_LOCATION_OPTIONS } from "./device-metadata.ts";
 
 export type SignalingTransport = "UDP" | "TCP";
 /** 音频流(语音广播/对讲下行)传输方式,与信令传输相互独立。 */
@@ -48,6 +49,10 @@ export interface DeviceSettings {
   /** 硬件版本，仅 GB-2022 的 DeviceInfo 应答输出；留空表示不填。 */
   hardware_version: string;
   channel_name: string;
+  /** 安装位置 id，空串表示未设置；对应目录 Item 的 <Address>。 */
+  location: string;
+  /** 摄像头类型 id，空串表示未设置；对应 DeviceInfo 应答的 <DeviceType>。 */
+  camera_type: string;
   register_expires_secs: number;
   heartbeat_interval_secs: number;
   heartbeat_fail_threshold: number;
@@ -254,6 +259,13 @@ function stringValue(value: unknown, fallback: string): string {
   return typeof value === "string" && value.trim() ? value : fallback;
 }
 
+/** 下拉框 id 只接受真值表内的值：旧 localStorage 里的脏值直接丢弃，不带给 Rust 校验。 */
+function metadataValue(value: unknown, options: readonly { value: string }[], fallback: string): string {
+  return typeof value === "string" && options.some((option) => option.value === value)
+    ? value
+    : fallback;
+}
+
 function positiveInt(value: unknown, fallback: number): number {
   const parsed = typeof value === "number"
     ? value
@@ -341,6 +353,8 @@ function migrateLegacy(base: DesktopConfigV2): DesktopConfigV2 | null {
       firmware: stringValue(legacyDevice.firmware, base.device.firmware),
       hardware_version: stringValue(legacyDevice.hardware_version, base.device.hardware_version),
       channel_name: stringValue(legacyDevice.channel_name, base.device.channel_name),
+      location: metadataValue(legacyDevice.location, DEVICE_LOCATION_OPTIONS, base.device.location),
+      camera_type: metadataValue(legacyDevice.camera_type, CAMERA_TYPE_OPTIONS, base.device.camera_type),
       register_expires_secs: positiveInt(legacyProtocol.register_expires_secs, base.device.register_expires_secs),
       heartbeat_interval_secs: positiveInt(legacyProtocol.heartbeat_interval_secs, base.device.heartbeat_interval_secs),
       heartbeat_fail_threshold: positiveInt(legacyProtocol.heartbeat_fail_threshold, base.device.heartbeat_fail_threshold),

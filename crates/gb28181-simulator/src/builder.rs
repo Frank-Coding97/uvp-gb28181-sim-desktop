@@ -589,6 +589,8 @@ mod tests {
                 model: "Sim".into(),
                 firmware: "0.1".into(),
                 hardware_version: None,
+                installation_address: None,
+                device_type: None,
             },
             video_source: None,
             media_profile: None,

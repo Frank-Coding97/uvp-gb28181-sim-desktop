@@ -78,6 +78,8 @@ async fn main() {
             model: "Desktop-Sim".into(),
             firmware: "0.1.0-dev".into(),
             hardware_version: None,
+            installation_address: None,
+            device_type: None,
         },
         video_source: std::env::var("VIDEO_SOURCE").ok(),
         media_profile: None,

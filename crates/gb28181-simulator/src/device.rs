@@ -193,6 +193,10 @@ pub struct DeviceInfo {
     pub firmware: String,
     /// 硬件版本（GB-2022 新增字段）。None 时不输出，兼容只认 2016 字段的平台。
     pub hardware_version: Option<String>,
+    /// 安装地址（目录 Item 的 `<Address>`）。None 时不输出，保持旧报文不变。
+    pub installation_address: Option<String>,
+    /// 设备类型（DeviceInfo 应答的 `<DeviceType>`）。None 时不输出。
+    pub device_type: Option<String>,
 }
 
 const REGISTER_RETRY_MIN_SECS: u64 = 60;
@@ -3318,6 +3322,8 @@ impl DeviceSimulator {
                 manufacturer: Some(self.config.device_info.manufacturer.clone()),
                 model: Some(self.config.device_info.model.clone()),
                 civil_code: node.civil_code.clone(),
+                // 设备级安装位置：同一台设备下的目录项共用，未配置时 None 不输出。
+                address: self.config.device_info.installation_address.clone(),
                 parental: Some(node.node_type.parental()),
                 parent_id: (node.id != node.parent_id).then(|| node.parent_id.clone()),
                 business_group_id: is_2022
@@ -3640,6 +3646,7 @@ impl DeviceSimulator {
                     device_id: query.device_id.clone(),
                     result: "OK".into(),
                     device_name: self.config.device_info.device_name.clone(),
+                    device_type: self.config.device_info.device_type.clone(),
                     manufacturer: self.config.device_info.manufacturer.clone(),
                     model: self.config.device_info.model.clone(),
                     firmware: self.current_firmware(),
@@ -5342,6 +5349,8 @@ mod tests {
                 model: "Sim".into(),
                 firmware: "0.1.0".into(),
                 hardware_version: None,
+                installation_address: None,
+                device_type: None,
             },
             video_source: None,
             media_profile: None,
@@ -6287,6 +6296,7 @@ y=0100000099\r\n";
             manufacturer: None,
             model: None,
             civil_code: None,
+            address: None,
             parental: Some(0),
             parent_id: Some(sim.config().device_id.to_string()),
             business_group_id: None,

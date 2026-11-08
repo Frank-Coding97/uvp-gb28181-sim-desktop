@@ -1274,6 +1274,10 @@ pub struct CatalogItem {
     /// 行政区划。
     #[serde(rename = "CivilCode", skip_serializing_if = "Option::is_none")]
     pub civil_code: Option<String>,
+    /// 设备安装地址(GB/T 28181 目录项标准字段,可选)。
+    /// 未配置时为 None,不输出该标签,保持与旧版本一致的报文。
+    #[serde(rename = "Address", skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     /// 是否为子设备/目录(0/1)。
     #[serde(rename = "Parental", skip_serializing_if = "Option::is_none")]
     pub parental: Option<u8>,
@@ -1396,6 +1400,10 @@ pub struct DeviceInfoResponse {
     pub result: String,
     #[serde(rename = "DeviceName")]
     pub device_name: String,
+    /// 设备类型(GB/T 28181 DeviceInfo 应答标准字段,可选)。
+    /// 未配置时为 None,不输出该标签,兼容只认基础字段的平台。
+    #[serde(rename = "DeviceType", skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
     #[serde(rename = "Manufacturer")]
     pub manufacturer: String,
     #[serde(rename = "Model")]
@@ -2828,6 +2836,7 @@ mod tests {
             manufacturer: Some("UVP".into()),
             model: Some("Sim".into()),
             civil_code: None,
+            address: Some("园区大门".into()),
             parental: Some(0),
             parent_id: Some("34020000001320000001".into()),
             business_group_id: None,
@@ -2842,6 +2851,8 @@ mod tests {
         assert!(xml.contains("<CmdType>Catalog</CmdType>"));
         assert!(xml.contains("<SecurityLevelCode>A</SecurityLevelCode>"));
         assert!(xml.contains("<IPAddress>10.0.0.2</IPAddress>"));
+        // 位置配置后以标准 <Address> 出现在目录项里。
+        assert!(xml.contains("<Address>园区大门</Address>"));
         assert!(xml.contains("<SumNum>1</SumNum>"));
         assert!(xml.contains("Num=\"1\""));
         assert!(xml.contains("<DeviceID>34020000001320000002</DeviceID>"));
@@ -2863,6 +2874,7 @@ mod tests {
                 manufacturer: None,
                 model: None,
                 civil_code: None,
+                address: None,
                 parental: Some(0),
                 parent_id: Some("34020000001110000001".into()),
                 business_group_id: None,
@@ -2877,6 +2889,8 @@ mod tests {
         assert!(pages.iter().all(|page| page.sum_num == 205));
         assert_eq!(pages[0].device_list.as_ref().unwrap().num, 100);
         assert_eq!(pages[2].device_list.as_ref().unwrap().num, 5);
+        // 未配置安装位置时不输出 <Address>，报文与加字段前一致。
+        assert!(!pages[0].to_xml().unwrap().contains("<Address>"));
     }
 
     #[test]
@@ -2887,6 +2901,7 @@ mod tests {
             device_id: "34020000001320000001".into(),
             result: "OK".into(),
             device_name: "UVP-Sim".into(),
+            device_type: None,
             manufacturer: "UVP".into(),
             model: "Desktop".into(),
             firmware: "0.1.0".into(),
@@ -2895,8 +2910,9 @@ mod tests {
         };
         let xml = resp.to_xml().unwrap();
         assert!(xml.contains("<CmdType>DeviceInfo</CmdType>"));
-        // 未填硬件版本时不能输出空标签。
+        // 未填硬件版本、未选摄像头类型时不能输出空标签。
         assert!(!xml.contains("<HardwareVersion>"), "实际: {xml}");
+        assert!(!xml.contains("<DeviceType>"), "实际: {xml}");
         assert!(xml.contains("<Manufacturer>UVP</Manufacturer>"));
         assert!(xml.contains("<Firmware>0.1.0</Firmware>"));
     }
@@ -2909,6 +2925,7 @@ mod tests {
             device_id: "34020000001320000001".into(),
             result: "OK".into(),
             device_name: "UVP-Sim".into(),
+            device_type: Some("固定枪机".into()),
             manufacturer: "UVP".into(),
             model: "Desktop".into(),
             firmware: "0.1.0".into(),
@@ -2917,6 +2934,8 @@ mod tests {
         };
         let xml = resp.to_xml().unwrap();
         assert!(xml.contains("<HardwareVersion>HW-2.1</HardwareVersion>"), "实际: {xml}");
+        // 摄像头类型配置后以标准 <DeviceType> 出现在设备信息应答里。
+        assert!(xml.contains("<DeviceType>固定枪机</DeviceType>"), "实际: {xml}");
         assert!(xml.contains("<Channel>1</Channel>"));
     }
 

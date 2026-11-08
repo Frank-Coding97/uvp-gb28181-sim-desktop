@@ -24,6 +24,7 @@ use tauri::{
 use tokio::sync::{broadcast, Mutex};
 
 mod config_store;
+mod device_metadata;
 mod log_export;
 mod preview_channel;
 mod preview_manager;
@@ -2301,6 +2302,11 @@ async fn start_device(
             hardware_version: (resolved.profile.gb_version == common::GbVersion::V2022
                 && !resolved.device.hardware_version.trim().is_empty())
             .then(|| resolved.device.hardware_version.clone()),
+            // 位置/类型只认真值表内的 id；未知值退化为 None，不把脏数据拼进 MANSCDP XML。
+            installation_address: device_metadata::location_label(&resolved.device.location)
+                .map(String::from),
+            device_type: device_metadata::camera_type_label(&resolved.device.camera_type)
+                .map(String::from),
         },
         video_source: resolved.video_source.clone(),
         video_fps: resolved.media.video_fps,

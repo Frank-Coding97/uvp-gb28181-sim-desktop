@@ -49,6 +49,8 @@ fn test_cfg(platform_port: u16, version: GbVersion) -> DeviceConfig {
             model: MODEL.into(),
             firmware: "0.1.0".into(),
             hardware_version: None,
+            installation_address: None,
+            device_type: None,
         },
         video_source: None,
         media_profile: None,

@@ -496,6 +496,12 @@ pub struct DeviceSettings {
     #[serde(default)]
     pub hardware_version: String,
     pub channel_name: String,
+    /// 安装位置（目录 Item 的 `<Address>`）。空串表示未设置，旧配置缺省为空。
+    #[serde(default)]
+    pub location: String,
+    /// 摄像头类型（DeviceInfo 应答的 `<DeviceType>`）。空串表示未设置，旧配置缺省为空。
+    #[serde(default)]
+    pub camera_type: String,
     pub register_expires_secs: u32,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_fail_threshold: u32,
@@ -607,6 +613,8 @@ impl Default for DesktopConfigV2 {
                 firmware: "0.1.2".into(),
                 hardware_version: String::new(),
                 channel_name: "Camera-1".into(),
+                location: String::new(),
+                camera_type: String::new(),
                 register_expires_secs: 86_400,
                 heartbeat_interval_secs: 60,
                 heartbeat_fail_threshold: 3,
@@ -677,6 +685,9 @@ impl DesktopConfigV2 {
         {
             return Err("设备名称、厂商、型号、固件和通道名称不能为空".into());
         }
+        // 下拉框的值要能安全地拼进 MANSCDP XML：只接受真值表内的 id。
+        crate::device_metadata::validate_location(&self.device.location)?;
+        crate::device_metadata::validate_camera_type(&self.device.camera_type)?;
         if self.device.register_expires_secs < 3_600 {
             return Err("注册有效期不得短于 3600 秒".into());
         }
@@ -1080,5 +1091,28 @@ mod tests {
         value.as_object_mut().unwrap().remove("catalog_tree");
         let decoded: DesktopConfigV2 = serde_json::from_value(value).unwrap();
         assert!(decoded.catalog_tree.is_empty());
+    }
+
+    #[test]
+    fn 旧配置缺位置与类型字段时回落未设置() {
+        let config = DesktopConfigV2::default();
+        let mut value = serde_json::to_value(&config).unwrap();
+        let device = value["device"].as_object_mut().unwrap();
+        device.remove("location");
+        device.remove("camera_type");
+        let decoded: DesktopConfigV2 = serde_json::from_value(value).unwrap();
+        assert!(decoded.device.location.is_empty());
+        assert!(decoded.device.camera_type.is_empty());
+        assert!(decoded.validate().is_ok(), "缺字段不能让旧配置文件无法保存");
+    }
+
+    #[test]
+    fn 位置与类型只接受真值表内的取值() {
+        let mut config = DesktopConfigV2::default();
+        config.device.location = "parking".into();
+        config.device.camera_type = "ptz_dome".into();
+        assert!(config.validate().is_ok());
+        config.device.location = "<script>".into();
+        assert!(config.validate().unwrap_err().contains("安装位置"));
     }
 }

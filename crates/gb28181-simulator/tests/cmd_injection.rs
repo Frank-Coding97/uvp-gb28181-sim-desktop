@@ -34,6 +34,8 @@ fn cfg() -> DeviceConfig {
             model: "Sim".into(),
             firmware: "1.0".into(),
             hardware_version: None,
+            installation_address: None,
+            device_type: None,
         },
         video_source: None,
         media_profile: None,

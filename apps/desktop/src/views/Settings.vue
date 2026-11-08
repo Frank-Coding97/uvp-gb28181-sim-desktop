@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
 import { useDevice } from "../device";
+import { CAMERA_TYPE_OPTIONS, DEVICE_LOCATION_OPTIONS } from "../device-metadata";
 import {
   MEDIA_AUDIO_CODECS,
   MEDIA_BITRATE_OPTIONS,
@@ -121,6 +122,8 @@ function sameDeviceDraft(left: DeviceSettings, right: DeviceSettings): boolean {
     && left.firmware === right.firmware
     && left.hardware_version === right.hardware_version
     && left.channel_name === right.channel_name
+    && left.location === right.location
+    && left.camera_type === right.camera_type
     && left.register_expires_secs === right.register_expires_secs
     && left.heartbeat_interval_secs === right.heartbeat_interval_secs
     && left.heartbeat_fail_threshold === right.heartbeat_fail_threshold;
@@ -558,6 +561,25 @@ function setBindMode(mode: BindMode) {
             <label class="field"><span>连续心跳失败阈值</span><input v-model.number="deviceDraft.heartbeat_fail_threshold" type="number" min="1" :disabled="locked" /></label>
             <button class="future-field" disabled>目录分页（后续阶段）</button>
           </div>
+
+          <div class="section-label">安装信息与摄像头类型</div>
+          <div class="field-grid two">
+            <label class="field">
+              <span>安装位置</span>
+              <select v-model="deviceDraft.location" :disabled="locked">
+                <option value="">未设置（目录不下发 Address）</option>
+                <option v-for="item in DEVICE_LOCATION_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>摄像头类型</span>
+              <select v-model="deviceDraft.camera_type" :disabled="locked">
+                <option value="">未设置（设备信息不下发 DeviceType）</option>
+                <option v-for="item in CAMERA_TYPE_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+              </select>
+            </label>
+          </div>
+          <div class="info-note">安装位置写入目录应答的 &lt;Address&gt;，摄像头类型写入设备信息应答的 &lt;DeviceType&gt;；留空则报文与旧版本完全一致。保存后下次启动设备时生效。</div>
 
           <div class="section-label">DeviceInfo 应答字段</div>
           <div class="field-grid two">
