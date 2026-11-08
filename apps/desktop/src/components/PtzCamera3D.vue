@@ -8,7 +8,9 @@
 //   变倍(zoom)：镜头前伸 + 视场锥收窄 + 地面视场投影缩小
 //
 // 坐标约定：+Y 向上；pan=0 / tilt=0 时镜头朝 +Z。
-// pan 正 = 向右（俯视顺时针），tilt 正 = 抬头，与 Ptz.vue 的命令语义一致。
+// pan 正 = 镜头在画面上向右摆，tilt 正 = 抬头，与 Ptz.vue / 平台"上/下/左/右"方向键一致。
+// 注意:盘面是第三视角(观察者在球机外部),若按"俯视顺时针"去转,按"右"键镜头在画面上
+// 反而向左摆 —— 与看实景/看方向键的通感相反,故此处以画面为准(见 headingVector 注释)。
 // props 由页面按命令积分得出，组件内再用临界阻尼弹簧跟随，消除离散更新带来的顿挫。
 import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
 import * as THREE from "three";
@@ -201,21 +203,22 @@ function canvasTexture(width: number, height: number, draw: (ctx: CanvasRenderin
   texture.anisotropy = 8;
   return texture;
 }
-// pan 角 θ 对应的水平朝向（pan 正 = 向右 = 俯视顺时针）。
+// pan 角 θ 对应的水平朝向。θ 增大时镜头朝 +X 一侧（即默认机位画面里的右侧）摆，
+// 与 "按右 → 画面里向右转" 一致；地面方位盘的 E 刻度随之落在 +X。
 function headingVector(deg: number, radius: number, y: number): THREE.Vector3 {
   const rad = THREE.MathUtils.degToRad(deg);
-  return new THREE.Vector3(-Math.sin(rad) * radius, y, Math.cos(rad) * radius);
+  return new THREE.Vector3(Math.sin(rad) * radius, y, Math.cos(rad) * radius);
 }
 
 function buildFloor(root: THREE.Object3D): void {
-  // 地面方位盘：0°/N 在 +Z（pan=0 的朝向），E 在 pan=+90°。
+  // 地面方位盘：0°/N 在 +Z（pan=0 的朝向），E 在 +X（pan=+90° 的朝向）。
   const size = 1024;
   const texture = canvasTexture(size, size, (ctx) => {
     const c = size / 2;
     const scale = c / 4; // 1 世界单位 = 128px，盘面半径 4
     const point = (deg: number, r: number): [number, number] => {
       const rad = (deg * Math.PI) / 180;
-      return [c - Math.sin(rad) * r * scale, c + Math.cos(rad) * r * scale];
+      return [c + Math.sin(rad) * r * scale, c + Math.cos(rad) * r * scale];
     };
     ctx.strokeStyle = "rgba(140, 186, 236, 0.30)";
     ctx.lineWidth = 2;
@@ -351,7 +354,7 @@ function buildFixed(root: THREE.Object3D, m: Materials): void {
     const major = deg % 90 === 0;
     const tick = mesh(fixed, major ? tickMajorGeo : tickGeo, major ? m.pointer : m.steel, false);
     tick.position.copy(headingVector(deg, 0.508, MOUNT_Y + (major ? 0.028 : 0.032)));
-    tick.rotation.y = -THREE.MathUtils.degToRad(deg);
+    tick.rotation.y = THREE.MathUtils.degToRad(deg);
   }
 }
 function buildPanHead(root: THREE.Object3D, m: Materials): void {
@@ -836,7 +839,8 @@ function buildScene(): void {
 
 function applyPose(): void {
   if (!panGroup || !tiltGroup || !lensGroup) return;
-  panGroup.rotation.y = -THREE.MathUtils.degToRad(panSpring.value);
+  // pan 正 → 绕 +Y 正向旋转 → 镜头朝 +X 摆，在默认机位画面里就是向右转。
+  panGroup.rotation.y = THREE.MathUtils.degToRad(panSpring.value);
   tiltGroup.rotation.x = -THREE.MathUtils.degToRad(tiltSpring.value);
   const zoom = Math.exp(zoomSpring.value);
   const progress = THREE.MathUtils.clamp(zoomSpring.value / Math.log(props.zoomMax), 0, 1);
