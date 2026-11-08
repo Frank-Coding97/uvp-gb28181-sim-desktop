@@ -13,16 +13,17 @@ import { tabForSummary, useSimulatorCenter, type SimTab } from "../simulator/use
 const sim = useSimulatorCenter();
 const { deviceLive, reconcile } = useDevice();
 
-const activeTab = ref<SimTab>("ptz");
-const tabBadges = ref<SimTab[]>([]);
+// 云台手操常驻右侧，不参与分组切换；只有只读回显需要按主题分组。
+type DetailTab = Exclude<SimTab, "ptz">;
+const detailTab = ref<DetailTab>("position");
+const detailBadges = ref<DetailTab[]>([]);
 const showFov = ref(true);
 const autoFollow = ref(true);
 
-const tabs: Array<{ key: SimTab; label: string; hint: string }> = [
-  { key: "ptz", label: "云台", hint: "本机手操" },
-  { key: "position", label: "定位", hint: "预置位/巡航" },
-  { key: "image", label: "图像", hint: "遮挡/镜像" },
-  { key: "device", label: "设备", hint: "状态/存储" },
+const detailTabs: Array<{ key: DetailTab; label: string; hint: string }> = [
+  { key: "position", label: "定位", hint: "预置位 / 巡航" },
+  { key: "image", label: "图像", hint: "遮挡 / 事件" },
+  { key: "device", label: "设备", hint: "存储 / 维护" },
 ];
 
 const normalizedPan = sim.normalizedPan;
@@ -104,9 +105,19 @@ function onPad(dPan: number, dTilt: number) {
   sim.adjustPtz(dPan, dTilt, 0);
 }
 
-function selectTab(key: SimTab) {
-  activeTab.value = key;
-  tabBadges.value = tabBadges.value.filter((item) => item !== key);
+function selectDetail(key: DetailTab) {
+  detailTab.value = key;
+  detailBadges.value = detailBadges.value.filter((item) => item !== key);
+}
+
+// 预置位在移动端只是只读 chip；桌面端已有 3D 舞台与本机姿态积分，
+// 直接调用 store 的 seekToPreset 即可本机调用，不向平台发任何指令。
+function callPreset(preset: { id: number; name: string; pan: number; tilt: number; zoom: number }) {
+  sim.seekToPreset(preset.id, preset.name, {
+    pan: preset.pan,
+    tilt: preset.tilt,
+    zoom: preset.zoom,
+  });
 }
 
 function onZoom(direction: 1 | -1, repeat: boolean) {
@@ -138,9 +149,11 @@ watch(
     const command = sim.lastCommand.value;
     if (!command) return;
     const target = tabForSummary(command.summary);
-    if (target && target !== activeTab.value) {
-      if (autoFollow.value) selectTab(target);
-      else if (!tabBadges.value.includes(target)) tabBadges.value = [...tabBadges.value, target];
+    // 云台命令由常驻手操区与顶部状态条承接，不再把手操区切走。
+    if (!target || target === "ptz" || target === detailTab.value) return;
+    if (autoFollow.value) selectDetail(target);
+    else if (!detailBadges.value.includes(target)) {
+      detailBadges.value = [...detailBadges.value, target];
     }
   },
 );
@@ -167,15 +180,10 @@ onUnmounted(() => {
         <div class="page-sub">3D 设备姿态 + 平台控制回显；本页不主动控制平台</div>
       </div>
 
-      <div class="headline" :style="{ '--dot': sim.headline.value.color }">
-        <i />
-        <span>{{ sim.headline.value.text }}</span>
-      </div>
-
       <div class="header-right">
         <label class="follow-toggle">
           <input v-model="autoFollow" type="checkbox" />
-          平台命令自动切页
+          平台命令自动切换分组
         </label>
         <span class="device-pill" :class="{ online: deviceLive }">
           {{ deviceLive ? "设备运行中" : "设备未运行" }}
@@ -273,249 +281,243 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <!-- 右：四页控制台 -->
+      <!-- 右：常驻手操 + 平台回显 -->
       <aside class="glass-card console">
-        <div class="console-head">
-          <div>
-            <div class="panel-title">平台控制 HUD</div>
-            <div class="panel-sub">平台命令会自动切到对应页</div>
+        <!-- 1) 全局状态总览：切换回显分组时始终可见 -->
+        <section class="overview" aria-label="设备状态总览">
+          <div class="overview-main">
+            <span class="overview-dot" :style="{ '--dot': sim.headline.value.color }" />
+            <div class="overview-text">
+              <strong>{{ sim.headline.value.text }}</strong>
+              <small>
+                最近命令 {{ sim.lastCommand.value ? timeText(sim.lastCommand.value.at) : "—" }}
+                · {{ sim.lastCommand.value?.summary ?? "尚未收到平台命令" }}
+              </small>
+            </div>
           </div>
-          <div class="active-preset">当前预置位 <b>{{ activePresetLabel }}</b></div>
-        </div>
+          <div class="lamp-row">
+            <span
+              v-for="lamp in lampItems"
+              :key="lamp.key"
+              class="lamp"
+              :class="{ on: lamp.active }"
+              :style="{ '--lamp': lamp.color }"
+            >
+              <i />
+              <b>{{ lamp.label }}</b>
+              <small>{{ lamp.active ? "开" : "关" }}</small>
+            </span>
+          </div>
+        </section>
 
-        <div class="tab-row">
-          <button
-            v-for="tab in tabs"
-            :key="tab.key"
-            type="button"
-            class="tab"
-            :class="{ active: activeTab === tab.key }"
-            @click="selectTab(tab.key)"
-          >
-            <b>{{ tab.label }}</b>
-            <small>{{ tab.hint }}</small>
-            <i v-if="tabBadges.includes(tab.key)" class="tab-badge" />
-          </button>
-        </div>
+        <!-- 2) 云台手操：常驻，不随回显分组切换 -->
+        <section class="control-section" aria-labelledby="control-title">
+          <div class="section-head">
+            <h3 id="control-title">云台手操</h3>
+            <span>按下走一步 · 长按连续</span>
+          </div>
 
-        <div class="console-body">
-          <!-- 云台 -->
-          <template v-if="activeTab === 'ptz'">
-            <div class="pose-strip">
-              <div class="pose-item">
-                <span>水平</span>
-                <b>{{ pose.pan.toFixed(0) }}°</b>
-              </div>
-              <div class="pose-divider" />
-              <div class="pose-item">
-                <span>俯仰</span>
-                <b>{{ pose.tilt.toFixed(0) }}°</b>
-              </div>
-              <div class="pose-divider" />
-              <div class="pose-item">
-                <span>变焦</span>
-                <b>{{ pose.zoom.toFixed(1) }}×</b>
-              </div>
-            </div>
+          <div class="pose-strip">
+            <div class="pose-item"><span>水平</span><b>{{ pose.pan.toFixed(0) }}°</b></div>
+            <div class="pose-item"><span>俯仰</span><b>{{ pose.tilt.toFixed(0) }}°</b></div>
+            <div class="pose-item"><span>变倍</span><b>{{ pose.zoom.toFixed(1) }}×</b></div>
+          </div>
 
-            <div class="ptz-workbench">
-              <div class="ptz-left">
-                <div class="control-card zoom-card">
-                  <div class="card-label">变焦</div>
-                  <div class="big-readout">{{ pose.zoom.toFixed(1) }}<small>×</small></div>
-                  <div class="key-row">
-                    <HoldKey label="−" aria-label="缩小" @trigger="onZoom(-1, $event)" />
-                    <HoldKey label="+" aria-label="放大" @trigger="onZoom(1, $event)" />
-                  </div>
+          <div class="ptz-workbench">
+            <PtzPad @adjust="onPad" />
+            <div class="lens-stack">
+              <div class="lens-card">
+                <div class="lens-card-info">
+                  <span>变倍</span>
+                  <b>{{ pose.zoom.toFixed(1) }}×</b>
+                </div>
+                <div class="lens-keys">
+                  <HoldKey label="−" aria-label="缩小" @trigger="onZoom(-1, $event)" />
+                  <HoldKey label="+" aria-label="放大" @trigger="onZoom(1, $event)" />
                 </div>
               </div>
-
-              <PtzPad @adjust="onPad" />
-
-              <div class="ptz-right lens-column">
-                <div class="control-card lens-card">
-                  <div class="lens-head"><span>光圈</span><b>{{ pct(pose.iris) }}%</b></div>
+              <div class="lens-card">
+                <div class="lens-card-info">
+                  <span>光圈</span>
+                  <b>{{ pct(pose.iris) }}%</b>
                   <div class="meter"><i :style="{ width: `${pct(pose.iris)}%` }" /></div>
-                  <div class="key-row">
-                    <HoldKey class="lens-key" tone="lens" label="−" aria-label="光圈缩小" @trigger="onIris(-1, $event)" />
-                    <HoldKey class="lens-key" tone="lens" label="+" aria-label="光圈放大" @trigger="onIris(1, $event)" />
-                  </div>
                 </div>
-                <div class="control-card lens-card">
-                  <div class="lens-head"><span>聚焦</span><b>{{ pct(pose.focus) }}%</b></div>
+                <div class="lens-keys">
+                  <HoldKey tone="lens" label="−" aria-label="光圈缩小" @trigger="onIris(-1, $event)" />
+                  <HoldKey tone="lens" label="+" aria-label="光圈放大" @trigger="onIris(1, $event)" />
+                </div>
+              </div>
+              <div class="lens-card">
+                <div class="lens-card-info">
+                  <span>聚焦</span>
+                  <b>{{ pct(pose.focus) }}%</b>
                   <div class="meter"><i :style="{ width: `${pct(pose.focus)}%` }" /></div>
-                  <div class="key-row">
-                    <HoldKey class="lens-key" tone="lens" label="近" aria-label="聚焦近" @trigger="onFocus(-1, $event)" />
-                    <HoldKey class="lens-key" tone="lens" label="远" aria-label="聚焦远" @trigger="onFocus(1, $event)" />
+                </div>
+                <div class="lens-keys">
+                  <HoldKey tone="lens" label="近" aria-label="聚焦近" @trigger="onFocus(-1, $event)" />
+                  <HoldKey tone="lens" label="远" aria-label="聚焦远" @trigger="onFocus(1, $event)" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ptz-status-bar">
+            <span><i class="ptz-status-dot" :class="{ hot: sim.ptzActive.value || sim.seeking.value }" />{{ sim.headline.value.text }}</span>
+            <span>{{ sim.directionText.value !== "—" ? sim.directionText.value : "待命" }}</span>
+            <span>{{ sim.localPushing.value ? "本机调整中" : "平台控制" }}</span>
+          </div>
+        </section>
+
+        <!-- 3) 平台回显：分组切换只作用于本区，不打断手操 -->
+        <section class="feedback" aria-labelledby="feedback-title">
+          <div class="section-head">
+            <h3 id="feedback-title">平台回显</h3>
+            <span>只读 · 平台下发</span>
+          </div>
+
+          <div class="segment" role="tablist" aria-label="平台回显分组">
+            <button
+              v-for="tab in detailTabs"
+              :key="tab.key"
+              :id="`tab-${tab.key}`"
+              type="button"
+              role="tab"
+              :aria-selected="detailTab === tab.key"
+              :aria-controls="`panel-${tab.key}`"
+              :class="{ active: detailTab === tab.key }"
+              @click="selectDetail(tab.key)"
+            >
+              <b>{{ tab.label }}</b>
+              <small>{{ tab.hint }}</small>
+              <i v-if="detailBadges.includes(tab.key)" class="segment-badge" aria-label="该分组有新命令" />
+            </button>
+          </div>
+
+          <div
+            :id="`panel-${detailTab}`"
+            class="feedback-body"
+            role="tabpanel"
+            :aria-labelledby="`tab-${detailTab}`"
+          >
+            <!-- 定位 -->
+            <template v-if="detailTab === 'position'">
+              <article class="info-card">
+                <header>
+                  <h4>预置位</h4>
+                  <span>{{ sim.presets.value.length ? `${sim.presets.value.length} 个 · 当前 ${activePresetLabel}` : "平台未下发" }}</span>
+                </header>
+                <div v-if="sim.presets.value.length" class="preset-list">
+                  <button
+                    v-for="preset in sim.presets.value"
+                    :key="preset.id"
+                    type="button"
+                    class="preset-button"
+                    :class="{ current: sim.activePreset.value === preset.id }"
+                    :title="`本机调用 ${preset.name}`"
+                    @click="callPreset(preset)"
+                  >
+                    <b>P{{ preset.id }}</b><span>{{ preset.name }}</span>
+                  </button>
+                </div>
+                <p v-else class="empty">未配置 · 等待平台下发</p>
+              </article>
+
+              <article class="info-card">
+                <header><h4>看守位</h4><span>平台下发</span></header>
+                <template v-if="sim.home.configured">
+                  <div class="kv-row"><span>状态</span><b>{{ sim.home.enabled ? "已启用" : "已关闭" }}</b></div>
+                  <div class="kv-row"><span>指向预置位</span><b>{{ sim.home.presetIndex !== null ? `P${sim.home.presetIndex}` : "未下发" }}</b></div>
+                  <div class="kv-row"><span>自动归位</span><b>{{ sim.home.resetTime !== null ? `${sim.home.resetTime}s` : "字段待后端补齐" }}</b></div>
+                </template>
+                <p v-else class="empty">未配置 · 等待平台下发</p>
+              </article>
+
+              <article class="info-card">
+                <header><h4>巡航轨迹</h4><span>{{ sim.cruiseTracks.value.length ? `${sim.cruiseTracks.value.length} 条` : "平台未下发" }}</span></header>
+                <template v-if="sim.cruiseTracks.value.length">
+                  <div v-for="track in sim.cruiseTracks.value" :key="track.id" class="kv-row" :class="{ hot: track.active }">
+                    <span>#{{ track.id }}{{ track.active ? " 运行中" : "" }}</span>
+                    <b>{{ track.points.length ? track.points.map((p) => `P${p}`).join(" → ") : "暂无点位" }}</b>
                   </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="ptz-status-bar">
-              <span class="ptz-status-item"><i class="ptz-status-dot" :class="{ hot: sim.ptzActive.value || sim.seeking.value }" />{{ sim.headline.value.text }}</span>
-              <span class="ptz-status-sep" />
-              <span class="ptz-status-item">{{ sim.directionText.value !== '—' ? sim.directionText.value : '待命' }}</span>
-              <span class="ptz-status-sep" />
-              <span class="ptz-status-item">{{ sim.localPushing.value ? "本机调整中" : "平台控制" }}</span>
-            </div>
-          </template>
-
-          <!-- 定位 -->
-          <template v-else-if="activeTab === 'position'">
-            <section class="block">
-              <div class="block-head"><span>预置位</span><small>{{ sim.presets.value.length ? `${sim.presets.value.length} 个` : "平台未下发" }}</small></div>
-              <div v-if="sim.presets.value.length" class="preset-chips">
-                <span
-                  v-for="preset in sim.presets.value"
-                  :key="preset.id"
-                  class="preset-chip"
-                  :class="{ current: sim.activePreset.value === preset.id }"
-                >
-                  P{{ preset.id }} <small>{{ preset.name }}</small>
-                </span>
-              </div>
-              <div v-else class="empty">未配置 · 等待平台下发</div>
-            </section>
-
-            <section class="block">
-              <div class="block-head"><span>看守位</span><small>平台下发</small></div>
-              <div v-if="sim.home.configured" class="home-card">
-                <span class="dot" :class="{ on: sim.home.enabled }" />
-                <b>{{ sim.home.enabled ? "已启用" : "已关闭" }}</b>
-                <span v-if="sim.home.presetIndex !== null">指向 P{{ sim.home.presetIndex }}</span>
-                <span v-if="sim.home.resetTime !== null">自动归位 {{ sim.home.resetTime }}s</span>
-                <span v-else class="muted">字段待后端补齐</span>
-              </div>
-              <div v-else class="empty">未配置 · 等待平台下发</div>
-            </section>
-
-            <section class="block">
-              <div class="block-head"><span>巡航轨迹</span><small>{{ sim.cruiseTracks.value.length ? `${sim.cruiseTracks.value.length} 条` : "平台未下发" }}</small></div>
-              <div v-if="sim.cruiseTracks.value.length" class="track-list">
-                <div v-for="track in sim.cruiseTracks.value" :key="track.id" class="track-row" :class="{ active: track.active }">
-                  <b>#{{ track.id }}{{ track.active ? " ▶" : "" }}</b>
-                  <div>
-                    <div>{{ track.points.length ? track.points.map((p) => `P${p}`).join(" → ") : "暂无点位" }}</div>
-                    <small>{{ track.dwell !== null ? `每点停留 ${track.dwell}s` : "停留未下发" }} · {{ track.speed !== null ? `速度 ${track.speed}` : "速度未下发" }}</small>
+                  <div v-for="track in sim.cruiseTracks.value" :key="`meta-${track.id}`" class="kv-row">
+                    <span>#{{ track.id }} 参数</span>
+                    <b>{{ track.dwell !== null ? `停留 ${track.dwell}s` : "停留未下发" }} · {{ track.speed !== null ? `速度 ${track.speed}` : "速度未下发" }}</b>
                   </div>
-                </div>
-              </div>
-              <div v-else class="empty">未配置 · 等待平台下发</div>
-            </section>
+                </template>
+                <p v-else class="empty">未配置 · 等待平台下发</p>
+              </article>
 
-            <section class="block">
-              <div class="block-head"><span>自动扫描</span><small>{{ sim.scanGroups.value.length ? `${sim.scanGroups.value.length} 组` : "平台未下发" }}</small></div>
-              <div v-if="sim.scanGroups.value.length" class="scan-list">
-                <span v-for="group in sim.scanGroups.value" :key="group.id" class="scan-chip" :class="{ active: group.active }">
-                  扫描#{{ group.id }}{{ group.active ? " ▶" : "" }} {{ group.left ?? "未设" }}↔{{ group.right ?? "未设" }} · {{ group.speed ?? "速度未下发" }}
-                </span>
-              </div>
-              <div v-else class="empty">平台未下发扫描组</div>
-            </section>
-          </template>
+              <article class="info-card">
+                <header><h4>自动扫描</h4><span>{{ sim.scanGroups.value.length ? `${sim.scanGroups.value.length} 组` : "平台未下发" }}</span></header>
+                <template v-if="sim.scanGroups.value.length">
+                  <div v-for="group in sim.scanGroups.value" :key="group.id" class="kv-row" :class="{ hot: group.active }">
+                    <span>#{{ group.id }}{{ group.active ? " 运行中" : "" }}</span>
+                    <b>{{ group.left ?? "未设" }} ↔ {{ group.right ?? "未设" }} · {{ group.speed ?? "速度未下发" }}</b>
+                  </div>
+                </template>
+                <p v-else class="empty">平台未下发扫描组</p>
+              </article>
+            </template>
 
-          <!-- 图像 -->
-          <template v-else-if="activeTab === 'image'">
-            <section class="block">
-              <div class="block-head"><span>画面遮挡</span><small>GB-2022 A.2.1.17</small></div>
-              <div class="state-row">
-                <span class="dot" :class="{ on: sim.mask.on }" />
-                <b>{{ sim.mask.configured ? (sim.mask.on ? "已启用" : "已停用") : "平台未配置" }}</b>
-                <span v-if="sim.mask.on && sim.mask.regions.length" class="muted">{{ sim.mask.regions.length }} 个区域</span>
-                <span v-else-if="sim.mask.on" class="muted">已启用 · 无区域</span>
-              </div>
-              <div v-if="sim.mask.on && sim.mask.regions.length" class="mask-list">
-                <div v-for="region in sim.mask.regions" :key="region.seq" class="mask-row">
-                  <b>区域 {{ region.seq }}</b>
-                  <span>{{ region.left }},{{ region.top }} → {{ region.right }},{{ region.bottom }}</span>
+            <!-- 图像 -->
+            <template v-else-if="detailTab === 'image'">
+              <article class="info-card">
+                <header><h4>画面遮挡</h4><span>GB-2022 A.2.1.17</span></header>
+                <div class="kv-row"><span>状态</span><b>{{ sim.mask.configured ? (sim.mask.on ? "已启用" : "已停用") : "平台未配置" }}</b></div>
+                <div class="kv-row"><span>遮挡区域</span><b>{{ sim.mask.on ? `${sim.mask.regions.length} 个` : "—" }}</b></div>
+                <div v-for="region in sim.mask.regions" :key="region.seq" class="kv-row">
+                  <span>区域 {{ region.seq }}</span>
+                  <b>{{ region.left }},{{ region.top }} → {{ region.right }},{{ region.bottom }}</b>
                 </div>
-              </div>
-            </section>
+              </article>
 
-            <section class="block">
-              <div class="block-head"><span>画面镜像</span><small>A.2.1.23</small></div>
-              <div class="mirror-row">
-                <span
-                  v-for="(label, index) in mirrorOptions"
-                  :key="label"
-                  class="mirror-chip"
-                  :class="{ selected: sim.mirror.configured && sim.mirror.mode === index }"
-                >
-                  {{ label }}
-                </span>
-              </div>
-              <div class="hint-line">{{ sim.mirror.configured ? "平台已下发" : "平台未配置，四张卡均不点亮" }}</div>
-            </section>
+              <article class="info-card">
+                <header><h4>画面镜像</h4><span>A.2.1.23</span></header>
+                <div class="mirror-row">
+                  <span
+                    v-for="(label, index) in mirrorOptions"
+                    :key="label"
+                    class="mirror-chip"
+                    :class="{ selected: sim.mirror.configured && sim.mirror.mode === index }"
+                  >{{ label }}</span>
+                </div>
+                <p class="hint-line">{{ sim.mirror.configured ? "平台已下发" : "平台未配置，四张卡均不点亮" }}</p>
+              </article>
 
-            <section class="block">
-              <div class="block-head"><span>画面事件</span><small>平台下发回显</small></div>
-              <div class="event-list">
-                <div class="event-row" :class="{ hot: sim.keyframeActive.value }">
-                  <span>请求关键帧</span>
-                  <b>{{ sim.keyframeActive.value ? "已收到平台请求" : "等待平台请求" }}</b>
-                </div>
-                <div class="event-row" :class="{ hot: sim.nowMs.value - sim.snapshotAt.value < 3000 }">
-                  <span>抓拍</span>
-                  <b>{{ sim.snapshotAt.value ? timeText(sim.snapshotAt.value) : "尚未收到抓拍" }}</b>
-                </div>
-                <div class="event-row" :class="{ hot: sim.targetActive.value }">
-                  <span>目标跟踪</span>
-                  <b>{{ targetLabel }}</b>
-                </div>
-                <div class="event-row" :class="{ hot: dragZoomRecent }">
-                  <span>拉框联动</span>
-                  <b>{{ dragZoomRecent ? "最近 3 秒收到" : "暂无" }}</b>
-                </div>
-              </div>
-            </section>
+              <article class="info-card">
+                <header><h4>画面事件</h4><span>平台下发回显</span></header>
+                <div class="kv-row" :class="{ hot: sim.keyframeActive.value }"><span>请求关键帧</span><b>{{ sim.keyframeActive.value ? "已收到平台请求" : "等待平台请求" }}</b></div>
+                <div class="kv-row" :class="{ hot: sim.nowMs.value - sim.snapshotAt.value < 3000 }"><span>抓拍</span><b>{{ sim.snapshotAt.value ? timeText(sim.snapshotAt.value) : "尚未收到抓拍" }}</b></div>
+                <div class="kv-row" :class="{ hot: sim.targetActive.value }"><span>目标跟踪</span><b>{{ targetLabel }}</b></div>
+                <div class="kv-row" :class="{ hot: dragZoomRecent }"><span>拉框联动</span><b>{{ dragZoomRecent ? "最近 3 秒收到" : "暂无" }}</b></div>
+              </article>
 
-            <section class="block">
-              <div class="block-head"><span>前端 OSD</span><small>平台配置回显</small></div>
-              <div class="event-list">
-                <div class="event-row"><span>OSD 信息</span><b>{{ sim.osd.configured ? (sim.osd.show ? "开" : "关") : "未配置" }}</b></div>
-                <div class="event-row"><span>时间水印</span><b>{{ sim.osd.configured ? (sim.osd.timeShow ? "开" : "关") : "未配置" }}</b></div>
-              </div>
-            </section>
-          </template>
+              <article class="info-card">
+                <header><h4>前端 OSD</h4><span>平台配置回显</span></header>
+                <div class="kv-row"><span>OSD 信息</span><b>{{ sim.osd.configured ? (sim.osd.show ? "开" : "关") : "未配置" }}</b></div>
+                <div class="kv-row"><span>时间水印</span><b>{{ sim.osd.configured ? (sim.osd.timeShow ? "开" : "关") : "未配置" }}</b></div>
+              </article>
+            </template>
 
-          <!-- 设备 -->
-          <template v-else>
-            <div class="lamp-grid">
-              <div
-                v-for="lamp in lampItems"
-                :key="lamp.key"
-                class="lamp-card"
-                :class="{ on: lamp.active }"
-                :style="{ '--lamp': lamp.color }"
-              >
-                <i />
-                <div><b>{{ lamp.label }}</b><small>{{ lamp.active ? "已开启" : "未开启" }}</small></div>
-              </div>
-            </div>
+            <!-- 设备 -->
+            <template v-else>
+              <article class="info-card">
+                <header><h4>存储卡</h4><span>{{ sim.storage.queried ? `${sim.storage.cards.length} 张` : "平台查询触发" }}</span></header>
+                <p v-if="!sim.storage.queried" class="empty">等待平台下发存储卡查询</p>
+                <p v-else-if="sim.storage.cards.length === 0" class="empty">未安装存储卡 (SumNum=0)</p>
+                <template v-else>
+                  <div v-for="card in sim.storage.cards" :key="card.id" class="kv-row">
+                    <span>{{ card.name }} · {{ storageCapacity(card.capacityMb) }}</span>
+                    <b>{{ card.status }} · {{ storageStatus(card) }}</b>
+                  </div>
+                </template>
+              </article>
 
-            <section class="block">
-              <div class="block-head"><span>存储卡</span><small>{{ sim.storage.queried ? `${sim.storage.cards.length} 张` : "平台查询触发" }}</small></div>
-              <div v-if="!sim.storage.queried" class="empty">等待平台下发存储卡查询</div>
-              <div v-else-if="sim.storage.cards.length === 0" class="empty">未安装存储卡 (SumNum=0)</div>
-              <div v-else class="storage-list">
-                <div v-for="card in sim.storage.cards" :key="card.id" class="storage-row">
-                  <i />
-                  <b>{{ card.name }}</b>
-                  <span>{{ storageCapacity(card.capacityMb) }}</span>
-                  <span>{{ storageStatus(card) }}</span>
-                  <span>{{ card.status }}</span>
-                </div>
-              </div>
-            </section>
-
-            <section class="block">
-              <div class="block-head"><span>设备维护</span><small>平台命令回显</small></div>
-              <div class="event-list">
-                <div class="event-row" :class="{ hot: sim.rebooting.value }">
-                  <span>远程重启</span>
-                  <b>{{ sim.rebooting.value ? "正在重启" : "暂无重启任务" }}</b>
-                </div>
+              <article class="info-card">
+                <header><h4>设备维护</h4><span>平台命令回显</span></header>
+                <div class="kv-row" :class="{ hot: sim.rebooting.value }"><span>远程重启</span><b>{{ sim.rebooting.value ? "正在重启" : "暂无重启任务" }}</b></div>
+                <div class="kv-row" :class="{ hot: formatRecent }"><span>格式化 SD 卡</span><b>{{ formatRecent ? `收到请求 · ${timeText(sim.formatAt.value)}` : "暂无请求" }}</b></div>
+                <div class="kv-row" :class="{ hot: sim.lastCommand.value?.summary === '在线升级' }"><span>升级请求</span><b>{{ sim.lastCommand.value?.summary === "在线升级" ? "平台已下发" : "暂无请求" }}</b></div>
                 <div v-if="sim.upgrade.value" class="upgrade-card">
                   <div class="upgrade-head">
                     <span>在线升级{{ sim.upgrade.value.firmware ? ` v${sim.upgrade.value.firmware}` : "" }}</span>
@@ -524,23 +526,15 @@ onUnmounted(() => {
                   </div>
                   <div class="meter"><i :style="{ width: `${sim.upgrade.value.percent}%` }" /></div>
                 </div>
-                <div class="event-row" :class="{ hot: formatRecent }">
-                  <span>格式化 SD 卡</span>
-                  <b>{{ formatRecent ? `收到请求 · ${timeText(sim.formatAt.value)}` : "暂无请求" }}</b>
-                </div>
-                <div class="event-row" :class="{ hot: sim.lastCommand.value?.summary === '在线升级' }">
-                  <span>升级请求</span>
-                  <b>{{ sim.lastCommand.value?.summary === "在线升级" ? "平台已下发" : "暂无请求" }}</b>
-                </div>
-              </div>
-            </section>
+              </article>
 
-            <section class="block">
-              <div class="block-head"><span>最近平台命令</span><small>{{ sim.lastCommand.value ? timeText(sim.lastCommand.value.at) : "—" }}</small></div>
-              <div class="last-command">{{ sim.lastCommand.value?.summary ?? "尚未收到平台命令" }}</div>
-            </section>
-          </template>
-        </div>
+              <article class="info-card">
+                <header><h4>最近平台命令</h4><span>{{ sim.lastCommand.value ? timeText(sim.lastCommand.value.at) : "—" }}</span></header>
+                <div class="last-command">{{ sim.lastCommand.value?.summary ?? "尚未收到平台命令" }}</div>
+              </article>
+            </template>
+          </div>
+        </section>
       </aside>
     </div>
   </div>
@@ -550,25 +544,11 @@ onUnmounted(() => {
 .sim-page { width: min(1540px, 100%); margin: 0 auto; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .page-header {
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) auto auto;
+  grid-template-columns: minmax(280px, 1fr) auto;
   align-items: center;
   gap: 20px;
   margin-bottom: 16px;
 }
-.headline {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 7px 12px;
-  border: 1px solid var(--border-default);
-  border-radius: 999px;
-  color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.5);
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-.headline i { width: 7px; height: 7px; border-radius: 50%; background: var(--dot); box-shadow: 0 0 10px var(--dot); }
 .header-right { display: flex; align-items: center; gap: 12px; }
 .follow-toggle { display: flex; align-items: center; gap: 5px; color: var(--text-tertiary); font-size: 11px; white-space: nowrap; cursor: pointer; }
 .follow-toggle input { accent-color: var(--accent); }
@@ -644,130 +624,107 @@ onUnmounted(() => {
 .snapshot-flash { position: absolute; z-index: 8; inset: 0; background: #fff; animation: flash-out .18s ease-out forwards; pointer-events: none; }
 @keyframes flash-out { from { opacity: .82; } to { opacity: 0; } }
 
-.console { display: flex; min-width: 0; height: 100%; flex-direction: column; padding: 14px; }
-.console-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.panel-title { color: var(--text-primary); font-size: 13px; font-weight: 750; }
-.panel-sub { margin-top: 4px; color: var(--text-tertiary); font-size: 10px; }
-.active-preset { padding: 5px 8px; border-radius: 6px; color: var(--text-tertiary); background: rgba(56,132,255,.07); font-size: 9px; white-space: nowrap; }
-.active-preset b { color: var(--accent); font-size: 10px; }
-.tab-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; margin-top: 12px; padding: 3px; border-radius: 9px; background: var(--bg-base); }
-.tab { position: relative; display: grid; gap: 1px; padding: 7px 4px; border: 0; border-radius: 7px; color: var(--text-secondary); background: transparent; cursor: pointer; text-align: center; }
-.tab b { font-size: 12px; font-weight: 650; }
-.tab small { color: var(--text-tertiary); font-size: 8px; }
-.tab.active { color: var(--accent); background: var(--bg-elevated); box-shadow: 0 1px 3px rgba(16,46,98,.08); }
-.tab.active small { color: var(--accent); opacity: .7; }
-.tab-badge { position: absolute; top: 5px; right: 6px; width: 5px; height: 5px; border-radius: 50%; background: var(--error); box-shadow: 0 0 6px rgba(229, 72, 92, 0.55); }
-.console-body { flex: 1; min-height: 0; margin-top: 12px; overflow-y: auto; padding-right: 3px; }
-.console-body::-webkit-scrollbar { width: 5px; }
-.console-body::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(143,161,189,.28); }
+.console { display: flex; min-width: 0; height: 100%; flex-direction: column; gap: 12px; padding: 14px; }
 
-/* 姿态读数条 */
-.pose-strip { display: flex; align-items: center; gap: 0; margin-top: 2px; padding: 10px 4px; border-radius: 10px; background: var(--bg-base); }
-.pose-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; }
-.pose-item span { color: var(--text-tertiary); font-size: 9px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
-.pose-item b { color: var(--text-primary); font: 700 20px "SF Mono", monospace; letter-spacing: -.02em; }
-.pose-divider { width: 1px; height: 32px; background: var(--border-default); flex-shrink: 0; }
+/* 右侧统一分区头：13px 标题 + 11px 说明，取代原先 8~10px 的小字堆叠。 */
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.section-head h3 { margin: 0; color: var(--text-primary); font-size: 13px; font-weight: 700; }
+.section-head > span { color: var(--text-tertiary); font-size: 11px; white-space: nowrap; }
 
-/* 云台工作台 */
-.ptz-workbench { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 10px; margin-top: 10px; }
-.ptz-left { display: flex; align-items: center; justify-content: flex-end; }
-.ptz-right { }
-.control-card { padding: 9px; border: 1px solid var(--border-default); border-radius: 10px; background: rgba(255,255,255,.34); }
-.zoom-card { display: grid; justify-items: center; gap: 7px; min-width: 72px; }
-.card-label { color: var(--text-tertiary); font-size: 10px; font-weight: 650; }
-.big-readout { color: var(--text-primary); font: 750 22px "SF Mono", monospace; }
-.big-readout small { color: var(--text-tertiary); font-size: 11px; }
-.key-row { display: flex; gap: 5px; }
-.lens-column { display: grid; gap: 7px; }
-.lens-card { display: grid; gap: 5px; }
-.lens-head { display: flex; align-items: center; justify-content: space-between; color: var(--text-tertiary); font-size: 10px; }
-.lens-head b { color: var(--text-primary); font: 650 11px "SF Mono", monospace; }
+/* 1) 状态总览：任何回显分组下都常驻 */
+.overview { display: grid; gap: 10px; padding: 11px 12px; border: 1px solid var(--border-default); border-radius: 12px; background: var(--bg-surface); }
+.overview-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.overview-dot { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--dot); box-shadow: 0 0 10px var(--dot); }
+.overview-text { display: grid; gap: 3px; min-width: 0; }
+.overview-text strong { overflow: hidden; color: var(--text-primary); font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.overview-text small { overflow: hidden; color: var(--text-tertiary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.lamp-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.lamp { display: flex; align-items: center; gap: 5px; min-width: 0; padding: 5px 7px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-base); }
+.lamp i { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--border-default); }
+.lamp b { color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+.lamp small { margin-left: auto; color: var(--text-tertiary); font-size: 10px; }
+.lamp.on { border-color: color-mix(in srgb, var(--lamp) 38%, transparent); background: color-mix(in srgb, var(--lamp) 8%, transparent); }
+.lamp.on i { background: var(--lamp); box-shadow: 0 0 8px color-mix(in srgb, var(--lamp) 60%, transparent); }
+.lamp.on b { color: var(--lamp); }
+
+/* 2) 云台手操：两段式，方盘在左、镜头参数在右，按键命中区域放大 */
+.control-section { display: grid; gap: 10px; }
+.pose-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 8px 4px; border-radius: 10px; background: var(--bg-base); }
+.pose-item { display: grid; justify-items: center; gap: 2px; }
+.pose-item + .pose-item { border-left: 1px solid var(--border-default); }
+.pose-item span { color: var(--text-tertiary); font-size: 11px; }
+.pose-item b { color: var(--text-primary); font: 700 20px "SF Mono", monospace; }
+.ptz-workbench { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 12px; }
+.lens-stack { display: grid; gap: 8px; min-width: 0; }
+.lens-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border-default); border-radius: 10px; background: var(--bg-surface); }
+.lens-card-info { display: grid; gap: 4px; min-width: 0; }
+.lens-card-info > span { color: var(--text-tertiary); font-size: 11px; }
+.lens-card-info > b { color: var(--text-primary); font: 700 15px "SF Mono", monospace; }
+.lens-keys { display: flex; gap: 5px; }
 .meter { height: 3px; overflow: hidden; border-radius: 99px; background: var(--border-default); }
 .meter i { display: block; height: 100%; border-radius: 99px; background: var(--accent); transition: width .15s ease; }
-/* 云台状态条 */
-.ptz-status-bar { display: flex; align-items: center; gap: 0; margin-top: 10px; padding: 7px 10px; border-radius: 8px; background: var(--bg-base); font-size: 10.5px; }
-.ptz-status-item { flex: 1; display: flex; align-items: center; justify-content: center; gap: 5px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ptz-status-dot { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: var(--text-tertiary); opacity: .5; transition: background .2s, opacity .2s; }
+/* 子组件保持移动端同款不动，只在控制台内放大命中区域。 */
+.console :deep(.hold-key) { min-width: 38px; height: 34px; padding-inline: 8px; font-size: 13px; border-radius: 8px; }
+.console :deep(.hold-key.lens) { min-width: 36px; }
+.console :deep(.hold-key:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ptz-status-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: center; padding: 7px 10px; border-radius: 9px; background: var(--bg-base); }
+.ptz-status-bar > span { display: flex; align-items: center; justify-content: center; gap: 5px; overflow: hidden; color: var(--text-secondary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.ptz-status-bar > span + span { border-left: 1px solid var(--border-default); }
+.ptz-status-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--text-tertiary); opacity: .5; }
 .ptz-status-dot.hot { background: var(--accent); opacity: 1; }
-.ptz-status-sep { width: 1px; height: 14px; background: var(--border-default); flex-shrink: 0; }
-.hint-line { margin: 9px 0 0; color: var(--text-tertiary); font-size: 9px; line-height: 1.6; }
 
-.block { margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--border-default); }
-.block:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
-.block-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
-.block-head span { color: var(--text-secondary); font-size: 11px; font-weight: 700; }
-.block-head small { color: var(--text-tertiary); font-size: 9px; }
-.empty { padding: 12px; border: 1px dashed var(--border-default); border-radius: 8px; color: var(--text-tertiary); font-size: 10px; text-align: center; }
-.preset-chips { display: flex; flex-wrap: wrap; gap: 5px; }
-.preset-chip { padding: 5px 7px; border: 1px solid var(--border-default); border-radius: 6px; color: var(--accent); background: var(--accent-dim); font: 650 10px "SF Mono", monospace; }
-.preset-chip small { margin-left: 3px; color: var(--text-tertiary); font: 500 9px inherit; }
-.preset-chip.current { border-color: var(--accent); color: #fff; background: var(--accent); }
-.preset-chip.current small { color: rgba(255,255,255,.78); }
-.home-card { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 9px 10px; border-radius: 8px; background: var(--bg-base); }
-.home-card b { color: var(--text-primary); font-size: 11px; }
-.home-card span { color: var(--text-secondary); font-size: 10px; }
-.home-card .muted { color: var(--text-tertiary); font-size: 9px; }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border-default); }
-.dot.on { background: var(--success); box-shadow: 0 0 7px rgba(8,179,136,.5); }
-.track-list { display: grid; gap: 5px; }
-.track-row { display: flex; gap: 9px; padding: 7px 8px; border-radius: 7px; background: var(--bg-base); }
-.track-row.active { outline: 1px solid rgba(56,132,255,.25); background: var(--accent-dim); }
-.track-row > b { color: var(--accent); font: 650 10px "SF Mono", monospace; white-space: nowrap; }
-.track-row > div { min-width: 0; }
-.track-row div div { overflow: hidden; color: var(--text-secondary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.track-row small { color: var(--text-tertiary); font-size: 9px; }
-.scan-list { display: flex; flex-wrap: wrap; gap: 5px; }
-.scan-chip { padding: 5px 7px; border-radius: 99px; color: var(--text-secondary); background: var(--border-default); font: 600 9px "SF Mono", monospace; }
-.scan-chip.active { color: #fff; background: var(--accent); }
-.state-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; background: var(--bg-base); }
-.state-row b { color: var(--text-primary); font-size: 11px; }
-.state-row .muted { color: var(--text-tertiary); font-size: 9px; }
-.mask-list { display: grid; gap: 3px; margin-top: 5px; }
-.mask-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; border-radius: 6px; background: var(--bg-base); }
-.mask-row b { color: var(--text-secondary); font-size: 9px; }
-.mask-row span { color: var(--text-tertiary); font: 9px "SF Mono", monospace; }
-.mirror-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
-.mirror-chip { display: grid; place-items: center; padding: 8px 2px; border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-tertiary); background: var(--bg-base); font-size: 10px; }
+/* 3) 平台回显：统一卡片 + 键值行，只有本区滚动 */
+.feedback { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 10px; }
+.segment { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; padding: 3px; border-radius: 10px; background: var(--bg-base); }
+.segment > button { position: relative; display: grid; gap: 2px; padding: 7px 4px; border: 0; border-radius: 8px; color: var(--text-secondary); background: transparent; font: inherit; text-align: center; cursor: pointer; }
+.segment > button b { font-size: 12px; font-weight: 650; }
+.segment > button small { color: var(--text-tertiary); font-size: 10px; }
+.segment > button.active { color: var(--accent); background: var(--bg-elevated); box-shadow: 0 1px 3px rgba(16,46,98,.08); }
+.segment > button.active b { color: var(--accent); }
+.segment > button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.segment-badge { position: absolute; top: 6px; right: 8px; width: 6px; height: 6px; border-radius: 50%; background: var(--error); box-shadow: 0 0 6px rgba(229, 72, 92, .55); }
+.feedback-body { display: grid; align-content: start; gap: 8px; flex: 1; min-height: 0; overflow-y: auto; padding-right: 3px; }
+.feedback-body::-webkit-scrollbar { width: 5px; }
+.feedback-body::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(143,161,189,.28); }
+.info-card { padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 10px; background: var(--bg-surface); }
+.info-card > header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.info-card h4 { margin: 0; color: var(--text-secondary); font-size: 12px; font-weight: 700; }
+.info-card > header > span { color: var(--text-tertiary); font-size: 11px; text-align: right; }
+.kv-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 5px 0; font-size: 11px; }
+.kv-row + .kv-row { border-top: 1px solid var(--border-default); }
+.kv-row > span { flex: none; color: var(--text-tertiary); }
+.kv-row > b { overflow: hidden; color: var(--text-primary); font-weight: 600; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.kv-row.hot > b { color: var(--accent); }
+.empty { margin: 0; padding: 10px; border: 1px dashed var(--border-default); border-radius: 8px; color: var(--text-tertiary); font-size: 11px; text-align: center; }
+.preset-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.preset-button { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 6px 9px; border: 1px solid var(--border-accent); border-radius: 8px; color: var(--accent); background: var(--accent-dim); font: inherit; font-size: 11px; cursor: pointer; }
+.preset-button b { font: 700 11px "SF Mono", monospace; }
+.preset-button span { color: var(--text-secondary); }
+.preset-button:hover { background: var(--accent-pale); }
+.preset-button.current { border-color: var(--accent); color: #fff; background: var(--accent); }
+.preset-button.current span { color: rgba(255,255,255,.85); }
+.preset-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mirror-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; }
+.mirror-chip { display: grid; place-items: center; padding: 7px 2px; border: 1px solid var(--border-default); border-radius: 8px; color: var(--text-tertiary); background: var(--bg-base); font-size: 11px; }
 .mirror-chip.selected { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); font-weight: 700; }
-.event-list { display: grid; gap: 4px; }
-.event-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 9px; border-radius: 7px; background: var(--bg-base); }
-.event-row span { color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
-.event-row b { overflow: hidden; color: var(--text-secondary); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.event-row.hot { background: var(--accent-dim); }
-.event-row.hot b { color: var(--accent); }
-.lamp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-.lamp-card { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-base); }
-.lamp-card i { width: 10px; height: 10px; border-radius: 50%; background: var(--border-default); }
-.lamp-card.on { border-color: color-mix(in srgb, var(--lamp) 38%, transparent); background: color-mix(in srgb, var(--lamp) 8%, transparent); }
-.lamp-card.on i { background: var(--lamp); box-shadow: 0 0 9px color-mix(in srgb, var(--lamp) 60%, transparent); }
-.lamp-card div { display: grid; gap: 1px; }
-.lamp-card b { color: var(--text-primary); font-size: 11px; }
-.lamp-card small { color: var(--text-tertiary); font-size: 8px; }
-.lamp-card.on b { color: var(--lamp); }
-.lamp-card.on small { color: color-mix(in srgb, var(--lamp) 80%, var(--text-secondary)); }
-.storage-list { display: grid; gap: 4px; }
-.storage-row { display: grid; grid-template-columns: auto 1.2fr .8fr 1fr .7fr; align-items: center; gap: 7px; padding: 6px 8px; border-radius: 7px; background: var(--bg-base); }
-.storage-row i { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
-.storage-row b { color: var(--text-primary); font-size: 10px; }
-.storage-row span { color: var(--text-secondary); font: 9px "SF Mono", monospace; text-align: right; }
-.upgrade-card { padding: 8px 9px; border: 1px solid rgba(56,132,255,.18); border-radius: 8px; background: var(--accent-dim); }
-.upgrade-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.upgrade-head span { flex: 1; color: var(--accent); font-size: 10px; font-weight: 650; }
-.upgrade-head b { color: var(--text-secondary); font-size: 9px; }
-.upgrade-head strong { color: var(--text-primary); font: 700 11px "SF Mono", monospace; }
-.last-command { padding: 9px 10px; border-radius: 8px; color: var(--text-primary); background: var(--bg-base); font-size: 10px; line-height: 1.6; word-break: break-all; }
+.hint-line { margin: 7px 0 0; color: var(--text-tertiary); font-size: 11px; }
+.upgrade-card { margin-top: 6px; padding: 8px 10px; border: 1px solid rgba(56,132,255,.18); border-radius: 8px; background: var(--accent-dim); }
+.upgrade-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.upgrade-head span { flex: 1; color: var(--accent); font-size: 11px; font-weight: 650; }
+.upgrade-head b { color: var(--text-secondary); font-size: 10px; }
+.upgrade-head strong { color: var(--text-primary); font: 700 12px "SF Mono", monospace; }
+.last-command { padding: 8px 10px; border-radius: 8px; color: var(--text-primary); background: var(--bg-base); font-size: 11px; line-height: 1.6; word-break: break-all; }
 
 @media (max-width: 1180px) {
   .page-header { grid-template-columns: 1fr auto; }
-  .headline { grid-column: 1 / -1; grid-row: 2; justify-self: start; }
   .sim-layout { grid-template-columns: 1fr; }
   .stage { min-height: 500px; }
   .console { height: auto; }
-  .console-body { max-height: 60vh; }
+  .feedback-body { max-height: 50vh; }
 }
 @media (max-width: 720px) {
   .ptz-workbench { grid-template-columns: 1fr; justify-items: center; }
-  .lens-column { width: 100%; grid-template-columns: 1fr 1fr; }
+  .lens-stack { width: 100%; }
   .page-header { grid-template-columns: 1fr; }
   .header-right { justify-content: space-between; }
 }
