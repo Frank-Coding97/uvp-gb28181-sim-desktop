@@ -62,3 +62,14 @@ assert.match(ptz, /<div class="page-title">云台控制<\/div>/, "云台控制�
 assert.match(ptz, /ptz_action/, "云台页必须继续消费平台 PTZ 命令");
 assert.doesNotMatch(dashboard, /设备状态真相|runtime-truth/, "首页不再展示设备运行时真相");
 assert.match(recordings, /<h1>录像中心<\/h1>/, "录像中心页面标题必须与菜单一致");
+
+// ── 顶栏容器块 ───────────────────────────────────────────────────────────
+// 顶栏原先没有背景/描边，控件直接贴在窗口背景上；复用 .glass-card 并内缩，
+// 让它成为视觉上独立的一块，同时保持 showTopbar 在首页隐藏的既有行为。
+assert.match(app, /<header v-if="showTopbar" class="topbar glass-card">/, "顶栏应复用卡片容器样式");
+const topbarRule = app.match(/^\.topbar \{([^}]*)\}/m)?.[1] ?? "";
+assert.ok(topbarRule, "应存在顶栏样式规则");
+assert.match(topbarRule, /margin:\s*8px 12px 6px;/, "顶栏必须内缩留白并与下方内容拉开间距");
+assert.match(topbarRule, /border-radius:\s*var\(--radius-md\);/, "顶栏容器必须有圆角");
+assert.match(app, /showTopbar = computed\(\(\) => route\.path !== "\/dashboard"\)/, "首页仍应隐藏顶栏");
+assert.match(app, /position: absolute; top: 64px;/, "顶栏加高后提示条仍应落在卡片下方");

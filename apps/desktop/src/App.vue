@@ -359,7 +359,7 @@ const themeOverrides = {
 
             <!-- 主区 -->
             <main class="main">
-              <header v-if="showTopbar" class="topbar">
+              <header v-if="showTopbar" class="topbar glass-card">
                 <!-- 全局目标平台:单设备/压测共用,下拉切换 + 编辑 -->
                 <div class="platform-bar">
                   <n-icon :component="ServerOutline" class="plat-icon" />
@@ -470,10 +470,13 @@ const themeOverrides = {
 }
 .sidebar-menu { flex: 1; min-height: 0; overflow-y: auto; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+/* 顶栏复用 .glass-card 做成独立容器块：内缩留白 + 圆角 + 描边 + 阴影，
+   与下方 .content 的卡片区分开，不再像直接贴在窗口背景上的一条裸控件。 */
 .topbar {
   height: 48px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 24px; gap: 12px;
+  margin: 8px 12px 6px; padding: 0 14px; gap: 12px;
+  border-radius: var(--radius-md);
 }
 .platform-bar { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
 .plat-select { width: 280px; min-width: 160px; }
@@ -487,7 +490,7 @@ const themeOverrides = {
 .reg-btns { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 /* 顶栏轻量提示条:居中浮在顶栏下方,不占布局。 */
 .top-toast {
-  position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+  position: absolute; top: 64px; left: 50%; transform: translateX(-50%);
   z-index: 50; padding: 7px 18px; border-radius: 999px; font-size: 13px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.12); backdrop-filter: var(--blur-light);
 }
@@ -519,7 +522,7 @@ const themeOverrides = {
 .error-bar {
   flex-shrink: 0;
   display: flex; align-items: center; gap: 10px;
-  margin: 4px 24px 0; padding: 9px 14px; border-radius: 10px;
+  margin: 8px 12px 0; padding: 9px 14px; border-radius: 10px;
   background: color-mix(in srgb, var(--error) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--error) 40%, transparent);
   color: var(--error); font-size: 13px;
@@ -539,7 +542,7 @@ const themeOverrides = {
 .content { flex: 1; overflow: hidden; padding: 0 12px; min-height: 0; display: flex; flex-direction: column; }
 
 @media (max-width: 1120px) {
-  .topbar { padding: 0 16px; }
+  .topbar { padding: 0 12px; }
   .plat-select { width: 220px; }
   .chip:nth-child(2) { display: none; }
   .status-area { gap: 7px; }
@@ -549,6 +552,7 @@ const themeOverrides = {
   .brand { padding-inline: 16px; }
   .plat-label, .chip:nth-child(3) { display: none; }
   .content { padding-inline: 10px; }
+  .topbar, .error-bar { margin-inline: 10px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .fade-enter-active, .fade-leave-active { transition: none; }
