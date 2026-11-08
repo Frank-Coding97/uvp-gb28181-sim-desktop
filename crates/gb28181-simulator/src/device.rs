@@ -1700,11 +1700,18 @@ impl DeviceSimulator {
     /// 载入一个内置目录模板(single/nvr-8ch/civil-3x2/large-16ch/business-platform),
     /// 替换现有目录树(FR-34)。business-platform 用于模拟下级平台业务分组。
     pub fn load_catalog_template(&self, template: &str) {
+        let channel_name = self
+            .config
+            .channels
+            .first()
+            .map(|c| c.name.as_str())
+            .unwrap_or("");
         let tree = gb28181_protocol::id_codec::catalog_template(
             template,
             self.config.device_id.as_str(),
             &self.config.device_info.device_name,
             &self.config.server_domain,
+            channel_name,
         );
         *self.catalog_tree.lock().unwrap() = tree;
     }

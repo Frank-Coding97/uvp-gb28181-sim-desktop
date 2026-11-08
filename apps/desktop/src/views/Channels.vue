@@ -190,7 +190,7 @@ function onAddTypeChange(value: string) {
 }
 
 function onAddNameInput(value: string) {
-  addName.value = String(value ?? "");
+  addName.value = value;
   addNameTouched.value = true;
 }
 
@@ -201,13 +201,14 @@ function confirmAdd() {
     : 1;
   const ids = new Set(draft.value.map((node) => node.id));
   const created: ChannelNode[] = [];
-  // 视频通道统一 `Uvp-Camera-序号`：沿用输入里的序号往后递增，没写序号就接着树里最大值。
-  let videoPrefix = "";
+  // 视频通道统一 `前缀-序号`：沿用输入里的序号往后递增，没写序号就接着树里最大值。
+  let videoPrefix = CHANNEL_NAME_PREFIX;
   let videoSeqStart = 0;
   if (addType.value === "VideoChannel") {
     const typed = addName.value.trim();
     const matched = /^(.*?)-(\d+)$/.exec(typed);
-    videoPrefix = matched?.[1] || typed || CHANNEL_NAME_PREFIX;
+    // Bug fix: 空前缀（如输入 "-5"）回退到默认前缀，避免生成 "-5-5" 等畸形名
+    videoPrefix = matched?.[1] ? matched[1] : CHANNEL_NAME_PREFIX;
     videoSeqStart = matched ? Number(matched[2]) : nextChannelSeq(draft.value, videoPrefix);
   }
   for (let i = 0; i < count; i += 1) {
@@ -217,11 +218,18 @@ function confirmAdd() {
       id = `${id.slice(0, 13)}${String(tail).padStart(7, "0")}`;
     }
     ids.add(id);
-    const name = addType.value === "VideoChannel"
-      ? `${videoPrefix}-${videoSeqStart + i}`
-      : count > 1
+    let name: string;
+    if (addType.value === "VideoChannel") {
+      // Bug fix: 批量新增时跳过 draft 或本批次已有的名称，避免重复
+      const existingNames = new Set([...draft.value, ...created].map((n) => n.name));
+      while (existingNames.has(`${videoPrefix}-${videoSeqStart}`)) videoSeqStart += 1;
+      name = `${videoPrefix}-${videoSeqStart}`;
+      videoSeqStart += 1;
+    } else {
+      name = count > 1
         ? `${addName.value.trim() || TYPE_LABELS[addType.value]}-${String(i + 1).padStart(3, "0")}`
         : (addName.value.trim() || TYPE_LABELS[addType.value]);
+    }
     let node = makeNode(id, addType.value, name, parent?.id ?? id);
     if (parent) node = attachCatalogNode(node, parent);
     created.push(node);

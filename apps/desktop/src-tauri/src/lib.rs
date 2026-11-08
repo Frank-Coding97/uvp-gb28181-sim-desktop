@@ -3011,6 +3011,7 @@ fn catalog_nodes_from_config(
         &config.device.device_id,
         &config.device.device_name,
         &profile.server_domain,
+        &config.device.channel_name,
     ))
 }
 
@@ -3058,6 +3059,7 @@ async fn load_catalog_template(
         &config.device.device_id,
         &config.device.device_name,
         &profile.server_domain,
+        &config.device.channel_name,
     );
     gb28181_protocol::id_codec::validate_catalog_tree(&nodes)?;
     save_catalog_config(&state, &app, &nodes).await?;

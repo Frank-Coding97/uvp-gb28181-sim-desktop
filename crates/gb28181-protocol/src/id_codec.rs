@@ -367,11 +367,13 @@ pub fn catalog_parent_id(tree: &[CatalogNode], node: &CatalogNode) -> Option<Str
 /// - `business-platform`:下级平台业务树,含 1 业务分组、嵌套虚拟组织和 3 视频通道。
 ///
 /// 返回节点列表(首个为根设备);`domain` 取前 10 位作 ID 前缀。
+/// `channel_name` 仅 `single` 模板用于命名首个视频通道；空串退回默认 "Uvp-Camera-1"。
 pub fn catalog_template(
     template: &str,
     device_id: &str,
     device_name: &str,
     domain: &str,
+    channel_name: &str,
 ) -> Vec<CatalogNode> {
     let root = || CatalogNode::new(device_id, CatalogNodeType::Device, device_name, device_id);
     // 部分实际设备编码本身就是 132/134 等类型码。模板从序号 1 生成子节点时
@@ -569,7 +571,16 @@ pub fn catalog_template(
         // "single" 及未知:默认单设备 + 1 视频 + 1 报警。
         _ => vec![
             root(),
-            CatalogNode::new(vid(1), CatalogNodeType::VideoChannel, "Uvp-Camera-1", device_id),
+            CatalogNode::new(
+                vid(1),
+                CatalogNodeType::VideoChannel,
+                if channel_name.trim().is_empty() {
+                    "Uvp-Camera-1".to_string()
+                } else {
+                    channel_name.trim().to_string()
+                },
+                device_id,
+            ),
             CatalogNode::new(
                 alarm(1),
                 CatalogNodeType::AlarmChannel,
@@ -614,7 +625,7 @@ mod tests {
 
     #[test]
     fn 目录目标只返回目标及其后代() {
-        let tree = catalog_template("large-16ch", "34020000001110000001", "Cam", "3402000000");
+        let tree = catalog_template("large-16ch", "34020000001110000001", "Cam", "3402000000", "");
         let indoor = tree.iter().find(|node| node.name == "室内监控").unwrap();
         let indoor_org = tree
             .iter()
@@ -633,7 +644,7 @@ mod tests {
 
     #[test]
     fn 行政区划查询按id与civilcode选取() {
-        let tree = catalog_template("civil-3x2", "34020000001110000001", "Cam", "3402000000");
+        let tree = catalog_template("civil-3x2", "34020000001110000001", "Cam", "3402000000", "");
         let selected = select_catalog_nodes(&tree, "310115");
         assert_eq!(selected.len(), 3);
         assert!(selected.iter().all(|node| {
@@ -700,6 +711,7 @@ mod tests {
             "34020000001110000001",
             "下级平台",
             "3402000000",
+            "",
         );
         let root = &tree[0];
         let group = tree
@@ -749,11 +761,11 @@ mod tests {
     #[test]
     fn 模板节点数与结构() {
         let dom = "3402000000";
-        let single = catalog_template("single", "34020000001110000001", "Cam", dom);
+        let single = catalog_template("single", "34020000001110000001", "Cam", dom, "");
         assert_eq!(single.len(), 3); // 根 + 视频 + 报警
         assert_eq!(single[0].node_type, CatalogNodeType::Device);
 
-        let nvr = catalog_template("nvr-8ch", "34020000001110000001", "Cam", dom);
+        let nvr = catalog_template("nvr-8ch", "34020000001110000001", "Cam", dom, "");
         assert_eq!(nvr.len(), 11); // 根 + 分组 + 虚拟组织 + 8 通道
         assert_eq!(nvr[1].node_type, CatalogNodeType::BusinessGroup);
         assert!(
@@ -767,11 +779,11 @@ mod tests {
                 == 8
         );
 
-        let civil = catalog_template("civil-3x2", "34020000001110000001", "Cam", dom);
+        let civil = catalog_template("civil-3x2", "34020000001110000001", "Cam", dom, "");
         assert_eq!(civil.len(), 11); // 根 + 业务分组 + 3 组织 + 6 通道
         assert_eq!(civil[2].civil_code.as_deref(), Some("310115"));
 
-        let large = catalog_template("large-16ch", "34020000001110000001", "Cam", dom);
+        let large = catalog_template("large-16ch", "34020000001110000001", "Cam", dom, "");
         assert_eq!(large.len(), 22); // 根 + 2 分组 + 2 虚拟组织 + 16 通道 + 1 报警
         assert!(
             large
@@ -779,7 +791,7 @@ mod tests {
                 .any(|n| n.node_type == CatalogNodeType::AlarmChannel)
         );
 
-        let business = catalog_template("business-platform", "34020000001110000001", "Cam", dom);
+        let business = catalog_template("business-platform", "34020000001110000001", "Cam", dom, "");
         assert_eq!(business.len(), 8); // 根 + 分组 + 3 虚拟组织 + 3 通道
     }
 
@@ -790,6 +802,7 @@ mod tests {
             "34020000001110000001",
             "下级平台",
             "3402000000",
+            "",
         );
         let group = tree
             .iter()
@@ -829,7 +842,7 @@ mod tests {
 
         for template in ["nvr-8ch", "civil-3x2", "large-16ch"] {
             let existing =
-                catalog_template(template, "34020000001110000001", "下级平台", "3402000000");
+                catalog_template(template, "34020000001110000001", "下级平台", "3402000000", "");
             for group in existing
                 .iter()
                 .filter(|node| node.node_type == CatalogNodeType::BusinessGroup)

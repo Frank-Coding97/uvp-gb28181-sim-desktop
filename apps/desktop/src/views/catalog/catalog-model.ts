@@ -97,10 +97,12 @@ function channelSeqOf(name: string, prefix: string): number | null {
   return /^\d+$/.test(tail) ? Number(tail) : null;
 }
 
-/** 下一个可用通道序号：树内同前缀 `Uvp-Camera-N` 的最大 N + 1。 */
+/** 下一个可用通道序号：树内 VideoChannel 节点中同前缀 `Uvp-Camera-N` 的最大 N + 1。
+ * 只扫描 VideoChannel，避免被重命名的业务分组/虚拟组织节点影响序号。 */
 export function nextChannelSeq(tree: CatalogNode[], prefix = CHANNEL_NAME_PREFIX): number {
   let max = 0;
   for (const node of tree) {
+    if (node.node_type !== "VideoChannel") continue;
     const seq = channelSeqOf(node.name, prefix);
     if (seq !== null) max = Math.max(max, seq);
   }
@@ -209,6 +211,17 @@ function large16Template(ctx: TemplateContext): CatalogNode[] {
 }
 
 /**
+ * 从基础通道名派生第 seq 个通道名，与 `confirmAdd` 的前缀提取逻辑保持一致。
+ * - "Uvp-Camera-1" → seq=2 → "Uvp-Camera-2"
+ * - "FrontDoor"    → seq=2 → "FrontDoor-2"
+ * - "Gate-1"       → seq=2 → "Gate-2"
+ */
+function deriveChannelName(base: string, seq: number): string {
+  const m = /^(.*?)-(\d+)$/.exec(base);
+  return m ? `${m[1]}-${seq}` : (seq === 1 ? base : `${base}-${seq}`);
+}
+
+/**
  * GB/T 28181-2022 附录 J 标准业务分组样例（移动端 standard-business-group 同款）。
  *
  * 移动端首层 216 不写 ParentID、只用 BusinessGroupID 归组，且通道用 "system/org" 复合父；
@@ -229,8 +242,8 @@ function standardBusinessGroupTemplate(ctx: TemplateContext): CatalogNode[] {
     makeNode(groupId, "BusinessGroup", "校园安防", systemId, { civil_code: civilCode }),
     makeNode(firstOrg, "VirtualOrg", "出入口", groupId, { business_group_id: groupId }),
     makeNode(nestedOrg, "VirtualOrg", "教学区域", firstOrg, { business_group_id: groupId }),
-    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", ctx.channelName || `${CHANNEL_NAME_PREFIX}-1`, firstOrg),
-    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", `${CHANNEL_NAME_PREFIX}-2`, nestedOrg),
+    makeNode(templateSeq(ctx, "VideoChannel", 1), "VideoChannel", deriveChannelName(ctx.channelName || `${CHANNEL_NAME_PREFIX}-1`, 1), firstOrg),
+    makeNode(templateSeq(ctx, "VideoChannel", 2), "VideoChannel", deriveChannelName(ctx.channelName || `${CHANNEL_NAME_PREFIX}-1`, 2), nestedOrg),
   ];
 }
 
