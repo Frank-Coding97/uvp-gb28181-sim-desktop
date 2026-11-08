@@ -436,9 +436,9 @@ const canSave = computed(() => editing.value && deviceIdValid.value && platformV
 // 注册按钮为什么不可点。
 //
 // 之前按钮的 disabled 由四个条件直接拼在模板里，而页面底部的提示只看 SIP 三个字段，
-// 于是出现过「提示说 SIP 配置完整、可以启动模拟，按钮却是灰的」——实际卡在没选采集
-// 来源（video_source 为空）。这里把判定收成一处，模板和提示共用，保证说出来的原因
-// 就是真正挡住按钮的那一条。
+// 于是出现过「提示说一切就绪、按钮却是灰的」——实际卡在没选采集来源（video_source
+// 为空）。这里把判定收成一处，按钮和提示共用；且只在有阻塞原因时才显示提示，无阻塞
+// 时页面底部保持空白。
 // 顺序即优先级：编辑态最先（此时连注销也不该点），其次是采集来源、传输方式、SIP 字段。
 const registerBlocker = computed(() => {
   if (editing.value) return "正在编辑配置，点「完成」保存后再操作";
@@ -1397,9 +1397,10 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="config-foot">
-          <n-icon :component="registerBlocker ? AlertCircleOutline : CheckmarkCircleOutline" />
-          <span>{{ registerBlocker || (deviceLive ? "SIP 已注册，设备运行中" : "SIP 配置完整，可以启动模拟") }}</span>
+        <!-- 只在有阻塞原因时提示；一切正常时不再常驻「配置完整 / 已注册」这类状态文案。 -->
+        <div v-if="registerBlocker" class="config-foot">
+          <n-icon :component="AlertCircleOutline" />
+          <span>{{ registerBlocker }}</span>
         </div>
       </aside>
     </main>
