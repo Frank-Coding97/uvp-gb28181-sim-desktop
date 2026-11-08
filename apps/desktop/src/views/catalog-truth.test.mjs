@@ -9,7 +9,7 @@ const [view, backend, protocol] = await Promise.all([
 ]);
 
 test("目录管理提供搜索移动状态和 JSON 导入导出", () => {
-  assert.match(view, /目录搜索/);
+  assert.match(view, /搜索名称/);
   assert.match(view, /移动节点/);
   assert.match(view, /切换状态/);
   assert.match(view, /导入 JSON/);

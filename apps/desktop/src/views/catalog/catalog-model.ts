@@ -11,7 +11,12 @@
 // - 移动端用 "/" 表达的复合 ParentID 在桌面端不可表达，导入时取末段；
 // - 保存校验以 Rust validate_catalog_tree 为准，前端做同口径预检；
 // - 移动端的父子类型白名单用于「新增/移动」候选过滤，不作为保存硬约束，
-//   以保留桌面端既有的 nvr-8ch / large-16ch 等模板（通道挂 215 分组）。
+//   以保留桌面端既有的 nvr-8ch / large-16ch 等模板（通道挂 215 分组）；
+// - 例外：桌面端默认目录根是 设备(111)，若沿用移动端「设备 → 仅通道」的白名单，
+//   用户必须先应用「标准业务分组」模板才能建 215/216，入口过深。移动端数据层
+//   （CatalogTreeStore.isAllowedParent）本就允许 215 挂 Device/System、216 挂
+//   Device/System/215/216，Rust validate_catalog_tree 也不校验父子类型，
+//   因此设备根下放开 215/216，与 canMove 的候选口径保持一致。
 
 import type { CatalogNodeConfig } from "../../platform";
 
@@ -291,15 +296,25 @@ export function canMove(node: CatalogNode, targetId: string, tree: CatalogNode[]
   }
 }
 
-/** 对齐移动端 AddChildDialog：按父节点类型限制可新增的子类型。 */
+/**
+ * 新增子节点可选类型。
+ *
+ * 与移动端 AddChildDialog 的差异只有一处：设备(111) 根下额外放开 215/216，
+ * 让「业务分组 / 虚拟组织」不必先套标准业务分组模板就能建（见文件头说明）。
+ * 通道排在前面，保持「新增节点」默认选中视频通道的既有习惯。
+ */
 export function allowedChildTypes(parent: CatalogNode | null): CatalogNodeType[] {
   switch (parent?.node_type) {
     case "System":
+      // 216 不直接挂 200：移动端保存校验在存在 System 根时要求 216 的父必须是 216，
+      // 直接挂 200 的树导回移动端会被判非法，因此保持「先建 215 再挂 216」。
       return ["BusinessGroup", "VideoChannel", "AlarmChannel"];
     case "BusinessGroup":
       return ["VirtualOrg"];
     case "VirtualOrg":
       return ["VirtualOrg", "VideoChannel", "AlarmChannel"];
+    case "Device":
+      return ["VideoChannel", "AlarmChannel", "BusinessGroup", "VirtualOrg"];
     default:
       return ["VideoChannel", "AlarmChannel"];
   }

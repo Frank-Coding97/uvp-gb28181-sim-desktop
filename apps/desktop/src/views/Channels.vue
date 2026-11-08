@@ -8,9 +8,9 @@
 import { computed, h, onMounted, ref, watch, type VNode } from "vue";
 import { onBeforeRouteLeave, useRouter } from "vue-router";
 import {
-  NAlert, NButton, NDataTable, NDropdown, NForm, NFormItem, NInput, NModal,
+  NAlert, NButton, NDataTable, NForm, NFormItem, NInput, NModal,
   NSelect, NSpace, NTag, useDialog, useMessage,
-  type DataTableColumns, type DropdownOption,
+  type DataTableColumns,
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { useDevice } from "../device";
@@ -322,22 +322,6 @@ const templateCards = computed(() => availableTemplates(gbVersion.value).map((tp
   id: tpl.id, title: tpl.title, description: tpl.description, origin: tpl.origin,
   nodeCount: tpl.build(templateContext.value).length, def: tpl,
 })));
-const moreOptions: DropdownOption[] = [
-  { label: "应用模板", key: "template" },
-  { label: "导入 JSON", key: "import" },
-  { label: "导出 JSON", key: "export" },
-  { label: "复位到默认", key: "reset" },
-];
-
-function onMoreSelect(key: string | number) {
-  switch (String(key)) {
-    case "template": showTemplate.value = true; break;
-    case "import": openImport(); break;
-    case "export": openExport(); break;
-    case "reset": showResetConfirm.value = true; break;
-    default: break;
-  }
-}
 
 function openExport() {
   jsonMode.value = "export";
@@ -483,7 +467,8 @@ function coloredButton(label: string, color: string, onClick: () => void, disabl
 function actionButtons(row: ChannelNode): VNode[] {
   const buttons: Array<VNode | null> = [
     coloredButton("编辑字段", ACTION_PALETTE.edit, () => openEdit(row)),
-    !isLeaf(row) && !isRoot(row)
+    // 根节点也要能加子节点：业务分组/虚拟组织就是挂在根下面的容器。
+    !isLeaf(row)
       ? coloredButton("新增子节点", ACTION_PALETTE.add, () => openAdd(row))
       : null,
     !isRoot(row)
@@ -537,7 +522,8 @@ onMounted(async () => {
     <n-alert v-if="showOnboarding" type="info" closable class="onboarding" @close="showOnboarding = false">
       <template #header>目录管理使用提示</template>
       • 编辑、克隆、移动、模板与导入都只改草稿，点「保存*」才生效；离开页面会提示未保存的修改<br />
-      • 标准业务分组场景：系统 → 分组 → 虚拟组织 → 通道；仅 GB/T 28181-2022 可用<br />
+      • 业务分组(215)、虚拟组织(216) 可直接在设备根下新增；虚拟组织可多级嵌套，通道挂在虚拟组织或根下<br />
+      • 需要 GB/T 28181-2022 附录 J 的「系统 → 分组 → 组织」结构时，用工具栏「应用模板」<br />
       • 移动端与桌面端 JSON 可互导；扩展字段与复合 ParentID 会在导入时给出提示
     </n-alert>
 
@@ -559,13 +545,14 @@ onMounted(async () => {
 
     <div class="glass-card panel">
       <div class="toolbar">
-        <n-input v-model:value="searchText" clearable class="search" placeholder="目录搜索：名称、ID、区划码、分组、类型" />
+        <n-input v-model:value="searchText" clearable class="search" placeholder="搜索名称 / ID / 区划码" />
         <n-button @click="reloadTree">刷新</n-button>
         <n-button type="info" @click="openAdd()">新增节点</n-button>
+        <n-button @click="showTemplate = true">应用模板</n-button>
+        <n-button @click="openImport">导入 JSON</n-button>
+        <n-button @click="openExport">导出 JSON</n-button>
         <n-button @click="openXmlPreview">预览 NOTIFY</n-button>
-        <n-dropdown trigger="click" :options="moreOptions" @select="onMoreSelect">
-          <n-button>更多 ···</n-button>
-        </n-dropdown>
+        <n-button @click="showResetConfirm = true">复位默认</n-button>
         <n-button type="primary" :loading="busy" :disabled="!isDirty" @click="saveDraft">
           {{ isDirty ? "保存*" : "保存" }}
         </n-button>
@@ -580,7 +567,7 @@ onMounted(async () => {
         :columns="columns" :data="treeRows" :bordered="false" size="small"
         :scroll-x="1500" :row-key="(row: TreeRow) => row.id" default-expand-all
       />
-      <div v-if="draft.length === 0" class="empty">目录为空，请在「更多」中应用模板或导入 JSON</div>
+      <div v-if="draft.length === 0" class="empty">目录为空，请点工具栏「应用模板」或「导入 JSON」</div>
     </div>
 
     <!-- 节点字段编辑（对齐移动端 NodeEditorSheet：ID/类型只读，父关系走移动对话框） -->
@@ -634,6 +621,10 @@ onMounted(async () => {
           <n-input :value="addCountText"
             @update:value="(v: string) => addCountText = String(v ?? '').replace(/\D/g, '').slice(0, 2)" />
         </n-form-item>
+        <div class="hint">
+          层级：设备(111)/系统(200) → 业务分组(215) → 虚拟组织(216) → 通道(132/134)。业务分组按业务归口，
+          虚拟组织可多级嵌套；容器类型下继续点「新增子节点」往下挂。
+        </div>
         <div class="hint">批量新增（1-50）按 name-001 顺序命名；国标 ID 由域编码 + 类型码 + 下一个可用序号自动生成。</div>
       </n-form>
       <template #footer>
@@ -750,8 +741,8 @@ onMounted(async () => {
 .section-title { color: var(--text-primary); font-size: 16px; font-weight: 600; }
 .section-hint { margin-top: 4px; color: var(--text-tertiary); font-size: 12px; }
 .panel { padding: 20px; }
-.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.search { min-width: 280px; flex: 1; }
+.toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.search { width: 220px; flex: 0 0 220px; }
 .summary { margin: 12px 0 10px; color: var(--text-tertiary); font-size: 12px; }
 .dirty { color: #d97706; font-weight: 600; }
 .clean { color: #16a34a; }

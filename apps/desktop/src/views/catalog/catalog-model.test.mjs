@@ -66,11 +66,30 @@ test("5 个模板全部能通过保存预检，且节点 ID 无重复", () => {
   assert.ok(standard.filter((n) => n.node_type === "VirtualOrg").every((n) => n.business_group_id));
 });
 
-test("新增子节点类型按父节点限制，与移动端 AddChildDialog 一致", () => {
+test("新增子节点类型按父节点限制，设备根下放开 215/216", () => {
   assert.deepEqual(allowedChildTypes(makeNode("r", "System", "系统", "r")), ["BusinessGroup", "VideoChannel", "AlarmChannel"]);
   assert.deepEqual(allowedChildTypes(makeNode("g", "BusinessGroup", "分组", "r")), ["VirtualOrg"]);
   assert.deepEqual(allowedChildTypes(makeNode("o", "VirtualOrg", "组织", "g")), ["VirtualOrg", "VideoChannel", "AlarmChannel"]);
+  assert.deepEqual(
+    allowedChildTypes(makeNode("d", "Device", "设备", "d")),
+    ["VideoChannel", "AlarmChannel", "BusinessGroup", "VirtualOrg"],
+    "设备根可直接建业务分组与虚拟组织，无需先套标准业务分组模板",
+  );
   assert.deepEqual(allowedChildTypes(null), ["VideoChannel", "AlarmChannel"]);
+});
+
+test("设备根下新增的 215/216 能通过草稿校验并保持父关系", () => {
+  const [root, ch1, alarm] = byId(CATALOG_TEMPLATES, "single").build(CTX);
+  const group = attachCatalogNode(makeNode(genChildId(CTX.domain, "BusinessGroup", 1), "BusinessGroup", "门禁", root.id), root);
+  const org = attachCatalogNode(makeNode(genChildId(CTX.domain, "VirtualOrg", 1), "VirtualOrg", "A 栋", root.id), root);
+  const nested = attachCatalogNode(makeNode(genChildId(CTX.domain, "VirtualOrg", 2), "VirtualOrg", "A 栋 1F", org.id), org);
+  const tree = [root, ch1, alarm, group, org, nested];
+  assert.equal(group.business_group_id, null, "215 挂设备根时不带 BusinessGroupID");
+  assert.equal(org.business_group_id, null, "216 挂设备根且无 215 时 BusinessGroupID 为空");
+  assert.deepEqual(validateDraft(tree), [], "设备根下的 215/216 结构应通过校验");
+  assert.equal(displayParent(org, tree), root.id);
+  assert.equal(displayParent(nested, tree), org.id);
+  assert.ok(collectDescendants(org.id, tree).has(nested.id));
 });
 
 test("canMove：根不可动、叶子不可作父、不可移入自身子树、按类型限制目标", () => {
@@ -202,12 +221,14 @@ test("JSON 导入拒绝非法输入", () => {
 test("Channels.vue 承载移动端对齐后的关键能力", async () => {
   const view = await readFile(new URL("../Channels.vue", import.meta.url), "utf8");
   for (const keyword of [
-    "目录搜索", "移动节点", "切换状态", "导入 JSON", "导出 JSON",
-    "当前通道名称", "克隆节点", "预览 NOTIFY", "复位到默认", "未保存", "批量新增",
+    "搜索名称", "移动节点", "切换状态", "导入 JSON", "导出 JSON",
+    "当前通道名称", "克隆节点", "预览 NOTIFY", "复位默认", "未保存", "批量新增",
     "保存*", "放弃修改", "标准业务分组", "解析预览",
   ]) {
     assert.ok(view.includes(keyword), `目录管理应包含「${keyword}」`);
   }
+  // 工具栏四项操作平铺，不再收进「更多」下拉。
+  assert.doesNotMatch(view, /n-dropdown|更多 ···/, "应用模板/导入/导出/复位应直接可见");
   assert.doesNotMatch(view, /page-header|最近平台查询/, "目录管理页不再展示顶部标题横条与平台查询卡片");
 });
 
