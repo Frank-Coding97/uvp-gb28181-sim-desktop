@@ -619,7 +619,7 @@ onUnmounted(() => {
 
       <!-- 左：配置面板 -->
       <aside class="config-col">
-        <div class="glass-card config-card">
+        <div class="glass-card config-card" :class="{ 'is-collapsed': running && configCollapsed }">
 
           <!-- 卡片头 + 折叠切换 -->
           <div class="card-head" @click="running && (configCollapsed = !configCollapsed)" :class="{ clickable: running }">
@@ -643,9 +643,10 @@ onUnmounted(() => {
             </div>
           </transition>
 
-          <!-- 完整配置表单 -->
-          <transition name="expand">
-            <div v-show="!running || !configCollapsed">
+          <!-- 完整配置表单（卡片内独立滚动，操作条始终可见） -->
+          <div class="config-scroll">
+            <transition name="expand">
+              <div v-show="!running || !configCollapsed">
               <!-- 快速预设 -->
               <div class="preset-row">
                 <span class="preset-label">快速预设</span>
@@ -731,19 +732,22 @@ onUnmounted(() => {
                   </div>
                 </div>
               </n-form>
-
-              <!-- 操作按钮 -->
-              <div class="action-row">
-                <n-button type="primary" size="large" style="flex:1" :loading="starting" :disabled="running || stopping || stopPending" @click="startStress">
-                  启动压测
-                </n-button>
-                <n-button type="error" secondary size="large" style="flex:1" :loading="stopPending" :disabled="!running || starting || stopping" @click="stopStress">
-                  停止压测
-                </n-button>
               </div>
-              <p class="action-hint">配置经后端语义校验 · 报告自动隐藏认证密码</p>
+            </transition>
+          </div>
+
+          <!-- 常驻操作条：贴在卡片底部，运行中收起配置也不消失 -->
+          <div class="action-bar">
+            <div class="action-row">
+              <n-button type="primary" size="large" style="flex:1" :loading="starting" :disabled="running || stopping || stopPending" @click="startStress">
+                启动压测
+              </n-button>
+              <n-button type="error" secondary size="large" style="flex:1" :loading="stopPending" :disabled="!running || starting || stopping" @click="stopStress">
+                停止压测
+              </n-button>
             </div>
-          </transition>
+            <p class="action-hint">配置经后端语义校验 · 报告自动隐藏认证密码</p>
+          </div>
         </div>
       </aside>
 
@@ -894,9 +898,12 @@ onUnmounted(() => {
 .workspace { display: grid; grid-template-columns: 320px minmax(0,1fr); gap: 12px; align-items: start; flex: 1; min-height: 0; overflow: hidden; }
 
 /* ── 配置面板 ── */
-.config-col { height: 100%; overflow-y: auto; overflow-x: hidden; }
-.config-card { padding: 14px 16px; }
-.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.config-col { display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; }
+.config-card { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 0; overflow: hidden; }
+.config-card.is-collapsed { flex: 0 0 auto; }
+/* 表单区独立滚动：卡片头与操作条固定在两端，启动按钮永远在视野内 */
+.config-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 16px 12px; }
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; padding: 14px 16px 0; }
 .card-head.clickable { cursor: pointer; user-select: none; }
 .card-head.clickable:hover .card-title { color: var(--accent); }
 .card-title { font-size: 13.5px; font-weight: 750; color: var(--text-primary); transition: color .15s; }
@@ -907,7 +914,7 @@ onUnmounted(() => {
 /* 折叠摘要 */
 .config-summary {
   display: flex; gap: 16px; flex-wrap: wrap;
-  padding: 8px 12px; margin-bottom: 12px;
+  margin: 0 16px 12px; padding: 8px 12px;
   background: rgba(56,132,255,.05); border-radius: var(--radius-sm);
   border: 1px solid rgba(56,132,255,.12);
   font-size: 12px; color: var(--text-secondary);
@@ -915,10 +922,10 @@ onUnmounted(() => {
 .config-summary b { color: var(--text-primary); font-weight: 700; }
 
 /* 快速预设 */
-.preset-row { display: flex; align-items: center; gap: 7px; margin-bottom: 12px; flex-wrap: wrap; }
-.preset-label { font-size: 11px; color: var(--text-tertiary); flex: 0 0 auto; }
+.preset-row { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.preset-label { font-size: 11px; color: var(--text-tertiary); flex: 0 0 100%; margin-bottom: 1px; }
 .preset-btn {
-  padding: 3px 12px; border-radius: 999px; border: 1px solid var(--border-default);
+  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border-default);
   background: rgba(255,255,255,.5); color: var(--text-secondary);
   font-size: 12px; font-weight: 600; cursor: pointer;
   transition: all .15s;
@@ -945,8 +952,9 @@ onUnmounted(() => {
 .rr-interval.disabled { opacity: .3; pointer-events: none; }
 .rr-interval span { font-size: 11px; color: var(--text-tertiary); }
 
-/* 操作行 */
-.action-row { display: flex; gap: 10px; margin-top: 16px; }
+/* 操作行（常驻条） */
+.action-bar { flex: 0 0 auto; padding: 10px 16px 12px; border-top: 1px solid var(--border-default); background: rgba(255,255,255,.42); }
+.action-row { display: flex; gap: 10px; }
 .action-hint { margin: 7px 0 0; font-size: 10.5px; color: var(--text-tertiary); text-align: center; }
 
 /* ── 监控列 ── */
@@ -1045,6 +1053,15 @@ onUnmounted(() => {
 @media (max-width: 980px) {
   .workspace { grid-template-columns: 1fr; overflow: visible; }
   .config-col, .monitor-col { height: auto; overflow: visible; }
+  /* 单列时表单不再内滚，操作条改为吸底，避免被长表单挤出屏幕 */
+  .config-scroll { overflow: visible; }
+  .config-card { overflow: visible; }
+  .action-bar {
+    position: sticky; bottom: 0; z-index: 3;
+    background: rgba(244, 249, 255, .95);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  }
   .metric-row { grid-template-columns: repeat(2,1fr); }
   .kpi-ring { grid-column: span 2; flex-direction: row; padding: 10px 14px; gap: 14px; justify-content: flex-start; align-items: center; }
   .kpi-sub { margin-top: 0; }
