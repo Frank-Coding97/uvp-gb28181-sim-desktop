@@ -197,86 +197,100 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
 
 <template>
   <div class="recording-page">
-    <header class="page-head">
-      <div>
-        <span class="eyebrow">LOCAL MEDIA ARCHIVE</span>
-        <h1>录像中心</h1>
-        <p>录制当前模拟设备的共享画面，并为国标检索、回放与下载提供真实文件。</p>
+    <main class="recording-card glass-card">
+      <div class="recording-head">
+        <div class="recording-head-copy">
+          <h1>录像中心</h1>
+        </div>
+        <div class="head-actions">
+          <n-button secondary :loading="loading" @click="refresh()"><template #icon><n-icon><RefreshOutline /></n-icon></template>刷新</n-button>
+          <n-button :type="isActive ? 'error' : 'primary'" :loading="actionBusy" :disabled="!isActive && !canStart" @click="toggleRecording">
+            <template #icon><n-icon><StopCircleOutline v-if="isActive" /><VideocamOutline v-else /></n-icon></template>
+            {{ isActive ? "停止录像" : "开始录像" }}
+          </n-button>
+        </div>
       </div>
-      <div class="head-actions">
-        <n-button secondary :loading="loading" @click="refresh()"><template #icon><n-icon><RefreshOutline /></n-icon></template>刷新</n-button>
-        <n-button :type="isActive ? 'error' : 'primary'" :loading="actionBusy" :disabled="!isActive && !canStart" @click="toggleRecording">
-          <template #icon><n-icon><StopCircleOutline v-if="isActive" /><VideocamOutline v-else /></n-icon></template>
-          {{ isActive ? "停止录像" : "开始录像" }}
-        </n-button>
+
+      <div class="recording-body">
+        <p class="recording-note">录制当前模拟设备的共享画面，并为国标检索、回放与下载提供真实文件。</p>
+
+        <section class="status-strip">
+          <div><small>录像状态</small><strong :class="`phase-${state.phase}`"><i />{{ phaseText[state.phase] }}</strong></div>
+          <div><small>设备采集</small><strong>{{ deviceLive ? "设备运行中" : "设备未启动" }}</strong></div>
+          <div><small>已完成录像</small><strong>{{ filtered.length === recordings.length ? `${recordings.length} 段` : `${filtered.length} / ${recordings.length} 段` }}</strong></div>
+          <div class="status-error"><small>最近错误</small><strong>{{ state.error || "无" }}</strong></div>
+        </section>
+
+        <div class="workspace">
+          <section class="library-panel">
+            <div class="toolbar">
+              <n-input v-model:value="keyword" clearable placeholder="搜索通道、文件或 ID" />
+              <n-select v-model:value="kind" :options="kindOptions" />
+              <n-select v-model:value="rangeKey" :options="rangeOptions" />
+            </div>
+            <div v-if="rangeKey === 'custom'" class="custom-range">
+              <label><span>开始</span><input v-model="customFrom" type="datetime-local" /></label>
+              <label><span>结束</span><input v-model="customTo" type="datetime-local" /></label>
+              <small>按时间窗重叠筛选：跨夜录像会在覆盖到的每一天都出现。</small>
+            </div>
+            <div v-if="filtered.length" class="recording-list">
+              <article v-for="entry in filtered" :key="entry.id" class="recording-row" :class="{ selected: selected?.id === entry.id }" @click="selected = entry">
+                <div class="recording-thumb" :title="thumbErrors[entry.id] || entry.path">
+                  <img v-if="thumbs[entry.id]" :src="thumbs[entry.id]!" :alt="`录像 ${entry.start_time} 缩略图`" loading="lazy" />
+                  <n-icon v-else :size="16" :class="{ failed: !!thumbErrors[entry.id] }"><CalendarOutline v-if="thumbErrors[entry.id]" /><VideocamOutline v-else /></n-icon>
+                </div>
+                <button class="play-button" type="button" title="本地播放" @click.stop="selected = entry"><n-icon><PlayCircleOutline /></n-icon></button>
+                <div class="recording-main">
+                  <div><strong>{{ entry.start_time }}</strong><n-tag size="small" :bordered="false">{{ kindText[entry.kind] }}</n-tag><n-tag size="small" :bordered="false" type="info">{{ entry.source === "platform" ? "平台触发" : "本地触发" }}</n-tag></div>
+                  <small>{{ entry.channel_id }} · {{ entry.path }}</small>
+                </div>
+                <div class="recording-meta"><strong>{{ formatBytes(entry.size_bytes) }}</strong><small>{{ formatDuration(durationSeconds(entry)) }} · 至 {{ entry.end_time }}</small></div>
+                <n-popconfirm positive-text="删除" negative-text="取消" @positive-click="remove(entry)">
+                  <template #trigger><n-button quaternary circle type="error" @click.stop><template #icon><n-icon><TrashOutline /></n-icon></template></n-button></template>
+                  确定删除该录像文件与索引吗？
+                </n-popconfirm>
+              </article>
+            </div>
+            <n-empty v-else class="empty" description="暂无符合条件的完成录像" />
+          </section>
+
+          <aside class="player-panel">
+            <template v-if="selected">
+              <div class="player-title"><div><small>LOCAL PLAYBACK</small><h2>{{ selected.start_time }}</h2></div><n-tag>{{ kindText[selected.kind] }}</n-tag></div>
+              <video :key="selected.id" controls preload="metadata" :src="selectedUrl" />
+              <dl><dt>通道</dt><dd>{{ selected.channel_id }}</dd><dt>时间范围</dt><dd>{{ selected.start_time }} — {{ selected.end_time }}</dd><dt>时长</dt><dd>{{ formatDuration(durationSeconds(selected)) }}</dd><dt>文件</dt><dd>{{ selected.path }}</dd></dl>
+            </template>
+            <n-empty v-else class="player-empty" description="选择一段录像进行本地播放" />
+          </aside>
+        </div>
       </div>
-    </header>
-
-    <section class="status-strip">
-      <div><small>录像状态</small><strong :class="`phase-${state.phase}`"><i />{{ phaseText[state.phase] }}</strong></div>
-      <div><small>设备采集</small><strong>{{ deviceLive ? "设备运行中" : "设备未启动" }}</strong></div>
-      <div><small>已完成录像</small><strong>{{ filtered.length === recordings.length ? `${recordings.length} 段` : `${filtered.length} / ${recordings.length} 段` }}</strong></div>
-      <div class="status-error"><small>最近错误</small><strong>{{ state.error || "无" }}</strong></div>
-    </section>
-
-    <div class="workspace">
-      <section class="library-panel">
-        <div class="toolbar">
-          <n-input v-model:value="keyword" clearable placeholder="搜索通道、文件或 ID" />
-          <n-select v-model:value="kind" :options="kindOptions" />
-          <n-select v-model:value="rangeKey" :options="rangeOptions" />
-        </div>
-        <div v-if="rangeKey === 'custom'" class="custom-range">
-          <label><span>开始</span><input v-model="customFrom" type="datetime-local" /></label>
-          <label><span>结束</span><input v-model="customTo" type="datetime-local" /></label>
-          <small>按时间窗重叠筛选：跨夜录像会在覆盖到的每一天都出现。</small>
-        </div>
-        <div v-if="filtered.length" class="recording-list">
-          <article v-for="entry in filtered" :key="entry.id" class="recording-row" :class="{ selected: selected?.id === entry.id }" @click="selected = entry">
-            <div class="recording-thumb" :title="thumbErrors[entry.id] || entry.path">
-              <img v-if="thumbs[entry.id]" :src="thumbs[entry.id]!" :alt="`录像 ${entry.start_time} 缩略图`" loading="lazy" />
-              <n-icon v-else :size="16" :class="{ failed: !!thumbErrors[entry.id] }"><CalendarOutline v-if="thumbErrors[entry.id]" /><VideocamOutline v-else /></n-icon>
-            </div>
-            <button class="play-button" type="button" title="本地播放" @click.stop="selected = entry"><n-icon><PlayCircleOutline /></n-icon></button>
-            <div class="recording-main">
-              <div><strong>{{ entry.start_time }}</strong><n-tag size="small" :bordered="false">{{ kindText[entry.kind] }}</n-tag><n-tag size="small" :bordered="false" type="info">{{ entry.source === "platform" ? "平台触发" : "本地触发" }}</n-tag></div>
-              <small>{{ entry.channel_id }} · {{ entry.path }}</small>
-            </div>
-            <div class="recording-meta"><strong>{{ formatBytes(entry.size_bytes) }}</strong><small>{{ formatDuration(durationSeconds(entry)) }} · 至 {{ entry.end_time }}</small></div>
-            <n-popconfirm positive-text="删除" negative-text="取消" @positive-click="remove(entry)">
-              <template #trigger><n-button quaternary circle type="error" @click.stop><template #icon><n-icon><TrashOutline /></n-icon></template></n-button></template>
-              确定删除该录像文件与索引吗？
-            </n-popconfirm>
-          </article>
-        </div>
-        <n-empty v-else class="empty" description="暂无符合条件的完成录像" />
-      </section>
-
-      <aside class="player-panel">
-        <template v-if="selected">
-          <div class="player-title"><div><small>LOCAL PLAYBACK</small><h2>{{ selected.start_time }}</h2></div><n-tag>{{ kindText[selected.kind] }}</n-tag></div>
-          <video :key="selected.id" controls preload="metadata" :src="selectedUrl" />
-          <dl><dt>通道</dt><dd>{{ selected.channel_id }}</dd><dt>时间范围</dt><dd>{{ selected.start_time }} — {{ selected.end_time }}</dd><dt>时长</dt><dd>{{ formatDuration(durationSeconds(selected)) }}</dd><dt>文件</dt><dd>{{ selected.path }}</dd></dl>
-        </template>
-        <n-empty v-else class="player-empty" description="选择一段录像进行本地播放" />
-      </aside>
-    </div>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.recording-page { flex: 1; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 12px; }
-.page-head { display: flex; align-items: end; justify-content: space-between; gap: 20px; }
-.eyebrow, .player-title small { color: var(--accent); font: 650 10px/1.2 "SF Mono", monospace; letter-spacing: .14em; }
-h1 { margin: 4px 0 2px; color: var(--text-primary); font-size: 25px; } h2 { margin: 4px 0 0; font-size: 15px; }
-.page-head p { margin: 0; color: var(--text-secondary); } .head-actions { display: flex; gap: 8px; }
-.status-strip { display: grid; grid-template-columns: .8fr 1fr .8fr 2fr; border: 1px solid var(--border-default); border-radius: 12px; background: rgba(255,255,255,.58); }
+/* 与设置页 / 校时页同口径：外层只把可用高度传给主卡片，滚动下沉到卡片内部，
+   卡片始终留在视口内，四角圆角在任意滚动位置都保留；冻结头部是卡片头部而非独立横条。 */
+.recording-page { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding-bottom: 16px; box-sizing: border-box; }
+.recording-card { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; padding: 0; }
+.recording-head { position: sticky; top: 0; z-index: 5; flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px 15px; border-bottom: 1px solid var(--border-default); border-radius: var(--radius-lg) var(--radius-lg) 0 0; background: color-mix(in srgb, #fff 50%, var(--bg-base)); box-shadow: none; }
+.recording-head-copy { min-width: 0; }
+.player-title small { color: var(--accent); font: 650 10px/1.2 "SF Mono", monospace; letter-spacing: .14em; }
+h1 { margin: 0; color: var(--text-primary); font-size: 16px; } h2 { margin: 4px 0 0; font-size: 15px; }
+.head-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.recording-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.recording-note { margin: 0; padding: 10px 16px 8px; color: var(--text-secondary); font-size: 12px; }
+/* 状态条不再是独立圆角块，改为卡片内的一行状态摘要，靠底部分隔线区分。 */
+.status-strip { display: grid; grid-template-columns: .8fr 1fr .8fr 2fr; border-bottom: 1px solid var(--border-default); background: transparent; }
 .status-strip > div { min-width: 0; padding: 11px 16px; border-right: 1px solid var(--border-subtle); } .status-strip > div:last-child { border: 0; }
 .status-strip small { display: block; color: var(--text-tertiary); font-size: 10px; } .status-strip strong { display: flex; align-items: center; gap: 7px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-strip i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); } .phase-recording i { background: var(--error); box-shadow: 0 0 0 4px rgba(208,48,80,.1); } .phase-failed { color: var(--error); }
-.workspace { min-height: 0; display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(340px, .75fr); gap: 12px; }
-.library-panel, .player-panel { min-height: 0; overflow: hidden; border: 1px solid var(--border-default); border-radius: 14px; background: rgba(255,255,255,.58); }
-.library-panel { display: flex; flex-direction: column; } .toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 130px 130px; gap: 8px; padding: 12px; border-bottom: 1px solid var(--border-subtle); }
+/* 左右两块也不再各自套独立卡片：去掉边框/圆角/白底，仅用一条竖向分隔线分区，
+   整页视觉上是一张主卡片，列表行与播放器自身仍保留交互反馈。 */
+.workspace { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(340px, .75fr); gap: 12px; padding: 12px 16px 16px; }
+.library-panel, .player-panel { min-height: 0; display: flex; flex-direction: column; }
+.library-panel { overflow: hidden; padding-right: 12px; border-right: 1px solid var(--border-subtle); }
+.toolbar { display: grid; grid-template-columns: minmax(0, 1fr) 130px 130px; gap: 8px; padding: 0 0 12px; border-bottom: 1px solid var(--border-subtle); }
 .custom-range { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border-subtle); background: rgba(56,132,255,.04); }
 .custom-range label { display: grid; gap: 3px; font-size: 10px; color: var(--text-tertiary); }
 .custom-range input { padding: 5px 8px; border: 1px solid var(--border-default); border-radius: 7px; background: white; color: var(--text-primary); font: inherit; font-size: 11px; }
@@ -288,7 +302,17 @@ h1 { margin: 4px 0 2px; color: var(--text-primary); font-size: 25px; } h2 { marg
 .recording-row:hover, .recording-row.selected { border-color: rgba(56,132,255,.3); background: var(--accent-soft); } .play-button { display: grid; place-items: center; width: 34px; height: 34px; border: 0; border-radius: 50%; color: var(--accent); background: white; font-size: 23px; cursor: pointer; }
 .recording-main { min-width: 0; } .recording-main > div { display: flex; align-items: center; gap: 6px; } .recording-main small { display: block; margin-top: 5px; overflow: hidden; color: var(--text-tertiary); text-overflow: ellipsis; white-space: nowrap; }
 .recording-meta { text-align: right; } .recording-meta small { display: block; margin-top: 4px; color: var(--text-tertiary); font-size: 10px; }
-.player-panel { padding: 14px; overflow: auto; } .player-title { display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px; } video { width: 100%; min-height: 220px; border-radius: 10px; background: #07111f; }
+.player-panel { padding-left: 12px; overflow: auto; } .player-title { display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px; } video { width: 100%; min-height: 220px; border-radius: 10px; background: #07111f; }
 dl { display: grid; grid-template-columns: 72px minmax(0,1fr); gap: 8px 12px; margin: 14px 0 0; font-size: 11px; } dt { color: var(--text-tertiary); } dd { margin: 0; overflow-wrap: anywhere; color: var(--text-secondary); }
-.empty, .player-empty { align-self: center; margin: auto; } @media (max-width: 1000px) { .workspace { grid-template-columns: 1fr; overflow: auto; } .player-panel { min-height: 360px; } .status-strip { grid-template-columns: repeat(2,1fr); } }
+.empty, .player-empty { align-self: center; margin: auto; }
+/* 窄视口改单列：body 不再被 flex 压缩，内容自然撑高后由主卡片统一滚动，
+   冻结头部与四角圆角因此始终常驻；列表给最小高度，避免被播放器挤成一条。 */
+@media (max-width: 1000px) {
+  .recording-body { flex: 0 0 auto; }
+  .workspace { flex: 0 0 auto; min-height: auto; grid-template-columns: 1fr; overflow: visible; }
+  .library-panel { min-height: 320px; padding-right: 0; padding-bottom: 12px; border-right: 0; border-bottom: 1px solid var(--border-subtle); }
+  .player-panel { min-height: 360px; padding-left: 0; overflow: visible; }
+  .status-strip { grid-template-columns: repeat(2,1fr); }
+}
+@media (max-width: 680px) { .recording-head { align-items: flex-start; flex-direction: column; } }
 </style>
