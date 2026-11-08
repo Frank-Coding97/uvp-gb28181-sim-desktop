@@ -22,6 +22,18 @@ assert.match(
   "媒体页提示应说明生效时机和运行中修改约束",
 );
 
+// ── 紧凑布局适用范围 ─────────────────────────────────────────────────────
+// 回归背景：「隐藏共用页头 + 冻结标题行」从媒体页、设备页扩到 OSD 水印、网络配置后，
+// 四个可编辑设置页已全覆盖，唯一例外是关于页。从页签清单机检范围，避免条件与清单脱节。
+const settingsBlock = source.match(/const settings = \[([\s\S]*?)\];/)?.[1] ?? "";
+const settingKeys = [...settingsBlock.matchAll(/key:\s*"([a-z]+)"/g)].map((match) => match[1]);
+assert.deepEqual(settingKeys, ["device", "media", "osd", "network", "about"], "设置页签应固定为五个区域");
+assert.match(
+  source,
+  /const editableSection = computed\(\(\) => activeKey\.value !== "about"\);/,
+  "可编辑区域须恰好排除关于页，紧凑布局才能覆盖四个参数页",
+);
+
 // ── 保存入口固定在标题行最右侧 ───────────────────────────────────────────
 const headingStart = source.indexOf('<div v-if="editableSection" class="content-heading"');
 const headingEnd = source.indexOf('<div v-if="feedback"');
@@ -31,8 +43,8 @@ const contentHeading = headingStart >= 0 && headingEnd > headingStart
 assert.ok(contentHeading, "应能定位到「模拟器有效配置」标题行");
 assert.match(
   contentHeading,
-  /sticky: activeKey === 'media' \|\| activeKey === 'device'/,
-  "媒体页与设备配置页标题行启用冻结，其余设置页保持原布局",
+  /sticky: editableSection/,
+  "四个可编辑设置页（含 OSD 水印、网络配置）标题行全部冻结，关于页无标题行",
 );
 const mediaActions = contentHeading.match(/<div v-else class="content-actions">[\s\S]*?<\/div>/)?.[0] ?? "";
 assert.ok(mediaActions, "标题行右侧应有媒体页专属操作区");
@@ -43,14 +55,15 @@ assert.match(
   "上移后保存按钮仍须保留锁定、配置与脏值三重禁用条件",
 );
 
-// ── 设备配置页沿用同一套冻结标题行 ───────────────────────────────────────
-// 回归背景：媒体页先做了「卡片内滚动 + 标题行冻结」，设备页当时未加 sticky，
-// 滚动后「恢复全部默认 / 保存有效设置」随内容一起滚走；现两页共用同一套头部样式。
-const deviceActions = contentHeading.match(/<div v-if="activeKey !== 'media'" class="content-actions">[\s\S]*?<\/div>/)?.[0] ?? "";
-assert.ok(deviceActions, "设备配置页应保留全量操作栏");
-assert.match(deviceActions, />恢复全部默认<\/button>/, "恢复默认按钮须随冻结标题行常驻");
-assert.match(deviceActions, />保存有效设置<\/button>/, "设备配置页保存按钮须随冻结标题行常驻");
-assert.match(deviceActions, /:disabled="locked \|\| !config"/, "设备配置页保存按钮禁用条件不得改动");
+// ── 四个参数页共用全量操作栏 ─────────────────────────────────────────────
+// 回归背景：媒体页先做了「卡片内滚动 + 标题行冻结」，设备 / OSD / 网络页当时未加 sticky，
+// 滚动后「恢复默认 / 保存有效设置」随内容一起滚走；现四页共用同一套冻结头部。
+const sharedActions = contentHeading.match(/<div v-if="activeKey !== 'media'" class="content-actions">[\s\S]*?<\/div>/)?.[0] ?? "";
+assert.ok(sharedActions, "设备 / OSD / 网络页应保留全量操作栏");
+assert.match(sharedActions, /activeKey === 'osd'[\s\S]*?>恢复 OSD 默认<\/button>/, "OSD 水印页恢复默认按钮须随冻结标题行常驻");
+assert.match(sharedActions, /<button v-else class="btn ghost"[\s\S]*?>恢复全部默认<\/button>/, "设备 / 网络页恢复默认按钮须随冻结标题行常驻");
+assert.match(sharedActions, />保存有效设置<\/button>/, "设备 / OSD / 网络页保存按钮须随冻结标题行常驻");
+assert.match(sharedActions, /:disabled="locked \|\| !config"/, "全量保存按钮禁用条件不得改动");
 
 // ── 标题行冻结 ───────────────────────────────────────────────────────────
 const stickyRule = source.match(/^\.content-heading\.sticky \{([^}]*)\}/m)?.[1] ?? "";
@@ -89,12 +102,14 @@ assert.match(pageStyles, /min-height:\s*0;/, "滚动容器需允许被父级 fle
 assert.match(pageStyles, /padding-bottom:\s*16px;/, "卡片底部需留出呼吸空间");
 
 // ── 共用页头显隐 ─────────────────────────────────────────────────────────
-// 回归背景：媒体页与设备配置页内容顶部都已有「模拟器有效配置」小节标题，
-// 共用页头（主标题 / 副标题 / 平台摘要 / 锁定徽标）重复且挤占首屏，两页一并隐藏。
+// 回归背景：四个可编辑设置页内容顶部都已有「模拟器有效配置」小节标题，
+// 共用页头（主标题 / 副标题 / 平台摘要 / 锁定徽标）重复且挤占首屏，四页一并隐藏；
+// 关于页保留页头与锁定徽标，避免把版本信息页的状态提示一起删掉。
 const headerTag = source.match(/<div[^>]*class="settings-header"[^>]*>/)?.[0] ?? "";
 assert.match(
   headerTag,
-  /v-if="activeKey !== 'media' && activeKey !== 'device'"/,
-  "媒体页与设备配置页应隐藏共用页头，其余设置页保留",
+  /v-if="!editableSection"/,
+  "四个可编辑设置页（含 OSD 水印、网络配置）应隐藏共用页头，仅关于页保留",
 );
-assert.match(source, /class="lock-badge"/, "其余设置页的锁定状态徽标不得一并删除");
+assert.match(source, /class="lock-badge"/, "关于页的锁定状态徽标不得一并删除");
+assert.match(source, /class="settings-section about-section"/, "关于页内容区仍须存在");
