@@ -166,6 +166,31 @@
 
 ## 界面一览
 
+<!--
+应用截图区（素材到位后用下面这段替换本注释，图片统一放 docs/screenshots/）。
+命名用小写英文 + 连字符；宽屏截图建议压到 1600px 宽 / 500KB 以内，避免仓库膨胀；
+截图里的平台 IP、设备编号、认证口令需先脱敏。
+
+<a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="首页：运行状态总览与平台连接" width="100%"/></a>
+
+<table>
+<tr>
+<td align="center" width="50%"><b>模拟器中心</b><br/><a href="docs/screenshots/simulator-center.png"><img src="docs/screenshots/simulator-center.png" alt="模拟器中心" width="100%"/></a></td>
+<td align="center" width="50%"><b>压力测试</b><br/><a href="docs/screenshots/stress-test.png"><img src="docs/screenshots/stress-test.png" alt="压力测试：场景编排与实时指标" width="100%"/></a></td>
+</tr>
+<tr>
+<td align="center"><b>目录管理</b><br/><a href="docs/screenshots/catalog.png"><img src="docs/screenshots/catalog.png" alt="目录管理" width="100%"/></a></td>
+<td align="center"><b>设备配置</b><br/><a href="docs/screenshots/device-settings.png"><img src="docs/screenshots/device-settings.png" alt="设备配置" width="100%"/></a></td>
+</tr>
+<tr>
+<td align="center"><b>SIP 信令追踪</b><br/><a href="docs/screenshots/sip-trace.png"><img src="docs/screenshots/sip-trace.png" alt="SIP 信令追踪与日志" width="100%"/></a></td>
+<td align="center"><b>录像中心</b><br/><a href="docs/screenshots/recordings.png"><img src="docs/screenshots/recordings.png" alt="录像中心" width="100%"/></a></td>
+</tr>
+</table>
+
+> 截图取自开发环境，图中设备编码、IP 地址与口令均已脱敏。点击图片可查看原图。
+-->
+
 | 菜单 | 用途 |
 | --- | --- |
 | 首页 | 运行状态总览、平台连接状态、本地预览入口 |
@@ -355,6 +380,7 @@ uvp-gb28181-sim-desktop/
 │   ├── scenario/           # 压测场景模型与解析（TOML）
 │   └── stress-engine/      # 压测调度 + 指标采集 + 对外服务
 ├── scripts/                # FFmpeg 能力检查、macOS 运行时内嵌、版本号单源化
+├── docs/screenshots/       # 应用截图（README「界面一览」引用）
 ├── assets/media/           # 测试码流
 ├── examples/scenarios/     # 示例压测场景（linear.toml）
 └── .github/workflows/      # CI：Rust 质量门 + 三平台构建 + tag 发布
