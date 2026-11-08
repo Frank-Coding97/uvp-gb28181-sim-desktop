@@ -207,8 +207,11 @@ function updateTps(succeeded: number) {
   tpsSamples.push({ t: now, n: succeeded });
   tpsSamples = tpsSamples.filter((s) => now - s.t < 10_000);
   if (tpsSamples.length >= 2) {
-    const dt = (tpsSamples.at(-1)!.t - tpsSamples[0].t) / 1000;
-    const dn = tpsSamples.at(-1)!.n - tpsSamples[0].n;
+    // 不用 Array.prototype.at：tsconfig 的 lib 是 ES2021，声明里没有 at()。
+    const first = tpsSamples[0];
+    const last = tpsSamples[tpsSamples.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    const dn = last.n - first.n;
     tps.value = dt > 0 ? Math.round(dn / dt) : 0;
   }
 }
