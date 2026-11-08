@@ -13,6 +13,8 @@ apps/desktop/.vite/
 # ---- Tauri ----
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
+# 打包脚本把 ffmpeg/ffprobe 暂存到这里再作为资源内嵌（单文件 200MB+，绝不入库）。
+apps/desktop/runtime/
 
 # ---- 本地开发临时目录（cl.exe 临时目录 / WebView2 数据目录）----
 /.tmp

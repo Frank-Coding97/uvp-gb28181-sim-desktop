@@ -71,6 +71,10 @@ pub fn ffmpeg_bin() -> Option<String> {
                 bundled.push(dir.join("resources").join(name));
                 bundled.push(dir.join("../resources").join(name));
                 bundled.push(dir.join("../Resources").join(name));
+                // Windows 安装包内嵌布局：Tauri 打包保留相对路径，
+                // `bundle.resources` 的 `runtime/ffmpeg/*` 落在 `resources/runtime/ffmpeg/`。
+                bundled.push(dir.join("resources").join("runtime").join("ffmpeg").join(name));
+                bundled.push(dir.join("runtime").join("ffmpeg").join(name));
             }
         }
     }
@@ -148,6 +152,10 @@ pub fn ffprobe_bin() -> Option<String> {
                 bundled.push(dir.join("resources").join(name));
                 bundled.push(dir.join("../resources").join(name));
                 bundled.push(dir.join("../Resources").join(name));
+                // Windows 安装包内嵌布局：Tauri 打包保留相对路径，
+                // `bundle.resources` 的 `runtime/ffmpeg/*` 落在 `resources/runtime/ffmpeg/`。
+                bundled.push(dir.join("resources").join("runtime").join("ffmpeg").join(name));
+                bundled.push(dir.join("runtime").join("ffmpeg").join(name));
             }
         }
     }
