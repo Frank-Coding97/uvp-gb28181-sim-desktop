@@ -40,11 +40,43 @@ const headingEnd = source.indexOf('<div v-if="feedback"');
 const contentHeading = headingStart >= 0 && headingEnd > headingStart
   ? source.slice(headingStart, headingEnd)
   : "";
-assert.ok(contentHeading, "应能定位到「模拟器有效配置」标题行");
+assert.ok(contentHeading, "应能定位到冻结的标题行");
 assert.match(
   contentHeading,
   /sticky: editableSection/,
   "四个可编辑设置页（含 OSD 水印、网络配置）标题行全部冻结，关于页无标题行",
+);
+
+// ── 冻结头部按页签显示对应名称 ───────────────────────────────────────────
+// 回归背景：四个可编辑设置页原先共用硬编码「模拟器有效配置」，隐藏共用页头后
+// 这行成了唯一的页签标识，用户无法分辨当前在哪个配置页。现改为渲染
+// activeSetting.title，与左侧导航 label 逐项同名；新增页签时若忘记配名称立即失败。
+const contextText = contentHeading.match(/<div class="content-context">([^<]*<span[^>]*>[^<]*<\/span>)?[^<]*<\/div>/)?.[0] ?? "";
+assert.match(contextText, /\{\{ activeSetting\.icon \}\}/, "标题行须保留页签图标");
+assert.match(contextText, /\{\{ activeSetting\.title \}\}/, "标题行须按当前页签渲染对应名称");
+assert.doesNotMatch(contextText, /模拟器有效配置/, "不得再出现四页共用的硬编码通用标题");
+assert.doesNotMatch(source, />模拟器有效配置</, "模板中不得残留旧的通用标题文本");
+assert.match(
+  source,
+  /const activeSetting = computed\(\(\) => settings\.find\(\(item\) => item\.key === activeKey\.value\)!\);/,
+  "页签名称须取自 settings 清单，不能另建一套映射",
+);
+const settingTitles = [...settingsBlock.matchAll(/key:\s*"([a-z]+)"[^}]*?title:\s*"([^"]+)"/g)]
+  .map((match) => [match[1], match[2]]);
+assert.deepEqual(settingTitles, [
+  ["device", "设备配置"],
+  ["media", "音视频配置"],
+  ["osd", "OSD 水印"],
+  ["network", "网络配置"],
+  ["about", "关于"],
+], "五个页签的 key 与名称须一一对应且保持既有文案");
+const appSource = await readFile(new URL("../App.vue", import.meta.url), "utf8");
+const navLabels = [...appSource.matchAll(/\{ label: "([^"]+)",\s*key: "\/([a-z-]+)-settings"/g)]
+  .map((match) => [match[2], match[1]]);
+assert.deepEqual(
+  settingTitles.filter(([key]) => key !== "about"),
+  navLabels,
+  "四个可编辑设置页的标题须与左侧导航名称逐项一致",
 );
 const mediaActions = contentHeading.match(/<div v-else class="content-actions">[\s\S]*?<\/div>/)?.[0] ?? "";
 assert.ok(mediaActions, "标题行右侧应有媒体页专属操作区");
@@ -102,7 +134,7 @@ assert.match(pageStyles, /min-height:\s*0;/, "滚动容器需允许被父级 fle
 assert.match(pageStyles, /padding-bottom:\s*16px;/, "卡片底部需留出呼吸空间");
 
 // ── 共用页头显隐 ─────────────────────────────────────────────────────────
-// 回归背景：四个可编辑设置页内容顶部都已有「模拟器有效配置」小节标题，
+// 回归背景：四个可编辑设置页内容顶部都已有带页签名称的冻结标题行，
 // 共用页头（主标题 / 副标题 / 平台摘要 / 锁定徽标）重复且挤占首屏，四页一并隐藏；
 // 关于页保留页头与锁定徽标，避免把版本信息页的状态提示一起删掉。
 const headerTag = source.match(/<div[^>]*class="settings-header"[^>]*>/)?.[0] ?? "";

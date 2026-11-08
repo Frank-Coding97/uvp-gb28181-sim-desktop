@@ -521,7 +521,7 @@ function setBindMode(mode: BindMode) {
 
     <main class="settings-main glass-card">
         <div v-if="editableSection" class="content-heading" :class="{ sticky: editableSection }">
-          <div class="content-context"><span class="content-icon">{{ activeSetting.icon }}</span>模拟器有效配置</div>
+          <div class="content-context"><span class="content-icon">{{ activeSetting.icon }}</span>{{ activeSetting.title }}</div>
           <div v-if="activeKey !== 'media'" class="content-actions">
             <button v-if="activeKey === 'osd'" class="btn ghost" type="button" :disabled="locked" @click="resetOsdDraft">恢复 OSD 默认</button>
             <button v-else class="btn ghost" type="button" :disabled="locked" @click="resetCurrent">恢复全部默认</button>
