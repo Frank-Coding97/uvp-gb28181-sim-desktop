@@ -49,7 +49,7 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "resources/builtin-sample.mp4"
+      "resources/builtin-camera.mp4"
     ]
   }
 }

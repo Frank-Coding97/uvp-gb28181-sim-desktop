@@ -637,13 +637,13 @@ fn resolve_writable_dir(
     Err(format!("没有可写的应用数据目录：{}", failures.join("; ")))
 }
 
-/// 内置演示视频（`resources/builtin-sample.mp4`）在运行期的绝对路径。
+/// 内置演示视频（`resources/builtin-camera.mp4`）在运行期的绝对路径。
 ///
 /// 发布包通过 `bundle.resources` 把它放到资源目录；`tauri dev` 下资源目录可能指到
 /// `target/debug`，未必已经复制，所以再回退到源码树里的同一份文件。找不到返回
 /// `None`，由调用方退回「未配置媒体源」的旧行为——内置素材不能变成启动硬依赖。
 fn resolve_builtin_video(app: &AppHandle) -> Option<std::path::PathBuf> {
-    const FILE_NAME: &str = "builtin-sample.mp4";
+    const FILE_NAME: &str = "builtin-camera.mp4";
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(dir) = app.path().resource_dir() {
         candidates.push(dir.join("resources").join(FILE_NAME));
