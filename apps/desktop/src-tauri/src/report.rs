@@ -930,6 +930,34 @@ mod tests {
         }
     }
 
+    /// 与真实运行同源的场景:走 lib 的 `scenario_report_rows`,保证样例和线上一致。
+    fn sample_scenario() -> scenario::LinearScenario {
+        scenario::LinearScenario::from_toml_str(
+            r#"
+base_device_id = "34020000001320000001"
+password = "***"
+server_host = "192.168.1.10"
+server_port = 5060
+server_domain = "3402000000"
+transport = "TCP"
+heartbeat_interval_secs = 60
+channels_per_device = 2
+media_profile = "B"
+video_fps = 25
+bitrate_kbps = 512
+active_ratio = 0.3
+ramp_per_second = 50
+
+[device_info]
+device_name = "压测设备"
+manufacturer = "UVP"
+model = "SIM-1000"
+firmware = "1.0.0"
+"#,
+        )
+        .expect("样例场景 TOML 应可解析")
+    }
+
     fn record() -> RunRecord {
         let metrics = sample_snapshot(1000, 997);
         RunRecord {
@@ -938,10 +966,7 @@ mod tests {
             device_count: 1000,
             target: "192.168.1.10:5060 · TCP".into(),
             gb_version: "GB/T 28181-2022".into(),
-            scenario_rows: vec![
-                ("设备名称".into(), "压测设备".into()),
-                ("注册密码".into(), "已隐藏".into()),
-            ],
+            scenario_rows: crate::scenario_report_rows(&sample_scenario()),
             scenario_toml_redacted: "password = \"***\"\n".into(),
             samples: vec![
                 Sample {
@@ -992,6 +1017,16 @@ mod tests {
         assert!(html.contains("<svg"), "应包含内联 SVG 图表");
         assert!(!html.contains("secret"), "报告不得出现明文密码");
         assert!(html.contains("password = &quot;***&quot;"), "TOML 需转义并脱敏");
+    }
+
+    #[test]
+    fn 参数表含速率与推流占比() {
+        let html = render_html(&record());
+        assert!(html.contains("爬坡速率"), "应展示设备拉起速率");
+        assert!(html.contains("50 台 / 秒"), "速率需带单位");
+        assert!(html.contains("真实推流占比"), "应展示真推流设备占比");
+        assert!(html.contains("30%"), "占比需换算成百分比");
+        assert!(html.contains("已隐藏"), "密码必须脱敏");
     }
 
     #[test]
