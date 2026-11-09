@@ -98,7 +98,9 @@ $BundleConfigJson = @{
 
 try {
   Push-Location $DesktopDir
-  npm run tauri build -- --bundles nsis,msi --config $BundleConfig
+  # ⛔ `nsis,msi` 必须加引号：PowerShell 会把裸写法的逗号当数组分隔符，
+  #    展开成两个参数传给 cargo，报 "unexpected argument 'nsis msi'"。
+  npm run tauri build -- --bundles 'nsis,msi' --config $BundleConfig
   # ⛔ 原生命令失败不会让 PowerShell 抛异常（$ErrorActionPreference 管不到），
   #    必须自己看退出码，否则「构建失败」会被后面的「已生成」误报成成功。
   if ($LASTEXITCODE -ne 0) {
