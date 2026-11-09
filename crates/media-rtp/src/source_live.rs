@@ -3413,18 +3413,20 @@ impl LiveSource {
             hardware = profile.encoder.is_hardware(),
             "屏幕采集视频编码器"
         );
-        let monitor = windows_screen::resolve(display_id)?;
-        let display_id = monitor.display_id;
+        let target = windows_screen::resolve(display_id)?;
+        let display_id = target.monitor.display_id;
+        let output_idx = target.output_idx;
         let audio_codec = profile.audio_codec;
         let fps = profile.video_fps;
         let osd_burn_in = osd.and_then(|overlay| crate::osd::OsdBurnIn::resolve(&ffmpeg, overlay));
         let mut screen_args =
-            windows_screen::command_args(&monitor, &profile, osd_burn_in.as_ref());
+            windows_screen::command_args(&target, &profile, osd_burn_in.as_ref());
         tracing::info!(
             display_id,
-            output_idx = display_id.saturating_sub(1),
-            monitor_width = monitor.width,
-            monitor_height = monitor.height,
+            output_idx,
+            device = %target.monitor.device_name,
+            monitor_width = target.monitor.width,
+            monitor_height = target.monitor.height,
             output_width = profile.width,
             output_height = profile.height,
             output_fps = fps,
@@ -3602,6 +3604,7 @@ impl LiveSource {
             None,
             CaptureStartup::Screen {
                 display_id,
+                output_idx,
                 input_fps: f64::from(fps),
             },
         )
@@ -3946,7 +3949,10 @@ enum CaptureStartup {
     },
     #[cfg(windows)]
     Screen {
+        /// 用户选中的 Windows 显示器编号（`\\.\DISPLAYn` 里的 n）。
         display_id: u32,
+        /// 真正传给 `ddagrab` 的索引，由 DXGI 实测校正，和 `display_id` 不同源。
+        output_idx: u32,
         input_fps: f64,
     },
 }
@@ -3994,9 +4000,10 @@ fn startup_timeout_message(
         #[cfg(windows)]
         CaptureStartup::Screen {
             display_id,
+            output_idx,
             input_fps,
         } => format!(
-            "screen produced no {missing} data within 15 seconds; display {display_id} at {input_fps} fps; video stderr: {video_stderr}; 可能原因：锁屏、桌面复制被其他程序占用、显示器已断开或 D3D11 桌面复制不可用"
+            "screen produced no {missing} data within 15 seconds; display {display_id} → output_idx {output_idx} at {input_fps} fps; video stderr: {video_stderr}; 可能原因：锁屏、桌面复制被其他程序占用、显示器已断开或 D3D11 桌面复制不可用"
         ),
     }
 }
@@ -4145,9 +4152,10 @@ fn wait_for_ffmpeg_startup(
                     #[cfg(windows)]
                     CaptureStartup::Screen {
                         display_id,
+                        output_idx,
                         input_fps,
                     } => format!(
-                        "screen {kind} capture exited before startup ({status}); display {display_id} at {input_fps} fps; video stderr: {}",
+                        "screen {kind} capture exited before startup ({status}); display {display_id} → output_idx {output_idx} at {input_fps} fps; video stderr: {}",
                         locked_tail(video_tail)
                     ),
                 };
@@ -5012,6 +5020,7 @@ mod tests {
             "video",
             CaptureStartup::Screen {
                 display_id: 1,
+                output_idx: 0,
                 input_fps: 25.0,
             },
             "Failed to enumerate DXGI output 0",
@@ -5019,7 +5028,7 @@ mod tests {
             false,
         );
 
-        assert!(message.contains("display 1 at 25 fps"), "{message}");
+        assert!(message.contains("display 1 → output_idx 0 at 25 fps"), "{message}");
         assert!(message.contains("桌面复制"), "{message}");
         assert!(!message.contains("camera produced no"), "{message}");
     }

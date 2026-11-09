@@ -1,10 +1,15 @@
 //! Windows monitor discovery and Desktop Duplication capture arguments.
 //!
 //! FFmpeg's `ddagrab` filter exposes one desktop-duplication output at a time.
-//! `output_idx` is the output index on the D3D11 adapter that owns the capture
-//! device; on the common single-adapter layout it is the Windows display number
-//! minus one.  The monitor list therefore keeps the `DISPLAYn` number as the
-//! public `display_id` and turns it back into an output index at capture time.
+//! `output_idx` is the index **inside the D3D11 adapter the filter's device
+//! lives on** (the first DXGI adapter), not the Windows display number.
+//! Windows names displays `\\.\DISPLAYn` and never recycles that number, so
+//! virtual display drivers — 向日葵 `OrayIddDriver`, GameViewer, Citrix IDD and
+//! friends — push `n` into the teens while the adapter still exposes a single
+//! output.  `DISPLAY15` therefore maps to `output_idx=0`, not 14: the number is
+//! resolved by matching the GDI device name against the real DXGI output list
+//! in [`resolve`], and only falls back to the old "number minus one" guess when
+//! DXGI cannot be enumerated at all.
 //!
 //! `ddagrab`'s `video_size` crops the desktop instead of scaling it, so the
 //! configured output profile is applied with the shared scale/pad filter in
@@ -25,6 +30,7 @@ use windows_sys::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
 use super::{windows_capture, LiveCaptureProfile};
 
@@ -34,13 +40,33 @@ const MONITORINFOF_PRIMARY: u32 = 1;
 /// A desktop-duplication output exposed to the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ScreenMonitor {
-    /// Windows display number, e.g. 1 for `\\.\DISPLAY1`; `output_idx` is this
-    /// number minus one on the adapter that drives the monitor.
+    /// Windows display number, e.g. 1 for `\\.\DISPLAY1`.  It is the public id
+    /// persisted by the UI; it is *not* `output_idx + 1` (see the module docs).
     pub display_id: u32,
+    /// Raw GDI device name, e.g. `\\.\DISPLAY15`.  Matching DXGI outputs by
+    /// this name is the only reliable way to learn the real `output_idx`.
+    pub device_name: String,
     pub name: String,
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+}
+
+/// A monitor resolved into something `ddagrab` can actually open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScreenTarget {
+    pub monitor: ScreenMonitor,
+    /// `ddagrab` 的 `output_idx`，已按 DXGI 实际枚举校正过。
+    pub output_idx: u32,
+}
+
+/// One desktop-duplication output on the adapter `ddagrab` binds to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DxgiOutput {
+    /// `\\.\DISPLAYn`, the same name GDI reports for the monitor.
+    device_name: String,
+    /// Index local to that adapter — exactly what `ddagrab` wants.
+    index: u32,
 }
 
 /// Enumerate the monitors currently attached to the interactive desktop.
@@ -71,10 +97,14 @@ pub(super) fn list_monitors() -> Result<Vec<ScreenMonitor>> {
     Ok(monitors)
 }
 
-/// Resolve a persisted display id, reporting the available displays on failure.
+/// Resolve a persisted display id into a capture target.
 ///
 /// `0` keeps the legacy `live:<id>` URI behavior: it means the primary display.
-pub(super) fn resolve(display_id: u32) -> Result<ScreenMonitor> {
+///
+/// The returned `output_idx` comes from the real DXGI output list, so a
+/// `\\.\DISPLAY15` monitor becomes `output_idx=0` on a machine whose display
+/// numbering was pushed up by virtual display drivers.
+pub(super) fn resolve(display_id: u32) -> Result<ScreenTarget> {
     let monitors = list_monitors()?;
     let monitor = if display_id == 0 {
         monitors
@@ -86,12 +116,112 @@ pub(super) fn resolve(display_id: u32) -> Result<ScreenMonitor> {
             .iter()
             .find(|monitor| monitor.display_id == display_id)
     };
-    monitor.cloned().ok_or_else(|| {
+    let monitor = monitor.cloned().ok_or_else(|| {
         Error::Media(format!(
             "未找到显示器 {display_id}；当前可用：{}",
             describe_monitors(&monitors)
         ))
+    })?;
+    let outputs = dxgi_outputs();
+    tracing::info!(
+        display_id = monitor.display_id,
+        device = %monitor.device_name,
+        dxgi_outputs = %describe_dxgi_outputs(&outputs),
+        "解析桌面复制输出索引"
+    );
+    let output_idx = output_idx_for(&monitor, &outputs)?;
+    Ok(ScreenTarget {
+        monitor,
+        output_idx,
     })
+}
+
+/// Enumerate the desktop-duplication outputs of the adapter `ddagrab` uses.
+///
+/// `ddagrab` creates its D3D11 device without an adapter selector, so the device
+/// (and every `EnumOutputs` call afterwards) belongs to adapter 0.  Enumerating
+/// the same adapter is what makes `output_idx` comparable at all.
+fn dxgi_outputs() -> Vec<DxgiOutput> {
+    let mut outputs = Vec::new();
+    let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
+        Ok(factory) => factory,
+        Err(error) => {
+            tracing::warn!(%error, "DXGI 工厂创建失败，退回「显示器编号减一」推算 output_idx");
+            return outputs;
+        }
+    };
+    let adapter = match unsafe { factory.EnumAdapters1(0) } {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            tracing::warn!(%error, "DXGI 适配器 0 不可用，退回「显示器编号减一」推算 output_idx");
+            return outputs;
+        }
+    };
+    // 正常机器上输出数量等于当前接的屏幕数量，几十个已经远超合理范围；
+    // 上限只是防止驱动在 `EnumOutputs` 上死循环。
+    for index in 0..32 {
+        let Ok(output) = (unsafe { adapter.EnumOutputs(index) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { output.GetDesc() }) else {
+            continue;
+        };
+        outputs.push(DxgiOutput {
+            device_name: decode_device_name(&desc.DeviceName),
+            index,
+        });
+    }
+    outputs
+}
+
+/// Map a GDI monitor onto `ddagrab`'s `output_idx`.
+///
+/// Matching by device name is exact; the fallbacks exist because DXGI can be
+/// unavailable (session 0, broken driver) or report names that GDI never does
+/// (`WinDisc` in a non-interactive session).
+fn output_idx_for(monitor: &ScreenMonitor, outputs: &[DxgiOutput]) -> Result<u32> {
+    if let Some(index) = outputs
+        .iter()
+        .find(|output| output.device_name.eq_ignore_ascii_case(&monitor.device_name))
+        .map(|output| output.index)
+    {
+        return Ok(index);
+    }
+    if outputs.is_empty() {
+        tracing::warn!(
+            display_id = monitor.display_id,
+            "DXGI 输出枚举为空，退回「显示器编号减一」推算 output_idx"
+        );
+        return Ok(monitor.display_id.saturating_sub(1));
+    }
+    if monitor.primary {
+        // 主显示器一定挂在驱动桌面的那块卡上，通常就是它唯一的输出。
+        tracing::warn!(
+            display_id = monitor.display_id,
+            device = %monitor.device_name,
+            "DXGI 输出里没有同名显示器，主显示器回退到 output_idx=0"
+        );
+        return Ok(0);
+    }
+    // 非主屏又不在 DXGI 输出里 ⇒ 它挂在另一块显卡上，ddagrab 采不到。
+    // 随便给个索引只会抓到别的屏幕，宁可直接报清楚。
+    Err(Error::Media(format!(
+        "显示器 {}（{}）不在桌面复制所用的显卡上，无法采集；当前可采集的桌面输出：{}",
+        monitor.display_id,
+        monitor.device_name,
+        describe_dxgi_outputs(outputs)
+    )))
+}
+
+fn describe_dxgi_outputs(outputs: &[DxgiOutput]) -> String {
+    if outputs.is_empty() {
+        return "（DXGI 枚举为空）".to_string();
+    }
+    outputs
+        .iter()
+        .map(|output| format!("{}（output_idx={}）", output.device_name, output.index))
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 /// Build the FFmpeg argument list for one monitor.
@@ -99,11 +229,12 @@ pub(super) fn resolve(display_id: u32) -> Result<ScreenMonitor> {
 /// The encoder tail is shared with the DirectShow camera path so both Windows
 /// sources keep identical codec, GOP and PTS behavior.
 pub(super) fn command_args(
-    monitor: &ScreenMonitor,
+    target: &ScreenTarget,
     profile: &LiveCaptureProfile,
     osd: Option<&crate::osd::OsdBurnIn>,
 ) -> Vec<String> {
-    let output_idx = monitor.display_id.saturating_sub(1);
+    let monitor = &target.monitor;
+    let output_idx = target.output_idx;
     // 硬件编码器的参数本来就是 `-pix_fmt nv12`；无 OSD 时让滤镜链直接出 nv12，
     // 可以省掉 `format=yuv420p` 之后再转 nv12 的一次整帧转换。
     let pixel_format =
@@ -215,6 +346,7 @@ unsafe extern "system" fn collect_monitor(
             let primary = info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0;
             monitors.push(ScreenMonitor {
                 display_id,
+                device_name: device,
                 name: monitor_name(display_id, primary),
                 width,
                 height,
@@ -286,10 +418,18 @@ mod tests {
     fn monitor(display_id: u32) -> ScreenMonitor {
         ScreenMonitor {
             display_id,
+            device_name: format!(r"\\.\DISPLAY{display_id}"),
             name: format!("显示器 {display_id}"),
             width: 1920,
             height: 1080,
             primary: true,
+        }
+    }
+
+    fn target(display_id: u32, output_idx: u32) -> ScreenTarget {
+        ScreenTarget {
+            monitor: monitor(display_id),
+            output_idx,
         }
     }
 
@@ -313,7 +453,7 @@ mod tests {
 
     #[test]
     fn ddagrab_command_selects_the_monitor_and_reuses_the_shared_encoder() {
-        let args = command_args(&monitor(2), &profile(LiveVideoCodec::H264), None);
+        let args = command_args(&target(2, 1), &profile(LiveVideoCodec::H264), None);
         let filter = args
             .windows(2)
             .find(|pair| pair[0] == "-filter_complex")
@@ -349,7 +489,7 @@ mod tests {
             encoder: crate::encoder::EncoderBackend::Nvenc,
             ..profile(LiveVideoCodec::H264)
         };
-        let args = command_args(&monitor(1), &hw, None);
+        let args = command_args(&target(1, 0), &hw, None);
         let filter = filter_of(&args);
         assert!(filter.ends_with("format=nv12[v]"), "{filter}");
         assert!(!filter.contains("format=yuv420p"), "{filter}");
@@ -370,10 +510,13 @@ mod tests {
     /// 宽高比不同时仍要补边,不能让画面被拉变形。
     #[test]
     fn letterbox_is_kept_when_the_monitor_aspect_differs() {
-        let wide = ScreenMonitor {
-            width: 2560,
-            height: 1600,
-            ..monitor(1)
+        let wide = ScreenTarget {
+            monitor: ScreenMonitor {
+                width: 2560,
+                height: 1600,
+                ..monitor(1)
+            },
+            output_idx: 0,
         };
         let filter = filter_of(&command_args(
             &wide,
@@ -389,7 +532,7 @@ mod tests {
 
     #[test]
     fn hevc_screen_command_keeps_hevc_and_the_configured_gop() {
-        let args = command_args(&monitor(1), &profile(LiveVideoCodec::H265), None);
+        let args = command_args(&target(1, 0), &profile(LiveVideoCodec::H265), None);
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx265"]));
         assert!(args.windows(2).any(|pair| pair == ["-f", "hevc"]));
         assert!(args.windows(2).any(|pair| pair == ["-g", "25"]));
@@ -415,9 +558,96 @@ mod tests {
         for monitor in &monitors {
             assert!(monitor.display_id > 0);
             assert!(monitor.width > 0 && monitor.height > 0);
+            assert!(!monitor.device_name.is_empty(), "{monitor:?}");
         }
         let legacy = resolve(0).expect("legacy display 0 resolves to the primary display");
-        assert!(legacy.primary);
+        assert!(legacy.monitor.primary);
         println!("MONITORS {monitors:?}");
+        println!(
+            "TARGET display={} device={} output_idx={}",
+            legacy.monitor.display_id, legacy.monitor.device_name, legacy.output_idx
+        );
+        println!("DXGI {}", describe_dxgi_outputs(&dxgi_outputs()));
+    }
+
+    /// 虚拟显示器驱动会把 `\\.\DISPLAYn` 顶到十几,真正的 output_idx 由 DXGI 定。
+    #[test]
+    fn dxgi_output_index_wins_over_the_display_number() {
+        let outputs = vec![DxgiOutput {
+            device_name: r"\\.\DISPLAY15".to_string(),
+            index: 0,
+        }];
+        assert_eq!(
+            output_idx_for(&monitor(15), &outputs).expect("matched by device name"),
+            0
+        );
+    }
+
+    /// 设备名比较不区分大小写:驱动层给的名字大小写并不可靠。
+    #[test]
+    fn device_name_match_ignores_case() {
+        let outputs = vec![DxgiOutput {
+            device_name: r"\\.\display2".to_string(),
+            index: 1,
+        }];
+        assert_eq!(
+            output_idx_for(&monitor(2), &outputs).expect("case-insensitive match"),
+            1
+        );
+    }
+
+    /// 非交互会话里 GDI 叫 `WinDisc`,DXGI 里没有同名输出:主屏回退到 0。
+    #[test]
+    fn unmatched_primary_monitor_falls_back_to_the_first_output() {
+        let outputs = vec![DxgiOutput {
+            device_name: r"\\.\DISPLAY1".to_string(),
+            index: 0,
+        }];
+        let monitor = ScreenMonitor {
+            device_name: "WinDisc".to_string(),
+            ..monitor(15)
+        };
+        assert_eq!(
+            output_idx_for(&monitor, &outputs).expect("primary fallback"),
+            0
+        );
+    }
+
+    /// 非主屏又不在 DXGI 输出里 ⇒ 它在另一块显卡上,不能赌一个索引去抓别的屏。
+    #[test]
+    fn unmatched_secondary_monitor_is_rejected_with_the_capturable_list() {
+        let outputs = vec![DxgiOutput {
+            device_name: r"\\.\DISPLAY1".to_string(),
+            index: 0,
+        }];
+        let monitor = ScreenMonitor {
+            primary: false,
+            ..monitor(12)
+        };
+        let message = output_idx_for(&monitor, &outputs)
+            .expect_err("secondary monitor off the capture adapter is not capturable")
+            .to_string();
+        assert!(message.contains("显示器 12"), "{message}");
+        assert!(message.contains(r"\\.\DISPLAY1（output_idx=0）"), "{message}");
+    }
+
+    /// DXGI 完全枚举不出来时保留旧行为,不能让整条采集链路直接不可用。
+    #[test]
+    fn empty_dxgi_list_keeps_the_legacy_index() {
+        assert_eq!(output_idx_for(&monitor(15), &[]).expect("legacy fallback"), 14);
+        assert_eq!(output_idx_for(&monitor(1), &[]).expect("legacy fallback"), 0);
+    }
+
+    /// 命令里必须用校正后的 output_idx,而不是显示器编号减一。
+    #[test]
+    fn command_uses_the_resolved_output_index() {
+        let filter = filter_of(&command_args(
+            &target(15, 0),
+            &profile(LiveVideoCodec::H264),
+            None,
+        ))
+        .to_string();
+        assert!(filter.contains("ddagrab=output_idx=0"), "{filter}");
+        assert!(!filter.contains("output_idx=14"), "{filter}");
     }
 }

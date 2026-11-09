@@ -2017,6 +2017,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "windows",
  "windows-sys 0.59.0",
 ]
 
