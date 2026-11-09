@@ -28,6 +28,7 @@ mod device_metadata;
 mod log_export;
 mod preview_channel;
 mod preview_manager;
+mod report;
 use config_store::{
     BindMode, CatalogNodeConfig, ConfigStore, DesktopConfigV2, EffectiveDeviceConfig,
     RecordPlanSettings, StartDeviceInput, TimeSyncSettings,
@@ -63,10 +64,12 @@ struct AppState {
     next_stress_id: AtomicU64,
     /// 当前压测的实时指标；None 表示任务已完全退出。
     metrics: Mutex<Option<Arc<Metrics>>>,
-    /// 最近一次压测的最终指标快照(停止后保留,供导出报告)。
-    last_metrics: Mutex<Option<stress_engine::MetricsSnapshot>>,
-    /// 最近一次启动使用的脱敏场景 TOML 与设备数（报告导出用）。
-    last_scenario: Mutex<Option<(String, usize)>>,
+    /// 最近一次压测的完整记录（场景 + 秒级采样 + 最终指标），供导出报告。
+    /// 停止后保留，直到下一次压测启动才清空。
+    last_run: Mutex<Option<report::RunRecord>>,
+    /// 正在运行的这次压测记录；每秒追加采样点。
+    /// 与 `last_run` 分开存放：运行时导出报告读这里，结束后由任务冻结进 `last_run`。
+    live_run: Mutex<Option<Arc<std::sync::Mutex<report::RunRecord>>>>,
     /// 单设备联调：当前设备实例 + 停止发射端 + 共享传输。
     device: Mutex<Option<DeviceHandle>>,
     /// 采集侧 MJPEG 旁路的最新帧总线。
@@ -304,8 +307,8 @@ impl AppState {
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
             metrics: Mutex::new(None),
-            last_metrics: Mutex::new(None),
-            last_scenario: Mutex::new(None),
+            last_run: Mutex::new(None),
+            live_run: Mutex::new(None),
             device: Mutex::new(None),
             preview_bus,
             preview_manager,
@@ -1431,6 +1434,62 @@ fn serialize_redacted_scenario(mut scenario: scenario::LinearScenario) -> Result
     toml::to_string(&scenario).map_err(|e| format!("脱敏场景序列化失败: {e}"))
 }
 
+/// 把场景结构体翻译成报告里的中文参数表。
+///
+/// 密码一律不写。这里给的是「人话」而不是字段名:报告是给客户看的,
+/// `active_ratio=0.3` 这种要读代码才知道含义的写法必须翻译掉。
+fn scenario_report_rows(sc: &scenario::LinearScenario) -> Vec<(String, String)> {
+    let media = match sc.media_profile {
+        scenario::MediaProfile::A => "A 档 · 仅信令，不推流",
+        scenario::MediaProfile::B => "B 档 · 轻量伪流",
+        scenario::MediaProfile::C => "C 档 · 真实 H.264 推流",
+    };
+    let ramp = if sc.ramp_per_second == 0 {
+        "一次性全部拉起".to_string()
+    } else {
+        format!("{} 台 / 秒", sc.ramp_per_second)
+    };
+    vec![
+        ("设备名称".into(), sc.device_info.device_name.clone()),
+        ("起始设备 ID".into(), sc.base_device_id.clone()),
+        (
+            "接入平台".into(),
+            format!("{}:{}", sc.server_host, sc.server_port),
+        ),
+        ("信令传输".into(), sc.transport.to_string()),
+        (
+            "平台 ID / 域".into(),
+            format!("{} / {}", sc.server_id, sc.server_domain),
+        ),
+        (
+            "心跳间隔".into(),
+            format!("{} 秒", sc.heartbeat_interval_secs),
+        ),
+        (
+            "每台通道数".into(),
+            sc.channels_per_device.to_string(),
+        ),
+        ("媒体档位".into(), media.to_string()),
+        (
+            "视频帧率 / 码率".into(),
+            format!("{} fps / {} kbps", sc.video_fps, sc.bitrate_kbps),
+        ),
+        (
+            "真实推流占比".into(),
+            format!("{:.0}%", sc.active_ratio * 100.0),
+        ),
+        ("爬坡速率".into(), ramp),
+        (
+            "厂商 / 型号 / 固件".into(),
+            format!(
+                "{} / {} / {}",
+                sc.device_info.manufacturer, sc.device_info.model, sc.device_info.firmware
+            ),
+        ),
+        ("注册密码".into(), "已隐藏（报告不保存密码）".into()),
+    ]
+}
+
 /// 启动压测。`toml` 为场景内容，`count` 为设备数。
 /// 成功后每秒向前端发送带 `run_id` 的 `metrics_tick` 事件。
 #[tauri::command]
@@ -1449,6 +1508,24 @@ async fn start_stress(
     let sc = scenario::LinearScenario::from_toml_str(&toml).map_err(|e| e.to_string())?;
     let redacted_scenario = serialize_redacted_scenario(sc.clone())?;
     let orch = Orchestrator::new(&sc, count).map_err(|e| e.to_string())?;
+
+    // 报告建档：启动即创建，运行中每秒追加采样点，停下时冻结进 last_run。
+    let record = Arc::new(std::sync::Mutex::new(report::RunRecord {
+        started_at_ms: common::clock::local_epoch_ms(),
+        finished_at_ms: 0,
+        device_count: count,
+        target: format!("{}:{} · {}", sc.server_host, sc.server_port, sc.transport),
+        gb_version: if sc.gb_version.is_2022() {
+            "GB/T 28181-2022"
+        } else {
+            "GB/T 28181-2016"
+        }
+        .into(),
+        scenario_rows: scenario_report_rows(&sc),
+        scenario_toml_redacted: redacted_scenario,
+        samples: Vec::new(),
+        metrics: stress_engine::MetricsSnapshot::default(),
+    }));
 
     let mut stress_guard = state.stress.lock().await;
     if stress_guard.is_some() {
@@ -1469,8 +1546,8 @@ async fn start_stress(
 
     let metrics = Arc::clone(&orch.metrics);
     *state.metrics.lock().await = Some(Arc::clone(&metrics));
-    *state.last_metrics.lock().await = None;
-    *state.last_scenario.lock().await = Some((redacted_scenario, count));
+    *state.live_run.lock().await = Some(Arc::clone(&record));
+    *state.last_run.lock().await = None;
 
     // 先发布运行事件再启动后台任务，避免初始化瞬时失败时“最终事件”被旧启动事件覆盖。
     let _ = app.emit(
@@ -1485,8 +1562,10 @@ async fn start_stress(
     drop(stress_guard);
 
     // 每秒推送带运行 ID 的指标快照，前端据此隔离迟到事件。
+    // 同一份快照同时写入报告记录，保证「界面看到的曲线」和「报告里的曲线」同源。
     let app_for_tick = app.clone();
     let metrics_for_tick = Arc::clone(&metrics);
+    let record_for_tick = Arc::clone(&record);
     tokio::spawn(async move {
         let mut tick_stop = tick_stop;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1495,11 +1574,32 @@ async fn start_stress(
             tokio::select! {
                 _ = tick_stop.recv() => break,
                 _ = interval.tick() => {
+                    let snapshot = metrics_for_tick.snapshot();
+                    if let Ok(mut rec) = record_for_tick.lock() {
+                        let elapsed = ((common::clock::local_epoch_ms() - rec.started_at_ms).max(0)
+                            / 1_000) as u64;
+                        let point = report::Sample {
+                            offset_secs: elapsed,
+                            snapshot: snapshot.clone(),
+                        };
+                        rec.samples.push(point.clone());
+                        // 超上限按 2 抽 1，末点必须留下：长时间压测不能让采样把内存吃穿。
+                        if rec.samples.len() > report::MAX_SAMPLES {
+                            let mut i = 0usize;
+                            rec.samples.retain(|_| {
+                                let keep = i % 2 == 0;
+                                i += 1;
+                                keep
+                            });
+                            rec.samples.push(point);
+                        }
+                        rec.metrics = snapshot.clone();
+                    }
                     let _ = app_for_tick.emit(
                         "metrics_tick",
                         serde_json::json!({
                             "run_id": run_id,
-                            "metrics": metrics_for_tick.snapshot(),
+                            "metrics": snapshot,
                         }),
                     );
                 }
@@ -1510,6 +1610,7 @@ async fn start_stress(
     // 压测任务结束后保存最终快照并回收槽位；停止请求不会提前释放运行权。
     let app_for_run = app.clone();
     let metrics_for_run = Arc::clone(&metrics);
+    let record_for_run = Arc::clone(&record);
     let tx_for_run = tx.clone();
     tokio::spawn(async move {
         let result = orch
@@ -1535,8 +1636,17 @@ async fn start_stress(
         let was_stopping = current.as_ref().is_some_and(|handle| handle.stopping);
 
         // 在仍持有本轮生命周期所有权时提交全部共享状态，最后才释放运行槽位。
-        // last_metrics 先写、metrics 后清，确保报告能力不会出现瞬时空窗。
-        *state.last_metrics.lock().await = Some(final_metrics.clone());
+        // last_run 先写、live_run 后清，确保报告能力不会出现瞬时空窗。
+        let frozen = record_for_run
+            .lock()
+            .map(|mut rec| {
+                rec.finished_at_ms = common::clock::local_epoch_ms();
+                rec.metrics = final_metrics.clone();
+                rec.clone()
+            })
+            .ok();
+        *state.last_run.lock().await = frozen;
+        *state.live_run.lock().await = None;
         state.metrics.lock().await.take();
         current.take();
         drop(current);
@@ -1618,17 +1728,17 @@ async fn get_stress_status(state: tauri::State<'_, AppState>) -> Result<serde_js
         ),
         None => {
             let count = state
-                .last_scenario
+                .last_run
                 .lock()
                 .await
                 .as_ref()
-                .map(|(_, count)| *count)
+                .map(|run| run.device_count)
                 .unwrap_or(0);
             (false, false, None, count)
         }
     };
     let has_report =
-        state.metrics.lock().await.is_some() || state.last_metrics.lock().await.is_some();
+        state.metrics.lock().await.is_some() || state.last_run.lock().await.is_some();
     drop(stress_guard);
     Ok(serde_json::json!({
         "running": running,
@@ -1785,41 +1895,74 @@ async fn report_ptz_pose(
     Ok(())
 }
 
-/// 导出压测报告(FR-28):把场景参数 + 当前指标快照写成 JSON 文件,返回路径。
-/// 文件落到系统临时目录下的 uvp-reports/report-<时间戳>.json。
+/// 导出压测报告(FR-28)。
+///
+/// 主产物是**一份自包含 HTML 报表**(图表内联,浏览器直接打开,可打印成 PDF);
+/// 同目录再落一份同名 `.json` 作为机器可读的原始数据,方便二次处理与归档比对。
+///
+/// `target_path` 由前端「另存为」对话框给出;为空时落到系统临时目录,
+/// 便于没有对话框的场景(或自动化调用)也能出报告。
 #[tauri::command]
-async fn export_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn export_report(
+    state: tauri::State<'_, AppState>,
+    target_path: Option<String>,
+) -> Result<String, String> {
     // 与启动/完成提交共用生命周期锁，避免混合读取不同 run 的场景和指标。
     let _stress_guard = state.stress.lock().await;
-    // 优先取运行中指标,否则取最近一次压测保留的快照。
-    let snap = match &*state.metrics.lock().await {
-        Some(m) => m.snapshot(),
-        None => match &*state.last_metrics.lock().await {
-            Some(s) => s.clone(),
-            None => return Err("无压测数据可导出(尚未运行过压测)".into()),
-        },
+    // 优先取运行中的记录,否则取最近一次压测冻结下来的记录。
+    let live = state.live_run.lock().await.clone();
+    let record = match live {
+        Some(shared) => shared
+            .lock()
+            .map(|rec| rec.clone())
+            .map_err(|_| "压测记录读取失败".to_string())?,
+        None => state
+            .last_run
+            .lock()
+            .await
+            .clone()
+            .ok_or("无压测数据可导出（尚未运行过压测）")?,
     };
-    let scenario = state.last_scenario.lock().await.clone();
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let html = report::render_html(&record);
+    let json = report::render_json(&record);
 
-    let report = serde_json::json!({
-        "generated_at_epoch_secs": ts,
-        "scenario_toml_redacted": scenario.as_ref().map(|(t, _)| t),
-        "device_count": scenario.as_ref().map(|(_, c)| c),
-        "metrics": snap,
-    });
+    // 目标路径:调用方给就用;否则落到临时目录的 uvp-reports/。
+    let target = match target_path {
+        Some(path) if !path.trim().is_empty() => {
+            let mut path = std::path::PathBuf::from(path);
+            // 对话框没补扩展名时补上,避免出现无后缀文件。
+            if path.extension().is_none() {
+                path.set_extension("html");
+            }
+            path
+        }
+        _ => {
+            let dir = std::env::temp_dir().join("uvp-reports");
+            std::fs::create_dir_all(&dir).map_err(|e| format!("创建报告目录失败: {e}"))?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            dir.join(format!("report-{ts}.html"))
+        }
+    };
 
-    let dir = std::env::temp_dir().join("uvp-reports");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建报告目录失败: {e}"))?;
-    let path = dir.join(format!("report-{ts}.json"));
-    let content = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    std::fs::write(&path, content).map_err(|e| format!("写报告失败: {e}"))?;
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建报告目录失败: {e}"))?;
+        }
+    }
 
-    Ok(path.to_string_lossy().to_string())
+    // 先写 HTML,再写 JSON 附属文件;两者共用同一个文件名主干。
+    std::fs::write(&target, html).map_err(|e| format!("写报告失败: {e}"))?;
+    let json_path = target.with_extension("json");
+    if let Err(error) = std::fs::write(&json_path, json) {
+        // 附属文件失败不该让用户以为主报告也没出来。
+        tracing::warn!(%error, path = %json_path.display(), "压测报告附属 JSON 写入失败");
+    }
+
+    Ok(target.to_string_lossy().to_string())
 }
 
 // ── 单设备联调命令 ────────────────────────────────────────

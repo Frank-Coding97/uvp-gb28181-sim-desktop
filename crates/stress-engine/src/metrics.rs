@@ -123,7 +123,9 @@ impl Metrics {
 }
 
 /// 指标只读快照(可序列化,推 UI / 落库)。
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// 实现 `Default` 便于压测启动时就建好一份「全零」报告记录,再逐秒覆盖。
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MetricsSnapshot {
     pub register_attempted: u64,
     pub register_succeeded: u64,

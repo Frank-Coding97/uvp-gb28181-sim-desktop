@@ -24,7 +24,7 @@ import {
 } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { LineChart } from "echarts/charts";
 import { GridComponent, LegendComponent, TooltipComponent } from "echarts/components";
 import { init, use as useECharts, type ECharts } from "echarts/core";
@@ -374,12 +374,32 @@ async function stopStress() {
   }
 }
 
+// 导出压测报告：后台渲染一份自包含 HTML 报表(带图表)，浏览器打开即可看，
+// 也可直接打印成 PDF。同目录会再落一份同名 .json 作为机器可读的原始数据。
 async function exportReport() {
   try {
-    const path = await invoke<string>("export_report");
-    message.success(`报告已导出：${path}`, { duration: 6000 });
+    let targetPath: string | undefined;
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      const now = new Date();
+      const pad = (n: number) => String(n).padStart(2, "0");
+      // 平台名可能带 / : 等非法字符，做一次替换，避免对话框默认名不合法。
+      const platform = (activePlatform.value?.name ?? "压测").replace(/[\\/:*?"<>|]/g, "-");
+      const defaultPath =
+        `压测报告-${platform}-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+        `-${pad(now.getHours())}${pad(now.getMinutes())}.html`;
+      const picked = await saveDialog({
+        defaultPath,
+        filters: [{ name: "压测报告（网页，可打印为 PDF）", extensions: ["html"] }],
+      });
+      // 用户取消对话框时不导出，也不弹错误。
+      if (typeof picked !== "string") return;
+      targetPath = picked;
+    }
+    // 显式传 null 而不是省掉键：Tauri 对缺失参数比 null 更严格。
+    const path = await invoke<string>("export_report", { targetPath: targetPath ?? null });
+    message.success(`报告已导出：${path}`, { duration: 8000 });
   } catch (error) {
-    message.error(String(error));
+    message.error(`导出失败：${String(error)}`);
   }
 }
 
@@ -624,7 +644,13 @@ onUnmounted(() => {
         <span class="sb-stat">TPS <b>{{ tps }}</b> reg/s</span>
       </template>
       <span class="sb-platform">{{ platformLabel }}</span>
-      <n-button size="small" secondary :disabled="!hasReport" @click="exportReport">导出报告</n-button>
+      <n-button
+        size="small"
+        secondary
+        :disabled="!hasReport"
+        :title="hasReport ? '导出一份带图表的网页报告，可直接打印为 PDF' : '先跑一次压测才能导出报告'"
+        @click="exportReport"
+      >导出报告</n-button>
     </div>
 
     <!-- ── 主体：左配置 / 右监控 ── -->
