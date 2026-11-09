@@ -317,6 +317,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CACHE_ROOT_ENV: &str = "UVP_MEDIA_PROFILE_CACHE_DIR";
+/// 文件读写缓冲大小。必须堆分配：Windows 阻塞线程栈只有 2MB，
+/// 若把 1MB 缓冲放在栈上，叠加同层调用会触发 STATUS_STACK_OVERFLOW。
+const COPY_BUFFER_BYTES: usize = 256 * 1024;
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -2103,11 +2106,13 @@ fn copy_source_snapshot(
         .map_err(|error| format!("创建源文件副本失败: {error}"))?;
     let mut digest = Sha256::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    // 必须放在堆上：Windows 阻塞线程默认栈只有 2MB，栈上的 1MB 缓冲叠加同层调用会直接
+    // 触发 STATUS_STACK_OVERFLOW（0xc00000fd）闪退，macOS 默认 8MB 栈才掩盖了这个问题。
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     loop {
         check_cancel(cancel)?;
         let count = input
-            .read(&mut buffer)
+            .read(&mut buffer[..])
             .map_err(|error| format!("读取源文件副本失败: {error}"))?;
         if count == 0 {
             break;
@@ -2158,11 +2163,12 @@ fn check_source_unchanged(
 fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let mut file = File::open(path).map_err(|error| format!("打开源文件失败: {error}"))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    // 同 copy_source_snapshot：缓冲一律走堆，避免 2MB 线程栈被顶爆。
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     loop {
         check_cancel(cancel)?;
         let count = file
-            .read(&mut buffer)
+            .read(&mut buffer[..])
             .map_err(|error| format!("读取源文件失败: {error}"))?;
         if count == 0 {
             break;

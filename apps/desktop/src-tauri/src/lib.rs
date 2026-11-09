@@ -2356,12 +2356,25 @@ async fn start_device(
                     serde_json::json!({"phase":"preparing", "message":message}),
                 );
             };
-            media_rtp::file_profile::prepare_file_profile(
-                &source_path,
-                &profile,
-                &task_cancel,
-                Some(&progress),
-            )
+            // Windows 上 tokio 阻塞线程栈默认只有 2MB，文件准备链路的栈开销会随参数变化，
+            // 这里显式给 8MB 栈兜底，避免再次触发 STATUS_STACK_OVERFLOW(0xc00000fd) 闪退。
+            std::thread::Builder::new()
+                .name("media-prepare".to_string())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    media_rtp::file_profile::prepare_file_profile(
+                        &source_path,
+                        &profile,
+                        &task_cancel,
+                        Some(&progress),
+                    )
+                })
+                .map_err(|error| format!("创建文件准备线程失败: {error}"))
+                .and_then(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("文件准备线程异常退出".to_string()))
+                })
         })
         .await;
         let result = result
