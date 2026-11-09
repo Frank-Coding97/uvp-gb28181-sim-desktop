@@ -321,7 +321,19 @@ function detectMediaMode(source: string): MediaMode {
   return "camera";
 }
 
+/** 本地视频文件（非 live: 实时源、且非空）才值得记住，切回「视频文件」时复用。 */
+function isLocalFilePath(source: string): boolean {
+  const value = source.trim();
+  return value.length > 0 && !value.startsWith("live:");
+}
+
 const mediaMode = ref<MediaMode>(detectMediaMode(form.value.video_source.trim()));
+// 记住上一次用过的本地视频文件（内置演示素材或用户自选）。
+// 切到摄像头/屏幕再切回「视频文件」时直接复用，不必重新弹一次文件选择框；
+// 只有用户主动点文件名那块才走 pickVideoFile。
+const lastFileSource = ref(isLocalFilePath(form.value.video_source) ? form.value.video_source.trim() : "");
+// 内置演示素材路径缓存：后端未打包素材时为 null，且只问一次后端。
+const builtinVideoSource = ref<string | null>(null);
 const selectedCamera = ref<number | null>(null);
 const selectedScreen = ref<number | null>(null);
 // 实时源的音频选择，直接对应 URI 的 audio= 取值：
@@ -717,10 +729,25 @@ function syncLiveSource() {
 
 async function setMediaMode(mode: MediaMode) {
   if (deviceLive.value) return;
+  if (mode === mediaMode.value) return;
   if (mode === "file") {
-    await pickVideoFile();
+    // 切回「视频文件」不弹文件选择框：先复用上次用的文件，其次回落内置演示素材。
+    // 两样都没有时才留空，由用户自己点文件名那块去选。
+    mediaMode.value = "file";
+    const remembered = lastFileSource.value.trim();
+    if (remembered) {
+      form.value.video_source = remembered;
+    } else {
+      const builtin = await loadBuiltinVideoSource();
+      lastFileSource.value = builtin ?? "";
+      form.value.video_source = builtin ?? "";
+    }
+    persistForm();
     return;
   }
+  // 离开「视频文件」前记下当前文件，否则会被下面的 syncLiveSource 覆盖成 live: 源。
+  const current = form.value.video_source.trim();
+  if (isLocalFilePath(current)) lastFileSource.value = current;
   mediaMode.value = mode;
   if (mode === "camera" && selectedCamera.value === null) {
     selectedCamera.value = catalog.value.cameras[0]?.index ?? null;
@@ -734,17 +761,27 @@ async function setMediaMode(mode: MediaMode) {
 // 内置演示视频：首次进入且尚未选择来源时自动填入，界面直接落在「视频文件」模式。
 // 用户点文件名仍可换成自己的素材；切到摄像头/屏幕后由 syncLiveSource 接管。
 // 未打包素材（后端返回 null）时保持原交互，不把内置素材变成注册的前置条件。
-async function applyBuiltinVideoSource() {
-  if (!isTauri || deviceLive.value || form.value.video_source.trim()) return;
+async function loadBuiltinVideoSource(): Promise<string | null> {
+  if (builtinVideoSource.value) return builtinVideoSource.value;
+  if (!isTauri) return null;
   try {
     const source = await invoke<string | null>("builtin_video_source");
-    if (source && !deviceLive.value && !form.value.video_source.trim()) {
-      form.value.video_source = source;
-      mediaMode.value = "file";
-      persistForm();
-    }
+    builtinVideoSource.value = source ?? null;
+    return builtinVideoSource.value;
   } catch {
     // 后端未提供内置素材时忽略：仍由用户自行选择采集来源。
+    return null;
+  }
+}
+
+async function applyBuiltinVideoSource() {
+  if (!isTauri || deviceLive.value || form.value.video_source.trim()) return;
+  const source = await loadBuiltinVideoSource();
+  if (source && !deviceLive.value && !form.value.video_source.trim()) {
+    form.value.video_source = source;
+    lastFileSource.value = source;
+    mediaMode.value = "file";
+    persistForm();
   }
 }
 
@@ -760,6 +797,7 @@ async function pickVideoFile() {
   });
   if (typeof picked === "string") {
     form.value.video_source = picked;
+    lastFileSource.value = picked;
     mediaMode.value = "file";
     persistForm();
   }
@@ -1109,10 +1147,10 @@ onUnmounted(() => {
               placeholder="选择屏幕"
               @update:value="syncLiveSource"
             />
-            <button v-else-if="mediaMode === 'file'" type="button" class="file-source" :disabled="deviceLive" title="点击更换视频文件" @click="pickVideoFile">
+            <button v-else-if="mediaMode === 'file'" type="button" class="file-source" :disabled="deviceLive" :title="form.video_source.trim() ? '点击更换视频文件' : '点击选择视频文件'" @click="pickVideoFile">
               <n-icon :component="DocumentOutline" class="file-source-icon" />
               <span class="file-source-name">{{ sourceSummary }}</span>
-              <span v-if="!deviceLive" class="file-source-action">更换</span>
+              <span v-if="!deviceLive" class="file-source-action">{{ form.video_source.trim() ? "更换" : "选择" }}</span>
             </button>
           </div>
           <div v-if="mediaMode === 'camera' || mediaMode === 'screen'" class="source-picker audio-picker" :title="audioPickerHint">
