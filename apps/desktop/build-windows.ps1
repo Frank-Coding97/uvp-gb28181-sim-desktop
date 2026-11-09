@@ -103,7 +103,7 @@ try {
   #    "unexpected argument 'nsis,msi'"（看着像参数名写错，其实是多了一层 --）。
   #    这里直接调 tauri CLI，绕开 npm 的参数重组。
   # ⛔ bundles 值必须加引号：PowerShell 会把裸写的逗号当数组分隔符拆成两个参数。
-  & '.\.node_modules\.bin\tauri.cmd' build --bundles 'nsis,msi' --config $BundleConfig
+  & '.\node_modules\.bin\tauri.cmd' build --bundles 'nsis,msi' --config $BundleConfig
   # ⛔ 原生命令失败不会让 PowerShell 抛异常（$ErrorActionPreference 管不到），
   #    必须自己看退出码，否则「构建失败」会被后面的「已生成」误报成成功。
   if ($LASTEXITCODE -ne 0) {
