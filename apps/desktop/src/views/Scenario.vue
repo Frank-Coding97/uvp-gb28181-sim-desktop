@@ -172,6 +172,15 @@ function applyPreset(p: (typeof presets)[number]) {
   form.value.ramp_per_second = p.ramp;
   form.value.media_profile = p.media;
 }
+// 选中态按「当前配置是否与该预设完全一致」推导：用户手动改了数量/爬坡/档位后
+// 高亮会自动消失，避免出现「配置已经不是预设了却还亮着」的假选中。
+const activePreset = computed(() => {
+  const { count, ramp_per_second, media_profile } = form.value;
+  const hit = presets.find(
+    (p) => p.count === count && p.ramp === ramp_per_second && p.media === media_profile,
+  );
+  return hit ? hit.label : null;
+});
 
 // 配置面板折叠（运行时自动折叠，可手动展开）
 const configCollapsed = ref(false);
@@ -658,6 +667,8 @@ onUnmounted(() => {
                   v-for="p in presets"
                   :key="p.label"
                   class="preset-btn"
+                  :class="{ active: activePreset === p.label }"
+                  :aria-pressed="activePreset === p.label"
                   :disabled="running || starting"
                   @click="applyPreset(p)"
                 >{{ p.label }}</button>
@@ -937,6 +948,14 @@ onUnmounted(() => {
 }
 .preset-btn:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: #fff; }
 .preset-btn:disabled { opacity: .4; cursor: not-allowed; }
+/* 选中态：点击后常驻高亮（hover 只是临时变色，真正"选中"看这条） */
+.preset-btn.active {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+.preset-btn.active:hover:not(:disabled) { background: var(--accent-deep); border-color: var(--accent-deep); }
+/* 压测运行中按钮整体禁用，但选中项仍要能看清是哪一档 */
+.preset-btn.active:disabled { opacity: .75; }
 
 .section-label {
   font-size: 10.5px; font-weight: 700; color: var(--accent);
