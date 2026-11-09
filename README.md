@@ -20,11 +20,15 @@
 
 ---
 
-- 官网：<https://www.uvplatform.com/>
+- 官网：<https://uvplatform.com/>
 - 当前版本：`1.0.0`（真源 `apps/desktop/src-tauri/tauri.conf.json`）
 - 许可证：MIT
 - 代码托管：[GitHub](https://github.com/Frank-Coding97/uvp-gb28181-sim-desktop) · [Gitee](https://gitee.com/Frank-Coding/uvp-gb28181-sim-desktop)
 - 安装包：[GitHub Releases](https://github.com/Frank-Coding97/uvp-gb28181-sim-desktop/releases/latest) · [Gitee Releases](https://gitee.com/Frank-Coding/uvp-gb28181-sim-desktop/releases)
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" alt="UVP GB28181 Desktop 首页：设备运行状态、SIP 接入配置与本地预览" width="100%">
+</p>
 
 ## 目录
 
@@ -214,9 +218,9 @@
 
 | 平台 | 安装包（以 1.0.0 为例） | 说明 |
 | --- | --- | --- |
-| Windows x64 | `UVP GB28181 Desktop_1.0.0_x64-setup.exe` / `..._x64_en-US.msi` | 双击安装，FFmpeg 及依赖 DLL 已内嵌 |
+| Windows x64 | `UVP.GB28181.Desktop_1.0.0_x64-setup.exe` / `..._x64_en-US.msi` | 双击安装，FFmpeg 及依赖 DLL 已内嵌 |
 | macOS Apple Silicon | `UVP-GB28181-Desktop_1.0.0_aarch64.dmg` | 双击后把 app 拖进「应用程序」 |
-| Linux x86_64 | `.deb` / `.AppImage` | 由 CI 构建，需系统自行提供 FFmpeg |
+| Linux x86_64 | 暂无发布包 | 需自行从源码构建，FFmpeg 由系统提供，详见[已知限制](#已知限制) |
 
 首次启动会请求摄像头、麦克风、屏幕录制权限，**需要全部允许**，否则对应采集功能不可用。
 
@@ -453,6 +457,6 @@ uvp-gb28181-sim-desktop/
 
 遇到 Bug、想要新功能、做平台兼容性反馈，欢迎提 [GitHub Issue](https://github.com/Frank-Coding97/uvp-gb28181-sim-desktop/issues)（Gitee 侧也有 [Issues](https://gitee.com/Frank-Coding/uvp-gb28181-sim-desktop/issues)）。把 SIP 报文片段、平台类型与复现步骤一起贴出来，排查会快很多；讨论留在 Issue 区也方便后来的人检索。
 
-产品介绍与各端下载入口见官网：<https://www.uvplatform.com/>
+产品介绍与各端下载入口见官网：<https://uvplatform.com/>
 
 如果这个项目对你有帮助，欢迎点个 Star，或者把它推荐给身边做国标接入的同行。
