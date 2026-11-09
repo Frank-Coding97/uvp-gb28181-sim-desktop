@@ -4670,9 +4670,14 @@ impl DeviceSimulator {
             transport.send_to(&busy, from).await?;
             return Ok(true);
         }
+        // 同一 INVITE 事务的所有响应(100 → 200/4xx/488)必须共用一个 To-tag,
+        // 否则平台会认为最终响应不属于该事务而立刻 BYE(现场紫光平台即是如此)。
+        let to_tag = builder::rand_token("");
         // 实时设备启动可能涉及 TCC 授权和最多 5 秒首帧等待，先发 100 防止
         // 平台在准备期间把事务误判为无响应。
-        let trying = sip_core::SipMessage::Response(builder::response_status(req, 100, "Trying"));
+        let trying = sip_core::SipMessage::Response(builder::response_status_tagged(
+            req, 100, "Trying", &to_tag,
+        ));
         transport.send_to(&trying, from).await?;
 
         // 传输角色:UDP / 设备主动连平台 / 设备被动等平台连入(由 offer 的 a=setup 推导)。
@@ -4705,10 +4710,11 @@ impl DeviceSimulator {
                 })
                 .unwrap_or_default();
             if entries.is_empty() {
-                let not_found = sip_core::SipMessage::Response(builder::response_status(
+                let not_found = sip_core::SipMessage::Response(builder::response_status_tagged(
                     req,
                     404,
                     "Recording Not Found",
+                    &to_tag,
                 ));
                 transport.send_to(&not_found, from).await?;
                 self.observer.on_event(common::DeviceEvent::RuntimeError {
@@ -4722,10 +4728,11 @@ impl DeviceSimulator {
                 Ok(source) => Some(Box::new(source)),
                 Err(error) => {
                     tracing::warn!(%error, "历史录像文件加载失败");
-                    let unavailable = sip_core::SipMessage::Response(builder::response_status(
+                    let unavailable = sip_core::SipMessage::Response(builder::response_status_tagged(
                         req,
                         480,
                         "Recording Unavailable",
+                        &to_tag,
                     ));
                     transport.send_to(&unavailable, from).await?;
                     return Ok(true);
@@ -4745,10 +4752,11 @@ impl DeviceSimulator {
                 scope: "capture".into(),
                 message: "平台点播时共享媒体源尚未就绪".into(),
             });
-            let unavailable = sip_core::SipMessage::Response(builder::response_status(
+            let unavailable = sip_core::SipMessage::Response(builder::response_status_tagged(
                 req,
                 480,
                 "Temporarily Unavailable",
+                &to_tag,
             ));
             transport.send_to(&unavailable, from).await?;
             return Ok(true);
@@ -4776,7 +4784,7 @@ impl DeviceSimulator {
                 Err(error) => {
                     tracing::warn!(%error, %local_ip, "TCP 被动推流监听端口绑定失败");
                     let unavailable = sip_core::SipMessage::Response(
-                        builder::response_status(req, 488, "Not Acceptable Here"),
+                        builder::response_status_tagged(req, 488, "Not Acceptable Here", &to_tag),
                     );
                     transport.send_to(&unavailable, from).await?;
                     return Ok(true);
@@ -4804,7 +4812,7 @@ impl DeviceSimulator {
         );
         let sdp_body = local_sdp.to_string();
 
-        let mut resp = builder::response_ok(req);
+        let mut resp = builder::response_ok_tagged(req, &to_tag);
         resp.headers.set("Content-Type", "application/sdp");
         resp.body = sdp_body.as_bytes().to_vec();
         transport
@@ -4843,8 +4851,10 @@ impl DeviceSimulator {
                     }
                     (sip_core::MediaTransport::TcpActive, _)
                     | (sip_core::MediaTransport::TcpPassive, None) => {
-                        // 主动模式给平台一点时间建监听并收 ACK。
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        // 200 OK 一发出就立刻连:平台侧的媒体端口在其发 INVITE 之前
+                        // 就已经在监听,这里再等只会白白错过窗口。原先固定 sleep 300ms,
+                        // 遇到平台在 200 OK 后 ~100ms 就发 BYE 的场景(紫光华智就是这样),
+                        // 连接还没发起就被 BYE 取消,推流永远建不起来。
                         media_rtp::RtpTarget::TcpActive(rtp_dst)
                     }
                     (sip_core::MediaTransport::Udp, _) => media_rtp::RtpTarget::Udp(rtp_dst),
@@ -5710,6 +5720,96 @@ y=0100000099\r\n";
         assert_eq!(&pkt[8..12], &100_000_099u32.to_be_bytes());
 
         sim.stop_shared_media().await;
+    }
+
+    /// 同一 INVITE 事务的 100 Trying 与 200 OK 必须共用同一个 To-tag
+    /// (RFC 3261 §8.2.6.2)。若两者 tag 不同,严格的平台会认为 200 OK
+    /// 不属于该事务而直接挂断——紫光华智平台即表现为回完 200 后 ~100ms 发 BYE。
+    #[tokio::test]
+    async fn invite_应答的100与200使用同一to_tag() {
+        use sip_core::{Method, Request};
+
+        let device_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
+        let platform_addr = platform_tp.local_addr().unwrap();
+        let device_addr = device_tp.local_addr().unwrap();
+        let cfg = test_cfg("127.0.0.1", platform_addr.port());
+        let sim = Arc::new(DeviceSimulator::with_observer(
+            cfg,
+            Arc::new(common::NoopObserver),
+        ));
+        let platform_task = tokio::spawn(mock_platform_register(
+            platform_tp.clone(),
+            device_addr,
+            sim.call_id().to_string(),
+            3_600,
+        ));
+        sim.register(&device_tp, "127.0.0.1", device_addr.port())
+            .await
+            .unwrap();
+        platform_task.await.unwrap();
+
+        // 不配媒体源:只验证信令应答的 To-tag,不真正推流。
+        let sdp = "v=0\r\n\
+o=34020000002000000001 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 40000 TCP/RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n\
+a=recvonly\r\n\
+a=setup:passive\r\n\
+a=connection:new\r\n\
+y=0100000099\r\n";
+        let mut h = Headers::new();
+        h.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKtag");
+        h.set("From", "<sip:34020000002000000001@3402>;tag=p1");
+        h.set("To", "<sip:34020000001320000001@3402>");
+        h.set("Call-ID", "inv-tag-1");
+        h.set("CSeq", "1 INVITE");
+        h.set("Content-Type", "application/sdp");
+        let invite = Request {
+            method: Method::Invite,
+            uri: "sip:34020000001320000001@127.0.0.1".into(),
+            headers: h,
+            body: sdp.as_bytes().to_vec(),
+        };
+        let mut presp = platform_tp.register("inv-tag-1");
+        let incoming = sip_core::Incoming {
+            message: SipMessage::Request(invite),
+            from: platform_addr,
+        };
+        assert!(sim.answer_inbound(&device_tp, &incoming).await.unwrap());
+
+        let to_tag_of = |resp: &sip_core::Response| -> Option<String> {
+            resp.headers
+                .get("To")
+                .and_then(|to| to.to_string().split("tag=").nth(1).map(|s| s.to_string()))
+        };
+
+        let mut trying_tag = None;
+        let mut ok_tag = None;
+        for _ in 0..4 {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(2), presp.recv())
+                .await
+                .expect("超时未收到 INVITE 应答")
+                .expect("应答通道关闭");
+            if let SipMessage::Response(resp) = got.message {
+                if resp.status == 100 {
+                    trying_tag = to_tag_of(&resp);
+                } else if resp.status == 200 {
+                    ok_tag = to_tag_of(&resp);
+                    break;
+                }
+            }
+        }
+
+        let trying_tag = trying_tag.expect("100 Trying 必须带 To-tag");
+        let ok_tag = ok_tag.expect("200 OK 必须带 To-tag");
+        assert_eq!(
+            trying_tag, ok_tag,
+            "同一 INVITE 事务的 100 Trying 与 200 OK To-tag 必须一致"
+        );
     }
 
     #[tokio::test]

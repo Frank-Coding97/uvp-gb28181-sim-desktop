@@ -463,7 +463,13 @@ pub fn response_ok_tagged(request: &sip_core::Request, to_tag: &str) -> sip_core
     response_status_tagged(request, 200, "OK", to_tag)
 }
 
-fn response_status_tagged(
+/// 用调用方指定的 `to_tag` 构造状态响应。
+///
+/// 同一 INVITE 事务的**所有**响应(100 Trying 与最终 200/4xx/5xx/6xx)必须携带
+/// 相同的 To-tag(RFC 3261 §8.2.6.2:一旦在早期响应里生成了 tag,后续响应必须沿用)。
+/// 每次调用 `response_status` 都随机生成 tag 会让 100 与 200 的 tag 不一致,
+/// 严格的平台会认为最终响应不属于同一会话而直接挂断,故由调用方生成一次并复用。
+pub fn response_status_tagged(
     request: &sip_core::Request,
     status: u16,
     reason: &str,
