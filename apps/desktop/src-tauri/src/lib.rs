@@ -1459,7 +1459,12 @@ fn scenario_report_rows(sc: &scenario::LinearScenario) -> Vec<(String, String)> 
         ("信令传输".into(), sc.transport.to_string()),
         (
             "平台 ID / 域".into(),
-            format!("{} / {}", sc.server_id, sc.server_domain),
+            if sc.server_id.trim().is_empty() {
+                // 旧场景 TOML 不写 server_id,目标按域解析;报告里不能显示成「 / 域」。
+                format!("{}（按域解析）", sc.server_domain)
+            } else {
+                format!("{} / {}", sc.server_id, sc.server_domain)
+            },
         ),
         (
             "心跳间隔".into(),
@@ -1514,6 +1519,7 @@ async fn start_stress(
         started_at_ms: common::clock::local_epoch_ms(),
         finished_at_ms: 0,
         device_count: count,
+        ramp_per_second: sc.ramp_per_second,
         target: format!("{}:{} · {}", sc.server_host, sc.server_port, sc.transport),
         gb_version: if sc.gb_version.is_2022() {
             "GB/T 28181-2022"
@@ -4019,6 +4025,38 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 报告参数行含速率并且在缺_server_id_时不显示空斜杠() {
+        let mut sc = scenario::LinearScenario::from_toml_str(
+            r#"
+base_device_id = "34020000001320000001"
+password = "secret"
+server_host = "10.0.0.9"
+server_port = 5060
+server_domain = "3402000000"
+ramp_per_second = 30
+active_ratio = 0.5
+
+[device_info]
+device_name = "压测"
+manufacturer = "UVP"
+model = "M"
+firmware = "1"
+"#,
+        )
+        .expect("场景应可解析");
+        let rows = scenario_report_rows(&sc);
+        assert!(rows.iter().any(|(k, v)| k == "爬坡速率" && v == "30 台 / 秒"));
+        assert!(rows.iter().any(|(k, v)| k == "真实推流占比" && v == "50%"));
+        let id_row = rows.iter().find(|(k, _)| k == "平台 ID / 域").unwrap();
+        assert_eq!(id_row.1, "3402000000（按域解析）", "缺 server_id 时不能出现空斜杠");
+
+        sc.server_id = "34020000002000000001".into();
+        let rows = scenario_report_rows(&sc);
+        let id_row = rows.iter().find(|(k, _)| k == "平台 ID / 域").unwrap();
+        assert_eq!(id_row.1, "34020000002000000001 / 3402000000");
+    }
 
     #[tokio::test]
     async fn media_preparation_cancel_does_not_wait_for_device_lock() {

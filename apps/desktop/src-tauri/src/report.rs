@@ -27,6 +27,8 @@ pub struct RunRecord {
     pub started_at_ms: i64,
     pub finished_at_ms: i64,
     pub device_count: usize,
+    /// 设定的爬坡速率(台/秒;0 表示一次性全部拉起),用于和实际注册速率对照。
+    pub ramp_per_second: u32,
     /// 目标平台描述,如 `192.168.1.10:5060 · TCP`。
     pub target: String,
     /// 国标版本,如 `GB/T 28181-2022`。
@@ -67,6 +69,17 @@ pub fn render_html(record: &RunRecord) -> String {
         common::clock::local_epoch_ms()
     };
     let running = record.finished_at_ms == 0;
+
+    // 实际注册速率:把累计注册次数按采样间隔求差,得到「每秒真正发起的注册数」。
+    // 与爬坡速率(设定每秒拉起多少台)不同,这个数由平台响应速度和链路时延共同决定。
+    let reg_rate_full = rate_series(&record.samples, |s| s.register_attempted);
+    let (peak_reg, peak_reg_sec) = reg_rate_full
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(t, v)| (*v, *t))
+        .unwrap_or((0.0, 0));
+    let elapsed_secs = (duration_ms.max(0) as f64 / 1000.0).max(1.0);
+    let avg_reg = attempted as f64 / elapsed_secs;
 
     let mut h = String::with_capacity(48 * 1024);
     h.push_str("<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n");
@@ -153,6 +166,31 @@ pub fn render_html(record: &RunRecord) -> String {
     );
     kpi(
         &mut h,
+        "实际注册速率",
+        &format!("{} 次/秒", fmt_rate(peak_reg)),
+        &format!(
+            "峰值在第 {} 秒 · 全程均值 {} 次/秒",
+            peak_reg_sec,
+            fmt_rate(avg_reg)
+        ),
+    );
+    let ramp_value = if record.ramp_per_second == 0 {
+        "一次性拉起".to_string()
+    } else {
+        format!("{} 台/秒", record.ramp_per_second)
+    };
+    kpi(
+        &mut h,
+        "爬坡速率・设定",
+        &ramp_value,
+        if record.ramp_per_second == 0 {
+            "未限速,设备集中涌入"
+        } else {
+            "设定每秒拉起的设备数"
+        },
+    );
+    kpi(
+        &mut h,
         "心跳成功率",
         &pct(ratio(m.heartbeat_succeeded, heartbeat_total), 1),
         &format!(
@@ -206,11 +244,38 @@ pub fn render_html(record: &RunRecord) -> String {
     } else {
         h.push_str(&empty_chart("采样点不足,未生成趋势图"));
     }
-    h.push_str("</div>\n<div class=\"card\">\n<h3>活跃推流趋势<small>路</small></h3>\n");
+    h.push_str("</div>\n<div class=\"card\">\n<h3>注册速率趋势<small>次 / 秒</small></h3>\n");
+    if reg_rate_full.len() >= 2 {
+        let (top, ticks) = int_axis(peak_reg.max(record.ramp_per_second as f64));
+        let ref_line = if record.ramp_per_second > 0 {
+            Some((record.ramp_per_second as f64, "设定速率"))
+        } else {
+            None
+        };
+        h.push_str(&line_chart(
+            &reg_rate_full,
+            0.0,
+            top,
+            &ticks,
+            ref_line,
+            |v| fmt_int(v.round() as u64),
+            "#7a5af8",
+        ));
+    } else {
+        h.push_str(&empty_chart("采样点不足,无法绘制速率曲线"));
+    }
+    let _ = writeln!(
+        h,
+        "<p class=\"note\">{}</p>",
+        esc(&rate_comment(record, peak_reg, peak_reg_sec))
+    );
+    h.push_str("</div>\n</section>\n");
+
+    // 推流趋势 + 失败归因
+    h.push_str("<section class=\"row two-even\">\n<div class=\"card\">\n<h3>活跃推流趋势<small>路</small></h3>\n");
     if stream_series.len() >= 2 {
         let max = stream_series.iter().map(|(_, v)| *v).fold(0.0, f64::max);
-        let top = nice_ceil(max.max(1.0));
-        let ticks = tick_values(0.0, top, 4);
+        let (top, ticks) = int_axis(max);
         h.push_str(&line_chart(
             &stream_series,
             0.0,
@@ -223,11 +288,8 @@ pub fn render_html(record: &RunRecord) -> String {
     } else {
         h.push_str(&empty_chart("本次压测没有推流设备"));
     }
-    h.push_str("</div>\n</section>\n");
-
-    // 失败归因 + 心跳
-    h.push_str("<section class=\"row two-even\">\n<div class=\"card\">\n<h3>注册失败归因<small>共 ");
-    let _ = write!(h, "{} 次</small></h3>\n", fmt_int(failures));
+    h.push_str("</div>\n<div class=\"card\">\n<h3>注册失败归因<small>共 ");
+    let _ = writeln!(h, "{} 次</small></h3>", fmt_int(failures));
     if failures == 0 {
         h.push_str("<div class=\"allgood\"><span>✓</span><div><b>本次没有注册失败</b><p>平台对所有设备的注册请求都给出了成功响应。</p></div></div>\n");
     } else {
@@ -256,7 +318,8 @@ pub fn render_html(record: &RunRecord) -> String {
         }
         h.push_str("</div>\n</div>\n");
     }
-    h.push_str("</div>\n<div class=\"card\">\n<h3>心跳与主动上报<small>累计次数</small></h3>\n");
+    h.push_str("</div>\n</section>\n");
+    h.push_str("<section class=\"card\">\n<h3>心跳与主动上报<small>累计次数</small></h3>\n");
 
     h.push_str("<div class=\"stack\">\n<div class=\"stack-head\"><span>心跳</span><b>");
     let _ = write!(h, "{} 成功 / {} 失败", fmt_int(m.heartbeat_succeeded), fmt_int(m.heartbeat_failed));
@@ -285,7 +348,7 @@ pub fn render_html(record: &RunRecord) -> String {
     );
     h.push_str("</div>\n</div>\n");
     h.push_str("<p class=\"note\">心跳按设备心跳周期累计;主动上报仅在压测时配置了周期才会产生。</p>\n");
-    h.push_str("</div>\n</section>\n");
+    h.push_str("</section>\n");
 
     // 指标明细
     h.push_str("<section class=\"card\">\n<h3>指标明细<small>压测结束时的累计值</small></h3>\n");
@@ -303,6 +366,18 @@ pub fn render_html(record: &RunRecord) -> String {
         "注册成功率",
         &pct(m.register_success_rate, 2),
         "注册成功 ÷ 注册尝试",
+    );
+    metric_row(
+        &mut h,
+        "峰值注册速率",
+        &format!("{} 次/秒", fmt_rate(peak_reg)),
+        &format!("出现在第 {} 秒,由每秒采样增量算出", peak_reg_sec),
+    );
+    metric_row(
+        &mut h,
+        "平均注册速率",
+        &format!("{} 次/秒", fmt_rate(avg_reg)),
+        &format!("注册尝试 ÷ 运行时长(全程均值);设定爬坡 {}", ramp_value),
     );
     metric_row(
         &mut h,
@@ -377,6 +452,7 @@ pub fn render_html(record: &RunRecord) -> String {
     // 页脚
     h.push_str("<footer>\n<p><b>判定口径</b>　注册成功率 ≥ 99.9% 为优秀,≥ 99% 为良好,≥ 95% 为需关注,低于 95% 为不达标。该阈值用于快速判断平台在本轮并发下的接入稳定性,不替代业务侧验收标准。</p>\n");
     h.push_str("<p><b>数据说明</b>　指标由压测引擎在设备注册、心跳、推流路径上实时累计;趋势图为每秒采样,长时间压测会按比例抽稀。报告不含注册密码,场景参数中的密码已替换为 ***。</p>\n");
+    h.push_str("<p><b>速率口径</b>　实际注册速率 = 相邻采样点的注册次数增量 ÷ 时间差,峰值取全过程最大的一秒;它由平台响应速度和链路时延决定,不一定等于设定的爬坡速率。</p>\n");
     h.push_str("<p class=\"gen\">本报告由 UVP GB28181 桌面端自动生成 · 可导出为 PDF 后归档</p>\n</footer>\n</div>\n");
 
     h.push_str(TIME_SCRIPT);
@@ -392,6 +468,14 @@ pub fn render_json(record: &RunRecord) -> String {
     } else {
         common::clock::local_epoch_ms()
     };
+    let rate_full = rate_series(&record.samples, |s| s.register_attempted);
+    let (peak, peak_sec) = rate_full
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(t, v)| (round1(*v), *t))
+        .unwrap_or((0.0, 0));
+    let duration_secs = ((finished - record.started_at_ms).max(0) as f64 / 1000.0).max(1.0);
+    let avg = round1(m.register_attempted as f64 / duration_secs);
     let value = serde_json::json!({
         "generated_at_epoch_secs": finished / 1000,
         "started_at_epoch_secs": record.started_at_ms / 1000,
@@ -400,10 +484,21 @@ pub fn render_json(record: &RunRecord) -> String {
         "target": record.target,
         "gb_version": record.gb_version,
         "device_count": record.device_count,
+        "ramp_per_second": record.ramp_per_second,
+        "registration_rate": {
+            "peak_per_sec": peak,
+            "peak_at_sec": peak_sec,
+            "avg_per_sec": avg,
+        },
         "scenario_toml_redacted": record.scenario_toml_redacted,
         "metrics": m,
     });
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+}
+
+/// JSON 里保留 1 位小数,避免浮点噪声把报告变难看。
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 // ── 结论与文案 ─────────────────────────────────────────────
@@ -523,6 +618,72 @@ fn series_from(record: &RunRecord, pick: impl Fn(&MetricsSnapshot) -> f64) -> Ve
         .map(|s| (s.offset_secs, pick(&s.snapshot)))
         .collect();
     decimate(raw, CHART_MAX_POINTS)
+}
+
+/// 由累计计数推导每秒速率:相邻采样点的增量 ÷ 时间差。
+///
+/// 采样在采集阶段已抽稀,但每点都带真实 `offset_secs`,
+/// 间隔变大时用两点差值平均,速率仍然准确。
+fn rate_series(samples: &[Sample], pick: impl Fn(&MetricsSnapshot) -> u64) -> Vec<(u64, f64)> {
+    let mut out: Vec<(u64, f64)> = Vec::with_capacity(samples.len());
+    for pair in samples.windows(2) {
+        let dt = pair[1].offset_secs.saturating_sub(pair[0].offset_secs);
+        if dt == 0 {
+            continue;
+        }
+        let delta = pick(&pair[1].snapshot).saturating_sub(pick(&pair[0].snapshot));
+        out.push((pair[1].offset_secs, delta as f64 / dt as f64));
+    }
+    decimate(out, CHART_MAX_POINTS)
+}
+
+/// 速率展示:整数不带小数点,否则保留 1 位。
+fn fmt_rate(v: f64) -> String {
+    if !v.is_finite() || v <= 0.0 {
+        return "0".into();
+    }
+    if (v - v.round()).abs() < 0.05 {
+        fmt_int(v.round() as u64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// 一句话解读:实际注册速率和爬坡设定差多少,可能是什么原因。
+fn rate_comment(record: &RunRecord, peak: f64, peak_sec: u64) -> String {
+    if peak <= 0.0 {
+        return "没有采到注册增量,无法判断实际拉起速度。".into();
+    }
+    if record.ramp_per_second == 0 {
+        return format!(
+            "未设爬坡:第 {} 秒瞬时打到 {} 次/秒,设备集中涌入,该峰值即瞬时冲击强度。",
+            peak_sec,
+            fmt_rate(peak)
+        );
+    }
+    let set = record.ramp_per_second as f64;
+    let reach = peak / set;
+    if reach >= 0.95 {
+        format!(
+            "设定 {} 台/秒,实际峰值 {} 次/秒,已追平设定,拉起过程没被平台拖慢。",
+            record.ramp_per_second,
+            fmt_rate(peak)
+        )
+    } else if reach >= 0.6 {
+        format!(
+            "设定 {} 台/秒,实际峰值 {} 次/秒(约设定的 {:.0}%),注册被响应速度或链路时延拖慢了一些。",
+            record.ramp_per_second,
+            fmt_rate(peak),
+            reach * 100.0
+        )
+    } else {
+        format!(
+            "设定 {} 台/秒,实际峰值只有 {} 次/秒(约设定的 {:.0}%),注册明显被阻塞,建议优先排查平台容量与网络链路。",
+            record.ramp_per_second,
+            fmt_rate(peak),
+            reach * 100.0
+        )
+    }
 }
 
 fn decimate(points: Vec<(u64, f64)>, max: usize) -> Vec<(u64, f64)> {
@@ -774,20 +935,29 @@ fn tick_values(min: f64, max: f64, count: usize) -> Vec<f64> {
     (0..count).map(|i| min + step * i as f64).collect()
 }
 
-fn nice_ceil(v: f64) -> f64 {
-    if !v.is_finite() || v <= 0.0 {
-        return 1.0;
-    }
-    let exp = v.log10().floor();
-    let base = 10f64.powf(exp);
-    // 候选取 1/2/2.5/3/4/5/10:带 3、4 是为了让 300 路这种常见峰值落在整刻度上,
-    // 否则 300 会被抬到 500,曲线被压在下半区不好看。
-    for m in [1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0] {
-        if v <= m * base {
-            return m * base;
-        }
-    }
-    10.0 * base
+/// 整数坐标轴:把上限抬到刻度的整数倍。
+///
+/// 「次/秒」「路」都是计数,刻度出现 16.7 这种数不好读;
+/// 候选取 1/2/2.5/3/4/5/10 是为了让 300 路这类常见峰值落在整刻度上,
+/// 否则会被抬到 500,曲线压在下半区。
+fn int_axis(max: f64) -> (f64, Vec<f64>) {
+    let max = if max.is_finite() && max > 0.0 { max } else { 1.0 };
+    let rough = max / 4.0;
+    let mag = 10f64.powf(rough.log10().floor());
+    let candidate = [1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
+        .iter()
+        .map(|m| m * mag)
+        .find(|s| *s >= rough)
+        .unwrap_or(10.0 * mag);
+    let step = if candidate < 1.0 {
+        1.0
+    } else {
+        candidate.round()
+    };
+    let slots = (max / step).ceil().max(2.0);
+    let top = step * slots;
+    let ticks: Vec<f64> = (0..=slots as usize).map(|i| step * i as f64).collect();
+    (top, ticks)
 }
 
 /// HTML 转义。所有注入到报告里的外部字符串都必须经过这里。
@@ -829,10 +999,10 @@ h1{font-size:27px;line-height:1.25;margin:8px 0 10px;font-weight:700;letter-spac
 .tone-good{border-left-color:#12805c}.tone-good .score,.tone-good h2{color:#12805c}
 .tone-warn{border-left-color:#d97706}.tone-warn .score,.tone-warn h2{color:#b54708}
 .tone-bad{border-left-color:#b42318}.tone-bad .score,.tone-bad h2{color:#b42318}
-.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 14px}
-.kpi{background:#fff;border:1px solid #e4e7ec;border-radius:12px;padding:14px 16px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:0 0 14px}
+.kpi{background:#fff;border:1px solid #e4e7ec;border-radius:12px;padding:13px 14px}
 .kpi .k{font-size:12px;color:#667085}
-.kpi .v{font-size:22px;font-weight:700;margin-top:3px;letter-spacing:-.01em}
+.kpi .v{font-size:19px;font-weight:700;margin-top:3px;letter-spacing:-.01em}
 .kpi .n{font-size:11.5px;color:#98a2b3;margin-top:3px}
 .row{display:grid;gap:12px;margin:0 0 14px}
 .row.two{grid-template-columns:1.32fr 1fr}
@@ -964,6 +1134,7 @@ firmware = "1.0.0"
             started_at_ms: 1_762_664_400_000,
             finished_at_ms: 1_762_665_000_000,
             device_count: 1000,
+            ramp_per_second: 50,
             target: "192.168.1.10:5060 · TCP".into(),
             gb_version: "GB/T 28181-2022".into(),
             scenario_rows: crate::scenario_report_rows(&sample_scenario()),
@@ -1030,6 +1201,81 @@ firmware = "1.0.0"
     }
 
     #[test]
+    fn 速率按采样增量计算() {
+        let samples: Vec<Sample> = [0u64, 50, 100, 150]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Sample {
+                offset_secs: i as u64,
+                snapshot: sample_snapshot(*n, *n),
+            })
+            .collect();
+        let rates = rate_series(&samples, |s| s.register_attempted);
+        assert_eq!(rates.len(), 3);
+        assert!(
+            rates.iter().all(|(_, v)| (*v - 50.0).abs() < 1e-9),
+            "每秒应稳定 50 次"
+        );
+
+        // 采样点被抽稀成 4 秒一个时,要用两点差值平均,不能按点数摊薄。
+        let coarse: Vec<Sample> = [0u64, 200]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Sample {
+                offset_secs: i as u64 * 4,
+                snapshot: sample_snapshot(*n, *n),
+            })
+            .collect();
+        assert_eq!(
+            rate_series(&coarse, |s| s.register_attempted),
+            vec![(4, 50.0)]
+        );
+    }
+
+    #[test]
+    fn 报告展示实际注册速率与设定速率() {
+        let html = render_html(&record());
+        assert!(html.contains("实际注册速率"), "应有实际速率卡片");
+        assert!(html.contains("爬坡速率・设定"), "设定值要并排展示");
+        assert!(html.contains("50 台/秒"), "设定速率需带单位");
+        assert!(html.contains("峰值注册速率"), "明细表应有峰值速率");
+        assert!(html.contains("注册速率趋势"), "应有速率趋势图");
+        assert!(html.contains("速率口径"), "页脚需说明速率算法");
+    }
+
+    #[test]
+    fn 未设爬坡时标注一次性拉起() {
+        let mut r = record();
+        r.ramp_per_second = 0;
+        r.samples.clear();
+        r.samples.push(Sample {
+            offset_secs: 0,
+            snapshot: sample_snapshot(0, 0),
+        });
+        r.samples.push(Sample {
+            offset_secs: 1,
+            snapshot: sample_snapshot(1000, 990),
+        });
+        let html = render_html(&r);
+        assert!(html.contains("一次性拉起"));
+        assert!(html.contains("未设爬坡"), "应解释瞬时冲击");
+    }
+
+    #[test]
+    fn 计数轴刻度为整数() {
+        for max in [7.0, 50.0, 300.0, 1234.0] {
+            let (top, ticks) = int_axis(max);
+            assert!(top >= max, "上限不应低于数据最大值");
+            assert_eq!(ticks.last().copied().unwrap(), top);
+            assert!(
+                ticks.iter().all(|t| (t - t.round()).abs() < 1e-9),
+                "计数刻度必须是整数: {ticks:?}"
+            );
+        }
+        assert_eq!(int_axis(300.0), (300.0, vec![0.0, 100.0, 200.0, 300.0]));
+    }
+
+    #[test]
     fn 无采样时不画趋势图() {
         let mut r = record();
         r.samples.clear();
@@ -1069,29 +1315,38 @@ firmware = "1.0.0"
     #[ignore = "手工预览报告样式时运行"]
     fn dump_preview() {
         let mut r = record();
-        r.samples = (0..180)
+        r.samples = (0..180u64)
             .map(|i| {
-                let attempted = 100 + i * 5;
-                let succeeded = attempted - (i / 18) as u64;
-                let mut snap = sample_snapshot(attempted, succeeded);
+                // 前 20 秒按设定 50 台/秒拉起 1000 台,之后不再新增;
+                // 后面仍有零星重注册,速率不会断崖到 0。
+                let ramp_done = (50 * i).min(1000);
+                let attempted = ramp_done + i.saturating_sub(20) / 10;
+                let failed = if attempted > 700 { (attempted - 700) / 60 } else { 0 };
+                let mut snap = sample_snapshot(attempted, attempted - failed);
+                // 失败归因要和失败总数自洽,否则环形图会多出一块「未归因」。
+                snap.fail_timeout = failed * 2 / 3;
+                snap.fail_rejected = failed - snap.fail_timeout;
+                snap.fail_other = 0;
                 snap.active_streams = if i < 30 {
-                    i as u64 * 10
+                    i * 10
                 } else if i < 120 {
                     300
                 } else {
-                    300 - (i - 120) as u64 * 2
+                    300 - (i - 120) * 2
                 };
                 Sample {
-                    offset_secs: i * 2,
+                    offset_secs: i,
                     snapshot: snap,
                 }
             })
             .collect();
         r.metrics = r.samples.last().unwrap().snapshot.clone();
         r.started_at_ms = 1_762_664_400_000;
-        r.finished_at_ms = r.started_at_ms + 180 * 2 * 1000;
+        r.finished_at_ms = r.started_at_ms + 180 * 1000;
         let path = std::env::temp_dir().join("uvp-report-preview.html");
         std::fs::write(&path, render_html(&r)).unwrap();
-        eprintln!("preview: {}", path.display());
+        let json = std::env::temp_dir().join("uvp-report-preview.json");
+        std::fs::write(&json, render_json(&r)).unwrap();
+        eprintln!("preview: {} / {}", path.display(), json.display());
     }
 }
