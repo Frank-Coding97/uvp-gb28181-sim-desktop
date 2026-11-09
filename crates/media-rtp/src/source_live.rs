@@ -931,11 +931,11 @@ fn ensure_audio_encoder(ffmpeg: &str, codec: LiveAudioCodec) -> Result<()> {
 
 /// 摄像头采集是否需要在编码前把画面水平翻正。
 ///
-/// 笔记本内置摄像头在 DirectShow 上普遍输出自拍镜像画面（自己举右手，画面里
-/// 看起来是左手），直接推给平台会让平台侧看到的左右方向和现场相反 —— 对模拟
-/// 真实 GB28181 摄像机来说是错的。因此默认翻正；外接摄像机本身方向已正常时，
-/// 可用 `UVP_CAMERA_MIRROR=0` 关闭。
-#[cfg(windows)]
+/// 内置摄像头在 Windows(DirectShow) 与 macOS(AVFoundation) 上都普遍输出自拍
+/// 镜像画面（自己举右手，画面里看起来是左手），直接推给平台会让平台侧看到的
+/// 左右方向和现场相反 —— 对模拟真实 GB28181 摄像机来说是错的。因此默认翻正；
+/// 外接摄像机本身方向已正常时，可用 `UVP_CAMERA_MIRROR=0` 关闭。
+#[cfg(any(windows, target_os = "macos"))]
 fn camera_mirror_enabled() -> bool {
     let Ok(value) = std::env::var("UVP_CAMERA_MIRROR") else {
         return true;
@@ -2004,6 +2004,13 @@ impl LiveSource {
         let osd_burn_in = osd.and_then(|overlay| crate::osd::OsdBurnIn::resolve(&ffmpeg, overlay));
         let video_label = format!("camera video index {video_index} at {input_fps} fps");
         let mut command = common::hidden_command(&ffmpeg);
+        #[cfg(any(target_os = "macos", windows))]
+        let mirror = camera_mirror_enabled();
+        #[cfg(any(target_os = "macos", windows))]
+        tracing::info!(
+            mirror,
+            "摄像头采集是否做水平翻转修正(UVP_CAMERA_MIRROR=0 可关闭)"
+        );
         #[cfg(target_os = "macos")]
         let mut camera_args = camera_command_args_for_profile(
             video_index,
@@ -2011,13 +2018,7 @@ impl LiveSource {
             &profile,
             input_mode,
             osd_burn_in.as_ref(),
-        );
-        #[cfg(windows)]
-        let mirror = camera_mirror_enabled();
-        #[cfg(windows)]
-        tracing::info!(
             mirror,
-            "摄像头采集是否做水平翻转修正(UVP_CAMERA_MIRROR=0 可关闭)"
         );
         #[cfg(windows)]
         let mut camera_args = windows_capture::command_args(
@@ -3661,7 +3662,7 @@ fn camera_command_args_for_test(
         height: profile.height,
         fps: f64::from(camera_input_fps(fps)),
     };
-    camera_command_args_for_profile(video_index, audio_index, &profile, input_mode, None)
+    camera_command_args_for_profile(video_index, audio_index, &profile, input_mode, None, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -3671,6 +3672,9 @@ fn camera_command_args_for_profile(
     profile: &LiveCaptureProfile,
     input_mode: camera_modes::CameraInputMode,
     osd: Option<&crate::osd::OsdBurnIn>,
+    // 采集端是否做一次水平翻转。AVFoundation 的内置摄像头（FaceTime 摄像头、
+    // 连续互通相机）给出的同样是自拍镜像画面，翻正后左右方向才和现场一致。
+    mirror: bool,
 ) -> Vec<String> {
     let input_fps = input_mode.fps;
     let input = audio_index.map_or_else(
@@ -3680,10 +3684,17 @@ fn camera_command_args_for_profile(
     let output_fps = profile.video_fps.max(1).to_string();
     let cfr_args = cfr_output_args(&output_fps);
     let input_fps = input_fps.to_string();
-    let output_size = format!(
+    // 翻转必须排在缩放与 OSD 之前：先翻正再 scale/pad，drawtext 画在已经翻正的
+    // 画面上，字幕才不会是反字（与 windows_capture 的顺序保持一致）。
+    let mut chain: Vec<String> = Vec::new();
+    if mirror {
+        chain.push("hflip".to_string());
+    }
+    chain.push(format!(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
         profile.width, profile.height, profile.width, profile.height
-    );
+    ));
+    let output_size = chain.join(",");
     // avfoundation 输出 uyvy422，而 drawtext/drawbox 只吃 yuv420p 系列。
     // 有 OSD 时先转格式，再画在缩放之后，坐标才对应输出分辨率；无 OSD 时
     // 滤镜链与原来逐字一致，不引入额外的整帧转换。
@@ -5122,6 +5133,8 @@ mod tests {
                 fps: 29.970030,
             },
             None,
+            // 这条用例只锁 profile 参数，翻转单独由 mirror 用例覆盖。
+            false,
         );
         assert!(args
             .windows(2)
@@ -5193,6 +5206,8 @@ mod tests {
                 fps: 29.970030,
             },
             osd,
+            // OSD 用例只锁绘制顺序，翻转恒关，滤镜链才是纯 scale/pad 基线。
+            false,
         )
     }
 
@@ -5238,6 +5253,53 @@ mod tests {
         assert_eq!(
             macos_camera_vf(&without),
             "scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macOS摄像头默认水平翻正且翻转排在缩放与osd之前() {
+        let profile = LiveCaptureProfile {
+            width: 640,
+            height: 480,
+            video_fps: 15,
+            bitrate_kbps: 600,
+            keyframe_interval_seconds: 4,
+            video_codec: LiveVideoCodec::H264,
+            audio_codec: LiveAudioCodec::Aac,
+            audio_sample_rate_hz: 8_000,
+            encoder: crate::encoder::EncoderBackend::VideoToolbox,
+        };
+        let mode = || camera_modes::CameraInputMode {
+            width: 1920,
+            height: 1440,
+            fps: 29.970030,
+        };
+
+        // 默认翻正：hflip 必须是滤镜链第一段，缩放紧跟其后。
+        let plain = camera_command_args_for_profile(0, None, &profile, mode(), None, true);
+        let vf = macos_camera_vf(&plain);
+        assert!(vf.starts_with("hflip,scale=640:480"), "{vf}");
+
+        // 显式关闭时不出现 hflip，滤镜链回到纯 scale/pad。
+        let off = camera_command_args_for_profile(0, None, &profile, mode(), None, false);
+        assert!(
+            !off.iter().any(|arg| arg.contains("hflip")),
+            "UVP_CAMERA_MIRROR=0 时不得翻转: {off:?}"
+        );
+
+        // OSD 必须画在翻正之后，否则烧进画面的时间码会变成反字。
+        let osd = macos_camera_osd(false);
+        let with = camera_command_args_for_profile(0, None, &profile, mode(), Some(&osd), true);
+        let vf = macos_camera_vf(&with);
+        assert!(vf.starts_with("hflip,"), "{vf}");
+        assert!(
+            vf.find("hflip").unwrap() < vf.find("scale=640:480").unwrap(),
+            "{vf}"
+        );
+        assert!(
+            vf.find("hflip").unwrap() < vf.find("drawtext").unwrap(),
+            "{vf}"
         );
     }
 
