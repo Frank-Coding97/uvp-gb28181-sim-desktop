@@ -2705,8 +2705,14 @@ impl DeviceSimulator {
     ) -> Result<u16> {
         let (pan, tilt, zoom) = self.precise_pose();
         let sn = self.next_cseq();
+        let channel_id = self
+            .config
+            .channels
+            .first()
+            .map(|channel| channel.channel_id.as_str())
+            .unwrap_or_else(|| self.config.device_id.as_str());
         let notify = gb28181_protocol::manscdp::PtzPreciseNotify::new(
-            self.config.device_id.as_str(),
+            channel_id,
             sn,
             common::clock::synced_iso8601(),
             pan,
@@ -6972,10 +6978,13 @@ y=0100000099\r\n";
         let platform_tp = SipTransport::bind_udp("127.0.0.1:0").await.unwrap();
         let platform_addr = platform_tp.local_addr().unwrap();
 
-        let sim = Arc::new(DeviceSimulator::new(test_cfg(
-            "127.0.0.1",
-            platform_addr.port(),
-        )));
+        let mut cfg = test_cfg("127.0.0.1", platform_addr.port());
+        cfg.channels.push(ChannelConfig {
+            channel_id: DeviceId::new("34020000001320000002").unwrap(),
+            name: "PTZ channel".into(),
+            status: "ON".into(),
+        });
+        let sim = Arc::new(DeviceSimulator::new(cfg));
 
         // 对话内 NOTIFY 沿用订阅 Call-ID,平台按同一 Call-ID 收(200 响应与入站 NOTIFY 同路由)。
         let mut pdlg = platform_tp.register("ptz-sub-1");
@@ -7022,6 +7031,7 @@ y=0100000099\r\n";
                 assert_eq!(r.headers.get("Event"), Some("PTZPosition"));
                 let body_str = std::str::from_utf8(&r.body).unwrap();
                 assert!(body_str.contains("<CmdType>PTZPosition</CmdType>"));
+                assert!(body_str.contains("<DeviceID>34020000001320000002</DeviceID>"));
                 assert!(body_str.contains("<Pan>0.00</Pan>"));
                 assert!(!body_str.contains("<Interval>"));
             }
