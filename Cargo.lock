@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "gb28181-protocol"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "common",
  "quick-xml 0.37.5",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "gb28181-simulator"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "common",
  "encoding_rs",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "media-rtp"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bytes",
  "common",
@@ -2815,7 +2815,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "record-plan"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
 ]
@@ -3086,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "scenario"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "common",
  "gb28181-simulator",
@@ -3440,7 +3440,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sip-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bytes",
  "common",
@@ -3534,7 +3534,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stress-engine"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "common",
  "gb28181-simulator",
@@ -4537,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "uvp-desktop"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "base64 0.22.1",
  "common",
