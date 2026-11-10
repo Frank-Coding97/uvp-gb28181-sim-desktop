@@ -177,6 +177,15 @@ impl Scenario for LinearScenario {
             .base_device_id
             .parse()
             .map_err(|_| common::Error::Gb28181("基础设备 ID 非纯数字".into()))?;
+        let base_serial: usize = self.base_device_id[13..]
+            .parse()
+            .map_err(|_| common::Error::Gb28181("基础设备序号非法".into()))?;
+        let reserved_channels = MAX_DEVICES * MAX_CHANNELS_PER_DEVICE;
+        let channel_base = if base_serial + MAX_DEVICES + reserved_channels <= 10_000_000 {
+            base_serial + MAX_DEVICES
+        } else {
+            base_serial - reserved_channels
+        };
 
         // FR-24:仅前 active_count 台带媒体源真推流,其余只维持信令。
         let active_count = (count as f32 * self.active_ratio).ceil() as usize;
@@ -190,10 +199,12 @@ impl Scenario for LinearScenario {
             let device_id_str = format!("{:020}", device_num);
             let device_id = DeviceId::new(&device_id_str)?;
 
-            // 通道 ID:设备 ID 基础上改后 3 位为 132/133/...
+            // 通道 ID 使用独立序号段，避免与设备 ID 或其他设备的通道 ID 冲突。
             let mut channels = Vec::with_capacity(self.channels_per_device);
             for ch_idx in 0..self.channels_per_device {
-                let channel_id_str = format!("{}{:03}", &device_id_str[..17], 132 + ch_idx);
+                let channel_serial = channel_base + i * MAX_CHANNELS_PER_DEVICE + ch_idx;
+                let channel_id_str =
+                    format!("{}132{:07}", &self.base_device_id[..10], channel_serial);
                 channels.push(ChannelConfig {
                     channel_id: DeviceId::new(channel_id_str)?,
                     name: format!("Camera-{}", ch_idx + 1),
@@ -308,8 +319,37 @@ mod tests {
         assert_eq!(cfgs[0].channels.len(), 1);
         assert_eq!(
             cfgs[0].channels[0].channel_id.as_str(),
-            "34020000001320000132"
+            "34020000001320010001"
         );
+
+        let cfgs = sc.generate(10_000).unwrap();
+        let device_ids: std::collections::HashSet<_> =
+            cfgs.iter().map(|cfg| cfg.device_id.as_str()).collect();
+        let channel_ids: std::collections::HashSet<_> = cfgs
+            .iter()
+            .flat_map(|cfg| {
+                cfg.channels
+                    .iter()
+                    .map(|channel| channel.channel_id.as_str())
+            })
+            .collect();
+        assert_eq!(device_ids.len(), 10_000);
+        assert_eq!(channel_ids.len(), 10_000);
+        assert!(channel_ids.is_disjoint(&device_ids));
+
+        let mut max_channels = sc.clone();
+        max_channels.channels_per_device = 8;
+        let cfgs = max_channels.generate(10_000).unwrap();
+        let channel_ids: std::collections::HashSet<_> = cfgs
+            .iter()
+            .flat_map(|cfg| {
+                cfg.channels
+                    .iter()
+                    .map(|channel| channel.channel_id.as_str())
+            })
+            .collect();
+        assert_eq!(channel_ids.len(), 80_000);
+        assert!(channel_ids.is_disjoint(&device_ids));
     }
 
     #[test]
