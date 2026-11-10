@@ -4813,6 +4813,17 @@ impl DeviceSimulator {
         let sdp_body = local_sdp.to_string();
 
         let mut resp = builder::response_ok_tagged(req, &to_tag);
+        // INVITE 的 2xx 必须声明本端对话目标,平台据此把 ACK/BYE 发回设备。
+        // 使用与注册相同的信令地址,不能用 SDP 的媒体端口。
+        resp.headers.set(
+            "Contact",
+            format!(
+                "<sip:{}@{}:{}>",
+                self.config.device_id,
+                self.local_host(),
+                self.local_port()
+            ),
+        );
         resp.headers.set("Content-Type", "application/sdp");
         resp.body = sdp_body.as_bytes().to_vec();
         transport
@@ -5748,8 +5759,9 @@ y=0100000099\r\n";
             .await
             .unwrap();
         platform_task.await.unwrap();
+        sim.set_local_addr_for_test("127.0.0.1", device_addr.port());
 
-        // 不配媒体源:只验证信令应答的 To-tag,不真正推流。
+        // 不配媒体源:只验证信令应答的 To-tag 和 Contact,不真正推流。
         let sdp = "v=0\r\n\
 o=34020000002000000001 0 0 IN IP4 127.0.0.1\r\n\
 s=Play\r\n\
@@ -5789,6 +5801,7 @@ y=0100000099\r\n";
 
         let mut trying_tag = None;
         let mut ok_tag = None;
+        let mut ok_contact = None;
         for _ in 0..4 {
             let got = tokio::time::timeout(std::time::Duration::from_secs(2), presp.recv())
                 .await
@@ -5799,6 +5812,7 @@ y=0100000099\r\n";
                     trying_tag = to_tag_of(&resp);
                 } else if resp.status == 200 {
                     ok_tag = to_tag_of(&resp);
+                    ok_contact = resp.headers.get("Contact").map(str::to_string);
                     break;
                 }
             }
@@ -5809,6 +5823,16 @@ y=0100000099\r\n";
         assert_eq!(
             trying_tag, ok_tag,
             "同一 INVITE 事务的 100 Trying 与 200 OK To-tag 必须一致"
+        );
+        let expected_contact = format!(
+            "<sip:{}@127.0.0.1:{}>",
+            sim.config().device_id,
+            device_addr.port()
+        );
+        assert_eq!(
+            ok_contact.as_deref(),
+            Some(expected_contact.as_str()),
+            "INVITE 200 OK 必须带设备信令 Contact,平台据此发送 ACK/BYE"
         );
     }
 
