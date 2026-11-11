@@ -713,8 +713,12 @@ onUnmounted(() => {
                   <n-form-item label="爬坡速率（台/秒）">
                     <n-input-number v-model:value="form.ramp_per_second" :min="0" :max="1000" style="width:100%" />
                   </n-form-item>
-                  <n-form-item label="协议版本">
-                    <n-select v-model:value="form.gb_version" :options="versionOptions" />
+                  <n-form-item label="协议版本" class="span-2">
+                    <n-select
+                      v-model:value="form.gb_version"
+                      :options="versionOptions"
+                      :consistent-menu-width="false"
+                    />
                   </n-form-item>
                   <n-form-item label="心跳间隔（秒）">
                     <n-input-number v-model:value="form.heartbeat_interval" :min="1" :max="600" style="width:100%" />
@@ -722,7 +726,7 @@ onUnmounted(() => {
                   <n-form-item label="每设备通道数">
                     <n-input-number v-model:value="form.channels_per_device" :min="1" :max="8" style="width:100%" />
                   </n-form-item>
-                  <n-form-item label="推流占比（%）">
+                  <n-form-item label="推流占比（%）" class="span-2">
                     <n-input-number
                       v-model:value="form.active_ratio" :min="0" :max="100"
                       :format="(v: number | null) => `${v ?? 0}%`"
@@ -735,7 +739,7 @@ onUnmounted(() => {
                 <div class="section-label">媒体档位</div>
                 <div class="form-grid">
                   <n-form-item label="档位" class="span-2">
-                    <n-select v-model:value="form.media_profile" :options="mediaOptions" />
+                    <n-select v-model:value="form.media_profile" :options="mediaOptions" :consistent-menu-width="false" />
                   </n-form-item>
                   <n-form-item v-if="form.media_profile === 'B'" label="伪流码率（kbps）" class="span-2">
                     <n-input-number v-model:value="form.bitrate_kbps" :min="64" :max="8192" style="width:100%" />
