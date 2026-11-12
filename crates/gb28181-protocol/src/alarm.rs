@@ -14,7 +14,9 @@ pub struct AlarmReport {
     pub priority: u8,
     /// 报警方式 1-7(1 电话/2 设备/3 短信/4 GPS/5 视频/6 器件/7 人工)。
     pub method: u8,
-    /// 报警类型(1 视频丢失/2 设备防拆/3 存储满/4 设备故障/5 其他)。None 表示不输出 `<Info>`。
+    /// 报警类型。取值随报警方式变化(方式 2: 1-5 / 方式 5: 1-13 / 方式 6: 1-2，
+    /// 其余方式标准不允许携带)。None 表示不输出 `<Info>`。
+    /// 名称表见 [`alarm_type_names`]，与平台展示文案同口径。
     #[serde(default)]
     pub alarm_type: Option<u32>,
     /// 报警类型参数(可选补充说明)。
@@ -34,6 +36,84 @@ pub struct AlarmReport {
     pub minutes_ago: i64,
 }
 
+/// 报警方式取值与名称(GB/T 28181-2016 A.2.5.3)。
+pub const ALARM_METHODS: &[(u8, &str)] = &[
+    (1, "电话"),
+    (2, "设备"),
+    (3, "短信"),
+    (4, "GPS"),
+    (5, "视频"),
+    (6, "器件故障"),
+    (7, "人工"),
+];
+
+/// 报警方式 2(设备报警)的类型表。
+const ALARM_TYPES_DEVICE: &[(u32, &str)] = &[
+    (1, "视频丢失报警"),
+    (2, "设备防拆报警"),
+    (3, "存储设备磁盘满报警"),
+    (4, "设备高温报警"),
+    (5, "设备低温报警"),
+];
+
+/// 报警方式 5(视频报警)的类型表；13 是 2022 版新增的图像遮挡。
+const ALARM_TYPES_VIDEO: &[(u32, &str)] = &[
+    (1, "人工视频报警"),
+    (2, "运动目标检测报警"),
+    (3, "遗留物检测报警"),
+    (4, "物体移除检测报警"),
+    (5, "绊线检测报警"),
+    (6, "入侵检测报警"),
+    (7, "逆行检测报警"),
+    (8, "徘徊检测报警"),
+    (9, "流量统计报警"),
+    (10, "密度检测报警"),
+    (11, "视频异常检测报警"),
+    (12, "快速移动报警"),
+    (13, "图像遮挡报警（2022）"),
+];
+
+/// 报警方式 6(器件故障)的类型表。
+const ALARM_TYPES_FAULT: &[(u32, &str)] = &[(1, "存储设备磁盘故障报警"), (2, "存储设备风扇故障报警")];
+
+/// 某报警方式的类型名称表。`None` = 标准未给该方式定义类型，不允许携带 `<AlarmType>`。
+///
+/// 这份表是「发什么」的唯一依据：协议层校验、桌面端下拉、平台展示都按它对齐，
+/// 避免再出现「方式 7 + 类型 5」这种两边都查不到的组合。
+pub fn alarm_type_names(method: u8) -> Option<&'static [(u32, &'static str)]> {
+    match method {
+        2 => Some(ALARM_TYPES_DEVICE),
+        5 => Some(ALARM_TYPES_VIDEO),
+        6 => Some(ALARM_TYPES_FAULT),
+        _ => None,
+    }
+}
+
+/// 某报警方式允许的类型取值范围 `(min, max)`；`None` = 不允许携带类型。
+pub fn alarm_type_range(method: u8) -> Option<(u32, u32)> {
+    let names = alarm_type_names(method)?;
+    let min = names.first()?.0;
+    let max = names.last()?.0;
+    Some((min, max))
+}
+
+/// 报警方式名称(未知取值原样返回数字)。
+pub fn alarm_method_name(method: u8) -> String {
+    ALARM_METHODS
+        .iter()
+        .find(|(value, _)| *value == method)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| method.to_string())
+}
+
+/// 某报警方式下某个类型的名称；方式无类型表或取值不在表中时返回 `None`。
+pub fn alarm_type_name(method: u8, alarm_type: u32) -> Option<&'static str> {
+    alarm_type_names(method)?
+        .iter()
+        .find(|(value, _)| *value == alarm_type)
+        .map(|(_, name)| *name)
+}
+
 impl Default for AlarmReport {
     fn default() -> Self {
         Self::video("移动侦测报警")
@@ -42,11 +122,14 @@ impl Default for AlarmReport {
 
 impl AlarmReport {
     /// 默认视频侦测报警单(与既有 `report_alarm` 行为一致)。
+    ///
+    /// 带类型 2(运动目标检测):没有 `<Info>` 的平台只能显示「未知」，
+    /// 而视频报警的可选类型里最贴近「移动侦测」的就是 2。
     pub fn video(description: impl Into<String>) -> Self {
         Self {
             priority: 1,
             method: 5,
-            alarm_type: None,
+            alarm_type: Some(2),
             alarm_type_param: None,
             description: Some(description.into()),
             longitude: None,
@@ -70,10 +153,21 @@ impl AlarmReport {
             )));
         }
         if let Some(alarm_type) = self.alarm_type {
-            if !(1..=5).contains(&alarm_type) {
-                return Err(Error::Gb28181(format!(
-                    "报警类型必须是 1-5，当前 {alarm_type}"
-                )));
+            match alarm_type_range(self.method) {
+                None => {
+                    return Err(Error::Gb28181(format!(
+                        "报警方式 {} 不允许携带报警类型(标准只给方式 2/5/6 定义了类型)",
+                        self.method
+                    )));
+                }
+                Some((min, max)) => {
+                    if !(min..=max).contains(&alarm_type) {
+                        return Err(Error::Gb28181(format!(
+                            "报警方式 {} 的报警类型必须是 {min}-{max}，当前 {alarm_type}",
+                            self.method
+                        )));
+                    }
+                }
             }
         }
         if let Some(longitude) = self.longitude {
@@ -156,8 +250,8 @@ mod tests {
         assert!(report.validate().is_err(), "方式 8 应被拒绝");
 
         let mut report = AlarmReport::video("x");
-        report.alarm_type = Some(9);
-        assert!(report.validate().is_err(), "类型 9 应被拒绝");
+        report.alarm_type = Some(14);
+        assert!(report.validate().is_err(), "视频报警类型 14 应被拒绝");
 
         let mut report = AlarmReport::video("x");
         report.longitude = Some(200.0);
@@ -181,6 +275,66 @@ mod tests {
         assert_eq!(format_coord(0.0), "0");
         // 超长小数截到 6 位，平台按 1e-6 度解析足够。
         assert_eq!(format_coord(116.3971284999), "116.397128");
+    }
+
+    /// 类型合法区间随报警方式变化：2→1-5、5→1-13、6→1-2，其余方式不允许带类型。
+    #[test]
+    fn alarm_type_range_follows_method() {
+        assert_eq!(alarm_type_range(2), Some((1, 5)));
+        assert_eq!(alarm_type_range(5), Some((1, 13)));
+        assert_eq!(alarm_type_range(6), Some((1, 2)));
+        for method in [1, 3, 4, 7, 8] {
+            assert_eq!(alarm_type_range(method), None, "方式 {method} 不应有类型表");
+        }
+
+        let with = |method: u8, alarm_type: u32| {
+            let mut report = AlarmReport::video("x");
+            report.method = method;
+            report.alarm_type = Some(alarm_type);
+            report.validate()
+        };
+        assert!(with(2, 5).is_ok(), "方式 2 上限 5 应通过");
+        assert!(with(2, 6).is_err(), "方式 2 的 6 应被拒绝");
+        assert!(with(5, 13).is_ok(), "方式 5 的 2022 类型 13 应通过");
+        assert!(with(6, 2).is_ok(), "方式 6 的上限 2 应通过");
+        assert!(with(6, 4).is_err(), "方式 6 的 4 应被拒绝");
+        assert!(with(7, 5).is_err(), "方式 7 不允许携带类型");
+
+        // 不带类型时，任何方式都合法（方式 7 就是这种形态）。
+        let mut report = AlarmReport::video("x");
+        report.method = 7;
+        report.alarm_type = None;
+        assert!(report.validate().is_ok());
+    }
+
+    /// 默认视频报警要带「运动目标检测」，否则平台只能显示「未知」。
+    #[test]
+    fn default_video_report_carries_motion_type() {
+        let report = AlarmReport::video("移动侦测报警");
+        assert_eq!(report.alarm_type, Some(2));
+        let xml = report
+            .to_notify("34020000001320000001", 1)
+            .expect("组装")
+            .to_xml()
+            .expect("序列化");
+        assert!(xml.contains("<Info><AlarmType>2</AlarmType></Info>"), "实际: {xml}");
+    }
+
+    /// 类型名称表要覆盖标准里的每一个取值，避免 UI 出现空标签。
+    #[test]
+    fn every_standard_type_has_a_name() {
+        for (method, count) in [(2u8, 5usize), (5, 13), (6, 2)] {
+            let names = alarm_type_names(method).expect("应有类型表");
+            assert_eq!(names.len(), count, "方式 {method} 类型数量不符");
+            for (index, (value, name)) in names.iter().enumerate() {
+                assert_eq!(*value, index as u32 + 1, "方式 {method} 类型取值应连续");
+                assert!(!name.is_empty(), "方式 {method} 类型 {value} 缺名称");
+                assert_eq!(alarm_type_name(method, *value), Some(*name));
+            }
+        }
+        assert_eq!(alarm_type_name(7, 5), None);
+        assert_eq!(alarm_method_name(6), "器件故障");
+        assert_eq!(alarm_method_name(9), "9");
     }
 
     #[test]

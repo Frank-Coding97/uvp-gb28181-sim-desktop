@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, onActivated, ref } from "vue";
+import { computed, onActivated, onMounted, ref, watch } from "vue";
 import { NButton, NEmpty, NInput, NInputNumber, NModal, NSelect, NTag, useMessage } from "naive-ui";
 import { useDevice } from "../device";
 import {
   clearAlarmHistory,
+  listAlarmCapability,
   listAlarmHistory,
   previewAlarmXml,
   reportAlarm,
   resetAlarm,
+  type AlarmMethodCapability,
   type AlarmRecord,
   type AlarmReport,
 } from "../platform";
@@ -22,22 +24,8 @@ const PRIORITIES = [
   { label: "3 紧急三级", value: 3 },
   { label: "4 一般报警", value: 4 },
 ];
-const METHODS = [
-  { label: "1 电话", value: 1 },
-  { label: "2 设备", value: 2 },
-  { label: "3 短信", value: 3 },
-  { label: "4 GPS", value: 4 },
-  { label: "5 视频", value: 5 },
-  { label: "6 器件故障", value: 6 },
-  { label: "7 人工", value: 7 },
-];
-const TYPES = [
-  { label: "1 视频丢失", value: 1 },
-  { label: "2 设备防拆", value: 2 },
-  { label: "3 存储满", value: 3 },
-  { label: "4 设备故障", value: 4 },
-  { label: "5 其他", value: 5 },
-];
+/** 方式与类型都取自协议层的标准表，见 `get_alarm_capability`。 */
+const capability = ref<AlarmMethodCapability[]>([]);
 const TIME_OPTIONS = [
   { label: "现在", value: 0 },
   { label: "5 分钟前", value: 5 },
@@ -46,19 +34,25 @@ const TIME_OPTIONS = [
   { label: "60 分钟前", value: 60 },
 ];
 
-/** 固定单：现场最高频的几种报警，一键填表后直接发。 */
+/**
+ * 固定单只发标准里成立的组合（方式 + 类型必须成对合法）：
+ * 方式 2 → 1-5；方式 5 → 1-13；方式 6 → 1-2；方式 7 不携带类型。
+ * 以前「视频丢失」发的是方式 5/类型 1（标准里那是人工视频报警），
+ * 「设备故障」发方式 6/类型 4、「人工触发」发方式 7/类型 5 —— 平台都只能显示「未知」。
+ */
 const PRESETS: Array<{ label: string; report: AlarmReport }> = [
-  { label: "视频丢失", report: { priority: 4, method: 5, alarm_type: 1, description: "通道视频信号丢失" } },
+  { label: "视频丢失", report: { priority: 4, method: 2, alarm_type: 1, description: "通道视频信号丢失" } },
   { label: "设备防拆", report: { priority: 2, method: 2, alarm_type: 2, description: "设备外壳被打开" } },
   { label: "存储满", report: { priority: 4, method: 2, alarm_type: 3, description: "存储空间不足" } },
-  { label: "设备故障", report: { priority: 3, method: 6, alarm_type: 4, description: "设备硬件异常" } },
-  { label: "人工触发", report: { priority: 4, method: 7, alarm_type: 5, description: "人工触发报警" } },
+  { label: "移动侦测", report: { priority: 4, method: 5, alarm_type: 2, description: "画面检测到运动目标" } },
+  { label: "磁盘故障", report: { priority: 2, method: 6, alarm_type: 1, description: "录像存储磁盘异常" } },
+  { label: "人工报警", report: { priority: 3, method: 7, alarm_type: null, description: "值守人员手动触发" } },
 ];
 
 const draft = ref<AlarmReport>({
   priority: 1,
   method: 5,
-  alarm_type: 5,
+  alarm_type: 2,
   description: "移动侦测报警",
   longitude: null,
   latitude: null,
@@ -71,8 +65,43 @@ const xml = ref("");
 const showXml = ref(false);
 const busy = ref("");
 
+const methodOptions = computed(() =>
+  capability.value.map((item) => ({ label: `${item.value} ${item.name}`, value: item.value })),
+);
+const typeOptions = computed(() => {
+  const current = capability.value.find((item) => item.value === draft.value.method);
+  return (current?.types ?? []).map((item) => ({ label: `${item.value} ${item.name}`, value: item.value }));
+});
+const typeHint = computed(() =>
+  typeOptions.value.length ? "清空则报文不带 <Info>" : "该报警方式不携带类型",
+);
+const typePlaceholder = computed(() =>
+  typeOptions.value.length ? "报警类型" : "该方式无类型",
+);
+
 const deviceIdText = computed(() => form.value.device_id || "未配置设备 ID");
 const canSend = computed(() => deviceState.value !== "Disconnected" && !sending.value);
+
+async function loadCapability() {
+  if (!isTauri || capability.value.length) return;
+  try {
+    capability.value = await listAlarmCapability();
+  } catch (error) {
+    message.error(`读取报警类型表失败：${String(error)}`);
+  }
+}
+
+// 换方式后旧类型可能不合法（如从方式 5 切到方式 6），直接清空而不是发一个平台查不到的值。
+watch(
+  () => draft.value.method,
+  () => {
+    const allowed = typeOptions.value.map((item) => item.value);
+    const current = draft.value.alarm_type;
+    if (current !== null && current !== undefined && !allowed.includes(current)) {
+      draft.value.alarm_type = undefined;
+    }
+  },
+);
 
 function applyPreset(preset: (typeof PRESETS)[number]) {
   draft.value = {
@@ -107,7 +136,8 @@ function fmtTime(ms: number) {
 }
 
 function methodLabel(code: number) {
-  return METHODS.find((item) => item.value === code)?.label ?? String(code);
+  const method = capability.value.find((item) => item.value === code);
+  return method ? `${method.value} ${method.name}` : String(code);
 }
 
 function statusText(record: AlarmRecord) {
@@ -188,6 +218,10 @@ async function clearHistory() {
   }
 }
 
+onMounted(() => {
+  void loadCapability();
+  void load();
+});
 onActivated(() => { void load(); });
 </script>
 
@@ -215,13 +249,20 @@ onActivated(() => { void load(); });
 
           <div class="field">
             <span class="label">报警方式 <code>AlarmMethod</code></span>
-            <n-select v-model:value="draft.method" :options="METHODS" size="small" />
+            <n-select v-model:value="draft.method" :options="methodOptions" size="small" />
           </div>
 
           <div class="field">
             <span class="label">报警类型 <code>AlarmType</code></span>
-            <n-select v-model:value="draft.alarm_type" :options="TYPES" size="small" clearable />
-            <span class="hint-inline">清空则报文不带 &lt;Info&gt;</span>
+            <n-select
+              v-model:value="draft.alarm_type"
+              :options="typeOptions"
+              :placeholder="typePlaceholder"
+              :disabled="!typeOptions.length"
+              size="small"
+              clearable
+            />
+            <span class="hint-inline">{{ typeHint }}</span>
           </div>
 
           <div class="field">

@@ -558,7 +558,7 @@ export interface AlarmReport {
   priority: number;
   /** 报警方式 1-7。 */
   method: number;
-  /** 报警类型 1-5；null/undefined 表示不输出 <Info>。 */
+  /** 报警类型：方式 2 取 1-5、方式 5 取 1-13、方式 6 取 1-2，其余方式不带；null/undefined 表示不输出 <Info>。 */
   alarm_type?: number | null;
   alarm_type_param?: string | null;
   description?: string | null;
@@ -588,6 +588,24 @@ export interface AlarmRecord {
 
 export async function reportAlarm(report: AlarmReport): Promise<AlarmRecord> {
   return invoke<AlarmRecord>("report_alarm", { report });
+}
+
+/** 报警类型选项（来源 = 协议层的标准类型表）。 */
+export interface AlarmTypeCapability {
+  value: number;
+  name: string;
+}
+
+/** 报警方式及其可用类型；`types` 为空表示该方式不携带 AlarmType。 */
+export interface AlarmMethodCapability {
+  value: number;
+  name: string;
+  types: AlarmTypeCapability[];
+}
+
+/** 读取协议层的报警方式/类型能力表，UI 的类型下拉据此联动。 */
+export async function listAlarmCapability(): Promise<AlarmMethodCapability[]> {
+  return invoke<AlarmMethodCapability[]>("get_alarm_capability");
 }
 
 /** 预览报警 XML；与实际发送共用同一份组装逻辑，SN 固定为 1。 */

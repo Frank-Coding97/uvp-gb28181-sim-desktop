@@ -57,6 +57,41 @@ test("报警单在协议层预检，非法值不进入 XML", () => {
   assert.match(alarm, /pub fn to_notify/);
 });
 
+test("类型下拉按报警方式联动，标准类型表只有一个来源", () => {
+  // 方式/类型不再各自写死在页面上，统一取协议层的 get_alarm_capability。
+  assert.match(view, /listAlarmCapability/);
+  assert.match(view, /const typeOptions = computed/);
+  assert.doesNotMatch(view, /const TYPES = \[/, "页面不应再维护写死的类型数组");
+  assert.doesNotMatch(view, /const METHODS = \[/, "方式名称应由协议层提供");
+  assert.match(platform, /export async function listAlarmCapability/);
+  assert.match(backend, /get_alarm_capability,/);
+  assert.match(alarm, /pub fn alarm_type_names/);
+  assert.match(alarm, /pub fn alarm_type_range/);
+});
+
+test("固定单给出的方式/类型组合必须在标准里成立", () => {
+  // 独立于源码的一份标准区间：方式 2 → 1-5，方式 5 → 1-13，方式 6 → 1-2，其余不带。
+  const ranges = { 2: [1, 5], 5: [1, 13], 6: [1, 2] };
+  const presets = [
+    ...view.matchAll(/\{ label: "([^"]+)", report: \{ priority: \d+, method: (\d+), alarm_type: (null|\d+)/g),
+  ];
+  assert.ok(presets.length >= 5, `固定单应至少 5 条，实际 ${presets.length}`);
+  for (const [, label, method, type] of presets) {
+    const code = Number(method);
+    if (type === "null") {
+      assert.equal(ranges[code], undefined, `${label}: 方式 ${code} 不应携带类型`);
+      continue;
+    }
+    const range = ranges[code];
+    assert.ok(range, `${label}: 方式 ${code} 在标准里没有类型表，不能携带类型`);
+    const value = Number(type);
+    assert.ok(
+      value >= range[0] && value <= range[1],
+      `${label}: 方式 ${code} 的类型 ${value} 超出 ${range[0]}-${range[1]}`,
+    );
+  }
+});
+
 test("AlarmType 位于 Info 容器，可选字段缺省时不输出", () => {
   assert.match(manscdp, /pub struct AlarmNotifyInfo/);
   assert.match(manscdp, /#\[serde\(rename = "Info", skip_serializing_if = "Option::is_none"\)\]/);

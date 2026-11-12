@@ -1547,6 +1547,45 @@ async fn get_osd_capability() -> Result<OsdCapability, String> {
     .map_err(|error| format!("检测 OSD 能力任务异常: {error}"))
 }
 
+/// 报警类型下拉项。与协议层的类型表同源，改名只需改 `gb28181-protocol`。
+#[derive(serde::Serialize)]
+struct AlarmTypeCapability {
+    value: u32,
+    name: &'static str,
+}
+
+/// 报警方式及其可用类型；`types` 为空表示该方式不携带 `AlarmType`。
+#[derive(serde::Serialize)]
+struct AlarmMethodCapability {
+    value: u8,
+    name: &'static str,
+    types: Vec<AlarmTypeCapability>,
+}
+
+/// 报警方式/类型能力表，「报警单」页按所选方式联动类型下拉。
+#[tauri::command]
+fn get_alarm_capability() -> Vec<AlarmMethodCapability> {
+    use gb28181_protocol::alarm;
+    alarm::ALARM_METHODS
+        .iter()
+        .map(|(value, name)| AlarmMethodCapability {
+            value: *value,
+            name,
+            types: alarm::alarm_type_names(*value)
+                .map(|table| {
+                    table
+                        .iter()
+                        .map(|(value, name)| AlarmTypeCapability {
+                            value: *value,
+                            name,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
 #[tauri::command]
 async fn reset_desktop_config(
     state: tauri::State<'_, AppState>,
@@ -4165,6 +4204,7 @@ pub fn run() {
             save_media_config,
             save_osd_config,
             get_osd_capability,
+            get_alarm_capability,
             get_clock_state,
             save_time_sync,
             sync_ntp_now,
