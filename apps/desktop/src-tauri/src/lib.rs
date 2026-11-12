@@ -1586,6 +1586,36 @@ fn get_alarm_capability() -> Vec<AlarmMethodCapability> {
         .collect()
 }
 
+#[cfg(test)]
+mod alarm_capability_tests {
+    use super::*;
+
+    /// 下拉项必须与协议层的类型表一致：方式 5 有 13 个类型，方式 7 一个都没有。
+    #[test]
+    fn capability_mirrors_protocol_table() {
+        let capability = get_alarm_capability();
+        assert_eq!(capability.len(), 7, "方式应为 1-7");
+        for (index, method) in capability.iter().enumerate() {
+            assert_eq!(method.value as usize, index + 1);
+            assert!(!method.name.is_empty());
+        }
+        let types = |value: u8| {
+            capability
+                .iter()
+                .find(|item| item.value == value)
+                .map(|item| item.types.as_slice())
+                .expect("方式存在")
+        };
+        assert_eq!(types(2).len(), 5);
+        assert_eq!(types(5).len(), 13);
+        assert_eq!(types(5)[0].name, "人工视频报警");
+        assert_eq!(types(6).len(), 2);
+        for method in [1, 3, 4, 7] {
+            assert!(types(method).is_empty(), "方式 {method} 不应有类型");
+        }
+    }
+}
+
 #[tauri::command]
 async fn reset_desktop_config(
     state: tauri::State<'_, AppState>,
