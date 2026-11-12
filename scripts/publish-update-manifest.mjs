@@ -11,7 +11,10 @@
 //   node scripts/publish-update-manifest.mjs --version 1.4.0 --sig-dir ./sigs
 //
 // 默认从官网仓库的 releases.json 取更新说明（--notes-from 可换），
-// 默认用 GitHub Release 直链（--host gitee 可切 Gitee，但那边需要手工同步附件）。
+// 默认用 **Gitee** Release 直链（--host github 可切）。
+// ⛔ 默认必须 Gitee：GitHub 会把附件名里的空格换成点（`UVP.GB28181.Desktop_...`），
+//    而清单里写的是编码后的原名（`UVP%20GB28181%20Desktop_...`）⇒ Windows 直链 404，
+//    客户端只显示「检查更新失败」。2026-11-12 发 1.3.0 时实际验证过这个差异。
 import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -47,7 +50,7 @@ if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
 const siteDir = resolve(
   arg("site-dir", join(homedir(), "code/uvp/uvplatform-website/docs/public/upgrades/desktop")),
 );
-const host = arg("host", "github");
+const host = arg("host", "gitee");
 const dryRun = has("dry-run");
 const checkUrls = !has("no-check");
 const sigDir = arg("sig-dir", "");
@@ -175,7 +178,26 @@ async function main() {
   if (checkUrls) {
     for (const target of TARGETS) {
       const url = platforms[target.key].url;
-      const response = await fetch(url, { headers: { Range: "bytes=0-1023" }, redirect: "follow" });
+      // Gitee 对带 Range 的请求偶尔直接断连（2026-11-12 实测 UND_ERR_SOCKET，curl 却正常），
+      // 重试一次再判失败，避免因为网络抖动拦住发布。
+      let response;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          response = await fetch(url, {
+            headers: { Range: "bytes=0-1023" },
+            redirect: "follow",
+            signal: AbortSignal.timeout(30_000),
+          });
+          break;
+        } catch (error) {
+          const reason = error.cause?.code ?? error.message;
+          if (attempt === 2) {
+            console.error(`更新包直链请求失败（${reason}）：${url}`);
+            process.exit(1);
+          }
+          console.warn(`直链请求失败（${reason}），重试一次`);
+        }
+      }
       if (!response.ok && response.status !== 206) {
         console.error(`更新包直链不可用（HTTP ${response.status}）：${url}`);
         process.exit(1);
