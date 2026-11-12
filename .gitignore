@@ -64,6 +64,8 @@ assets/media/*.ps
 .env.*
 !.env.example
 *.pem
+# 在线升级的 minisign 私钥（desktop-updater.key），丢了就再也签不出用户能装的更新。
+*.key
 *.p12
 *.pfx
 Thumbs.db

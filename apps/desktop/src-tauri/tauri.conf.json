@@ -51,5 +51,16 @@
     "resources": [
       "resources/builtin-camera.mp4"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://uvplatform.com/upgrades/desktop/stable/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI3MjNDM0FEMzU2NjczMDMKUldRRGMyWTFyY01qSjgxWHJvREtOSXllZko0cWR5cGZMcDBuZ25oTnRMb05SY0EwVlJjbHRWQWEK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

@@ -4104,6 +4104,11 @@ pub fn run() {
     install_media_tool_env();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // 在线升级：updater 只认 plugins.updater 里配置的 HTTPS 清单，
+        // 下载的整包必须通过 minisign 验签才会被安装（签名不可关闭）。
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // 安装完成后由前端调 relaunch 拉起新版本；macOS 不在此时退出应用会被旧进程占住。
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .on_window_event(|window, event| {
             if matches!(

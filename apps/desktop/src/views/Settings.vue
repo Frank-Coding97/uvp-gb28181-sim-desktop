@@ -60,6 +60,8 @@ import {
   optionsFor,
   parseEncoding,
 } from "../signaling-charset.mjs";
+import { progressPercent } from "../updater.mjs";
+import { checkForUpdates, installUpdate, updaterBusy, updaterProgress, updaterState } from "../updater-client";
 
 type SettingKey = "device" | "media" | "osd" | "network" | "about";
 
@@ -97,6 +99,25 @@ const locked = computed(() => deviceLive.value
   || deviceState.value === "Registered"
   || deviceState.value === "InCall");
 const editableSection = computed(() => activeKey.value !== "about");
+
+// 在线升级：检查与安装都走 updater-client.ts，这里只负责把状态翻译成按钮和文案。
+// 升级必须重启应用，所以「立即升级」先展开一行确认，避免误点把正在跑的压测打断。
+const confirmingUpgrade = ref(false);
+// 发布包是 ad-hoc 签名（未买 Apple 证书），换版本后系统按 cdhash 认成"另一个应用"，
+// 摄像头/麦克风/屏幕录制权限会全部失效。这一条必须写在卡片里，否则升级完用户以为坏了。
+const needsMacPermissionNote = /Mac/i.test(navigator.userAgent);
+const updatePercent = computed(() => progressPercent(updaterState.downloaded, updaterState.total));
+const updateButtonText = computed(() => (updaterState.phase === "checking" ? "检查中…" : "检查更新"));
+
+async function onCheckUpdate() {
+  confirmingUpgrade.value = false;
+  await checkForUpdates();
+}
+
+async function onConfirmUpgrade() {
+  confirmingUpgrade.value = false;
+  await installUpdate();
+}
 
 const deviceDraft = ref<DeviceSettings | null>(null);
 const mediaDraft = ref<MediaProfile | null>(null);
@@ -796,6 +817,45 @@ function setBindMode(mode: BindMode) {
         <section v-else-if="activeKey === 'about'" class="settings-section about-section">
           <div class="about-hero"><div class="about-logo">UVP</div><div><h2>GB28181 Sim</h2><p>国标设备模拟 · 压力测试</p></div></div>
           <div class="about-grid"><div><span>版本</span><strong>v{{ appVersion }}</strong></div><div><span>协议</span><strong>GB/T 28181-2016 / 2022</strong></div><div><span>桌面框架</span><strong>Tauri 2 + Vue 3</strong></div><div><span>配置真相源</span><strong>Rust ConfigStore</strong></div></div>
+
+          <div class="update-card">
+            <div class="update-head">
+              <div>
+                <strong>在线升级</strong>
+                <span>当前 v{{ appVersion }}<template v-if="updaterState.version"> · 最新 v{{ updaterState.version }}</template></span>
+              </div>
+              <button class="btn ghost" type="button" :disabled="updaterBusy" @click="onCheckUpdate">{{ updateButtonText }}</button>
+            </div>
+
+            <p v-if="updaterState.phase === 'latest'" class="update-tip ok">当前已是最新版本</p>
+            <p v-else-if="updaterState.phase === 'available'" class="update-tip">发现新版本 v{{ updaterState.version }}，升级完成后应用会自动重启。</p>
+            <p v-else-if="updaterState.phase === 'installing'" class="update-tip">正在安装更新，请稍候…</p>
+            <p v-else-if="updaterState.phase === 'installed'" class="update-tip ok">安装完成，正在重启到新版本…</p>
+            <p v-else-if="updaterState.phase === 'error'" class="update-tip error">{{ updaterState.error }}</p>
+
+            <div v-if="updaterState.phase === 'downloading'" class="update-progress">
+              <div class="update-bar"><i :style="{ width: `${updatePercent ?? 6}%` }"></i></div>
+              <span>正在下载 {{ updaterProgress.downloaded }}<template v-if="updaterProgress.total"> / {{ updaterProgress.total }}</template><template v-if="updatePercent !== null"> · {{ updatePercent }}%</template></span>
+            </div>
+
+            <details v-if="updaterState.phase === 'available' && updaterState.notes" class="update-notes">
+              <summary>更新说明</summary>
+              <pre>{{ updaterState.notes }}</pre>
+            </details>
+
+            <div v-if="updaterState.phase === 'available'" class="update-actions">
+              <template v-if="!confirmingUpgrade">
+                <button class="btn primary" type="button" @click="confirmingUpgrade = true">立即升级</button>
+                <span class="update-hint">升级会重启应用，正在运行的设备与压测会中断。</span>
+              </template>
+              <template v-else>
+                <button class="btn primary" type="button" @click="onConfirmUpgrade">确认升级并重启</button>
+                <button class="btn ghost" type="button" @click="confirmingUpgrade = false">取消</button>
+                <span class="update-hint">点击后开始下载安装包，安装完成会自动重启。</span>
+              </template>
+            </div>
+            <p v-if="needsMacPermissionNote" class="update-hint">macOS 安装包未做 Apple 签名，升级后需重新授予摄像头、麦克风与屏幕录制权限。</p>
+          </div>
         </section>
         <section v-else class="settings-section loading-section">
           <strong>配置正在加载</strong>
@@ -908,6 +968,22 @@ function setBindMode(mode: BindMode) {
 .about-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .about-grid div { display: flex; flex-direction: column; gap: 6px; padding: 13px; border: 1px solid var(--border-default); border-radius: 9px; background: rgba(255,255,255,.35); }
 .about-grid span { color: var(--text-tertiary); font-size: 11px; }
+/* 在线升级卡片：与 about-grid 同宽同风格，状态文案跟随阶段切换。 */
+.update-card { display: flex; flex-direction: column; gap: 10px; padding: 16px; border: 1px solid var(--border-default); border-radius: 12px; background: rgba(255, 255, 255, .35); }
+.update-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.update-head strong { display: block; font-size: 13px; color: var(--text-primary); }
+.update-head span { display: block; margin-top: 4px; font-size: 11px; color: var(--text-tertiary); }
+.update-tip { margin: 0; font-size: 12px; color: var(--text-secondary); }
+.update-tip.ok { color: var(--success); }
+.update-tip.error { color: var(--error); }
+.update-progress { display: flex; flex-direction: column; gap: 6px; font-size: 11px; color: var(--text-tertiary); }
+.update-bar { height: 6px; border-radius: 999px; background: var(--accent-dim); overflow: hidden; }
+.update-bar i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-deep)); transition: width .2s ease; }
+.update-notes { font-size: 12px; color: var(--text-secondary); }
+.update-notes summary { cursor: pointer; color: var(--text-tertiary); }
+.update-notes pre { margin: 8px 0 0; padding: 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word; border-radius: 8px; background: rgba(255, 255, 255, .5); font-family: inherit; font-size: 12px; line-height: 1.6; }
+.update-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.update-hint { font-size: 11px; color: var(--text-tertiary); }
 .loading-section { min-height: 180px; align-items: center; justify-content: center; color: var(--text-tertiary); }
 .loading-section strong { color: var(--text-primary); font-size: 15px; }
 @media (max-width: 980px) { .settings-header { align-items: flex-start; flex-direction: column; } }

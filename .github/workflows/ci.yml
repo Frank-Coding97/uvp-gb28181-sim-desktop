@@ -79,6 +79,10 @@ jobs:
           BUNDLE_FFMPEG: "1"
           # 正式发布(tag)时缺 OSD 能力直接失败，避免静默产出不带水印的包。
           REQUIRE_OSD_FFMPEG: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+          # 在线升级包只在发版时生成：PR / 分支构建拿不到签名私钥，也不需要 .sig。
+          UVP_UPDATER: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         run: ./build-macos-dmg.sh
       - name: 构建 Linux 安装包
         if: matrix.os == 'ubuntu-latest'
@@ -92,6 +96,11 @@ jobs:
         if: matrix.os == 'windows-latest'
         working-directory: apps/desktop
         shell: pwsh
+        env:
+          # 只出 NSIS（-setup.exe）：updater 不支持 msi，双份包会装出两个应用。
+          UVP_UPDATER: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         run: ./build-windows.ps1
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -99,11 +108,13 @@ jobs:
           name: desktop-${{ matrix.os }}
           path: |
             target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app.tar.gz
+            target/release/bundle/macos/*.sig
             target/${{ matrix.target }}/release/bundle/**/*.dmg
             target/${{ matrix.target }}/release/bundle/**/*.deb
             target/${{ matrix.target }}/release/bundle/**/*.AppImage
-            target/${{ matrix.target }}/release/bundle/**/*.msi
             target/${{ matrix.target }}/release/bundle/**/*.exe
+            target/${{ matrix.target }}/release/bundle/**/*.sig
           if-no-files-found: ignore
 
   # ── 打 tag 时发布 GitHub Release ────────────────────────

@@ -39,6 +39,12 @@ toml = "=0.8.2"
 tokio.workspace = true
 tracing.workspace = true
 tauri-plugin-dialog = "=2.7.1"
+# 在线升级：updater 负责「读清单 → 下载 → 验签 → 替换安装」，process 负责安装后重启。
+# 清单里带的是 minisign 签名，公钥在 tauri.conf.json 的 plugins.updater.pubkey。
+# ⛔ 版本必须和 tauri = 2.11.5 对齐：updater 2.13+ / process 2.4+ 要求 tauri ^2.12，
+#    直接升会把整个 Tauri 框架一起抬上去（CLI、api、build 全要跟着动）。
+tauri-plugin-updater = "=2.12.0"
+tauri-plugin-process = "=2.3.1"
 
 [features]
 # 发布构建必须开启:tauri 用 `dev = !custom-protocol` 判定构建形态,

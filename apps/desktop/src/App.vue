@@ -35,6 +35,7 @@ import { effective, normalizeForVersion, optionsFor, parseEncoding } from "./sig
 import { useDevice } from "./device";
 import NotificationBell from "./components/NotificationBell.vue";
 import { startNotificationCenter, stopNotificationCenter } from "./notification-center";
+import { checkForUpdates } from "./updater-client";
 
 const route = useRoute();
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -296,6 +297,9 @@ onMounted(async () => {
   await startNotificationCenter();
   // app 启动/刷新后与引擎对账,反映后台是否已有设备在跑。
   reconcile();
+  // 启动时静默查一次更新：命中新版本只往通知中心放一条，不弹窗、不打断任何操作。
+  // 真正的安装入口在「关于」页，由用户手动确认（安装完成要重启应用）。
+  void checkForUpdates({ silent: true });
 });
 onUnmounted(() => {
   unlisten?.(); unlistenErr?.();

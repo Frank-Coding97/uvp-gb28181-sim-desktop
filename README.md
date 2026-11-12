@@ -165,6 +165,7 @@
 - **成功率曲线**：注册 / 心跳 / 点播趋势图 + 失败原因统计，拐点一眼可见。
 - **模拟器中心**：单设备状态、云台三维朝向、点播与采集来源集中操作。
 - **通知中心**：订阅、报警、录像等运行事件统一汇总。
+- **在线升级**：启动时静默检查，关于页手动确认升级；安装包经签名校验后整包替换并自动重启。
 
 ---
 
@@ -218,7 +219,7 @@
 
 | 平台 | 安装包（以 1.0.0 为例） | 说明 |
 | --- | --- | --- |
-| Windows x64 | `UVP.GB28181.Desktop_1.0.0_x64-setup.exe` / `..._x64_en-US.msi` | 双击安装，FFmpeg 及依赖 DLL 已内嵌 |
+| Windows x64 | `UVP.GB28181.Desktop_1.0.0_x64-setup.exe` | 双击安装，FFmpeg 及依赖 DLL 已内嵌；**只发布 NSIS（exe）包**，在线升级不支持 msi |
 | macOS Apple Silicon | `UVP-GB28181-Desktop_1.0.0_aarch64.dmg` | 双击后把 app 拖进「应用程序」 |
 | Linux x86_64 | 暂无发布包 | 需自行从源码构建，FFmpeg 由系统提供，详见[已知限制](#已知限制) |
 
@@ -406,12 +407,40 @@ uvp-gb28181-sim-desktop/
 - 推送 `v*` tag 会触发 Release 发布；仓库同时维护 GitHub 与 Gitee 两个远程，发版需两边同步。
 - 版本基线为 `1.0.0`，各版本变更见 Releases 页面。
 
+### 在线升级
+
+装在用户机器上的版本可以自己升级，不需要重新下载安装包：
+
+- **启动时静默检查**一次更新清单，命中新版本只往「通知中心」放一条提示，不弹窗、不打断正在跑的压测。
+- 真正的升级入口在「关于」页：显示当前版本、更新说明、下载进度，用户点「立即升级」并确认后才会下载安装，安装完成自动重启。
+- 更新清单是官网上的静态 JSON：`https://uvplatform.com/upgrades/desktop/stable/latest.json`；安装包经 minisign 签名，客户端用内置公钥验签，签名不匹配直接拒绝安装。
+- 出带升级能力的发布包：
+
+  ```bash
+  # macOS：先内置 FFmpeg / Swift runtime，再打 .app.tar.gz 并签名（顺序不能反）
+  BUNDLE_FFMPEG=1 UVP_UPDATER=1 ./build-macos-dmg.sh
+
+  # Windows：只出 NSIS exe，同时产出 .exe.sig
+  $env:UVP_UPDATER = "1"; .\build-windows.ps1
+  ```
+
+- 发布清单（在仓库根目录执行，写入官网仓库后再推官网）：
+
+  ```bash
+  node scripts/publish-update-manifest.mjs --version 1.3.0 --from-release --dry-run  # 先演练
+  node scripts/publish-update-manifest.mjs --version 1.3.0 --from-release
+  ```
+
+- 签名私钥不进仓库：本机放在 `~/.uvp-release-keys/desktop-updater.key`，CI 用 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 两个 secret。**私钥丢失后已装用户再也收不到更新**，只能让用户手动重装。
+
 ---
 
 ## 已知限制
 
 - **macOS 发布包仅提供 arm64**（Apple Silicon）；Intel 芯片的 Mac 需自行从源码构建。
 - 两个平台的安装包**未做代码签名 / Apple 公证**，首次运行需按上文步骤放行；对外正式交付应使用 Developer ID 签名并完成公证。
+- **macOS 每次在线升级后需重新授予权限**：包是 ad-hoc 签名，系统按构建哈希识别应用，新版本会被当成「另一个 App」，摄像头、麦克风、屏幕录制权限会失效，需在系统设置里重新勾选（屏幕录制还要重启应用）。配置、录像与压测数据不受影响。购买 Apple Developer ID 正式签名后即可随版本继承。
+- **在线升级从带此功能的版本开始生效**：更早的版本没有检查更新的代码，需要用户手动安装一次；Windows 用 msi 装过的用户需改用 exe 安装包覆盖安装一次。
 - 压测**单机上限 10,000 台**，实际可承载数量受本机网卡、端口、内存与上级平台性能共同限制。
 - 压测报告导出为**单文件 HTML**（图表内联、不依赖网络），可打印成 PDF；同目录另落一份同名 JSON 作为原始数据。趋势图来自运行期的秒级采样（内存中，最长 2 小时后自动抽稀），**时序指标落 SQLite 仍在规划中**，因此历史多次压测的趋势无法在当前版本横向对比。
 - 报告里的**实际注册速率**由相邻采样点的注册次数增量 ÷ 时间差算出（峰值取全过程最大的一秒），和「爬坡速率」是两个概念：前者是平台实际吃下的接入速度，受响应时延与链路影响，通常不等于设定值。

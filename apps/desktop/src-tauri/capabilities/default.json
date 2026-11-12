@@ -1,7 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "桌面端默认权限:主窗口 + 核心 IPC。",
+  "description": "桌面端默认权限:主窗口 + 核心 IPC + 在线升级(检查/下载/安装/重启)。",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "updater:default",
+    "process:allow-restart"
+  ]
 }

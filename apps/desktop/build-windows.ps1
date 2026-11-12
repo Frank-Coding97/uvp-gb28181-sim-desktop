@@ -89,11 +89,17 @@ Write-Host "FFmpeg/ffprobe 能力报告已生成：$CapabilityReport"
 # ⛔ 必须用 File.WriteAllText（UTF-8 无 BOM）。PS 5.1 的 Set-Content -Encoding UTF8 会写 BOM，
 #    serde_json 见到 BOM 会报 "expected value"。
 $BundleConfig = Join-Path $env:TEMP "uvp-desktop-bundle-config.json"
-$BundleConfigJson = @{
-  bundle = @{
-    resources = @("resources/builtin-camera.mp4", "runtime/ffmpeg/*")
-  }
-} | ConvertTo-Json -Depth 5
+# 在线升级：只有发版时才生成 updater 制品（需要签名私钥），日常/PR 构建不签，
+# 否则本地 `tauri build` 会因为没配私钥直接失败。
+$BuildUpdater = ($env:UVP_UPDATER -eq "1")
+if ($BuildUpdater -and [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -and [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
+  throw "UVP_UPDATER=1 需要签名私钥：请设置 TAURI_SIGNING_PRIVATE_KEY 或 TAURI_SIGNING_PRIVATE_KEY_PATH。"
+}
+$BundlePayload = @{
+  resources = @("resources/builtin-camera.mp4", "runtime/ffmpeg/*")
+}
+if ($BuildUpdater) { $BundlePayload["createUpdaterArtifacts"] = $true }
+$BundleConfigJson = @{ bundle = $BundlePayload } | ConvertTo-Json -Depth 5
 [System.IO.File]::WriteAllText($BundleConfig, $BundleConfigJson)
 
 try {
@@ -102,8 +108,10 @@ try {
   #    后续参数被当成「要转发给 cargo 的 args」，cargo 直接报
   #    "unexpected argument 'nsis,msi'"（看着像参数名写错，其实是多了一层 --）。
   #    这里直接调 tauri CLI，绕开 npm 的参数重组。
+  # ⛔ 只出 NSIS（-setup.exe）：在线升级只支持 NSIS 安装包。msi 走不了 updater，
+  #    用 msi 装的用户升级时会被静默装成第二份。1.4.0 起不再发布 msi。
   # ⛔ bundles 值必须加引号：PowerShell 会把裸写的逗号当数组分隔符拆成两个参数。
-  & '.\node_modules\.bin\tauri.cmd' build --bundles 'nsis,msi' --config $BundleConfig
+  & '.\node_modules\.bin\tauri.cmd' build --bundles 'nsis' --config $BundleConfig
   # ⛔ 原生命令失败不会让 PowerShell 抛异常（$ErrorActionPreference 管不到），
   #    必须自己看退出码，否则「构建失败」会被后面的「已生成」误报成成功。
   if ($LASTEXITCODE -ne 0) {
@@ -122,3 +130,17 @@ finally {
 $dllNote = ""
 if ($StagedDlls.Count -gt 0) { $dllNote = "，另含 $($StagedDlls.Count) 个依赖 DLL" }
 Write-Host "Windows 安装包已生成；ffmpeg.exe 与 ffprobe.exe 已作为应用资源内嵌（resources\runtime\ffmpeg\${dllNote}）。"
+
+if ($BuildUpdater) {
+  # updater 在 Windows 上就是把 -setup.exe 本身当更新包，签名文件必须和它并排存在。
+  $setup = Get-ChildItem -Path (Join-Path $DesktopDir "..\..\target\release\bundle\nsis") -Filter "*-setup.exe" -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if ($null -eq $setup) {
+    throw "未找到 NSIS 安装包（*-setup.exe），无法确认在线升级产物。"
+  }
+  $sig = "$($setup.FullName).sig"
+  if (!(Test-Path -LiteralPath $sig) -or (Get-Item -LiteralPath $sig).Length -le 0) {
+    throw "升级签名缺失：$sig。请确认 TAURI_SIGNING_PRIVATE_KEY 与 tauri.updater.conf.json 均已生效。"
+  }
+  Write-Host "在线升级包已生成：$($setup.Name)（签名 $([math]::Round((Get-Item -LiteralPath $sig).Length / 1024, 1)) KB）"
+}
