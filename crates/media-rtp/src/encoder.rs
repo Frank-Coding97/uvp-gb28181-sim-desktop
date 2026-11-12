@@ -10,8 +10,9 @@
 //! 选择时跳过该后端。
 //!
 //! 统一参数:无 B 帧、固定 GOP(`-g` 加 `-force_key_frames`,AMF H.264 不认 `-g`)、
-//! CBR(`-maxrate`/`-bufsize` 等于码率)、`dump_extra=freq=keyframe` 在每个关键帧
-//! 前补参数集。调试时可用环境变量 `UVP_VIDEO_ENCODER` 强制指定后端。
+//! CBR(`-maxrate`/`-bufsize` 等于码率,VideoToolbox 例外——它带上这两个参数只会
+//! 输出 70% 目标码率)、`dump_extra=freq=keyframe` 在每个关键帧前补参数集。
+//! 调试时可用环境变量 `UVP_VIDEO_ENCODER` 强制指定后端。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -159,10 +160,20 @@ pub fn encoder_args(backend: EncoderBackend, codec: VideoCodec, params: EncodePa
         format!("expr:gte(n,n_forced*{gop})"),
         "-b:v".into(),
         bitrate.clone(),
-        "-maxrate".into(),
-        bitrate.clone(),
-        "-bufsize".into(),
-        bitrate,
+    ]);
+    // VideoToolbox 只要 -b:v 就按目标码率出流;再叠加 -maxrate/-bufsize 反而被它当成
+    // "上限",实际平均码率固定落在目标的 70%(macOS 实测 3000k→2093、8000k→5592、
+    // 10000k→6990、12000k→8393,比值恒定 1.43)。其它硬件后端要靠 maxrate+bufsize
+    // 才进 CBR,照旧保留。
+    if backend != EncoderBackend::VideoToolbox {
+        args.extend([
+            "-maxrate".into(),
+            bitrate.clone(),
+            "-bufsize".into(),
+            bitrate,
+        ]);
+    }
+    args.extend([
         "-pix_fmt".into(),
         if backend.is_hardware() { "nv12" } else { "yuv420p" }.into(),
         // 每个关键帧前补参数集,迟加入的订阅者/解码器都能起播。
@@ -279,6 +290,8 @@ pub struct SourceVideoStream {
     /// 帧率分子/分母,如 (30, 1) 或 (30000, 1001)。
     pub fps_num: u32,
     pub fps_den: u32,
+    /// 流的平均码率(bit/s)。容器没写就是 `None`——那时宁可转码也不直通。
+    pub bit_rate: Option<u64>,
 }
 
 impl SourceVideoStream {
@@ -296,7 +309,7 @@ pub fn probe_source_video(ffprobe: &str, source: &Path) -> Result<SourceVideoStr
     let output = Command::new(ffprobe)
         .args([
             "-v", "error", "-select_streams", "v:0", "-show_entries",
-            "stream=codec_name,width,height,r_frame_rate", "-of", "json",
+            "stream=codec_name,width,height,r_frame_rate,bit_rate", "-of", "json",
         ])
         .arg(source)
         .stdout(Stdio::piped())
@@ -343,7 +356,57 @@ pub fn probe_source_video(ffprobe: &str, source: &Path) -> Result<SourceVideoStr
     let fps_den = den_str
         .parse::<u32>()
         .map_err(|_| format!("帧率分母非法: {den_str}"))?;
-    Ok(SourceVideoStream { codec, width, height, fps_num, fps_den })
+    let bit_rate = stream
+        .get("bit_rate")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok());
+    Ok(SourceVideoStream { codec, width, height, fps_num, fps_den, bit_rate })
+}
+
+/// 探测源文件"最长关键帧间隔"(帧数)。
+///
+/// 只扫开头 `window_seconds` 秒的包,扫到两个关键帧就收工——直通要保证 I 帧密度不
+/// 低于目标 GOP,而源文件可能是 10 秒一个 I 帧的长 GOP 素材,那会让点播起播和拖动
+/// 都变慢。窗口内看不到两个关键帧就返回 `None`,由调用方当作"GOP 太长"处理。
+pub fn probe_source_keyframe_gap(
+    ffprobe: &str,
+    source: &Path,
+    window_seconds: f64,
+) -> Option<u32> {
+    let read_intervals = format!("0%+{}", window_seconds.max(1.0).round() as u64);
+    let output = common::hidden_command(ffprobe)
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-read_intervals", &read_intervals,
+            "-show_entries", "packet=flags", "-of", "csv=p=0",
+        ])
+        .arg(source)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut gap: u32 = 0;
+    let mut max_gap: u32 = 0;
+    let mut keyframes = 0_u32;
+    for line in text.lines() {
+        let flags = line.trim();
+        if flags.is_empty() {
+            continue;
+        }
+        if flags.starts_with('K') {
+            keyframes += 1;
+            if keyframes > 1 {
+                max_gap = max_gap.max(gap);
+            }
+            gap = 0;
+        } else {
+            gap = gap.saturating_add(1);
+        }
+    }
+    (keyframes >= 2).then_some(max_gap)
 }
 
 /// 探测用的 GOP:12 帧里应出现 3 个 IDR(第 0、5、10 帧)。
@@ -550,7 +613,14 @@ mod tests {
                 assert!(has_pair(&args, "-g", "50"));
                 assert!(has_pair(&args, "-force_key_frames", "expr:gte(n,n_forced*50)"));
                 assert!(has_pair(&args, "-b:v", "4000k"));
-                assert!(has_pair(&args, "-maxrate", "4000k"));
+                // VideoToolbox 一旦拿到 -maxrate 就只按目标的 70% 给码率，所以它不带这一对。
+                let wants_maxrate = backend != EncoderBackend::VideoToolbox;
+                assert_eq!(
+                    has_pair(&args, "-maxrate", "4000k"),
+                    wants_maxrate,
+                    "{backend:?} {codec:?} 的 maxrate 策略不符合预期"
+                );
+                assert_eq!(has_pair(&args, "-bufsize", "4000k"), wants_maxrate);
                 assert!(has_pair(&args, "-bsf:v", "dump_extra=freq=keyframe"));
                 let pix = if backend.is_hardware() { "nv12" } else { "yuv420p" };
                 assert!(has_pair(&args, "-pix_fmt", pix));

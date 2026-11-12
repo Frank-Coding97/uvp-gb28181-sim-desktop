@@ -612,42 +612,20 @@ fn verify_profile(
         "{group}/{case_name} 首个视频 AU 不是关键帧"
     );
 
-    let container_path = prepared.cache_dir().join("media.mkv");
+    // 产物不再保留中间容器：编码参数直接从裸流验证（见下），
+    // 帧率由"帧数 / 索引跨度"反推——分段拼接错位时这里会立刻暴露。
+    let index_span_90k = prepared
+        .video_index()
+        .iter()
+        .map(|au| au.pts_90k.saturating_add(au.duration_90k))
+        .max()
+        .unwrap_or(0);
+    let measured_fps = prepared.video_index().len() as f64 / (index_span_90k as f64 / 90_000.0);
     assert!(
-        container_path.is_file(),
-        "{group}/{case_name} 准备结果缺少输出容器"
-    );
-    let container_probe = probe_prepared_container(ffprobe, &container_path);
-    let container_video_stream = stream_with_type(&container_probe, "video", "输出容器视频");
-    assert_eq!(
-        container_video_stream
-            .get("codec_name")
-            .and_then(Value::as_str),
-        Some(video_codec_name(profile.video_codec)),
-        "{group}/{case_name} 输出容器视频编码不匹配"
-    );
-    assert_eq!(
-        json_u64(container_video_stream.get("width")),
-        Some(u64::from(profile.width)),
-        "{group}/{case_name} 输出容器视频宽度不匹配"
-    );
-    assert_eq!(
-        json_u64(container_video_stream.get("height")),
-        Some(u64::from(profile.height)),
-        "{group}/{case_name} 输出容器视频高度不匹配"
-    );
-    let container_frame_rate = container_video_stream
-        .get("r_frame_rate")
-        .and_then(Value::as_str)
-        .map(parse_frame_rate)
-        .unwrap_or_else(|| panic!("{group}/{case_name} 输出容器缺少视频帧率"));
-    assert!(
-        (container_frame_rate - f64::from(profile.video_fps)).abs() < 0.001,
-        "{group}/{case_name} 输出容器视频帧率 {container_frame_rate} != {}",
+        (measured_fps - f64::from(profile.video_fps)).abs() < 0.01,
+        "{group}/{case_name} 索引反推帧率 {measured_fps} != {}",
         profile.video_fps
     );
-    let container_video_frames = json_u64(container_video_stream.get("nb_read_frames"))
-        .unwrap_or_else(|| panic!("{group}/{case_name} 输出容器未返回视频 frame count"));
 
     let video_path = prepared.video_path().to_path_buf();
     let video_format = match profile.video_codec {
@@ -677,11 +655,6 @@ fn verify_profile(
         probed_video_frames as usize,
         prepared.video_index().len(),
         "{group}/{case_name} ffprobe 帧数与视频 AU 数量不一致"
-    );
-    assert_eq!(
-        container_video_frames as usize,
-        prepared.video_index().len(),
-        "{group}/{case_name} 输出容器帧数与视频 AU 数量不一致"
     );
     let video_decode = decode_raw(ffmpeg, &video_path, video_format, None, "视频");
     assert!(video_decode, "{group}/{case_name} 视频解码失败");
@@ -751,7 +724,8 @@ fn verify_profile(
         );
     }
 
-    let video_last = prepared.video_index().last().expect("视频 AU 不应为空");
+    let video_index = prepared.video_index();
+    let video_last = video_index.last().expect("视频 AU 不应为空");
     let video_duration_90k = video_last.pts_90k.saturating_add(video_last.duration_90k);
     let prepared_duration_seconds = prepared.duration_90k() as f64 / 90_000.0;
     assert!(
@@ -818,7 +792,7 @@ fn verify_profile(
         "{group}/{case_name} 关键帧间隔过大：实际 {max_keyframe_gap} 帧，允许 {max_allowed_gap} 帧"
     );
     let payload_bitrate = (group == "bitrate")
-        .then(|| measure_video_payload_bitrate(prepared.video_index(), profile));
+        .then(|| measure_video_payload_bitrate(&prepared.video_index(), profile));
 
     let audio_path = prepared
         .audio_path()
@@ -859,26 +833,12 @@ fn verify_profile(
     );
     let probed_audio_frames = json_u64(audio_stream.get("nb_read_frames"))
         .unwrap_or_else(|| panic!("{group}/{case_name} ffprobe 未返回音频 frame count"));
-    let (aac_priming_packet_count, aac_skip_samples) =
-        if profile.audio_codec == MediaAudioCodec::Aac {
-            let packet_probe = probe_container_audio_packets(ffprobe, &container_path);
-            aac_skip_samples_from_packets(&packet_probe)
-        } else {
-            (0, 0)
-        };
-    let effective_audio_frames = probed_audio_frames
-        .checked_sub(aac_priming_packet_count as u64)
-        .unwrap_or_else(|| panic!("{group}/{case_name} AAC priming 帧数超过裸音频帧数"));
-    if profile.audio_codec == MediaAudioCodec::Aac {
-        assert!(
-            aac_priming_packet_count > 0,
-            "{group}/{case_name} AAC 输出缺少可识别的 skip_samples priming 包"
-        );
-    }
+    // 产物只剩裸流，AAC priming 已经固化在 ADTS 帧里（`skip_samples` 只有容器 side data 才有）。
+    // 直接比对帧数：索引必须与裸流帧数一一对应。
     assert_eq!(
-        effective_audio_frames as usize,
+        probed_audio_frames as usize,
         prepared.audio_index().len(),
-        "{group}/{case_name} 排除 AAC priming 后的有效音频帧数与音频 AU 数量不一致"
+        "{group}/{case_name} 裸音频帧数与音频 AU 数量不一致"
     );
     let audio_decode = decode_raw(
         ffmpeg,
@@ -935,11 +895,9 @@ fn verify_profile(
             "codec_name": video_stream.get("codec_name"),
             "width": video_stream.get("width"),
             "height": video_stream.get("height"),
-            "container_r_frame_rate": container_video_stream.get("r_frame_rate"),
-            "container_avg_frame_rate": container_video_stream.get("avg_frame_rate"),
+            "measured_fps": measured_fps,
             "raw_probe_r_frame_rate_ignored": video_stream.get("r_frame_rate"),
             "ffprobe_frame_count": probed_video_frames,
-            "container_frame_count": container_video_frames,
             "index_frame_count": prepared.video_index().len(),
             "source_read_frame_count": read_video_frames,
             "decoded": video_decode,
@@ -972,9 +930,7 @@ fn verify_profile(
             "sample_rate_hz": audio_stream.get("sample_rate"),
             "channels": audio_stream.get("channels"),
             "ffprobe_frame_count": probed_audio_frames,
-            "aac_priming_packet_count": aac_priming_packet_count,
-            "aac_skip_samples": aac_skip_samples,
-            "effective_frame_count": effective_audio_frames,
+            "index_au_count": prepared.audio_index().len(),
             "index_au_count": prepared.audio_index().len(),
             "source_read_au_count": read_audio_units,
             "decoded": audio_decode,
@@ -1150,81 +1106,6 @@ fn probe_raw_video(ffprobe: &str, input: &Path, format: &str) -> Value {
         input,
         "探测裸视频",
     )
-}
-
-fn probe_prepared_container(ffprobe: &str, input: &Path) -> Value {
-    probe_json(
-        ffprobe,
-        &[
-            "-v".into(),
-            "error".into(),
-            "-count_frames".into(),
-            "-show_streams".into(),
-            "-show_format".into(),
-            "-of".into(),
-            "json".into(),
-        ],
-        input,
-        "探测准备输出容器",
-    )
-}
-
-fn probe_container_audio_packets(ffprobe: &str, input: &Path) -> Value {
-    probe_json(
-        ffprobe,
-        &[
-            "-v".into(),
-            "error".into(),
-            "-select_streams".into(),
-            "a:0".into(),
-            "-show_packets".into(),
-            "-show_entries".into(),
-            "packet=pts_time,duration_time,side_data_list".into(),
-            "-of".into(),
-            "json".into(),
-        ],
-        input,
-        "探测准备输出音频包",
-    )
-}
-
-fn stream_with_type<'a>(probe: &'a Value, codec_type: &str, kind: &str) -> &'a Value {
-    probe
-        .get("streams")
-        .and_then(Value::as_array)
-        .and_then(|streams| {
-            streams
-                .iter()
-                .find(|stream| stream.get("codec_type").and_then(Value::as_str) == Some(codec_type))
-        })
-        .unwrap_or_else(|| panic!("ffprobe 未找到{kind}流"))
-}
-
-fn aac_skip_samples_from_packets(probe: &Value) -> (usize, u64) {
-    let mut packet_count = 0;
-    let mut skip_samples: u64 = 0;
-    for packet in probe
-        .get("packets")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        for side_data in packet
-            .get("side_data_list")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(samples) = json_u64(side_data.get("skip_samples")) else {
-                continue;
-            };
-            if samples > 0 {
-                packet_count += 1;
-                skip_samples = skip_samples.saturating_add(samples);
-            }
-        }
-    }
-    (packet_count, skip_samples)
 }
 
 fn probe_raw_audio(
@@ -1452,16 +1333,6 @@ fn json_f64(value: Option<&Value>) -> Option<f64> {
             .as_f64()
             .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
     })
-}
-
-fn parse_frame_rate(value: &str) -> f64 {
-    let (numerator, denominator) = value
-        .split_once('/')
-        .unwrap_or_else(|| panic!("无法解析 ffprobe 帧率：{value}"));
-    let numerator: f64 = numerator.parse().expect("帧率分子不是数字");
-    let denominator: f64 = denominator.parse().expect("帧率分母不是数字");
-    assert!(denominator > 0.0, "帧率分母必须大于 0");
-    numerator / denominator
 }
 
 fn video_codec_name(codec: MediaVideoCodec) -> &'static str {

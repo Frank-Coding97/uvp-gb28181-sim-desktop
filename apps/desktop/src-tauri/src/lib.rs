@@ -2764,22 +2764,79 @@ async fn start_device(
             );
             let task_cancel = Arc::clone(&cancel);
             let progress_app = prepare_app.clone();
+
+            // 首段就绪就交付：准备线程把产物快照发过来，这个任务立刻装产物并起推流。
+            // 剩余分段继续在后台追加到同一份产物，推流端按游标追着读。
+            let (playable_tx, playable_rx) =
+                tokio::sync::oneshot::channel::<media_rtp::file_profile::PreparedFileProfile>();
+            let playable_slot = Arc::new(std::sync::Mutex::new(Some(playable_tx)));
+            let install_app = prepare_app.clone();
+            let install_cancel = Arc::clone(&cancel);
+            let install_sim = Arc::clone(&prepare_sim);
+            let install_task = tokio::spawn(async move {
+                let Ok(prepared) = playable_rx.await else {
+                    return;
+                };
+                if install_cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                match install_sim
+                    .install_prepared_file_and_start(prepared, &install_cancel)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = install_app.emit(
+                            "media_preparation",
+                            serde_json::json!({
+                                "phase": "ready",
+                                "message": "首段已就绪，可以点播；剩余部分继续后台转换",
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        // 收尾阶段被停止设备打断时，不要显示成"准备失败"——
+                        // 那是用户主动行为，不是故障。
+                        let phase = if install_cancel.load(Ordering::Acquire) {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        };
+                        let _ = install_app.emit(
+                            "media_preparation",
+                            serde_json::json!({"phase": phase, "message": error}),
+                        );
+                    }
+                }
+            });
+
             let joined = tokio::task::spawn_blocking(move || {
                 let progress =
                     move |progress: media_rtp::file_profile::FilePreparationProgress| {
                         emit_media_progress(&progress_app, progress);
                     };
+                let notify = {
+                    let slot = Arc::clone(&playable_slot);
+                    move |snapshot: media_rtp::file_profile::PreparedFileProfile| {
+                        // 只发一次：槽位被取走后后续分段不再通知。
+                        if let Ok(mut slot) = slot.lock() {
+                            if let Some(tx) = slot.take() {
+                                let _ = tx.send(snapshot);
+                            }
+                        }
+                    }
+                };
                 // Windows 上 tokio 阻塞线程栈默认只有 2MB，文件准备链路的栈开销随参数变化，
                 // 这里显式给 8MB 栈兜底，避免再次触发 STATUS_STACK_OVERFLOW(0xc00000fd) 闪退。
                 std::thread::Builder::new()
                     .name("media-prepare".to_string())
                     .stack_size(8 * 1024 * 1024)
                     .spawn(move || {
-                        media_rtp::file_profile::prepare_file_profile(
+                        media_rtp::file_profile::prepare_file_profile_streaming(
                             &source_path,
                             &profile,
                             &task_cancel,
                             Some(&progress),
+                            Some(&notify),
                         )
                     })
                     .map_err(|error| format!("创建文件准备线程失败: {error}"))
@@ -2797,6 +2854,7 @@ async fn start_device(
             // 设备可能已被停止或重新启动：取消后不再安装产物，避免给已下线的
             // 实例补媒体、或在错误的 profile 上启动采集。
             if cancel.load(Ordering::Acquire) {
+                let _ = install_task.await;
                 let _ = prepare_app.emit(
                     "media_preparation",
                     serde_json::json!({"phase":"cancelled", "message":"已取消文件准备"}),
@@ -2805,31 +2863,21 @@ async fn start_device(
                 return;
             }
             match result {
-                Ok(prepared) => match prepare_sim
-                    .install_prepared_file_and_start(prepared, &cancel)
-                    .await
-                {
-                    Ok(()) => {
-                        let _ = prepare_app.emit(
-                            "media_preparation",
-                            serde_json::json!({"phase":"ready", "message":"文件音视频准备完成，可以点播"}),
-                        );
-                    }
-                    Err(error) => {
-                        // 收尾阶段被停止设备打断时，不要显示成"准备失败"——
-                        // 那是用户主动行为，不是故障。
-                        let phase = if cancel.load(Ordering::Acquire) {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        };
-                        let _ = prepare_app.emit(
-                            "media_preparation",
-                            serde_json::json!({"phase": phase, "message": error}),
-                        );
-                    }
-                },
+                Ok(_) => {
+                    // 首段早已可播，这里只代表"整片都已转完"。不再重复安装产物，
+                    // 索引是在同一份句柄里长出来的，推流端自动就能看到后半段。
+                    // 先等安装任务收尾，免得"准备完成"抢在"首段就绪"前面到前端。
+                    let _ = install_task.await;
+                    let _ = prepare_app.emit(
+                        "media_preparation",
+                        serde_json::json!({
+                            "phase":"ready",
+                            "message":"文件音视频准备完成，可循环播放",
+                        }),
+                    );
+                }
                 Err(error) => {
+                    let _ = install_task.await;
                     let _ = prepare_app.emit(
                         "media_preparation",
                         serde_json::json!({"phase":"failed", "message":error}),

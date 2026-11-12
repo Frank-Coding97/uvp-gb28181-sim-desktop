@@ -165,8 +165,9 @@ fn verify_profile_timing(
     assert!(!prepared.video_index().is_empty(), "{label} 没有视频 AU");
     assert!(!prepared.audio_index().is_empty(), "{label} 没有音频 AU");
 
-    let first_video = prepared.video_index().first().expect("视频 AU 不应为空");
-    let last_video = prepared.video_index().last().expect("视频 AU 不应为空");
+    let video_index = prepared.video_index();
+    let first_video = video_index.first().expect("视频 AU 不应为空");
+    let last_video = video_index.last().expect("视频 AU 不应为空");
     assert_eq!(first_video.pts_90k, 0, "{label} 视频首个 PTS 应从 0 开始");
     let video_span_90k = last_video
         .pts_90k
@@ -188,8 +189,9 @@ fn verify_profile_timing(
         &format!("{label} 视频帧数"),
     );
 
-    let first_audio = prepared.audio_index().first().expect("音频 AU 不应为空");
-    let last_audio = prepared.audio_index().last().expect("音频 AU 不应为空");
+    let audio_index = prepared.audio_index();
+    let first_audio = audio_index.first().expect("音频 AU 不应为空");
+    let last_audio = audio_index.last().expect("音频 AU 不应为空");
     assert_eq!(
         first_audio.codec,
         MediaAudioCodec::Aac,
@@ -232,84 +234,91 @@ fn verify_profile_timing(
         &format!("{label} 音频有效时长，AAC padding 允许一个 AU"),
     );
 
-    let container_path = prepared.cache_dir().join("media.mkv");
-    assert!(container_path.is_file(), "{label} 缺少输出容器");
-    let container_video_probe = probe_json(
+    // 产物不再保留中间容器（转码直接出裸流），从裸流验证编码参数；
+    // 帧率则由"帧数 / 索引时长"反推——分段拼接错位时这里第一时间会崩。
+    let video_path = prepared.video_path();
+    assert!(video_path.is_file(), "{label} 缺少视频产物");
+    let output_video_probe = probe_json(
         ffprobe,
         vec![
             "-v",
             "error",
+            "-f",
+            "h264",
+            "-framerate",
+            &profile.video_fps.to_string(),
             "-select_streams",
             "v:0",
             "-count_frames",
             "-show_entries",
-            "stream=codec_name,width,height,r_frame_rate,nb_read_frames",
+            "stream=codec_name,width,height,nb_read_frames",
             "-of",
             "json",
         ],
-        &container_path,
+        video_path.as_path(),
         &format!("探测 {label} 输出视频"),
     );
-    let container_video = first_stream(&container_video_probe, &format!("{label} 输出视频"));
+    let output_video = first_stream(&output_video_probe, &format!("{label} 输出视频"));
     assert_eq!(
-        container_video.get("codec_name").and_then(Value::as_str),
+        output_video.get("codec_name").and_then(Value::as_str),
         Some("h264"),
         "{label} 输出视频编码不匹配"
     );
     assert_eq!(
-        container_video.get("width").and_then(value_u64),
+        output_video.get("width").and_then(value_u64),
         Some(u64::from(profile.width)),
         "{label} 输出视频宽度不匹配"
     );
     assert_eq!(
-        container_video.get("height").and_then(value_u64),
+        output_video.get("height").and_then(value_u64),
         Some(u64::from(profile.height)),
         "{label} 输出视频高度不匹配"
     );
-    let output_fps = container_video
-        .get("r_frame_rate")
-        .and_then(Value::as_str)
-        .map(parse_rational)
-        .expect("输出视频缺少 r_frame_rate");
-    assert!(
-        (output_fps - f64::from(profile.video_fps)).abs() < 0.001,
-        "{label} 输出视频 FPS {output_fps} != {}",
-        profile.video_fps
-    );
     assert_close_u64(
-        container_video
+        output_video
             .get("nb_read_frames")
             .and_then(value_u64)
             .expect("输出视频缺少帧数") as u64,
         expected_video_frames as u64,
         1,
-        &format!("{label} 输出容器视频帧数"),
+        &format!("{label} 输出视频帧数"),
+    );
+    let measured_fps = prepared.video_index().len() as f64
+        / (video_span_90k as f64 / CLOCK_HZ as f64);
+    assert!(
+        (measured_fps - f64::from(profile.video_fps)).abs() < 0.01,
+        "{label} 索引反推的帧率 {measured_fps} != {}",
+        profile.video_fps
     );
 
-    let container_audio_probe = probe_json(
+    let audio_path = prepared
+        .audio_path()
+        .unwrap_or_else(|| panic!("{label} 缺少音频产物"));
+    let output_audio_probe = probe_json(
         ffprobe,
         vec![
             "-v",
             "error",
+            "-f",
+            "aac",
             "-select_streams",
             "a:0",
-            "-count_frames",
             "-show_entries",
-            "stream=codec_name,sample_rate,initial_padding,nb_read_frames",
+            "stream=codec_name,sample_rate",
             "-of",
             "json",
         ],
-        &container_path,
+        audio_path,
         &format!("探测 {label} 输出音频"),
     );
-    let container_audio = first_stream(&container_audio_probe, &format!("{label} 输出音频"));
+    let output_audio = first_stream(&output_audio_probe, &format!("{label} 输出音频"));
     assert_eq!(
-        container_audio.get("codec_name").and_then(Value::as_str),
+        output_audio.get("codec_name").and_then(Value::as_str),
         Some("aac"),
         "{label} 输出音频编码不匹配"
     );
     assert_eq!(
-        container_audio.get("sample_rate").and_then(value_u64),
+        output_audio.get("sample_rate").and_then(value_u64),
         Some(8000),
         "{label} 输出音频采样率不匹配"
     );
@@ -332,7 +341,7 @@ fn verify_profile_timing(
             "span_90k": video_span_90k,
             "expected_span_90k": expected_video_span_90k,
             "tolerance_90k": video_tolerance_90k,
-            "container_r_frame_rate": container_video.get("r_frame_rate"),
+            "measured_fps": measured_fps,
         },
         "audio": {
             "au_count": prepared.audio_index().len(),
@@ -343,10 +352,7 @@ fn verify_profile_timing(
             "expected_effective_span_90k": expected_audio_span_90k,
             "aac_padding_90k": audio_padding_90k,
             "aac_padding_tolerance_90k": audio_au_tolerance_90k,
-            "container_sample_rate_hz": container_audio.get("sample_rate").and_then(value_u64),
-            "container_initial_padding_samples": container_audio
-                .get("initial_padding")
-                .and_then(value_u64),
+            "output_sample_rate_hz": output_audio.get("sample_rate").and_then(value_u64),
         },
         "unpaced_event_count": events.len(),
     })
