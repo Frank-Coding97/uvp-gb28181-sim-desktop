@@ -249,13 +249,22 @@ fn media_preparation_message(
 ///
 /// `completed`/`total` 同单位（字节或微秒），前端据此画进度条并估算剩余时间；
 /// 拿不到总量时只显示阶段文案，不编造百分比。
+///
+/// `playable` 为真表示首段已经交付推流：此时后台仍在转，文案必须改成"可以点播"，
+/// 否则用户盯着"正在按所选参数转换音视频 20%"会以为设备还不能用。
 fn emit_media_progress(
     app: &AppHandle,
     progress: media_rtp::file_profile::FilePreparationProgress,
+    playable: bool,
 ) {
+    let message = if playable {
+        "首段已就绪，可以点播；正在后台转换剩余部分"
+    } else {
+        media_preparation_message(progress.phase)
+    };
     let mut payload = serde_json::json!({
         "phase": "preparing",
-        "message": media_preparation_message(progress.phase),
+        "message": message,
         "completed": progress.completed,
         "total": progress.total,
     });
@@ -2770,6 +2779,9 @@ async fn start_device(
             let (playable_tx, playable_rx) =
                 tokio::sync::oneshot::channel::<media_rtp::file_profile::PreparedFileProfile>();
             let playable_slot = Arc::new(std::sync::Mutex::new(Some(playable_tx)));
+            // 首段是否已经交付推流。进度上报据此切换文案：后台继续转，但用户已经能点播。
+            let playable = Arc::new(AtomicBool::new(false));
+            let install_playable = Arc::clone(&playable);
             let install_app = prepare_app.clone();
             let install_cancel = Arc::clone(&cancel);
             let install_sim = Arc::clone(&prepare_sim);
@@ -2785,11 +2797,12 @@ async fn start_device(
                     .await
                 {
                     Ok(()) => {
+                        install_playable.store(true, Ordering::Release);
                         let _ = install_app.emit(
                             "media_preparation",
                             serde_json::json!({
-                                "phase": "ready",
-                                "message": "首段已就绪，可以点播；剩余部分继续后台转换",
+                                "phase": "preparing",
+                                "message": "首段已就绪，可以点播；正在后台转换剩余部分",
                             }),
                         );
                     }
@@ -2810,10 +2823,14 @@ async fn start_device(
             });
 
             let joined = tokio::task::spawn_blocking(move || {
-                let progress =
-                    move |progress: media_rtp::file_profile::FilePreparationProgress| {
-                        emit_media_progress(&progress_app, progress);
-                    };
+                let progress_playable = Arc::clone(&playable);
+                let progress = move |progress: media_rtp::file_profile::FilePreparationProgress| {
+                    emit_media_progress(
+                        &progress_app,
+                        progress,
+                        progress_playable.load(Ordering::Acquire),
+                    );
+                };
                 let notify = {
                     let slot = Arc::clone(&playable_slot);
                     move |snapshot: media_rtp::file_profile::PreparedFileProfile| {

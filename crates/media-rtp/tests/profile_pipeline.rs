@@ -575,7 +575,7 @@ fn verify_profile(
         "{group}/{case_name} 无视频 AU"
     );
     assert!(
-        prepared.audio_index().len() > 0,
+        !prepared.audio_index().is_empty(),
         "{group}/{case_name} 无音频 AU；合成源必须带音轨"
     );
     assert_eq!(
@@ -1358,8 +1358,8 @@ fn tool_version(tool: &str) -> String {
 fn last_output_line(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr)
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .last()
+        .rev()
+        .find(|line| !line.trim().is_empty())
         .unwrap_or("未知错误")
         .trim()
         .to_string()

@@ -255,7 +255,7 @@ fn verify_profile_timing(
             "-of",
             "json",
         ],
-        video_path.as_path(),
+        video_path,
         &format!("探测 {label} 输出视频"),
     );
     let output_video = first_stream(&output_video_probe, &format!("{label} 输出视频"));
@@ -762,20 +762,6 @@ fn first_stream<'a>(probe: &'a Value, label: &str) -> &'a Value {
         .and_then(Value::as_array)
         .and_then(|streams| streams.first())
         .unwrap_or_else(|| panic!("{label} 缺少 stream"))
-}
-
-fn parse_rational(value: &str) -> f64 {
-    let (numerator, denominator) = value
-        .split_once('/')
-        .unwrap_or_else(|| panic!("无法解析 ffprobe 帧率 {value}"));
-    let numerator = numerator
-        .parse::<f64>()
-        .unwrap_or_else(|error| panic!("无法解析 ffprobe 帧率分子 {value}：{error}"));
-    let denominator = denominator
-        .parse::<f64>()
-        .unwrap_or_else(|error| panic!("无法解析 ffprobe 帧率分母 {value}：{error}"));
-    assert!(denominator > 0.0, "ffprobe 帧率分母必须大于 0：{value}");
-    numerator / denominator
 }
 
 fn value_f64(value: &Value) -> Option<f64> {

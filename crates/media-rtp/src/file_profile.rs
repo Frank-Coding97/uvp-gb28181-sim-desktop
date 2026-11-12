@@ -670,11 +670,10 @@ fn video_strategies(
         .saturating_mul(profile.keyframe_interval_seconds)
         .max(1);
     if let Some(source) = source_video {
-        let codec_match = match (source.codec, profile.video_codec) {
-            (VideoCodec::H264, MediaVideoCodec::H264) => true,
-            (VideoCodec::H265, MediaVideoCodec::H265) => true,
-            _ => false,
-        };
+        let codec_match = matches!(
+            (source.codec, profile.video_codec),
+            (VideoCodec::H264, MediaVideoCodec::H264) | (VideoCodec::H265, MediaVideoCodec::H265)
+        );
         let bitrate_ok = source.bit_rate.is_some_and(|rate| {
             // 允许 30% 余量:源文件码率贴着目标值时,重编码省下的那点带宽没意义。
             rate / 1000 <= u64::from(profile.bitrate_kbps) * 13 / 10
@@ -2256,7 +2255,7 @@ fn parse_hhmmss_us(text: &str) -> Option<u64> {
     let minutes = parts.next()?.parse::<f64>().ok()?;
     let seconds = parts.next()?.parse::<f64>().ok()?;
     let total = hours as f64 * 3600.0 + minutes * 60.0 + seconds;
-    (total.is_finite() && total >= 0.0).then(|| (total * 1_000_000.0) as u64)
+    (total.is_finite() && total >= 0.0).then_some((total * 1_000_000.0) as u64)
 }
 
 /// 读取 `-progress` 文件里最后一个 `out_time` 值（微秒）。
@@ -2618,8 +2617,8 @@ fn run_cancellable_with_progress(
 fn last_stderr_line_bytes(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .last()
+        .rev()
+        .find(|line| !line.trim().is_empty())
         .unwrap_or("未知错误")
         .trim()
         .to_string()
