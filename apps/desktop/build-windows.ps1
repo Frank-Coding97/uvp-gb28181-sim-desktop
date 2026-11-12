@@ -91,7 +91,10 @@ Write-Host "FFmpeg/ffprobe 能力报告已生成：$CapabilityReport"
 $BundleConfig = Join-Path $env:TEMP "uvp-desktop-bundle-config.json"
 # 在线升级：只有发版时才生成 updater 制品（需要签名私钥），日常/PR 构建不签，
 # 否则本地 `tauri build` 会因为没配私钥直接失败。
-$BuildUpdater = ($env:UVP_UPDATER -eq "1")
+# ⛔ 要 Trim：cmd 里写 `set UVP_UPDATER=1 && ...` 时，cmd 会把 `&&` 前的空格算进变量值，
+#    PowerShell 读到的是 "1 "，与 "1" 不相等 ⇒ 整段签名被静默跳过，旧 .sig 留在目录里
+#    （2026-11-12 发 1.3.0 时踩到：exe 是新的，sig 却是上一轮的，验签必然失败）。
+$BuildUpdater = ("$env:UVP_UPDATER".Trim() -eq "1")
 if ($BuildUpdater -and
     [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -and
     [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
@@ -177,4 +180,10 @@ if ($BuildUpdater) {
     throw "升级签名缺失：$sig。请确认签名私钥与公钥（tauri.conf.json plugins.updater.pubkey）配对。"
   }
   Write-Host "在线升级包已生成：$($setup.Name)（签名 $((Get-Item -LiteralPath $sig).Length) 字节）"
+}
+else {
+  # 没开在线升级构建时，清掉上一轮留在目录里的签名：否则「exe 是新的、sig 是旧的」
+  # 这种组合会被下游当成有效产物（2026-11-12 差点这样发版）。
+  Get-ChildItem -Path (Join-Path $DesktopDir "..\..\target\release\bundle\nsis") -Filter "*-setup.exe.sig" -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 }

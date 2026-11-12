@@ -82,3 +82,16 @@ test("Windows 升级包由脚本自己用 -f 签名，且不与 TAURI_SIGNING_PR
   assert.match(winScript, /Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY/);
   assert.match(winScript, /cmd \/c \$signCmd/);
 });
+
+// 2026-11-12 发 1.3.0 时踩到：cmd 里 `set UVP_UPDATER=1 && ...` 会把 `&&` 前的空格算进值，
+// PowerShell 读到 "1 " 与 "1" 不等 ⇒ 整个签名段被静默跳过，目录里留着上一轮的 .sig，
+// 结果「exe 是新的、签名是旧的」，用户端验签必然失败。
+test("Windows 脚本对 UVP_UPDATER 做 Trim，且不打升级包时清掉残留签名", () => {
+  assert.match(
+    winScript,
+    /\$BuildUpdater\s*=\s*\("?\$env:UVP_UPDATER"?\s*\.Trim\(\)\s*-eq\s*"1"\)/,
+    "UVP_UPDATER 必须 Trim 后比较，否则 cmd 传参会带尾随空格",
+  );
+  const elseBranch = winScript.split("else {").pop() ?? "";
+  assert.match(elseBranch, /-setup\.exe\.sig/, "未构建升级包时应删除上一轮残留的 .sig");
+});
