@@ -298,6 +298,116 @@ mod tests {
         );
         remove_indexed_test_profile(&prepared);
     }
+
+    #[test]
+    fn quick_fingerprint_reuses_full_hash_when_source_is_unchanged() {
+        let input = temp_input("fingerprint-stable");
+        make_synthetic_input(&input);
+        let cancel = AtomicBool::new(false);
+
+        let first = SourceSnapshot::capture(&input, &cancel, None).expect("首次快照失败");
+        let second = SourceSnapshot::capture(&input, &cancel, None).expect("二次快照失败");
+
+        assert_eq!(first.sha256, second.sha256);
+        assert_eq!(first.sample_sha256, second.sample_sha256);
+        assert_eq!(first.length, second.length);
+        // 索引必须落盘：只有内存缓存的话，下次启动仍要重算整片。
+        assert!(
+            source_index_path(&cache_root()).is_file(),
+            "快速指纹索引未写入磁盘"
+        );
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn quick_fingerprint_changes_when_source_content_changes() {
+        let input = temp_input("fingerprint-changed");
+        make_synthetic_input(&input);
+        let cancel = AtomicBool::new(false);
+
+        let before = SourceSnapshot::capture(&input, &cancel, None).expect("首次快照失败");
+        fs::write(&input, b"not a video anymore").expect("覆盖源文件失败");
+        let after = SourceSnapshot::capture(&input, &cancel, None).expect("二次快照失败");
+
+        assert_ne!(before.sha256, after.sha256, "内容变了必须重算全量哈希");
+        let _ = fs::remove_file(&input);
+    }
+
+    #[test]
+    fn parses_ffmpeg_progress_out_time() {
+        assert_eq!(parse_hhmmss_us("00:00:05.500000"), Some(5_500_000));
+        assert_eq!(parse_hhmmss_us("01:02:03.000000"), Some(3_723_000_000));
+        assert_eq!(parse_hhmmss_us("N/A"), None);
+        assert_eq!(parse_hhmmss_us(""), None);
+
+        let path = std::env::temp_dir().join(format!(
+            "uvp-ffprogress-{}-{}",
+            std::process::id(),
+            TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            "frame=12\nout_time_us=500000\nout_time_ms=500000\nout_time=00:00:00.500000\nprogress=continue\n\
+             frame=25\nout_time_us=1000000\nout_time_ms=1000000\nout_time=00:00:01.000000\nprogress=end\n",
+        )
+        .expect("写入进度文件失败");
+        assert_eq!(read_progress_out_time_us(&path), Some(1_000_000));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn preparation_reports_transcode_progress_with_total() {
+        assert!(ffmpeg().is_some(), "该测试需要可用的 ffmpeg");
+        let input = temp_input("progress-report");
+        make_synthetic_input(&input);
+        let cancel = AtomicBool::new(false);
+        // 用一组没被其它测试用过的参数，确保这次真的走转码而不是命中缓存。
+        let profile = MediaProfile {
+            width: 640,
+            height: 480,
+            video_fps: 20,
+            bitrate_kbps: 600,
+            keyframe_interval_seconds: 1,
+            video_codec: MediaVideoCodec::H264,
+            audio_codec: MediaAudioCodec::Aac,
+            audio_sample_rate_hz: 16000,
+        };
+        // 回调要求 'static，用 Arc 共享收集器，测试体自己再读一遍。
+        let events: Arc<Mutex<Vec<FilePreparationProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let callback = move |progress: FilePreparationProgress| {
+            sink.lock().expect("进度收集锁异常").push(progress);
+        };
+
+        let prepared = prepare_file_profile(&input, &profile, &cancel, Some(&callback))
+            .expect("合成文件准备失败");
+
+        let captured = events.lock().expect("进度收集锁异常").clone();
+        let transcoding: Vec<_> = captured
+            .iter()
+            .filter(|event| event.phase == FilePreparationPhase::Transcoding)
+            .collect();
+        assert!(!transcoding.is_empty(), "没有收到转码阶段进度");
+        assert!(
+            transcoding
+                .iter()
+                .any(|event| event.total.is_some() && event.completed == event.total),
+            "转码阶段应给出带总量的进度并收尾到 100%: {transcoding:?}"
+        );
+        // 阶段顺序不能乱：转码一定在索引之前。
+        let transcode_at = captured
+            .iter()
+            .position(|event| event.phase == FilePreparationPhase::Transcoding)
+            .expect("缺少转码阶段");
+        let probing_at = captured
+            .iter()
+            .position(|event| event.phase == FilePreparationPhase::Probing)
+            .expect("缺少索引阶段");
+        assert!(transcode_at < probing_at);
+
+        remove_indexed_test_profile(&prepared);
+        let _ = fs::remove_file(&input);
+    }
 }
 use crate::profile::{MediaAudioCodec, MediaProfile, MediaVideoCodec};
 use crate::encoder::{self, probe_source_video, SourceVideoStream};
@@ -310,7 +420,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -322,6 +432,24 @@ const CACHE_ROOT_ENV: &str = "UVP_MEDIA_PROFILE_CACHE_DIR";
 const COPY_BUFFER_BYTES: usize = 256 * 1024;
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// 源文件快速指纹索引。
+///
+/// 缓存键仍然用整片 SHA256（保持与既有缓存目录兼容），但每次注册都把整片重读一遍
+/// 只为算出这个键，长素材动辄几十秒。这里额外记一份「路径 → 大小/修改时间/首尾采样」
+/// 的索引：命中就直接复用上次算出的 SHA256，未命中才算全量。
+///
+/// 索引只是加速产物，任何读写失败都退回全量哈希，不能影响媒体准备的正确性。
+const SOURCE_INDEX_FILE: &str = "source-index.json";
+const SOURCE_INDEX_VERSION: u32 = 1;
+/// 首尾各取多少字节参与快速指纹。两次小读即可覆盖「同大小同时间但内容被换掉」的情况。
+const QUICK_SAMPLE_BYTES: u64 = 64 * 1024;
+/// 索引条目上限。超过就整体重建：它只是加速用的旁路数据，
+/// 与其为清理单个失效条目引入时间戳/排序，不如一次性清空换简单可靠。
+const SOURCE_INDEX_MAX_ENTRIES: usize = 128;
+/// 进度事件最小上报间隔。ffmpeg 本身约每 0.5 秒一行，这里再限流一次，
+/// 避免长片转码把 Tauri 事件通道刷爆（前端按帧重绘也会卡）。
+const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 文件转码策略(P6):直通 → 硬件 → 软编。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -984,7 +1112,7 @@ pub fn prepare_file_profile(
     }
 
     report(progress, FilePreparationPhase::HashingSource);
-    let source_snapshot = SourceSnapshot::capture(path, cancel)?;
+    let source_snapshot = SourceSnapshot::capture(path, cancel, progress)?;
     let ffmpeg = crate::source::ffmpeg_bin()
         .ok_or_else(|| "未找到 ffmpeg，无法准备文件媒体 profile".to_string())?;
     let ffprobe = ffprobe_bin()
@@ -1082,6 +1210,8 @@ fn prepare_uncached(
     let source_copy = copy_source_snapshot(source, source_snapshot, cancel, temp_dir)?;
     let source_has_audio = has_audio_stream(ffprobe, &source_copy, cancel)?;
     let source_video = probe_source_video(ffprobe, &source_copy).ok();
+    // 进度分母：转码耗时与时长线性相关，拿到时长前端才能给出百分比与剩余时间。
+    let source_duration_us = probe_stream_duration_us(ffprobe, &source_copy, cancel);
     let container = temp_dir.join("media.mkv");
     let video_file = temp_dir.join(video_filename(profile.video_codec));
 
@@ -1093,7 +1223,16 @@ fn prepare_uncached(
         check_cancel(cancel)?;
         let attempt = (|| -> Result<_, String> {
             let _ = fs::remove_file(&container);
-            transcode_source(ffmpeg, &source_copy, profile, &container, strategy, cancel)?;
+            transcode_source(
+                ffmpeg,
+                &source_copy,
+                profile,
+                &container,
+                strategy,
+                source_duration_us,
+                progress,
+                cancel,
+            )?;
             check_source_unchanged(source, source_snapshot, cancel)?;
 
             report(progress, FilePreparationPhase::Extracting);
@@ -1251,12 +1390,94 @@ fn load_cached_profile(
     })
 }
 
+/// 解析 `HH:MM:SS.ffffff` 为微秒。ffmpeg 各版本的进度输出都带这一行。
+fn parse_hhmmss_us(text: &str) -> Option<u64> {
+    let mut parts = text.split(':');
+    let hours = parts.next()?.parse::<u64>().ok()?;
+    let minutes = parts.next()?.parse::<f64>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    let total = hours as f64 * 3600.0 + minutes * 60.0 + seconds;
+    (total.is_finite() && total >= 0.0).then(|| (total * 1_000_000.0) as u64)
+}
+
+/// 读取 `-progress` 文件里最后一个 `out_time` 值（微秒）。
+///
+/// 优先用 `out_time=` 字符串形式：`out_time_us` 是较新版本才有的字段，
+/// 而 `out_time_ms` 在旧版本里名不副实（值其实是微秒），两者都只作兜底。
+fn read_progress_out_time_us(path: &Path) -> Option<u64> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut latest = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("out_time_us=") {
+            if let Ok(us) = value.trim().parse::<u64>() {
+                latest = Some(us);
+            }
+        } else if let Some(value) = line.strip_prefix("out_time_ms=") {
+            if let Ok(us) = value.trim().parse::<u64>() {
+                latest = Some(us);
+            }
+        } else if let Some(value) = line.strip_prefix("out_time=") {
+            if let Some(us) = parse_hhmmss_us(value.trim()) {
+                latest = Some(us);
+            }
+        }
+    }
+    latest
+}
+
+/// 取源视频流时长（微秒），作为转码进度的分母。
+///
+/// 流级时长在部分容器里是 `N/A`，此时退回容器总时长；都拿不到就不显示百分比，
+/// 不影响准备流程本身。
+fn probe_stream_duration_us(ffprobe: &str, path: &Path, cancel: &AtomicBool) -> Option<u64> {
+    let seconds_from = |value: &Value, scope: &str| {
+        value
+            .get(scope)
+            .and_then(|node| match scope {
+                "streams" => node.as_array().and_then(|streams| streams.first()),
+                _ => Some(node),
+            })
+            .and_then(|node| node.get("duration"))
+            .and_then(Value::as_str)
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    };
+    let stream = run_probe(
+        ffprobe,
+        [
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "json",
+        ],
+        path,
+        cancel,
+    )
+    .ok()
+    .and_then(|value| seconds_from(&value, "streams"));
+    let seconds = stream.or_else(|| {
+        run_probe(
+            ffprobe,
+            ["-show_entries", "format=duration", "-of", "json"],
+            path,
+            cancel,
+        )
+        .ok()
+        .and_then(|value| seconds_from(&value, "format"))
+    })?;
+    Some((seconds * 1_000_000.0) as u64)
+}
+
 fn transcode_source(
     ffmpeg: &str,
     source: &Path,
     profile: &MediaProfile,
     output: &Path,
     strategy: TranscodeStrategy,
+    duration_us: Option<u64>,
+    progress: Option<&FilePreparationProgressCallback>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let gop_frames = profile
@@ -1272,10 +1493,16 @@ fn transcode_source(
     command.arg(source);
     command.args(["-map", "0:v:0", "-map", "0:a:0?"]);
 
+    // `-progress` 把周期性进度写成 key=value 行。写到临时文件而不是 stdout：
+    // 主循环保持 25ms 轮询（取消响应快），不必阻塞在读管道上等下一行。
+    let progress_file = output.with_extension("ffprogress");
+    command.args(["-nostats", "-progress"]);
+    command.arg(&progress_file);
+
     // 根据策略决定视频参数。
     match strategy {
         TranscodeStrategy::Passthrough => {
-            // 直通:只裁剪到目标时长,不重编码。
+            // 直通:只换容器、不重编码，仍然整片复制（源编码/分辨率/帧率与目标一致时才有此档）。
             command.args(["-c:v", "copy"]);
         }
         TranscodeStrategy::Hardware(backend) => {
@@ -1324,7 +1551,14 @@ fn transcode_source(
     append_audio_args(&mut command, profile);
     command.args(["-avoid_negative_ts", "disabled", "-f", "matroska"]);
     command.arg(output);
-    run_cancellable(command, cancel, "ffmpeg 文件转码")
+    run_cancellable_with_progress(
+        command,
+        cancel,
+        "ffmpeg 文件转码",
+        Some(&progress_file),
+        duration_us,
+        progress,
+    )
 }
 
 fn append_audio_args(command: &mut Command, profile: &MediaProfile) {
@@ -1394,43 +1628,118 @@ fn extract_audio(
 }
 
 fn run_cancellable(
-    mut command: Command,
+    command: Command,
     cancel: &AtomicBool,
     operation: &str,
 ) -> Result<(), String> {
+    run_cancellable_with_progress(command, cancel, operation, None, None, None)
+}
+
+/// 运行可取消的外部命令，并可选地上报阶段内进度。
+///
+/// `progress_file` 是传给 ffmpeg `-progress` 的路径：主循环按固定间隔读这个文件，
+/// 而不是阻塞在 stdout 上等下一行——后者会让取消响应被 ffmpeg 的输出节奏绑死。
+fn run_cancellable_with_progress(
+    mut command: Command,
+    cancel: &AtomicBool,
+    operation: &str,
+    progress_file: Option<&Path>,
+    total_us: Option<u64>,
+    progress: Option<&FilePreparationProgressCallback>,
+) -> Result<(), String> {
     check_cancel(cancel)?;
+    if let Some(path) = progress_file {
+        let _ = fs::remove_file(path);
+    }
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("{operation}启动失败: {error}"))?;
+    // stderr 必须一直在读：管道写满会把子进程阻塞在日志输出上，现场表现就是"转码卡死"。
+    // 收集放独立线程，主线程才能继续用 25ms 轮询处理取消。
+    let mut stderr_reader = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut data = Vec::new();
+            let _ = reader.read_to_end(&mut data);
+            data
+        })
+    });
+    let mut last_report = Instant::now()
+        .checked_sub(PROGRESS_REPORT_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         if cancel.load(Ordering::Acquire) {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(reader) = stderr_reader.take() {
+                let _ = reader.join();
+            }
+            if let Some(path) = progress_file {
+                let _ = fs::remove_file(path);
+            }
             return Err(format!("{operation}已取消"));
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|error| format!("{operation}读取结果失败: {error}"))?;
+                let stderr = stderr_reader
+                    .take()
+                    .map(|reader| reader.join().unwrap_or_default())
+                    .unwrap_or_default();
                 if status.success() {
+                    // 收尾补一次满格，避免进度停在最后一格。
+                    if let (Some(total), Some(callback)) = (total_us, progress) {
+                        report_with_progress(
+                            Some(callback),
+                            FilePreparationPhase::Transcoding,
+                            Some(total),
+                            Some(total),
+                        );
+                    }
+                    if let Some(path) = progress_file {
+                        let _ = fs::remove_file(path);
+                    }
                     return Ok(());
                 }
-                return Err(format!("{operation}失败: {}", last_stderr_line(&output)));
+                if let Some(path) = progress_file {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(format!(
+                    "{operation}失败: {}",
+                    last_stderr_line_bytes(&stderr)
+                ));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                if let (Some(path), Some(total), Some(callback)) =
+                    (progress_file, total_us, progress)
+                {
+                    if last_report.elapsed() >= PROGRESS_REPORT_INTERVAL {
+                        last_report = Instant::now();
+                        if let Some(out_us) = read_progress_out_time_us(path) {
+                            report_with_progress(
+                                Some(callback),
+                                FilePreparationPhase::Transcoding,
+                                Some(out_us.min(total)),
+                                Some(total),
+                            );
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(reader) = stderr_reader.take() {
+                    let _ = reader.join();
+                }
+                if let Some(path) = progress_file {
+                    let _ = fs::remove_file(path);
+                }
                 return Err(format!("{operation}等待失败: {error}"));
             }
         }
     }
-}
-
-fn last_stderr_line(output: &Output) -> String {
-    last_stderr_line_bytes(&output.stderr)
 }
 
 fn last_stderr_line_bytes(stderr: &[u8]) -> String {
@@ -2048,11 +2357,22 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
 }
 
 fn report(callback: Option<&FilePreparationProgressCallback>, phase: FilePreparationPhase) {
+    report_with_progress(callback, phase, None, None);
+}
+
+/// 带阶段内进度的上报。`completed`/`total` 用同一单位（字节或微秒），
+/// 前端据此刻画进度条与剩余时间。
+fn report_with_progress(
+    callback: Option<&FilePreparationProgressCallback>,
+    phase: FilePreparationPhase,
+    completed: Option<u64>,
+    total: Option<u64>,
+) {
     if let Some(callback) = callback {
         callback(FilePreparationProgress {
             phase,
-            completed: None,
-            total: None,
+            completed,
+            total,
         });
     }
 }
@@ -2061,14 +2381,145 @@ fn report(callback: Option<&FilePreparationProgressCallback>, phase: FilePrepara
 struct SourceSnapshot {
     length: u64,
     modified: Option<SystemTime>,
+    /// 首尾采样指纹：用于在元数据未变时低成本复核内容是否被换掉。
+    sample_sha256: String,
     sha256: String,
 }
 
+/// 一条快速指纹记录。字段全部参与命中判断，任一不符就退回全量哈希。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SourceIndexEntry {
+    length: u64,
+    modified_ns: u64,
+    sample_sha256: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceIndex {
+    version: u32,
+    entries: HashMap<String, SourceIndexEntry>,
+}
+
+impl SourceIndex {
+    fn empty() -> Self {
+        Self {
+            version: SOURCE_INDEX_VERSION,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+fn source_index_path(root: &Path) -> PathBuf {
+    root.join(SOURCE_INDEX_FILE)
+}
+
+/// 读取快速指纹索引。文件缺失、损坏或版本不符都当作空索引重建——
+/// 它只影响速度，不能成为媒体准备的失败原因。
+fn load_source_index(root: &Path) -> SourceIndex {
+    match read_json::<SourceIndex>(&source_index_path(root)) {
+        Ok(index) if index.version == SOURCE_INDEX_VERSION => index,
+        _ => SourceIndex::empty(),
+    }
+}
+
+fn store_source_index(root: &Path, index: &SourceIndex) {
+    let path = source_index_path(root);
+    let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let Ok(data) = serde_json::to_vec(index) else {
+        return;
+    };
+    if fs::write(&temp, data).is_ok() {
+        let _ = fs::rename(&temp, &path);
+    }
+}
+
+fn metadata_modified_ns(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|delta| delta.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// 计算首尾采样指纹：文件很小时就是全文件，稍大时只读头尾各 64KB。
+///
+/// 与「大小 + 修改时间」组合，足以识别正常的文件替换；即使有人刻意把
+/// 修改时间改回去，采样不同仍会触发全量重算。
+fn quick_sample_sha256(path: &Path, length: u64) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("打开源文件失败: {error}"))?;
+    let mut digest = Sha256::new();
+    digest.update(length.to_le_bytes());
+    let mut buffer = vec![0_u8; QUICK_SAMPLE_BYTES as usize];
+    let head = length.min(QUICK_SAMPLE_BYTES);
+    if head > 0 {
+        file.read_exact(&mut buffer[..head as usize])
+            .map_err(|error| format!("读取源文件头部失败: {error}"))?;
+        digest.update(&buffer[..head as usize]);
+    }
+    if length > QUICK_SAMPLE_BYTES {
+        let tail = QUICK_SAMPLE_BYTES.min(length - QUICK_SAMPLE_BYTES);
+        file.seek(SeekFrom::End(-(tail as i64)))
+            .map_err(|error| format!("定位源文件尾部失败: {error}"))?;
+        file.read_exact(&mut buffer[..tail as usize])
+            .map_err(|error| format!("读取源文件尾部失败: {error}"))?;
+        digest.update(&buffer[..tail as usize]);
+    }
+    Ok(hex_encode(&digest.finalize()))
+}
+
 impl SourceSnapshot {
-    fn capture(path: &Path, cancel: &AtomicBool) -> Result<Self, String> {
+    fn capture(
+        path: &Path,
+        cancel: &AtomicBool,
+        progress: Option<&FilePreparationProgressCallback>,
+    ) -> Result<Self, String> {
         let metadata =
             fs::metadata(path).map_err(|error| format!("读取源文件信息失败: {error}"))?;
-        let sha256 = sha256_file(path, cancel)?;
+        let length = metadata.len();
+        let modified_ns = metadata_modified_ns(&metadata);
+        // 用规范化路径做键：同一个素材经符号链接/相对路径选中时也能命中。
+        let index_key = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let sample_sha256 = quick_sample_sha256(path, length)?;
+
+        let cache_root = cache_root();
+        let mut index = load_source_index(&cache_root);
+        let reused = index.entries.get(&index_key).is_some_and(|entry| {
+            entry.length == length
+                && entry.modified_ns == modified_ns
+                && entry.sample_sha256 == sample_sha256
+        });
+        let sha256 = if reused {
+            let cached = index
+                .entries
+                .get(&index_key)
+                .map(|entry| entry.sha256.clone())
+                .unwrap_or_default();
+            tracing::debug!(path = %path.display(), "源文件快速指纹命中，跳过全量哈希");
+            cached
+        } else {
+            let sha256 = sha256_file(path, cancel, progress.map(|callback| (callback, length)))?;
+            // 条目数到顶就整体重建，避免长期使用后索引无限增长。
+            if index.entries.len() >= SOURCE_INDEX_MAX_ENTRIES {
+                index.entries.clear();
+            }
+            index.entries.insert(
+                index_key,
+                SourceIndexEntry {
+                    length,
+                    modified_ns,
+                    sample_sha256: sample_sha256.clone(),
+                    sha256: sha256.clone(),
+                },
+            );
+            store_source_index(&cache_root, &index);
+            sha256
+        };
         let after_hash =
             fs::metadata(path).map_err(|error| format!("读取源文件信息失败: {error}"))?;
         if metadata.len() != after_hash.len()
@@ -2079,6 +2530,7 @@ impl SourceSnapshot {
         Ok(Self {
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            sample_sha256,
             sha256,
         })
     }
@@ -2153,18 +2605,28 @@ fn check_source_unchanged(
     if metadata.len() != snapshot.length || metadata.modified().ok() != snapshot.modified {
         return Err("源文件在准备期间发生变化，已放弃缓存发布".into());
     }
-    let sha256 = sha256_file(path, cancel)?;
-    if sha256 != snapshot.sha256 {
+    // 元数据一致时用首尾采样复核即可：这里曾经每次都重算整片 SHA256，
+    // 等于每档转码策略（直通/硬件/软编）都白读一遍整个文件，长素材代价是分钟级。
+    // 正确性由前面的复制快照阶段保证（那一步已完整比对过 SHA256）。
+    let sample = quick_sample_sha256(path, snapshot.length)?;
+    if sample != snapshot.sample_sha256 {
         return Err("源文件内容在准备期间发生变化，已放弃缓存发布".into());
     }
     Ok(())
 }
 
-fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+/// 计算整片 SHA256。传入 `progress` 时按字节数上报进度（首次准备大文件时才看得到）。
+fn sha256_file(
+    path: &Path,
+    cancel: &AtomicBool,
+    progress: Option<(&FilePreparationProgressCallback, u64)>,
+) -> Result<String, String> {
     let mut file = File::open(path).map_err(|error| format!("打开源文件失败: {error}"))?;
     let mut digest = Sha256::new();
     // 同 copy_source_snapshot：缓冲一律走堆，避免 2MB 线程栈被顶爆。
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    let mut hashed = 0_u64;
+    let mut last_report = Instant::now();
     loop {
         check_cancel(cancel)?;
         let count = file
@@ -2174,6 +2636,18 @@ fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
             break;
         }
         digest.update(&buffer[..count]);
+        hashed = hashed.saturating_add(count as u64);
+        if let Some((callback, total)) = progress {
+            if last_report.elapsed() >= PROGRESS_REPORT_INTERVAL {
+                last_report = Instant::now();
+                report_with_progress(
+                    Some(callback),
+                    FilePreparationPhase::HashingSource,
+                    Some(hashed.min(total)),
+                    Some(total),
+                );
+            }
+        }
     }
     Ok(hex_encode(&digest.finalize()))
 }

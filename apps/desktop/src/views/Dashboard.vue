@@ -75,6 +75,10 @@ type MediaPreparationPhase = "idle" | "preparing" | "ready" | "cancelled" | "fai
 interface MediaPreparationEvent {
   phase: Exclude<MediaPreparationPhase, "idle">;
   message: string;
+  /** 阶段内进度（0-100）。后端只在能精确测量时给出，否则省略。 */
+  percent?: number | null;
+  completed?: number | null;
+  total?: number | null;
 }
 
 type SubscriptionKind = "MobilePosition" | "Catalog" | "Alarm" | "PTZPosition";
@@ -178,7 +182,46 @@ let unlistenSub: UnlistenFn | null = null;
 let unlistenMediaPreparation: UnlistenFn | null = null;
 let recordingRefreshTimer: number | null = null;
 const recordingPhase = ref<"idle" | "starting" | "recording" | "finalizing" | "failed">("idle");
-const mediaPreparation = ref<{ phase: MediaPreparationPhase; message: string }>({ phase: "idle", message: "" });
+const mediaPreparation = ref<{
+  phase: MediaPreparationPhase;
+  message: string;
+  percent?: number | null;
+}>({ phase: "idle", message: "", percent: null });
+// 阶段内进度与剩余时间。后端只在能精确测量时给 percent（校验源文件 / 转码），
+// 拿不到就只显示阶段文案，不编造数字。
+const mediaPreparationProgress = ref<{ percent: number; etaSeconds: number | null } | null>(null);
+// 估算锚点：同一阶段内 percent 单调递增，用「开始记进度」到现在的平均速度推剩余时间。
+let mediaPreparationAnchor: { at: number; percent: number } | null = null;
+
+function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  if (minutes < 60) return rest > 0 ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 小时 ${minutes % 60} 分`;
+}
+
+function applyMediaPreparation(event: MediaPreparationEvent) {
+  mediaPreparation.value = event;
+  const percent = typeof event.percent === "number" ? event.percent : null;
+  if (event.phase !== "preparing" || percent === null) {
+    mediaPreparationAnchor = null;
+    mediaPreparationProgress.value =
+      event.phase === "preparing" && percent !== null ? { percent, etaSeconds: null } : null;
+    return;
+  }
+  const now = Date.now();
+  // 阶段切换时 percent 会回落（哈希按字节、转码按时间），据此重置锚点。
+  if (!mediaPreparationAnchor || percent < mediaPreparationAnchor.percent) {
+    mediaPreparationAnchor = { at: now, percent };
+  }
+  const elapsed = (now - mediaPreparationAnchor.at) / 1000;
+  const gained = percent - mediaPreparationAnchor.percent;
+  const etaSeconds = gained > 0 ? Math.round((elapsed / gained) * (100 - percent)) : null;
+  mediaPreparationProgress.value = { percent, etaSeconds };
+}
 const recordingLabel = computed(() => ({
   idle: deviceLive.value ? "可录制" : "设备未启动",
   starting: "等待关键帧",
@@ -836,7 +879,9 @@ async function cancelMediaPreparation() {
   if (mediaPreparation.value.phase !== "preparing") return;
   try {
     await invoke<string>("cancel_media_preparation");
-    mediaPreparation.value = { phase: "cancelled", message: "正在取消媒体准备…" };
+    mediaPreparation.value = { phase: "cancelled", message: "正在取消媒体准备…", percent: null };
+    mediaPreparationProgress.value = null;
+    mediaPreparationAnchor = null;
   } catch (error) {
     message.error(`取消媒体准备失败：${String(error)}`);
   }
@@ -986,10 +1031,21 @@ onMounted(async () => {
     }
   });
   unlistenMediaPreparation = await listen<MediaPreparationEvent>("media_preparation", (event) => {
-    mediaPreparation.value = event.payload;
+    applyMediaPreparation(event.payload);
   });
   const [runtime] = await Promise.all([reconcile(), refreshSources(false)]);
-  if (runtime) captureState.value = runtime.capture_state as CaptureState;
+  if (runtime) {
+    captureState.value = runtime.capture_state as CaptureState;
+    // 页面重进时后台预热可能还没跑完：恢复"准备中"提示，否则用户只会看到一个
+    // 已注册但没有任何画面的设备，误以为卡住了。
+    if (runtime.media_preparing && mediaPreparation.value.phase === "idle") {
+      mediaPreparation.value = {
+        phase: "preparing",
+        message: "设备已注册，正在后台准备文件音视频",
+        percent: null,
+      };
+    }
+  }
   await refreshSubscriptions();
   await refreshRecordingState();
   recordingRefreshTimer = window.setInterval(() => {
@@ -1173,7 +1229,14 @@ onUnmounted(() => {
         <div v-if="mediaPreparation.phase !== 'idle'" class="media-preparation" :class="mediaPreparation.phase">
           <span v-if="mediaPreparation.phase === 'preparing'" class="preparation-spinner" aria-hidden="true" />
           <span class="preparation-message">{{ mediaPreparation.message }}</span>
+          <span v-if="mediaPreparationProgress" class="preparation-percent">
+            {{ Math.round(mediaPreparationProgress.percent) }}%
+            <em v-if="mediaPreparationProgress.etaSeconds !== null">· 还需约 {{ formatEta(mediaPreparationProgress.etaSeconds) }}</em>
+          </span>
           <n-button v-if="mediaPreparation.phase === 'preparing'" size="tiny" quaternary @click="cancelMediaPreparation">取消准备</n-button>
+          <div v-if="mediaPreparationProgress" class="preparation-bar" role="progressbar" :aria-valuenow="Math.round(mediaPreparationProgress.percent)" aria-valuemin="0" aria-valuemax="100">
+            <span class="preparation-bar-fill" :style="{ width: `${mediaPreparationProgress.percent}%` }" />
+          </div>
         </div>
         <div v-if="sourceHint" class="source-hint">
           <n-icon :component="AlertCircleOutline" />
@@ -1693,6 +1756,12 @@ onUnmounted(() => {
 .media-preparation.cancelled, .media-preparation.failed { background: color-mix(in srgb, var(--error) 10%, transparent); color: var(--error); }
 .preparation-message { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preparation-spinner { width: 12px; height: 12px; flex: 0 0 auto; border: 2px solid color-mix(in srgb, var(--accent) 25%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: media-preparation-spin .8s linear infinite; }
+/* 进度行：文案 + 百分比一行，细进度条独占下一行 */
+.media-preparation { flex-wrap: wrap; }
+.preparation-percent { flex: 0 0 auto; font-variant-numeric: tabular-nums; font-weight: 500; color: var(--accent-deep); }
+.preparation-percent em { font-style: normal; font-weight: 400; color: var(--text-tertiary); }
+.preparation-bar { flex: 1 0 100%; height: 2px; margin-top: 2px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 18%, transparent); overflow: hidden; }
+.preparation-bar-fill { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .3s linear; }
 @keyframes media-preparation-spin { to { transform: rotate(360deg); } }
 
 .config-actions { display: flex; gap: 4px; }

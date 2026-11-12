@@ -1540,9 +1540,55 @@ impl DeviceSimulator {
         Ok(())
     }
 
+    /// 后台文件预热完成后的收尾：装入产物并补上采集/推流源。
+    ///
+    /// 与启动期的区别是此时设备已经注册在案，采集失败只能上报事件，不能反过来
+    /// 影响注册状态——平台侧应保持在线，只是点播暂时拿不到流。
+    ///
+    /// `cancel` 是预热任务自己的取消令牌：停止设备会置位它，这里在启动采集前后
+    /// 各查一次，避免"停止"和"收尾"擦身而过时给已停机的设备又拉起一条采集线程。
+    pub async fn install_prepared_file_and_start(
+        &self,
+        prepared: media_rtp::file_profile::PreparedFileProfile,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<(), String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("已取消文件准备".into());
+        }
+        self.install_prepared_file(prepared)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("已取消文件准备".into());
+        }
+        self.observer.on_event(common::DeviceEvent::CaptureStarting);
+        let started = self.start_shared_media().await;
+        if cancel.load(Ordering::Acquire) {
+            self.stop_shared_media().await;
+            return Err("已取消文件准备".into());
+        }
+        match started {
+            Ok(true) => {
+                self.observer.on_event(common::DeviceEvent::CaptureReady);
+                Ok(())
+            }
+            Ok(false) => {
+                self.observer.on_event(common::DeviceEvent::CaptureStopped);
+                Ok(())
+            }
+            Err(error) => {
+                self.stop_shared_media().await;
+                self.observer
+                    .on_event(common::DeviceEvent::CaptureFailure(error.to_string()));
+                self.observer.on_event(common::DeviceEvent::RuntimeError {
+                    scope: "capture".into(),
+                    message: error.to_string(),
+                });
+                Err(error.to_string())
+            }
+        }
+    }
+
     /// 注册成功后启动唯一媒体采集源。采集失败不影响 SIP 注册，但会通过观察者上报。
-    async fn start_shared_media(&self) -> Result<bool> {
-        if let Some(profile) = &self.config.media_profile {
+    async fn start_shared_media(&self) -> Result<bool> {        if let Some(profile) = &self.config.media_profile {
             profile.validate().map_err(Error::Media)?;
             if profile.video_fps != self.config.video_fps {
                 return Err(Error::Media("媒体配置与兼容FPS冲突".into()));
@@ -1574,6 +1620,14 @@ impl DeviceSimulator {
             .lock()
             .map_err(|_| Error::Media("文件准备状态锁异常".into()))?
             .clone();
+        // 文件源要按 profile 预热产物才能推流。产物还没就绪时这里必须"什么都不做"
+        // 而不是报错：注册与心跳在前台继续跑，平台侧先看到设备上线；后台准备完成
+        // 后会通过 install_prepared_file_and_start 再补上采集源。点播早于准备完成时
+        // handle_invite 已有 480 Temporarily Unavailable 的兜底。
+        if !path.starts_with("live:") && profile.is_some() && prepared.is_none() {
+            tracing::info!(source = %path, "文件媒体尚未预热完成，先保持注册并等待后台准备");
+            return Ok(false);
+        }
         // 本地预览不再由采集源内部旁路,改为桌面端订阅共享媒体总线(media-pipeline-v2 P4)。
         // OSD 只烧进实时采集；文件循环不重新编码。
         let osd = path.starts_with("live:").then(|| self.osd_overlay()).flatten();
@@ -5642,6 +5696,33 @@ mod tests {
         );
         sim.stop_shared_media().await;
         platform_task.await.unwrap();
+    }
+
+    /// 文件媒体未预热时，注册期的采集启动必须安静地「不启动」，而不是报错。
+    ///
+    /// 这是「注册先行、媒体后补」的关键契约：产物还没到位是正常中间态。
+    /// 若这里退回 Err，注册流程会把它当成采集失败上报，页面又回到
+    /// 「设备起来了但没有画面」的老观感，解耦也就白做了。
+    #[tokio::test]
+    async fn 文件源未预热时注册不因缺少产物而报错() {
+        let mut cfg = test_cfg("127.0.0.1", 19_000);
+        cfg.video_source = Some("/tmp/uvp-not-yet-prepared.mp4".to_string());
+        let fps = cfg.video_fps;
+        cfg.media_profile = Some(media_rtp::profile::MediaProfile {
+            video_fps: fps,
+            ..Default::default()
+        });
+        let sim = DeviceSimulator::with_observer(cfg, Arc::new(common::NoopObserver));
+
+        let started = sim
+            .start_shared_media()
+            .await
+            .expect("未预热属于正常中间态，不应报错");
+        assert!(!started, "没有预热产物时不能启动采集");
+        assert!(
+            sim.subscribe_shared_media().await.is_none(),
+            "未启动采集时不应留下可订阅的媒体总线"
+        );
     }
 
     /// 平台 offer `a=setup:active`:设备在 200 OK 里写真实监听端口 + `setup:passive`,

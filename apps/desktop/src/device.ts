@@ -23,6 +23,8 @@ export interface DeviceForm {
 export interface DeviceStatus {
   running: boolean;
   capture_state: string;
+  /** 设备已注册、但文件媒体仍在后台预热。 */
+  media_preparing?: boolean;
   effective_config: EffectiveDeviceConfig | null;
 }
 

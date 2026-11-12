@@ -57,6 +57,12 @@ struct AppState {
     config_io: Mutex<()>,
     /// Independent cancellation path: preparation holds the device startup lock.
     media_preparation: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    /// 设备已注册、但文件媒体仍在后台预热时的取消令牌。
+    ///
+    /// 与 `media_preparation` 分开：后者只覆盖"设备启动请求"这段短生命周期，
+    /// 一旦 REGISTER 提交就会被清空；而预热可能还要跑几分钟，必须有自己的槽位，
+    /// 停止设备/退出应用时才能把它一起掐掉。
+    media_task: std::sync::Mutex<Option<Arc<AtomicBool>>>,
     shutting_down: AtomicBool,
     /// 当前压测句柄；任务完全退出前始终占用槽位。
     stress: Mutex<Option<StressHandle>>,
@@ -189,6 +195,85 @@ impl Drop for DeviceStartup<'_> {
     }
 }
 
+/// 后台媒体预热槽位的 RAII 占位。
+///
+/// 只有显式 `release()` 才把令牌交给后台任务；任何提前返回（transport 绑定失败、
+/// 应用退出…）都会在 Drop 里释放，避免"设备没起来但槽位一直被占"。
+struct MediaTaskSlot<'a> {
+    state: &'a AppState,
+    token: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl<'a> MediaTaskSlot<'a> {
+    fn new(state: &'a AppState) -> Result<Self, String> {
+        let token = state.begin_media_task()?;
+        Ok(Self {
+            state,
+            token,
+            armed: true,
+        })
+    }
+
+    fn release(mut self) -> Arc<AtomicBool> {
+        self.armed = false;
+        Arc::clone(&self.token)
+    }
+}
+
+impl Drop for MediaTaskSlot<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.finish_media_task(&self.token);
+        }
+    }
+}
+
+/// 媒体准备阶段的用户可读文案。
+fn media_preparation_message(
+    phase: media_rtp::file_profile::FilePreparationPhase,
+) -> &'static str {
+    use media_rtp::file_profile::FilePreparationPhase;
+    match phase {
+        FilePreparationPhase::HashingSource => "正在校验源文件",
+        FilePreparationPhase::CheckingCache => "正在检查文件缓存",
+        FilePreparationPhase::Transcoding => "正在按所选参数转换音视频",
+        FilePreparationPhase::Extracting => "正在建立音视频索引",
+        FilePreparationPhase::Probing => "正在验证输出音视频",
+        FilePreparationPhase::Publishing => "正在保存准备结果",
+        FilePreparationPhase::Complete => "文件音视频准备完成",
+    }
+}
+
+/// 上报媒体准备进度。
+///
+/// `completed`/`total` 同单位（字节或微秒），前端据此画进度条并估算剩余时间；
+/// 拿不到总量时只显示阶段文案，不编造百分比。
+fn emit_media_progress(
+    app: &AppHandle,
+    progress: media_rtp::file_profile::FilePreparationProgress,
+) {
+    let mut payload = serde_json::json!({
+        "phase": "preparing",
+        "message": media_preparation_message(progress.phase),
+        "completed": progress.completed,
+        "total": progress.total,
+    });
+    if let (Some(done), Some(total)) = (progress.completed, progress.total) {
+        if total > 0 {
+            payload["percent"] =
+                serde_json::json!((done as f64 * 100.0 / total as f64).clamp(0.0, 100.0));
+        }
+    }
+    let _ = app.emit("media_preparation", payload);
+}
+
+/// 后台任务里没有 `State` 借用，只能从 `AppHandle` 反查状态来释放预热槽位。
+fn finish_media_task_via(app: &AppHandle, token: &Arc<AtomicBool>) {
+    let state = app.state::<AppState>();
+    state.finish_media_task(token);
+}
+
 impl AppState {
     /// 启动（或重启）NTP 周期刷新任务。
     ///
@@ -280,6 +365,17 @@ impl AppState {
     }
 
     fn cancel_file_preparation(&self) -> Result<(), String> {
+        // 先掐后台预热：设备已经注册之后，用户点「取消准备」针对的就是它。
+        {
+            let task = self
+                .media_task
+                .lock()
+                .map_err(|_| "媒体预热状态锁异常")?;
+            if let Some(cancel) = task.as_ref() {
+                cancel.store(true, Ordering::Release);
+                return Ok(());
+            }
+        }
         let preparation = self
             .media_preparation
             .lock()
@@ -289,6 +385,48 @@ impl AppState {
             .ok_or("文件准备已结束，当前没有可取消的启动")?;
         cancel.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// 占用后台媒体预热槽位。
+    ///
+    /// 已有任务在跑时直接拒绝：并发预热同一素材既浪费 CPU，也会让"当前进度"
+    /// 出现两条互不相关的流。调用方应先让用户停止设备（会取消旧任务）。
+    fn begin_media_task(&self) -> Result<Arc<AtomicBool>, String> {
+        let mut slot = self.media_task.lock().map_err(|_| "媒体预热状态锁异常")?;
+        if slot.is_some() {
+            return Err("媒体仍在准备中，请等待完成或先停止设备".into());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        *slot = Some(Arc::clone(&cancel));
+        Ok(cancel)
+    }
+
+    /// 释放槽位。只清自己那一个令牌，避免旧任务退出时误删新任务的占位。
+    fn finish_media_task(&self, token: &Arc<AtomicBool>) {
+        if let Ok(mut slot) = self.media_task.lock() {
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+            {
+                *slot = None;
+            }
+        }
+    }
+
+    /// 停止设备/退出应用时取消后台预热。没有任务时是无操作。
+    fn cancel_media_task(&self) {
+        if let Ok(slot) = self.media_task.lock() {
+            if let Some(token) = slot.as_ref() {
+                token.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn media_task_running(&self) -> bool {
+        self.media_task
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 
     fn new() -> Self {
@@ -303,6 +441,7 @@ impl AppState {
             next_alarm_id: AtomicU64::new(1),
             config_io: Mutex::new(()),
             media_preparation: std::sync::Mutex::new(None),
+            media_task: std::sync::Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             stress: Mutex::new(None),
             next_stress_id: AtomicU64::new(1),
@@ -1773,6 +1912,9 @@ async fn get_device_status(state: tauri::State<'_, AppState>) -> Result<serde_js
     Ok(serde_json::json!({
         "running": running,
         "capture_state": capture_state,
+        // 设备已注册但文件媒体还在后台预热：页面据此显示"上线中/准备中"，
+        // 而不是把 capture_state=starting 误读成采集卡住。
+        "media_preparing": state.media_task_running(),
         "effective_config": effective_config,
     }))
 }
@@ -2470,90 +2612,20 @@ async fn start_device(
             .effective(resolved.profile.gb_version),
     };
 
-    // Prepare the immutable output before REGISTER; INVITE only subscribes to it.
-    let prepared_file = if let Some(path) = resolved
+    // 文件源只记下待预热的素材：REGISTER 只需要 SIP 身份（设备 ID/密码/平台地址），
+    // 与有没有转码产物无关。以前把整片预热串在注册前面，长素材会让"设备上线"等好
+    // 几分钟，转码失败甚至直接导致注册不上——两个独立的失败域被绑在了一起。
+    // 现在注册先行，产物由下方后台任务补齐；点播早于产物就绪时 INVITE 回 480。
+    let pending_file: Option<(std::path::PathBuf, media_rtp::profile::MediaProfile)> = resolved
         .video_source
         .as_ref()
         .filter(|path| !path.trim().is_empty() && !path.starts_with("live:"))
-    {
-        let cancel = startup.cancel.clone();
-        if state.shutting_down.load(Ordering::Acquire) {
-            cancel.store(true, Ordering::Release);
-        }
-        let _ = app.emit(
-            "media_preparation",
-            serde_json::json!({"phase":"preparing", "message":"正在准备文件音视频"}),
-        );
-        let prepare_app = app.clone();
-        let source_path = std::path::PathBuf::from(path);
-        let profile = resolved.media.clone();
-        let task_cancel = cancel.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let progress = move |progress: media_rtp::file_profile::FilePreparationProgress| {
-                use media_rtp::file_profile::FilePreparationPhase;
-                let message = match progress.phase {
-                    FilePreparationPhase::HashingSource => "正在检查源文件",
-                    FilePreparationPhase::CheckingCache => "正在检查文件缓存",
-                    FilePreparationPhase::Transcoding => "正在按所选参数转换音视频",
-                    FilePreparationPhase::Extracting => "正在建立音视频索引",
-                    FilePreparationPhase::Probing => "正在验证输出音视频",
-                    FilePreparationPhase::Publishing => "正在保存准备结果",
-                    FilePreparationPhase::Complete => "文件音视频准备完成",
-                };
-                let _ = prepare_app.emit(
-                    "media_preparation",
-                    serde_json::json!({"phase":"preparing", "message":message}),
-                );
-            };
-            // Windows 上 tokio 阻塞线程栈默认只有 2MB，文件准备链路的栈开销会随参数变化，
-            // 这里显式给 8MB 栈兜底，避免再次触发 STATUS_STACK_OVERFLOW(0xc00000fd) 闪退。
-            std::thread::Builder::new()
-                .name("media-prepare".to_string())
-                .stack_size(8 * 1024 * 1024)
-                .spawn(move || {
-                    media_rtp::file_profile::prepare_file_profile(
-                        &source_path,
-                        &profile,
-                        &task_cancel,
-                        Some(&progress),
-                    )
-                })
-                .map_err(|error| format!("创建文件准备线程失败: {error}"))
-                .and_then(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err("文件准备线程异常退出".to_string()))
-                })
-        })
-        .await;
-        let result = result
-            .map_err(|error| format!("文件准备任务异常: {error}"))
-            .and_then(|result| result);
-        if cancel.load(Ordering::Acquire) {
-            let _ = app.emit(
-                "media_preparation",
-                serde_json::json!({"phase":"cancelled", "message":"已取消文件准备"}),
-            );
-            return Err("已取消文件准备".into());
-        }
-        match result {
-            Ok(prepared) => {
-                let _ = app.emit(
-                    "media_preparation",
-                    serde_json::json!({"phase":"ready", "message":"文件音视频准备完成"}),
-                );
-                Some(prepared)
-            }
-            Err(error) => {
-                let _ = app.emit(
-                    "media_preparation",
-                    serde_json::json!({"phase":"failed", "message":error}),
-                );
-                return Err(format!("视频源准备失败: {error}"));
-            }
-        }
-    } else {
-        None
+        .map(|path| (std::path::PathBuf::from(path), resolved.media.clone()));
+    // 预热槽位提前占：占不到说明上一次预热还没退干净。此时设备尚未启动，
+    // 直接失败比"设备起来了却没人预热"干净；guard 在提前返回时会自动释放。
+    let media_slot = match pending_file {
+        Some(_) => Some(MediaTaskSlot::new(state.inner())?),
+        None => None,
     };
 
     if state.shutting_down.load(Ordering::Acquire) {
@@ -2604,9 +2676,7 @@ async fn start_device(
         observer,
         upgrade_state_dir,
     ));
-    if let Some(prepared) = prepared_file {
-        sim.install_prepared_file(prepared)?;
-    }
+    // 文件媒体的预热产物由下方后台任务装入；注册不需要它。
     load_control_state(sim.as_ref(), &state, &app);
     sim.install_recording_store(app_recording_store(&state, &app)?);
     // 单设备实时采集时把 OSD 烧进码流；文件源在模拟器内部自动跳过。
@@ -2641,6 +2711,7 @@ async fn start_device(
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let sim_run = sim.clone();
+    let sim_for_media = Arc::clone(&sim);
     let tp_run = transport.clone();
     let host_run = local_host.clone();
     startup.commit(|| {
@@ -2675,7 +2746,103 @@ async fn start_device(
         sim.set_record_plan_enabled(plan_effective(&persisted.record_plan));
         state.start_plan_scheduler(sim).await;
     }
-    Ok("设备已启动".into())
+
+    // 文件媒体的预热放到这里：REGISTER 已经提交，平台侧马上能看到设备上线，
+    // 预热期间点播收到 480（handle_invite 的既有无就绪分支），就绪后自动可播。
+    let started_message = if let (Some((source_path, profile)), Some(slot)) = (pending_file, media_slot)
+    {
+        let cancel = slot.release();
+        let prepare_app = app.clone();
+        let prepare_sim = sim_for_media;
+        tokio::spawn(async move {
+            let _ = prepare_app.emit(
+                "media_preparation",
+                serde_json::json!({
+                    "phase": "preparing",
+                    "message": "设备已注册，正在后台准备文件音视频",
+                }),
+            );
+            let task_cancel = Arc::clone(&cancel);
+            let progress_app = prepare_app.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let progress =
+                    move |progress: media_rtp::file_profile::FilePreparationProgress| {
+                        emit_media_progress(&progress_app, progress);
+                    };
+                // Windows 上 tokio 阻塞线程栈默认只有 2MB，文件准备链路的栈开销随参数变化，
+                // 这里显式给 8MB 栈兜底，避免再次触发 STATUS_STACK_OVERFLOW(0xc00000fd) 闪退。
+                std::thread::Builder::new()
+                    .name("media-prepare".to_string())
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        media_rtp::file_profile::prepare_file_profile(
+                            &source_path,
+                            &profile,
+                            &task_cancel,
+                            Some(&progress),
+                        )
+                    })
+                    .map_err(|error| format!("创建文件准备线程失败: {error}"))
+                    .and_then(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| Err("文件准备线程异常退出".to_string()))
+                    })
+            })
+            .await;
+            let result = joined
+                .map_err(|error| format!("文件准备任务异常: {error}"))
+                .and_then(|result| result);
+
+            // 设备可能已被停止或重新启动：取消后不再安装产物，避免给已下线的
+            // 实例补媒体、或在错误的 profile 上启动采集。
+            if cancel.load(Ordering::Acquire) {
+                let _ = prepare_app.emit(
+                    "media_preparation",
+                    serde_json::json!({"phase":"cancelled", "message":"已取消文件准备"}),
+                );
+                finish_media_task_via(&prepare_app, &cancel);
+                return;
+            }
+            match result {
+                Ok(prepared) => match prepare_sim
+                    .install_prepared_file_and_start(prepared, &cancel)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = prepare_app.emit(
+                            "media_preparation",
+                            serde_json::json!({"phase":"ready", "message":"文件音视频准备完成，可以点播"}),
+                        );
+                    }
+                    Err(error) => {
+                        // 收尾阶段被停止设备打断时，不要显示成"准备失败"——
+                        // 那是用户主动行为，不是故障。
+                        let phase = if cancel.load(Ordering::Acquire) {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        };
+                        let _ = prepare_app.emit(
+                            "media_preparation",
+                            serde_json::json!({"phase": phase, "message": error}),
+                        );
+                    }
+                },
+                Err(error) => {
+                    let _ = prepare_app.emit(
+                        "media_preparation",
+                        serde_json::json!({"phase":"failed", "message":error}),
+                    );
+                }
+            }
+            finish_media_task_via(&prepare_app, &cancel);
+        });
+        "设备已启动，正在后台准备文件音视频"
+    } else {
+        "设备已启动"
+    };
+    Ok(started_message.into())
 }
 
 #[derive(Debug, Serialize)]
@@ -2849,6 +3016,8 @@ async fn delete_recording(
 #[tauri::command]
 async fn stop_device(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
     let mut guard = state.device.lock().await;
+    // 先掐掉后台预热：设备都停了还继续转码只是白烧 CPU，且产物不会被任何人使用。
+    state.cancel_media_task();
     // 设备停止后不再有"设备时间"的维护者，先停 NTP 周期任务；偏移保留，
     // 这样平台侧看到的最后一次时间不会突然跳回本机时钟。
     state.stop_ntp_refresh().await;
@@ -4067,6 +4236,27 @@ firmware = "1"
         state.cancel_file_preparation().unwrap();
         assert!(token.load(Ordering::Acquire));
         *state.media_preparation.lock().unwrap() = None;
+        assert!(state.cancel_file_preparation().is_err());
+    }
+
+    /// 设备注册完成后（启动令牌已释放），「取消准备」必须仍然有效——
+    /// 这才是用户真正会点的时刻：平台已经看到设备上线，但文件还在后台转码。
+    #[test]
+    fn 注册后取消准备仍然生效且不会并发预热() {
+        let state = AppState::new();
+        let token = state.begin_media_task().expect("首次占用预热槽位应成功");
+        assert!(state.media_task_running());
+        // 同一时刻只允许一个预热任务：并发转同一素材既浪费 CPU，进度也会串台。
+        assert!(state.begin_media_task().is_err());
+
+        state
+            .cancel_file_preparation()
+            .expect("启动令牌已释放时，取消必须落到后台预热上");
+        assert!(token.load(Ordering::Acquire), "取消应置位预热令牌");
+
+        state.finish_media_task(&token);
+        assert!(!state.media_task_running(), "任务退出后槽位必须清空");
+        // 槽位空且没有启动请求时，重复取消应明确报错而不是静默成功。
         assert!(state.cancel_file_preparation().is_err());
     }
 
