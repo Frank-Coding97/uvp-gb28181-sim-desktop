@@ -68,16 +68,21 @@ const TARGETS = [
   {
     key: "windows-x86_64",
     label: "Windows x64",
-    file: `UVP.GB28181.Desktop_${version}_x64-setup.exe`,
+    // ⛔ 文件名按 productName 原样来（`UVP GB28181 Desktop`，中间是空格，不是点）。
+    //    写成 UVP.GB28181.Desktop 时清单里的直链会 404，客户端只会报「检查更新失败」。
+    //    2026-11-12 在 52 上实跑到 bundle/nsis 才确认这个命名。
+    file: `UVP GB28181 Desktop_${version}_x64-setup.exe`,
     sigSuffix: "-setup.exe.sig",
   },
 ];
 
 function downloadUrl(file) {
   const tag = `v${version}`;
+  // 安装包名里有空格，URL 必须编码（%20），否则 updater 拿到的地址不可用。
+  const encoded = encodeURIComponent(file);
   return host === "gitee"
-    ? `https://gitee.com/${GITEE_REPO}/releases/download/${tag}/${file}`
-    : `https://github.com/${GITHUB_REPO}/releases/download/${tag}/${file}`;
+    ? `https://gitee.com/${GITEE_REPO}/releases/download/${tag}/${encoded}`
+    : `https://github.com/${GITHUB_REPO}/releases/download/${tag}/${encoded}`;
 }
 
 async function readNotes() {

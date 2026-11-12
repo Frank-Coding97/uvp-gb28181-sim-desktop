@@ -92,13 +92,17 @@ $BundleConfig = Join-Path $env:TEMP "uvp-desktop-bundle-config.json"
 # 在线升级：只有发版时才生成 updater 制品（需要签名私钥），日常/PR 构建不签，
 # 否则本地 `tauri build` 会因为没配私钥直接失败。
 $BuildUpdater = ($env:UVP_UPDATER -eq "1")
-if ($BuildUpdater -and [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -and [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
-  throw "UVP_UPDATER=1 需要签名私钥：请设置 TAURI_SIGNING_PRIVATE_KEY 或 TAURI_SIGNING_PRIVATE_KEY_PATH。"
+if ($BuildUpdater -and
+    [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -and
+    [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
+  throw "UVP_UPDATER=1 需要签名私钥：请设置 TAURI_SIGNING_PRIVATE_KEY（内容）或 TAURI_SIGNING_PRIVATE_KEY_PATH（文件路径）。"
 }
 $BundlePayload = @{
   resources = @("resources/builtin-camera.mp4", "runtime/ffmpeg/*")
 }
-if ($BuildUpdater) { $BundlePayload["createUpdaterArtifacts"] = $true }
+# ⛔ 这里**故意不**注入 createUpdaterArtifacts：tauri build 内置签名会去交互读私钥密码，
+#    在无 TTY 的 ssh / CI 里直接挂住（安装包已经打完，进程却永远不退出，2026-11-12 在 52 实测）。
+#    改成构建结束后自己调 `tauri signer sign`，用 cmd 传空密码（见文件末尾）。
 $BundleConfigJson = @{ bundle = $BundlePayload } | ConvertTo-Json -Depth 5
 [System.IO.File]::WriteAllText($BundleConfig, $BundleConfigJson)
 
@@ -139,8 +143,38 @@ if ($BuildUpdater) {
     throw "未找到 NSIS 安装包（*-setup.exe），无法确认在线升级产物。"
   }
   $sig = "$($setup.FullName).sig"
-  if (!(Test-Path -LiteralPath $sig) -or (Get-Item -LiteralPath $sig).Length -le 0) {
-    throw "升级签名缺失：$sig。请确认 TAURI_SIGNING_PRIVATE_KEY 与 tauri.updater.conf.json 均已生效。"
+  Remove-Item -Force -ErrorAction SilentlyContinue $sig
+
+  # 私钥优先用文件（cmd 不适合传多行内容）；只有内容时落一个临时文件。
+  $keyFile = $env:TAURI_SIGNING_PRIVATE_KEY_PATH
+  $tempKey = $false
+  if ([string]::IsNullOrWhiteSpace($keyFile) -or !(Test-Path -LiteralPath $keyFile)) {
+    $keyFile = Join-Path $env:TEMP "uvp-updater-sign.key"
+    [System.IO.File]::WriteAllText($keyFile, $env:TAURI_SIGNING_PRIVATE_KEY)
+    $tempKey = $true
   }
-  Write-Host "在线升级包已生成：$($setup.Name)（签名 $([math]::Round((Get-Item -LiteralPath $sig).Length / 1024, 1)) KB）"
+  # ⛔ 环境变量和 -f 不能同时给：CLI 会报
+  #    `the argument '--private-key-path' cannot be used with '--private-key'`
+  #    （2026-11-12 在 52 上实测，安装包已生成却判为构建失败）。
+  Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+
+  # ⛔ 必须经 cmd 传 `-p ""`：PowerShell 会把空字符串参数丢掉，CLI 于是转去交互读密码，
+  #    在无 TTY 的 ssh / CI 里永久挂住（2026-11-12 在 52 上踩过）。写个临时 .cmd 绕开引号问题。
+  $signerJs = Join-Path $DesktopDir "node_modules\@tauri-apps\cli\tauri.js"
+  if (!(Test-Path -LiteralPath $signerJs)) { throw "找不到 tauri CLI：$signerJs" }
+  $nodeExe = (Get-Command node -ErrorAction Stop).Source
+  $signCmd = Join-Path $env:TEMP "uvp-updater-sign.cmd"
+  $cmdLines = @(
+    "@echo off",
+    "`"$nodeExe`" `"$signerJs`" signer sign -f `"$keyFile`" -p `"`" `"$($setup.FullName)`""
+  )
+  [System.IO.File]::WriteAllLines($signCmd, $cmdLines, (New-Object System.Text.UTF8Encoding($false)))
+  & cmd /c $signCmd
+  if ($LASTEXITCODE -ne 0) { throw "升级包签名失败（exit $LASTEXITCODE）：$($setup.Name)" }
+  if ($tempKey) { Remove-Item -Force -ErrorAction SilentlyContinue $keyFile }
+
+  if (!(Test-Path -LiteralPath $sig) -or (Get-Item -LiteralPath $sig).Length -le 0) {
+    throw "升级签名缺失：$sig。请确认签名私钥与公钥（tauri.conf.json plugins.updater.pubkey）配对。"
+  }
+  Write-Host "在线升级包已生成：$($setup.Name)（签名 $((Get-Item -LiteralPath $sig).Length) 字节）"
 }
