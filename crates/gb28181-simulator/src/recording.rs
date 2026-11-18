@@ -155,13 +155,93 @@ impl RecordingFinalizer for FfmpegRecordingFinalizer {
         output: &Path,
         media: &RecordingMediaSpec,
     ) -> Result<()> {
+        // ① 快路径:视频直拷。绝大多数视频源(内置示例视频/摄像头)本身无 B 帧,
+        // 一次拷贝即可,不额外消耗 CPU。
+        self.run_media_pass(input, output, media, VideoEncode::Copy)?;
+        // ② 兜底:视频源带 B 帧时(容器素材自带、或硬件编码器不认 `-bf 0`),
+        // 重编码成无 B 帧。GB28181 历史回放按显示顺序重建时间轴,含 B 帧的成品
+        // 设备端自己都放不了(probe_historical_segment 直接拒收)。
+        if let Some(probed) = probe_recording_video(output)? {
+            if probed.has_b_frames > 0 {
+                tracing::info!(
+                    has_b_frames = probed.has_b_frames,
+                    codec = %probed.codec_name,
+                    "录像视频含 B 帧，重编码为无 B 帧"
+                );
+                let _ = fs::remove_file(output);
+                self.run_media_pass(input, output, media, VideoEncode::NoBFrames)?;
+                let remaining = probe_recording_video(output)?
+                    .map(|probed| probed.has_b_frames)
+                    .unwrap_or(0);
+                if remaining > 0 {
+                    return Err(Error::Media(format!(
+                        "录像视频重编码后仍含 B 帧(has_b_frames={remaining})，平台回放会失败"
+                    )));
+                }
+            }
+        }
+        if let Some(audio_codec) = media.audio_codec {
+            // `None` 表示环境里没有 ffprobe：跳过校验但保留已写好的录像。
+            if let Some(probed) = probe_recording_audio(output)? {
+                let expected_codec = match audio_codec {
+                    media_rtp::AudioCodec::G711A
+                    | media_rtp::AudioCodec::G711U
+                    | media_rtp::AudioCodec::Aac => "aac",
+                    media_rtp::AudioCodec::Opus => "opus",
+                };
+                if probed.codec_name != expected_codec {
+                    return Err(Error::Media(format!(
+                        "录像音轨编码不符: 期望 {expected_codec}, 实际 {}",
+                        probed.codec_name
+                    )));
+                }
+                if let Some(expected_rate) = media.audio_sample_rate_hz {
+                    if probed.sample_rate_hz != Some(expected_rate) {
+                        return Err(Error::Media(format!(
+                            "录像音轨采样率不符: 期望 {expected_rate}, 实际 {:?}",
+                            probed.sample_rate_hz
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 收尾时视频轨的处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoEncode {
+    /// 直拷(无损、零 CPU)。
+    Copy,
+    /// 重编码为无 B 帧(H.264/H.265 各自保持编码族不变)。
+    NoBFrames,
+}
+
+impl FfmpegRecordingFinalizer {
+    /// 跑一遍收尾转封装。`video` 决定视频轨是拷贝还是重编码。
+    fn run_media_pass(
+        &self,
+        input: &Path,
+        output: &Path,
+        media: &RecordingMediaSpec,
+        video: VideoEncode,
+    ) -> Result<()> {
         let ffmpeg = media_rtp::ffmpeg_bin()
             .ok_or_else(|| Error::Media("未找到 ffmpeg，无法收尾录像".into()))?;
         let mut command = common::hidden_command(ffmpeg);
         command
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(input)
-            .args(["-map", "0:v:0", "-c:v", "copy"]);
+            .args(["-map", "0:v:0"]);
+        match video {
+            VideoEncode::Copy => {
+                command.args(["-c:v", "copy"]);
+            }
+            VideoEncode::NoBFrames => {
+                self.append_no_b_frames_args(&mut command, media.video_codec);
+            }
+        }
         match media.audio_codec {
             None => {
                 command.arg("-an");
@@ -199,33 +279,108 @@ impl RecordingFinalizer for FfmpegRecordingFinalizer {
                     .unwrap_or("未知错误")
             )));
         }
-        if let Some(audio_codec) = media.audio_codec {
-            // `None` 表示环境里没有 ffprobe：跳过校验但保留已写好的录像。
-            if let Some(probed) = probe_recording_audio(output)? {
-                let expected_codec = match audio_codec {
-                    media_rtp::AudioCodec::G711A
-                    | media_rtp::AudioCodec::G711U
-                    | media_rtp::AudioCodec::Aac => "aac",
-                    media_rtp::AudioCodec::Opus => "opus",
-                };
-                if probed.codec_name != expected_codec {
-                    return Err(Error::Media(format!(
-                        "录像音轨编码不符: 期望 {expected_codec}, 实际 {}",
-                        probed.codec_name
-                    )));
-                }
-                if let Some(expected_rate) = media.audio_sample_rate_hz {
-                    if probed.sample_rate_hz != Some(expected_rate) {
-                        return Err(Error::Media(format!(
-                            "录像音轨采样率不符: 期望 {expected_rate}, 实际 {:?}",
-                            probed.sample_rate_hz
-                        )));
-                    }
-                }
-            }
-        }
         Ok(())
     }
+
+    /// 视频轨重编码为无 B 帧的编码参数。
+    ///
+    /// - H.264:显式 `-bf 0` + Main profile(与内置示例视频一致,平台与播放器都稳);
+    /// - H.265:bframes 只能经 `-x265-params` 关闭,`-bf` 对 libx265 不生效。
+    fn append_no_b_frames_args(
+        &self,
+        command: &mut std::process::Command,
+        codec: media_rtp::VideoCodec,
+    ) {
+        match codec {
+            media_rtp::VideoCodec::H264 => {
+                command.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]);
+                command.args(["-profile:v", "main", "-pix_fmt", "yuv420p", "-bf", "0"]);
+            }
+            media_rtp::VideoCodec::H265 => {
+                command.args(["-c:v", "libx265", "-preset", "veryfast", "-crf", "22"]);
+                command.args([
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-x265-params",
+                    "bframes=0:log-level=error",
+                ]);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbedRecordingVideo {
+    codec_name: String,
+    has_b_frames: u32,
+}
+
+/// 读取成品视频流的编码与 B 帧数。
+///
+/// `has_b_frames > 0` 意味着这份录像设备端自己都无法回放:GB28181 历史时间轴
+/// 要求按显示顺序出帧,含 B 帧的码流只能拿到解码顺序,`probe_historical_segment`
+/// 会直接拒收,平台侧表现为 INVITE 收到 480。
+///
+/// 返回 `Ok(None)` 表示当前环境探测不到 ffprobe(与音轨校验同策略:自检项缺失
+/// 不能让录像整体失败)。
+fn probe_recording_video(path: &Path) -> Result<Option<ProbedRecordingVideo>> {
+    let Some(ffprobe) = recording_ffprobe_bin() else {
+        tracing::warn!(
+            path = %path.display(),
+            "未找到 ffprobe，跳过录像视频 B 帧校验（录像文件保留）"
+        );
+        return Ok(None);
+    };
+    let result = common::hidden_command(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,has_b_frames",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| Error::Media(format!("ffprobe 录像视频启动失败: {error}")))?;
+    if !result.status.success() {
+        return Err(Error::Media(format!(
+            "ffprobe 录像视频失败: {}",
+            String::from_utf8_lossy(&result.stderr)
+                .lines()
+                .last()
+                .unwrap_or("未知错误")
+        )));
+    }
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout)
+        .map_err(|error| Error::Media(format!("ffprobe 录像视频结果解析失败: {error}")))?;
+    let Some(stream) = report
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| streams.first())
+    else {
+        return Err(Error::Media("录像收尾成功但未发现视频流".into()));
+    };
+    let codec_name = stream
+        .get("codec_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // ffprobe 用字符串输出该字段(不同版本可能是数字),两种都认。
+    let has_b_frames = stream
+        .get("has_b_frames")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
+        .unwrap_or(0);
+    Ok(Some(ProbedRecordingVideo {
+        codec_name,
+        has_b_frames: u32::try_from(has_b_frames).unwrap_or(u32::MAX),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2083,4 +2238,75 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+    /// 回归:视频源带 B 帧时,收尾必须产出设备端能回放的录像。
+    ///
+    /// 现场(222 / 1.3 版)故障链:内置示例视频自带 B 帧 → 录制 `-c:v copy` 原样保留 →
+    /// 平台回放时 `probe_historical_segment` 拒收 → INVITE 回 480 → 平台 502。
+    #[test]
+    fn ffmpeg_finalizer_strips_b_frames_so_history_playback_accepts_recording() {
+        let Some(ffmpeg) = media_rtp::ffmpeg_bin() else {
+            eprintln!("跳过：环境里没有 ffmpeg");
+            return;
+        };
+        if recording_ffprobe_bin().is_none() {
+            eprintln!("跳过：环境里没有 ffprobe");
+            return;
+        }
+        let root = temp_root("ffmpeg-bframes");
+        fs::create_dir_all(&root).unwrap();
+        let input_path = root.join("bframes.mp4");
+        let output_path = root.join("final.mp4");
+        // libx264 默认开 B 帧,这里显式写 -bf 2 保证素材一定带 B 帧。
+        let made = common::hidden_command(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x180:rate=25",
+                "-frames:v",
+                "50",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-bf",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&input_path)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "合成带 B 帧素材失败: {made:?}");
+        let before = probe_recording_video(&input_path)
+            .expect("探测输入视频失败")
+            .expect("需要 ffprobe");
+        assert!(before.has_b_frames > 0, "合成素材应含 B 帧");
+
+        let spec = RecordingMediaSpec {
+            fps: 25,
+            video_codec: media_rtp::VideoCodec::H264,
+            audio_codec: None,
+            audio_sample_rate_hz: None,
+        };
+        FfmpegRecordingFinalizer
+            .finalize_media(&input_path, &output_path, &spec)
+            .expect("含 B 帧素材的收尾不应失败");
+
+        let after = probe_recording_video(&output_path)
+            .expect("探测成品视频失败")
+            .expect("需要 ffprobe");
+        assert_eq!(after.has_b_frames, 0, "收尾后视频仍含 B 帧");
+        assert_eq!(after.codec_name, "h264", "重编码不应改变编码族");
+        // 最终判据:设备端历史回放加载器必须能收下这份录像。
+        media_rtp::FileSource::from_paths_once(&[output_path.clone()])
+            .expect("历史回放加载应成功");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
 }
