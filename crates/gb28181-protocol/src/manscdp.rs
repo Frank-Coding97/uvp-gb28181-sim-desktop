@@ -1763,11 +1763,18 @@ pub struct ConfigDownloadResponse {
     pub svac_decode_config: Option<SvacConfig>,
 }
 
+/// 设备对外声明的录像下载倍速档位(`VideoParamOpt/DownSpeed`)。
+///
+/// 平台用它推导这台设备的最大下载倍速(取最大值),再据此在下载 INVITE 里
+/// 下发 `a=downloadspeed:N`。推流侧按 `PTS/N` 打点(见 media-rtp 的
+/// `PlaybackControl`),所以档位只影响"平台敢发多大",不构成设备侧上限。
+pub const DOWNLOAD_SPEED_CODES: &str = "1/2/4/8";
+
 /// 视频参数(ConfigDownload/VideoParamOpt 的内容,GB-2022)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "VideoParamOpt")]
 pub struct VideoParamOpt {
-    /// 支持的下载倍速,斜杠分隔(固定 "1/2/4",与上游一致)。
+    /// 支持的下载倍速,斜杠分隔(固定 "1/2/4/8",与平台侧合法档位一致)。
     #[serde(rename = "DownloadSpeed")]
     pub download_speed: String,
     /// 分辨率标签(如 "1920*1080")。
@@ -2036,7 +2043,7 @@ impl ConfigDownloadResponse {
                 heartbeat_count,
             }),
             video_param_opt: want_video.then(|| VideoParamOpt {
-                download_speed: "1/2/4".into(),
+                download_speed: DOWNLOAD_SPEED_CODES.into(),
                 resolution: resolution.into(),
             }),
             video_record_plan: want_record_plan.then_some(VideoRecordPlan {
@@ -3514,7 +3521,7 @@ mod tests {
         .to_xml()
         .unwrap();
         assert!(v.contains("<VideoParamOpt>"));
-        assert!(v.contains("<DownloadSpeed>1/2/4</DownloadSpeed>"));
+        assert!(v.contains("<DownloadSpeed>1/2/4/8</DownloadSpeed>"));
         assert!(v.contains("<Resolution>1920*1080</Resolution>"));
         assert!(!v.contains("<BasicParam>"));
         // 组合 BasicParam/VideoParamOpt。

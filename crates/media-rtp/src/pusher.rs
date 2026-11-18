@@ -846,6 +846,9 @@ mod tests {
 
         c.set_speed(2.0);
         assert_eq!(c.speed(), 2.0);
+        // 平台合法档位上探到 8x(设备 VideoParamOpt 声明 1/2/4/8)时不能被夹断。
+        c.set_speed(8.0);
+        assert_eq!(c.speed(), 8.0);
         c.set_speed(0.5);
         assert_eq!(c.speed(), 0.5);
         c.set_speed(-1.0); // 非正忽略,保持上一次。
