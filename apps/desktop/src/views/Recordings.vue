@@ -93,6 +93,24 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/**
+ * 列表行只容得下一行短时间。原来的 ISO 原文（2026-11-18T10:13:37）在窄列里会折行，
+ * 把同行的时间、标签、大小挤到互相叠字，这里统一压成 `11-18 10:13:37`（跨年才带年份）。
+ */
+function shortTime(iso: string) {
+  const matched = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2}:\d{2})/.exec(iso);
+  if (!matched) return iso;
+  const [, year, month, day, clock] = matched;
+  return Number(year) === new Date().getFullYear() ? `${month}-${day} ${clock}` : `${year}-${month}-${day} ${clock}`;
+}
+
+/** 结束时间与开始同一天只显示时分秒，跨零点才补日期，避免右侧再被撑爆。 */
+function endLabel(entry: RecordingEntry) {
+  const clock = /T(\d{2}:\d{2}:\d{2})/.exec(entry.end_time)?.[1];
+  if (!clock) return entry.end_time;
+  return entry.start_time.slice(0, 10) === entry.end_time.slice(0, 10) ? clock : shortTime(entry.end_time);
+}
+
 /** 一次最多为多少段录像抽缩略图。抽帧要起 ffmpeg 子进程，无上限会在长列表上打满 CPU。 */
 const THUMB_LIMIT = 80;
 /** 抽帧串行队列：并发跑 ffmpeg 只会互相抢 CPU，反而更慢。 */
@@ -241,10 +259,19 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
                 </div>
                 <button class="play-button" type="button" title="本地播放" @click.stop="selected = entry"><n-icon><PlayCircleOutline /></n-icon></button>
                 <div class="recording-main">
-                  <div><strong>{{ entry.start_time }}</strong><n-tag size="small" :bordered="false">{{ kindText[entry.kind] }}</n-tag><n-tag size="small" :bordered="false" type="info">{{ entry.source === "platform" ? "平台触发" : "本地触发" }}</n-tag></div>
-                  <small>{{ entry.channel_id }} · {{ entry.path }}</small>
+                  <div class="recording-line">
+                    <strong class="recording-time" :title="entry.start_time">{{ shortTime(entry.start_time) }}</strong>
+                    <n-tag size="small" :bordered="false">{{ kindText[entry.kind] }}</n-tag>
+                    <n-tag size="small" :bordered="false" type="info">{{ entry.source === "platform" ? "平台触发" : "本地触发" }}</n-tag>
+                  </div>
+                  <small class="recording-sub" :title="`${entry.channel_id} · ${entry.path} · 至 ${entry.end_time}`">
+                    {{ entry.channel_id }} · 至 {{ endLabel(entry) }} · {{ entry.path }}
+                  </small>
                 </div>
-                <div class="recording-meta"><strong>{{ formatBytes(entry.size_bytes) }}</strong><small>{{ formatDuration(durationSeconds(entry)) }} · 至 {{ entry.end_time }}</small></div>
+                <div class="recording-meta" :title="`${formatBytes(entry.size_bytes)} · ${formatDuration(durationSeconds(entry))}`">
+                  <strong>{{ formatBytes(entry.size_bytes) }}</strong>
+                  <small>{{ formatDuration(durationSeconds(entry)) }}</small>
+                </div>
                 <n-popconfirm positive-text="删除" negative-text="取消" @positive-click="remove(entry)">
                   <template #trigger><n-button quaternary circle type="error" @click.stop><template #icon><n-icon><TrashOutline /></n-icon></template></n-button></template>
                   确定删除该录像文件与索引吗？
@@ -295,13 +322,23 @@ h1 { margin: 0; color: var(--text-primary); font-size: 16px; } h2 { margin: 4px 
 .custom-range label { display: grid; gap: 3px; font-size: 10px; color: var(--text-tertiary); }
 .custom-range input { padding: 5px 8px; border: 1px solid var(--border-default); border-radius: 7px; background: white; color: var(--text-primary); font: inherit; font-size: 11px; }
 .custom-range small { flex: 1 1 100%; color: var(--text-tertiary); font-size: 10px; }
-.recording-list { flex: 1; min-height: 0; overflow: auto; padding: 6px; } .recording-row { display: grid; grid-template-columns: 64px 38px minmax(0,1fr) auto 34px; align-items: center; gap: 10px; margin-bottom: 4px; padding: 10px; border: 1px solid transparent; border-radius: 10px; cursor: pointer; }
+.recording-list { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 6px; }
+/* 列宽一律走 minmax(0, …)，每段文字各自 nowrap + 省略号：
+   窄窗口下时间/标签/大小只截断不折行，不会再出现两行文字互相压在一起。 */
+.recording-row { display: grid; grid-template-columns: 64px 34px minmax(0, 1fr) minmax(0, 96px) 34px; align-items: center; gap: 10px; margin-bottom: 4px; padding: 10px; border: 1px solid transparent; border-radius: 10px; cursor: pointer; overflow: hidden; }
+.recording-row > * { min-width: 0; }
 .recording-thumb { display: grid; place-items: center; width: 64px; height: 40px; overflow: hidden; border-radius: 6px; background: #0b1626; color: rgba(255,255,255,.42); }
 .recording-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .recording-thumb .failed { color: var(--warning, #d07818); }
 .recording-row:hover, .recording-row.selected { border-color: rgba(56,132,255,.3); background: var(--accent-soft); } .play-button { display: grid; place-items: center; width: 34px; height: 34px; border: 0; border-radius: 50%; color: var(--accent); background: white; font-size: 23px; cursor: pointer; }
-.recording-main { min-width: 0; } .recording-main > div { display: flex; align-items: center; gap: 6px; } .recording-main small { display: block; margin-top: 5px; overflow: hidden; color: var(--text-tertiary); text-overflow: ellipsis; white-space: nowrap; }
-.recording-meta { text-align: right; } .recording-meta small { display: block; margin-top: 4px; color: var(--text-tertiary); font-size: 10px; }
+.recording-main { min-width: 0; }
+.recording-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.recording-time { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--text-primary); font-size: 13px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.recording-line .n-tag { flex: 0 0 auto; }
+.recording-sub { display: block; margin-top: 4px; overflow: hidden; color: var(--text-tertiary); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.recording-meta { text-align: right; }
+.recording-meta strong { display: block; overflow: hidden; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.recording-meta small { display: block; margin-top: 4px; overflow: hidden; color: var(--text-tertiary); font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .player-panel { padding-left: 12px; overflow: auto; } .player-title { display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px; } video { width: 100%; min-height: 220px; border-radius: 10px; background: #07111f; }
 dl { display: grid; grid-template-columns: 72px minmax(0,1fr); gap: 8px 12px; margin: 14px 0 0; font-size: 11px; } dt { color: var(--text-tertiary); } dd { margin: 0; overflow-wrap: anywhere; color: var(--text-secondary); }
 .empty, .player-empty { align-self: center; margin: auto; }
@@ -314,5 +351,5 @@ dl { display: grid; grid-template-columns: 72px minmax(0,1fr); gap: 8px 12px; ma
   .player-panel { min-height: 360px; padding-left: 0; overflow: visible; }
   .status-strip { grid-template-columns: repeat(2,1fr); }
 }
-@media (max-width: 680px) { .recording-head { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 680px) { .recording-head { align-items: flex-start; flex-direction: column; } .recording-line .n-tag.info { display: none; } }
 </style>
