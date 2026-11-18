@@ -177,12 +177,43 @@ function tickUptime() {
   uptime.value = `${h}:${m}:${ss}`;
 }
 
-// 全局顶栏状态芯片:连接状态 + 在线时长 + 传输模式(TCP/UDP)。
-const statusChips = computed(() => [
-  { key: "state", label: "连接状态", value: statusMeta.value.text, color: statusMeta.value.color, dot: true },
-  { key: "uptime", label: "在线时长", value: uptime.value, mono: true },
-  { key: "transport", label: "传输模式", value: active.value?.transport.toUpperCase() ?? "—", mono: true },
-]);
+// 顶栏活动标识。录像状态后端没有事件通道，沿用各页面已有的 get_recording_state
+// 轮询；平台观看仍以 device_state=InCall 为唯一真源，不另开状态通道。
+type RecordingPhase = "idle" | "starting" | "recording" | "finalizing" | "failed";
+type TopbarChip = {
+  key: string; label: string; value: string;
+  color?: string; dot?: boolean; mono?: boolean; pulse?: boolean;
+};
+const recordingActive = ref(false);
+const platformWatching = computed(() => deviceState.value === "InCall");
+let recordingTimer: number | undefined;
+async function refreshRecordingFlag() {
+  if (!isTauri) return;
+  try {
+    const state = await invoke<{ phase: RecordingPhase }>("get_recording_state");
+    recordingActive.value = ["starting", "recording", "finalizing"].includes(state.phase);
+  } catch {
+    recordingActive.value = false;
+  }
+}
+
+// 全局顶栏状态芯片:连接状态 + 活动标识(录像/观看) + 在线时长 + 传输模式。
+const statusChips = computed<TopbarChip[]>(() => {
+  const chips: TopbarChip[] = [
+    { key: "state", label: "连接状态", value: statusMeta.value.text, color: statusMeta.value.color, dot: true },
+  ];
+  if (recordingActive.value) {
+    chips.push({ key: "recording", label: "录像状态", value: "录像中", color: "var(--error)", dot: true, pulse: true });
+  }
+  if (platformWatching.value) {
+    chips.push({ key: "watching", label: "平台状态", value: "平台观看", color: "var(--success)", dot: true, pulse: true });
+  }
+  chips.push(
+    { key: "uptime", label: "在线时长", value: uptime.value, mono: true },
+    { key: "transport", label: "传输模式", value: active.value?.transport.toUpperCase() ?? "—", mono: true },
+  );
+  return chips;
+});
 
 // 顶栏注册/注销:任意页面可操作同一台设备。成功用 message,失败落全局错误条。
 async function toggleRegistration() {
@@ -297,6 +328,9 @@ onMounted(async () => {
   await startNotificationCenter();
   // app 启动/刷新后与引擎对账,反映后台是否已有设备在跑。
   reconcile();
+  // 顶栏活动标识跨页面常驻：录像状态需要自行轮询，切到任意页面都不丢。
+  void refreshRecordingFlag();
+  recordingTimer = window.setInterval(() => { void refreshRecordingFlag(); }, 1000);
   // 启动时静默查一次更新：命中新版本只往通知中心放一条，不弹窗、不打断任何操作。
   // 真正的安装入口在「关于」页，由用户手动确认（安装完成要重启应用）。
   void checkForUpdates({ silent: true });
@@ -304,6 +338,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisten?.(); unlistenErr?.();
   if (uptimeTimer) clearInterval(uptimeTimer);
+  if (recordingTimer) clearInterval(recordingTimer);
   stopNotificationCenter();
 });
 
@@ -455,9 +490,11 @@ const themeOverrides = {
                       v-for="c in statusChips"
                       :key="c.key"
                       class="chip"
+                      :class="[c.pulse && 'is-live', `chip-${c.key}`]"
                       :title="c.label + '：' + c.value"
+                      :aria-label="c.label + '：' + c.value"
                     >
-                      <span v-if="c.dot" class="chip-dot" :style="{ background: c.color }" />
+                      <span v-if="c.dot" class="chip-dot" :class="{ pulse: c.pulse }" :style="{ background: c.color }" />
                       <span class="chip-val" :class="{ mono: c.mono }" :style="{ color: c.color }">{{ c.value }}</span>
                     </div>
                   </div>
@@ -582,6 +619,19 @@ const themeOverrides = {
   max-width: 200px; min-width: 0;
 }
 .chip-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; transition: background var(--transition); }
+/* 活动中的标识：红=录像，绿=平台观看。浅底深字，闪烁点只在真正活动时存在。 */
+.chip-recording { border-color: color-mix(in srgb, var(--error) 38%, transparent); }
+.chip-watching { border-color: color-mix(in srgb, var(--success) 38%, transparent); }
+.chip-recording .chip-dot.pulse { --pulse-color: var(--error); }
+.chip-watching .chip-dot.pulse { --pulse-color: var(--success); }
+.chip-dot.pulse { animation: topbar-live-pulse 1.4s ease-in-out infinite; }
+@keyframes topbar-live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse-color) 55%, transparent); opacity: 1; }
+  50% { box-shadow: 0 0 0 5px transparent; opacity: .5; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chip-dot.pulse { animation: none; }
+}
 .chip-val {
   font-size: 12.5px; font-weight: 600; color: var(--text-secondary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
