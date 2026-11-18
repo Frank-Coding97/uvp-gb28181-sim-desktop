@@ -29,8 +29,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { usePlatform } from "./platform";
 import type { GbVersion, SignalingEncoding } from "./platform";
-// 应用图标与应用包图标同源(app-icon.svg → tauri icon),侧边栏 logo 直接复用矢量图。
-import appIconUrl from "./assets/app-icon.svg?url";
+// 侧边栏与应用包共用定稿图标，应用包图标由 tauri icon 从此 PNG 生成。
+import appIconUrl from "./assets/app-icon.png";
 import { effective, normalizeForVersion, optionsFor, parseEncoding } from "./signaling-charset.mjs";
 import { useDevice } from "./device";
 import NotificationBell from "./components/NotificationBell.vue";
@@ -561,14 +561,12 @@ const themeOverrides = {
 .brand-logo {
   width: 38px; height: 38px; border-radius: 10px; flex: 0 0 auto;
   overflow: hidden;
-  /* 渐变底色作 img 加载前的兜底，避免闪白 */
-  background: linear-gradient(135deg, #3884ff, #1e63dc);
+  /* 与图标底色一致，避免加载时闪白 */
+  background: #1687f8;
   display: flex; align-items: center; justify-content: center;
   box-shadow: 0 4px 12px var(--accent-glow);
 }
-/* 图标 SVG 画布四周有 3.9% 透明留白(40/1024)，放大 1/0.9219 使可见圆角方块
-   正好 38px，与改动前的尺寸、位置完全一致，不影响 .brand 布局。 */
-.brand-logo img { width: 41.22px; height: 41.22px; display: block; }
+.brand-logo img { width: 38px; height: 38px; display: block; }
 .brand-title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
 .brand-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
 .sidebar-footer {
