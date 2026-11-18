@@ -119,6 +119,61 @@ pub fn synced_iso8601() -> String {
     epoch_to_iso8601(synced_epoch_secs())
 }
 
+/// 时区偏移(秒):把「平台时间 − 本地时间」的总偏移拆成「时区」+「钟差」。
+///
+/// 为什么要拆:GB28181 的 `Date` 头是平台**本地挂钟**(不带时区),所以
+/// `offset_secs()` 里粘了两样东西 —— 时区位移,加上真正的钟差(平台钟比
+/// 本机快/慢几秒)。前者是成小时的常量,后者是几秒的误差。
+///
+/// 录像条目必须用「设备自己的挂钟」记时,不能用 `synced_iso8601`:
+/// 平台拿到目录时间后,会按**它自己的**时区把它换回 UNIX 时间戳,再拿这个
+/// 戳发回放 INVITE;而设备侧比对用的是本机 UNIX 时间戳。一旦把整块校时偏移
+/// 塞进录像时间,平台换回来的窗口就整体偏移了「钟差」那么多,录像尾部这一小段
+/// 永远对不上 —— 现场(222)就是 3 秒,点回放稳定 404。
+///
+/// 时区偏移一定是 15 分钟的整数倍(±450 秒内的余数视为钟差),据此拆分。
+pub fn utc_offset_secs() -> i64 {
+    utc_offset_from(offset_secs())
+}
+
+/// 从总偏移里拆出时区部分(纯函数,便于单测)。
+pub fn utc_offset_from(offset: i64) -> i64 {
+    offset.saturating_add(450).div_euclid(900) * 900
+}
+
+/// 设备挂钟的 ISO8601(`YYYY-MM-DDThh:mm:ss`,不含时区后缀)。
+///
+/// 与 [`synced_iso8601`] 的区别:只叠加时区、**不叠加钟差**,因此它和本机
+/// `epoch_millis` 描述的是同一个时刻,[`device_ms_from_iso`] 可无损还原。
+/// 凡是需要和设备本地时间戳互相换算的地方(录像索引、按时间窗检索录像)都用这个。
+pub fn device_iso8601() -> String {
+    device_iso8601_from_ms(local_epoch_ms())
+}
+
+/// 本机 UNIX 毫秒 → 设备挂钟 ISO8601(见 [`device_iso8601`])。
+pub fn device_iso8601_from_ms(ms: i64) -> String {
+    iso8601_from_ms_with_utc_offset(ms, utc_offset_secs())
+}
+
+/// [`device_iso8601_from_ms`] 的纯函数版本,时区偏移由调用方给定(便于单测)。
+pub fn iso8601_from_ms_with_utc_offset(ms: i64, utc_offset: i64) -> String {
+    epoch_to_iso8601(ms.div_euclid(1000).saturating_add(utc_offset))
+}
+
+/// 设备挂钟 ISO8601 → 本机 UNIX 毫秒,与 [`device_iso8601_from_ms`] 互逆。
+///
+/// `parse_iso8601` 按 UTC 历法算出的是「挂钟时间当 UNIX 秒」,这里减掉时区
+/// 才是本机真正的 UNIX 时间戳。
+pub fn device_ms_from_iso(value: &str) -> Option<i64> {
+    ms_from_iso_with_utc_offset(value, utc_offset_secs())
+}
+
+/// [`device_ms_from_iso`] 的纯函数版本(便于单测)。
+pub fn ms_from_iso_with_utc_offset(value: &str, utc_offset: i64) -> Option<i64> {
+    parse_iso8601(value)
+        .map(|secs| secs.saturating_sub(utc_offset).saturating_mul(1000))
+}
+
 /// 把 UNIX 纪元秒转成 `YYYY-MM-DDThh:mm:ss`(UTC 历法计算,不带时区后缀)。
 ///
 /// 注:这里按“纪元秒对应的挂钟时间”直接换算。偏移已在 synced_epoch_secs 叠加,
@@ -415,4 +470,37 @@ mod tests {
         assert!(parse_iso8601("2026-07-04T00:23:5中文乱码尾巴").is_none());
         assert!(parse_iso8601("中文中文中文").is_none());
     }
+    #[test]
+    fn 时区偏移从总偏移里拆出来() {
+        let _guard = serial();
+        // 现场(222)：本机在 +08:00，平台 Date 比本机快 3 秒 → 总偏移 28803。
+        assert_eq!(utc_offset_from(28_803), 28_800);
+        assert_eq!(utc_offset_from(28_800), 28_800);
+        assert_eq!(utc_offset_from(-28_797), -28_800);
+        assert_eq!(utc_offset_from(0), 0);
+        // 半小时时区（如 +05:30）同样要拆对。
+        assert_eq!(utc_offset_from(19_801), 19_800);
+    }
+
+    #[test]
+    fn 录像挂钟时间与本地时间戳互逆() {
+        let _guard = serial();
+        set_offset_secs(28_803);
+        let start_ms = 1_794_971_558_136_i64;
+        let end_ms = 1_794_971_572_484_i64;
+        let start = device_iso8601_from_ms(start_ms);
+        let end = device_iso8601_from_ms(end_ms);
+        // 只叠加时区、不叠加钟差：报出去的就是设备自己的挂钟。
+        assert_eq!(start, "2026-11-18T11:12:38");
+        assert_eq!(end, "2026-11-18T11:12:52");
+        // 反解回来必须等于原始毫秒（秒级精度），否则按目录时间检索录像会漏。
+        assert_eq!(device_ms_from_iso(&start), Some(start_ms / 1_000 * 1_000));
+        assert_eq!(device_ms_from_iso(&end), Some(end_ms / 1_000 * 1_000));
+        // 对照：synced 版本带 3 秒钟差，正是现场 404 的来源。
+        // 用同一个毫秒做基准，避免两次读时钟跨秒导致偶发失败。
+        let synced = epoch_to_iso8601(start_ms / 1_000 + offset_secs());
+        let skew = parse_iso8601(&synced).unwrap() - parse_iso8601(&start).unwrap();
+        assert_eq!(skew, 3, "校时钟差应恰好被 device_* 剔除");
+    }
+
 }

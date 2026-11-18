@@ -3629,11 +3629,12 @@ impl DeviceSimulator {
         use crate::recording::{RecordingKind, RecordingQuery};
         use gb28181_protocol::manscdp::{RecordInfoResponse, RecordItem};
 
+        // 平台下发的是**它自己的挂钟**时间,必须折成本机 UNIX 毫秒再和索引比,
+        // 否则查询窗口会整体偏一个时区(白天 8 小时),只有跨天的大窗口才碰巧命中。
         let parse_time = |value: Option<&String>| {
             value
-                .and_then(|value| common::clock::parse_iso8601(value))
-                .and_then(|seconds| u64::try_from(seconds).ok())
-                .map(|seconds| seconds.saturating_mul(1_000))
+                .and_then(|value| common::clock::device_ms_from_iso(value))
+                .and_then(|ms| u64::try_from(ms).ok())
         };
         let kind = match query.record_type.as_deref().map(str::trim) {
             None | Some("") | Some("all") | Some("ALL") => None,

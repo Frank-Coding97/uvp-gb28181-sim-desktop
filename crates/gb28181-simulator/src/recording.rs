@@ -471,7 +471,6 @@ struct ActiveRecording {
     id: String,
     channel_id: String,
     start_time_ms: u64,
-    start_time: String,
     source: RecordingSource,
     kind: RecordingKind,
     media: RecordingMediaSpec,
@@ -694,7 +693,6 @@ impl RecordingService {
             id,
             channel_id,
             start_time_ms,
-            start_time: common::clock::synced_iso8601(),
             source,
             kind,
             media: media_spec,
@@ -741,13 +739,17 @@ impl RecordingService {
         let size_bytes = fs::metadata(&active.final_path)
             .map(|metadata| metadata.len())
             .unwrap_or(capture.bytes_written);
+        // 时间一律从 ms 派生:同一条录像的「毫秒」和「ISO 字符串」必须是同一个
+        // 时刻。用 synced_iso8601 会额外叠加校时钟差(现场 222 是 3 秒),
+        // 平台按目录时间发回放 INVITE 时就会飘出录像尾部,稳定 404。
+        let end_time_ms = epoch_millis();
         let entry = RecordingEntry {
             id: active.id,
             channel_id: active.channel_id,
             start_time_ms: active.start_time_ms,
-            end_time_ms: epoch_millis(),
-            start_time: active.start_time,
-            end_time: common::clock::synced_iso8601(),
+            end_time_ms,
+            start_time: common::clock::device_iso8601_from_ms(active.start_time_ms as i64),
+            end_time: common::clock::device_iso8601_from_ms(end_time_ms as i64),
             source: active.source,
             kind: active.kind,
             path: active.final_path,
@@ -2306,6 +2308,64 @@ mod tests {
         media_rtp::FileSource::from_paths_once(&[output_path.clone()])
             .expect("历史回放加载应成功");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 回归：目录里报给平台的时间，必须能反查回同一条录像。
+    ///
+    /// 现场（222）故障链：录像真实区间 `11:12:38.136~11:12:52.484`；目录时间
+    /// 曾经用 `synced_iso8601` 生成，额外叠加了 3 秒校时钟差，报成
+    /// `11:12:41~11:12:55`。平台按目录时间换回 UNIX 戳后发回放 INVITE
+    /// 【11:12:53~11:12:55】，整段落在录像之后 → 设备回 404 Recording Not Found
+    /// → 平台报「设备回放信令建立失败」（接口 502，耗时仅 40ms）。
+    /// 时间一律由 ms 派生后，任何按目录时间推出来的窗口都必然命中。
+    #[test]
+    fn 目录时间经平台换算后仍能命中同一条录像() {
+        const TZ: i64 = 28_800; // +08:00
+        let root = temp_root("catalog-window");
+        fs::create_dir_all(&root).unwrap();
+        let store = RecordingStore::open(&root).unwrap();
+        let start_ms = 1_794_971_558_136_i64;
+        let end_ms = 1_794_971_572_484_i64;
+        let channel = "45020200001321000132";
+        let path = root.join("r.mp4");
+        fs::write(&path, b"media").unwrap();
+        let entry = RecordingEntry {
+            id: "r".into(),
+            channel_id: channel.into(),
+            start_time_ms: start_ms as u64,
+            end_time_ms: end_ms as u64,
+            start_time: common::clock::iso8601_from_ms_with_utc_offset(start_ms, TZ),
+            end_time: common::clock::iso8601_from_ms_with_utc_offset(end_ms, TZ),
+            source: RecordingSource::Local,
+            kind: RecordingKind::Manual,
+            path,
+            size_bytes: 5,
+            video_codec: Some("h264".into()),
+            audio_codec: None,
+            audio_sample_rate_hz: None,
+        };
+        assert_eq!(entry.start_time, "2026-11-18T11:12:38");
+        assert_eq!(entry.end_time, "2026-11-18T11:12:52");
+        store.add(entry.clone()).unwrap();
+
+        // 平台侧：目录时间 → 自己的时区 → UNIX 秒，再发 INVITE（取录像最后 2 秒）。
+        let platform_end = common::clock::parse_iso8601(&entry.end_time).unwrap() - TZ;
+        let platform_start = platform_end - 2;
+        let found = store.query(&RecordingQuery {
+            start_time_ms: Some(platform_start as u64 * 1_000),
+            end_time_ms: Some(platform_end as u64 * 1_000),
+            channel_id: Some(channel.into()),
+            kind: None,
+        });
+        assert_eq!(found.len(), 1, "录像尾部窗口必须命中录像，否则平台会收到 404");
+        assert_eq!(found[0].id, "r");
+
+        // 往返无损：目录时间换回 UNIX 毫秒 = 索引里记录的真实值。
+        assert_eq!(
+            common::clock::ms_from_iso_with_utc_offset(&entry.start_time, TZ),
+            Some(start_ms / 1_000 * 1_000)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
