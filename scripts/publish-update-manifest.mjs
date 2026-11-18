@@ -109,17 +109,23 @@ async function readNotes() {
 /** 本地产物目录里找 .sig：macOS 在 bundle/macos，Windows 在 bundle/nsis。 */
 async function readLocalSignature(target) {
   const candidates = [
+    // ⚠️ 显式提供的 sig-dir 必须排第一。构建目录里常年留着上一版的 .sig，
+    //    按后缀模糊匹配会拿到旧签名，客户端升级时验签直接失败。
+    sigDir ? resolve(sigDir) : "",
     join(root, "target/release/bundle/macos"),
     join(root, `target/x86_64-pc-windows-msvc/release/bundle/nsis`),
     join(root, `target/release/bundle/nsis`),
-    sigDir ? resolve(sigDir) : "",
   ].filter(Boolean);
 
-  for (const dir of candidates) {
-    if (!existsSync(dir)) continue;
-    const files = await readdir(dir);
-    const match = files.find((name) => name.endsWith(target.sigSuffix));
-    if (match) {
+  const exact = `${target.file}.sig`;
+  for (const matchName of [exact, null]) {
+    for (const dir of candidates) {
+      if (!existsSync(dir)) continue;
+      const files = await readdir(dir);
+      const match = matchName
+        ? files.find((name) => name === matchName)
+        : files.find((name) => name.endsWith(target.sigSuffix));
+      if (!match) continue;
       const text = (await readFile(join(dir, match), "utf8")).trim();
       if (text) return { signature: text, source: join(dir, match) };
     }
