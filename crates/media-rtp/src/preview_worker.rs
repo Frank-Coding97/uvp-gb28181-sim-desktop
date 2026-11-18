@@ -1720,7 +1720,33 @@ mod tests {
         let sink_trait: Arc<dyn PreviewSink> = sink.clone();
         let (input, mut worker) = spawn_preview_worker(ffmpeg, 10, 77, sink_trait);
         let input_count = frames.len();
-        for (index, frame) in frames.into_iter().enumerate() {
+        let mut frames = frames.into_iter();
+        // Annex-B 解码器要看到下一帧起始码才吐上一帧；先灌两帧让冷启动完成，
+        // 之后按解码器实际产出节奏推进，避免整套测试并发跑时 30ms 固定节奏
+        // 把输入队列灌满（队列满会被记成 Dropped，误判成丢帧缺陷）。
+        for index in 0..2 {
+            let frame = frames.next().expect("fixture 至少应有两帧");
+            let access_unit = CapturedAccessUnit::new(
+                77,
+                index + 1,
+                frame.data,
+                frame.key_frame,
+                index as u64 + 100,
+            );
+            assert_eq!(input.try_send(access_unit), PreviewSendResult::Sent);
+        }
+        for (offset, frame) in frames.enumerate() {
+            let index = offset + 2;
+            let needed = index as u64 - 1;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while (sink.frames.lock().unwrap().len() as u64) < needed && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                (sink.frames.lock().unwrap().len() as u64) >= needed,
+                "解码器未及时产出第 {needed} 帧；statuses: {:#?}",
+                sink.statuses.lock().unwrap()
+            );
             let access_unit = CapturedAccessUnit::new(
                 77,
                 index as u64 + 1,
@@ -1729,7 +1755,6 @@ mod tests {
                 index as u64 + 100,
             );
             assert_eq!(input.try_send(access_unit), PreviewSendResult::Sent);
-            std::thread::sleep(Duration::from_millis(30));
         }
 
         // Annex-B decoder 需要下一帧起始码才能确认当前帧结束；持续流允许固定一帧在途。
