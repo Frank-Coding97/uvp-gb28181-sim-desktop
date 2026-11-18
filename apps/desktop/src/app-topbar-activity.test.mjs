@@ -10,11 +10,11 @@ assert.match(source, /\["starting", "recording", "finalizing"\]\.includes\(state
 assert.match(source, /const platformWatching = computed\(\(\) => deviceState\.value === "InCall"\)/, "平台观看必须复用 InCall 这一唯一真源");
 assert.doesNotMatch(source, /listen<[^>]*>\("(viewer|watching)_state"/, "不应为顶栏另建观看状态事件通道");
 
-assert.match(source, /if \(recordingActive\.value\)[\s\S]*?key: "recording"[\s\S]*?value: "录像中"/, "录像中应生成顶栏芯片");
-assert.match(source, /if \(platformWatching\.value\)[\s\S]*?key: "watching"[\s\S]*?value: "平台观看"/, "平台观看应生成顶栏芯片");
+assert.match(source, /if \(recordingActive\.value\)[\s\S]*?key: "recording"[\s\S]*?value: "REC"[\s\S]*?hint: "正在录像"/, "录像中应生成 REC 芯片并带中文语义");
+assert.match(source, /if \(platformWatching\.value\)[\s\S]*?key: "watching"[\s\S]*?value: "LIVE"[\s\S]*?hint: "平台正在观看"/, "平台观看应生成 LIVE 芯片并带中文语义");
 assert.match(source, /v-for="c in statusChips"/, "顶栏应渲染状态芯片列表");
 assert.match(source, /class="chip-dot" :class="\{ pulse: c\.pulse \}"/, "仅活动芯片带闪烁点");
-assert.match(source, /:aria-label="c\.label \+ '：' \+ c\.value"/, "状态芯片要给读屏软件补语义");
+assert.match(source, /:aria-label="c\.hint \?\? c\.label \+ '：' \+ c\.value"/, "REC/LIVE 要给读屏软件补中文语义");
 assert.match(source, /@media \(prefers-reduced-motion: reduce\) \{\s*\.chip-dot\.pulse \{ animation: none; \}/, "跟随系统关闭闪烁动画");
 
 assert.match(source, /recordingTimer = window\.setInterval/, "录像状态需要定时回读");

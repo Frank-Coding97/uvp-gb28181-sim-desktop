@@ -182,7 +182,7 @@ function tickUptime() {
 type RecordingPhase = "idle" | "starting" | "recording" | "finalizing" | "failed";
 type TopbarChip = {
   key: string; label: string; value: string;
-  color?: string; dot?: boolean; mono?: boolean; pulse?: boolean;
+  hint?: string; color?: string; dot?: boolean; mono?: boolean; pulse?: boolean;
 };
 const recordingActive = ref(false);
 const platformWatching = computed(() => deviceState.value === "InCall");
@@ -203,10 +203,10 @@ const statusChips = computed<TopbarChip[]>(() => {
     { key: "state", label: "连接状态", value: statusMeta.value.text, color: statusMeta.value.color, dot: true },
   ];
   if (recordingActive.value) {
-    chips.push({ key: "recording", label: "录像状态", value: "录像中", color: "var(--error)", dot: true, pulse: true });
+    chips.push({ key: "recording", label: "录像状态", value: "REC", hint: "正在录像", color: "var(--error)", dot: true, pulse: true });
   }
   if (platformWatching.value) {
-    chips.push({ key: "watching", label: "平台状态", value: "平台观看", color: "var(--success)", dot: true, pulse: true });
+    chips.push({ key: "watching", label: "平台状态", value: "LIVE", hint: "平台正在观看", color: "var(--success)", dot: true, pulse: true });
   }
   chips.push(
     { key: "uptime", label: "在线时长", value: uptime.value, mono: true },
@@ -491,8 +491,8 @@ const themeOverrides = {
                       :key="c.key"
                       class="chip"
                       :class="[c.pulse && 'is-live', `chip-${c.key}`]"
-                      :title="c.label + '：' + c.value"
-                      :aria-label="c.label + '：' + c.value"
+                      :title="c.hint ?? c.label + '：' + c.value"
+                      :aria-label="c.hint ?? c.label + '：' + c.value"
                     >
                       <span v-if="c.dot" class="chip-dot" :class="{ pulse: c.pulse }" :style="{ background: c.color }" />
                       <span class="chip-val" :class="{ mono: c.mono }" :style="{ color: c.color }">{{ c.value }}</span>
@@ -622,6 +622,9 @@ const themeOverrides = {
 /* 活动中的标识：红=录像，绿=平台观看。浅底深字，闪烁点只在真正活动时存在。 */
 .chip-recording { border-color: color-mix(in srgb, var(--error) 38%, transparent); }
 .chip-watching { border-color: color-mix(in srgb, var(--success) 38%, transparent); }
+.chip-recording .chip-val, .chip-watching .chip-val {
+  font-family: "SF Mono", Menlo, monospace; font-size: 11.5px; letter-spacing: .8px;
+}
 .chip-recording .chip-dot.pulse { --pulse-color: var(--error); }
 .chip-watching .chip-dot.pulse { --pulse-color: var(--success); }
 .chip-dot.pulse { animation: topbar-live-pulse 1.4s ease-in-out infinite; }
